@@ -3,7 +3,7 @@ use crate::commands::init_flow::find_git_root;
 use crate::config::{
     load_global_config, load_repo_config, migrate_legacy_repo_config, save_global_config,
     save_repo_config, GlobalConfig, HeadlessConfig, RepoConfig, WorkItemsConfig,
-    DEFAULT_SCROLLBACK_LINES,
+    DEFAULT_SCROLLBACK_LINES, DEFAULT_STUCK_TIMEOUT_SECS,
 };
 use anyhow::{bail, Result};
 use std::path::Path;
@@ -129,6 +129,13 @@ pub static ALL_FIELDS: &[ConfigFieldDef] = &[
         builtin_default: "(not set)",
         settable: true,
     },
+    ConfigFieldDef {
+        key: "agentStuckTimeout",
+        scope: FieldScope::Both,
+        hint: "seconds of inactivity before agent is considered stuck (e.g. 30)",
+        builtin_default: "30",
+        settable: true,
+    },
 ];
 
 /// Look up a field definition by its CLI/TUI key.
@@ -244,6 +251,10 @@ pub fn global_display(field: &ConfigFieldDef, global: &GlobalConfig) -> String {
                     }
                 })
                 .unwrap_or_else(|| format!("{} (built-in)", field.builtin_default)),
+            "agentStuckTimeout" => global
+                .agent_stuck_timeout_secs
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| format!("{} (built-in)", field.builtin_default)),
             _ => "N/A".to_string(),
         },
     }
@@ -295,6 +306,10 @@ pub fn repo_display(field: &ConfigFieldDef, repo: Option<&RepoConfig>) -> String
                     .as_ref()
                     .and_then(|w| w.template.as_deref())
                     .filter(|s| !s.is_empty())
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "(not set)".to_string()),
+                "agentStuckTimeout" => repo
+                    .agent_stuck_timeout_secs
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "(not set)".to_string()),
                 _ => "(not set)".to_string(),
@@ -426,6 +441,17 @@ pub fn effective_display(
                 }
             })
             .unwrap_or_else(|| "(not set)".to_string()),
+        "agentStuckTimeout" => {
+            if let Some(repo) = repo {
+                if let Some(v) = repo.agent_stuck_timeout_secs {
+                    return v.to_string();
+                }
+            }
+            global
+                .agent_stuck_timeout_secs
+                .unwrap_or(DEFAULT_STUCK_TIMEOUT_SECS)
+                .to_string()
+        }
         _ => "?".to_string(),
     }
 }
@@ -481,6 +507,14 @@ pub fn override_indicator(
             }
         }
         "auto_agent_auth_accepted" => "—",
+        "agentStuckTimeout" => {
+            if let Some(rv) = repo.agent_stuck_timeout_secs {
+                let gv = global.agent_stuck_timeout_secs.unwrap_or(DEFAULT_STUCK_TIMEOUT_SECS);
+                if rv != gv { "yes" } else { "—" }
+            } else {
+                "—"
+            }
+        }
         _ => "—",
     }
 }
@@ -548,6 +582,17 @@ pub fn validate_value(field: &ConfigFieldDef, value: &str) -> Result<()> {
         "remote.defaultAPIKey" => {
             // Any string is valid; empty string clears.
         }
+        "agentStuckTimeout" => {
+            let n: u64 = value.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid value '{}' for 'agentStuckTimeout'. Expected a positive integer (seconds).",
+                    value
+                )
+            })?;
+            if n == 0 {
+                bail!("Invalid value '0' for 'agentStuckTimeout'. Must be a positive integer.");
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -574,6 +619,9 @@ pub fn apply_to_repo(field: &ConfigFieldDef, value: &str, repo: &mut RepoConfig)
         "work_items.template" => {
             let work_items = repo.work_items.get_or_insert_with(WorkItemsConfig::default);
             work_items.template = if value.is_empty() { None } else { Some(value.to_string()) };
+        }
+        "agentStuckTimeout" => {
+            repo.agent_stuck_timeout_secs = Some(value.trim().parse().expect("validated"));
         }
         _ => {}
     }
@@ -614,6 +662,9 @@ pub fn apply_to_global(field: &ConfigFieldDef, value: &str, global: &mut GlobalC
             let remote = global.remote.get_or_insert_with(crate::config::RemoteConfig::default);
             remote.default_api_key = if value.trim().is_empty() { None } else { Some(value.to_string()) };
         }
+        "agentStuckTimeout" => {
+            global.agent_stuck_timeout_secs = Some(value.trim().parse().expect("validated"));
+        }
         _ => {}
     }
 }
@@ -638,6 +689,7 @@ fn repo_field_is_set(field: &ConfigFieldDef, repo: &RepoConfig) -> bool {
             .and_then(|w| w.template.as_deref())
             .map(|s| !s.is_empty())
             .unwrap_or(false),
+        "agentStuckTimeout" => repo.agent_stuck_timeout_secs.is_some(),
         _ => false,
     }
 }
@@ -664,6 +716,14 @@ fn values_match_global(field: &ConfigFieldDef, new_value: &str, global: &GlobalC
             let nv = parse_vec_value(new_value);
             let gv = global.env_passthrough.as_deref().unwrap_or(&[]);
             nv.as_slice() == gv
+        }
+        "agentStuckTimeout" => {
+            if let Ok(n) = new_value.trim().parse::<u64>() {
+                let g = global.agent_stuck_timeout_secs.unwrap_or(DEFAULT_STUCK_TIMEOUT_SECS);
+                n == g
+            } else {
+                false
+            }
         }
         _ => false,
     }
@@ -734,6 +794,20 @@ fn scope_annotation(
                 }
             } else if global.default_agent.is_some() {
                 "  ← using default_agent from global config"
+            } else {
+                ""
+            }
+        }
+        "agentStuckTimeout" => {
+            if let Some(rv) = repo.agent_stuck_timeout_secs {
+                let gv = global.agent_stuck_timeout_secs.unwrap_or(DEFAULT_STUCK_TIMEOUT_SECS);
+                if rv != gv {
+                    "  ← repo overrides global"
+                } else {
+                    ""
+                }
+            } else if global.agent_stuck_timeout_secs.is_some() {
+                "  ← global overrides built-in default"
             } else {
                 ""
             }

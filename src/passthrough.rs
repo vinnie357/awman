@@ -71,49 +71,57 @@ impl AgentPassthrough for ClaudePassthrough {
 
 // ─── Opencode ────────────────────────────────────────────────────────────────
 
-/// Top-level entries in `~/.local/share/opencode/` to exclude from the container copy.
+/// Top-level entries in `~/.config/opencode/` to exclude from the container copy.
 const OPENCODE_DIR_DENYLIST: &[&str] = &["logs"];
 
 /// Passthrough for the Opencode agent.
 ///
 /// - **Keychain**: none (opencode does not use the system keychain).
 /// - **Env vars**: none (API keys should be passed via the `envPassthrough` config key).
-/// - **Settings**: copies `~/.local/share/opencode/` into a temp dir and mounts it
-///   (read-write) at `/root/.local/share/opencode` inside the container. The mount is
+/// - **Settings**: copies `~/.config/opencode/` into a temp dir and mounts it
+///   (read-write) at `/root/.config/opencode` inside the container. The mount is
 ///   read-write because the source is a temp copy, not the live host directory.
-///   Returns `None` if `~/.local/share/opencode/` does not exist on the host.
+///   Returns `None` if `~/.config/opencode/` does not exist on the host.
+///
+/// The initial container path is `/root/.config/opencode`, which is remapped by
+/// [`apply_dockerfile_user`] to `/home/<username>/.config/opencode` when the
+/// Dockerfile specifies a non-root USER directive (e.g. `USER amux`).
 pub struct OpencodePassthrough;
 
 impl AgentPassthrough for OpencodePassthrough {
     fn prepare_host_settings(&self) -> Option<HostSettings> {
         let home = dirs::home_dir()?;
-        let src = home.join(".local/share/opencode");
+        let src = home.join(".config").join("opencode");
         if !src.exists() {
             return None;
         }
         let temp_dir = tempfile::TempDir::new().ok()?;
-        let dst = temp_dir.path().join("opencode-data");
+        let dst = temp_dir.path().join("opencode-config");
         crate::runtime::copy_dir_filtered(&src, &dst, OPENCODE_DIR_DENYLIST).ok()?;
         Some(HostSettings::new_agent_dir(
             Some(temp_dir),
             "/root".to_string(),
-            Some((dst, "/root/.local/share/opencode".to_string())),
+            // Use /root/ prefix so apply_dockerfile_user remaps this to the correct
+            // container home when the Dockerfile sets USER to a non-root user.
+            Some((dst, "/root/.config/opencode".to_string())),
         ))
     }
 
     fn prepare_host_settings_to_dir(&self, dir: &Path) -> Option<HostSettings> {
         let home = dirs::home_dir()?;
-        let src = home.join(".local/share/opencode");
+        let src = home.join(".config").join("opencode");
         if !src.exists() {
             return None;
         }
         std::fs::create_dir_all(dir).ok()?;
-        let dst = dir.join("opencode-data");
+        let dst = dir.join("opencode-config");
         crate::runtime::copy_dir_filtered(&src, &dst, OPENCODE_DIR_DENYLIST).ok()?;
         Some(HostSettings::new_agent_dir(
             None,
             "/root".to_string(),
-            Some((dst, "/root/.local/share/opencode".to_string())),
+            // Use /root/ prefix so apply_dockerfile_user remaps this to the correct
+            // container home when the Dockerfile sets USER to a non-root user.
+            Some((dst, "/root/.config/opencode".to_string())),
         ))
     }
 }
@@ -252,21 +260,61 @@ impl AgentPassthrough for CopilotPassthrough {
 
 // ─── Crush ──────────────────────────────────────────────────────────────────
 
+/// Top-level entries in `~/.config/crush/` to exclude from the container copy.
+const CRUSH_CONFIG_DENYLIST: &[&str] = &["logs"];
+
 /// Passthrough for the Crush agent (Charmbracelet).
 ///
 /// - **Keychain**: none.
 /// - **Env vars**: none hardcoded; auth via envPassthrough (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.).
-/// - **Settings**: no config directory mounting needed. Crush's global config is at
-///   `~/.config/crush/crush.json` but contains provider/model setup, not secrets.
-///   Secrets are API keys passed via env vars.
+/// - **Settings**: copies `~/.config/crush/` into a temp dir and mounts it (read-write) at
+///   `/root/.config/crush` inside the container. The mount is read-write because the source is
+///   a temp copy, not the live host directory. If `~/.config/crush/` does not exist on the host,
+///   creates an empty temp dir and mounts that instead, so the container starts with a clean
+///   crush state (crush will prompt for provider/model setup on first use).
+///
+/// The initial container path is `/root/.config/crush`, which is remapped by
+/// [`apply_dockerfile_user`] to `/home/<username>/.config/crush` when the
+/// Dockerfile specifies a non-root USER directive (e.g. `USER amux`).
 pub struct CrushPassthrough;
 
 impl AgentPassthrough for CrushPassthrough {
     fn prepare_host_settings(&self) -> Option<HostSettings> {
-        None
+        let home = dirs::home_dir()?;
+        let src = home.join(".config").join("crush");
+        let temp_dir = tempfile::TempDir::new().ok()?;
+        let dst = temp_dir.path().join("crush-config");
+        if src.exists() {
+            crate::runtime::copy_dir_filtered(&src, &dst, CRUSH_CONFIG_DENYLIST).ok()?;
+        } else {
+            std::fs::create_dir_all(&dst).ok()?;
+        }
+        Some(HostSettings::new_agent_dir(
+            Some(temp_dir),
+            "/root".to_string(),
+            // Use /root/ prefix so apply_dockerfile_user remaps this to the correct
+            // container home when the Dockerfile sets USER to a non-root user.
+            Some((dst, "/root/.config/crush".to_string())),
+        ))
     }
-    fn prepare_host_settings_to_dir(&self, _dir: &Path) -> Option<HostSettings> {
-        None
+
+    fn prepare_host_settings_to_dir(&self, dir: &Path) -> Option<HostSettings> {
+        let home = dirs::home_dir()?;
+        let src = home.join(".config").join("crush");
+        std::fs::create_dir_all(dir).ok()?;
+        let dst = dir.join("crush-config");
+        if src.exists() {
+            crate::runtime::copy_dir_filtered(&src, &dst, CRUSH_CONFIG_DENYLIST).ok()?;
+        } else {
+            std::fs::create_dir_all(&dst).ok()?;
+        }
+        Some(HostSettings::new_agent_dir(
+            None,
+            "/root".to_string(),
+            // Use /root/ prefix so apply_dockerfile_user remaps this to the correct
+            // container home when the Dockerfile sets USER to a non-root user.
+            Some((dst, "/root/.config/crush".to_string())),
+        ))
     }
 }
 
@@ -481,7 +529,7 @@ mod tests {
 
     #[test]
     fn opencode_passthrough_returns_none_or_some_without_panic() {
-        // If ~/.local/share/opencode does not exist, returns None without panicking.
+        // If ~/.config/opencode does not exist, returns None without panicking.
         let _ = OpencodePassthrough.prepare_host_settings();
     }
 
@@ -497,7 +545,7 @@ mod tests {
             let (_, container_path) = settings
                 .agent_config_dir
                 .expect("Opencode settings must set agent_config_dir");
-            assert_eq!(container_path, "/root/.local/share/opencode");
+            assert_eq!(container_path, "/root/.config/opencode");
         }
     }
 
@@ -510,7 +558,7 @@ mod tests {
             let (_, container_path) = settings
                 .agent_config_dir
                 .expect("Opencode settings must set agent_config_dir");
-            assert_eq!(container_path, "/root/.local/share/opencode");
+            assert_eq!(container_path, "/root/.config/opencode");
         }
     }
 
@@ -526,7 +574,7 @@ mod tests {
 
         // Copy using the same denylist as OpencodePassthrough.
         let dst_tmp = TempDir::new().unwrap();
-        let dst = dst_tmp.path().join("opencode-data");
+        let dst = dst_tmp.path().join("opencode-config");
         crate::runtime::copy_dir_filtered(fake_src.path(), &dst, OPENCODE_DIR_DENYLIST).unwrap();
 
         assert!(dst.join("auth.json").exists(), "auth.json must be copied");
@@ -752,14 +800,77 @@ mod tests {
     }
 
     #[test]
-    fn crush_passthrough_prepare_host_settings_returns_none() {
-        assert!(CrushPassthrough.prepare_host_settings().is_none());
+    fn crush_passthrough_always_returns_some() {
+        // CrushPassthrough must always return Some — even when ~/.config/crush/ does not exist
+        // it falls back to an empty temp dir so the container gets a clean crush state.
+        let settings = CrushPassthrough.prepare_host_settings();
+        assert!(settings.is_some(), "CrushPassthrough must always return Some");
     }
 
     #[test]
-    fn crush_passthrough_prepare_host_settings_to_dir_returns_none() {
+    fn crush_passthrough_settings_contract_mount_claude_files_false() {
+        let settings = CrushPassthrough
+            .prepare_host_settings()
+            .expect("CrushPassthrough must always return Some");
+        assert!(
+            !settings.mount_claude_files,
+            "Crush settings must have mount_claude_files = false"
+        );
+    }
+
+    #[test]
+    fn crush_passthrough_settings_contract_agent_config_dir_path() {
+        // The initial container path uses /root/ prefix so apply_dockerfile_user can
+        // remap it to /home/amux/.config/crush when the Dockerfile sets USER amux.
+        let settings = CrushPassthrough
+            .prepare_host_settings()
+            .expect("CrushPassthrough must always return Some");
+        let (_, container_path) = settings
+            .agent_config_dir
+            .expect("Crush settings must set agent_config_dir");
+        assert_eq!(
+            container_path, "/root/.config/crush",
+            "Container path must use /root/ prefix for apply_dockerfile_user remapping"
+        );
+    }
+
+    #[test]
+    fn crush_passthrough_prepare_to_dir_always_returns_some() {
         let tmp = TempDir::new().unwrap();
-        assert!(CrushPassthrough.prepare_host_settings_to_dir(tmp.path()).is_none());
+        let settings = CrushPassthrough.prepare_host_settings_to_dir(tmp.path());
+        assert!(settings.is_some(), "prepare_host_settings_to_dir must always return Some");
+    }
+
+    #[test]
+    fn crush_passthrough_prepare_to_dir_settings_contract() {
+        let tmp = TempDir::new().unwrap();
+        let settings = CrushPassthrough
+            .prepare_host_settings_to_dir(tmp.path())
+            .expect("prepare_host_settings_to_dir must always return Some");
+        assert!(!settings.mount_claude_files);
+        let (_, container_path) = settings
+            .agent_config_dir
+            .expect("Crush settings must set agent_config_dir");
+        assert_eq!(container_path, "/root/.config/crush");
+    }
+
+    #[test]
+    fn crush_passthrough_copy_excludes_logs() {
+        use std::io::Write;
+
+        // Build a fake ~/.config/crush source directory.
+        let fake_src = TempDir::new().unwrap();
+        let config_file = fake_src.path().join("crush.json");
+        std::fs::File::create(&config_file).unwrap().write_all(b"{}").unwrap();
+        std::fs::create_dir(fake_src.path().join("logs")).unwrap();
+
+        // Copy using the same denylist as CrushPassthrough.
+        let dst_tmp = TempDir::new().unwrap();
+        let dst = dst_tmp.path().join("crush-config");
+        crate::runtime::copy_dir_filtered(fake_src.path(), &dst, CRUSH_CONFIG_DENYLIST).unwrap();
+
+        assert!(dst.join("crush.json").exists(), "crush.json must be copied");
+        assert!(!dst.join("logs").exists(), "logs must be excluded by denylist");
     }
 
     #[test]
@@ -767,8 +878,10 @@ mod tests {
         let p = passthrough_for_agent("crush");
         assert!(p.keychain_credentials().env_vars.is_empty());
         assert!(p.extra_env_vars().is_empty());
-        // Auth is via envPassthrough (API keys); no settings mounting needed.
-        assert!(p.prepare_host_settings().is_none());
+        // CrushPassthrough always returns Some (even without ~/.config/crush/).
+        let settings = p.prepare_host_settings();
+        assert!(settings.is_some(), "crush passthrough must always return Some settings");
+        assert!(!settings.unwrap().mount_claude_files);
     }
 
     // ─── ClinePassthrough ─────────────────────────────────────────────────────
@@ -895,6 +1008,7 @@ mod tests {
             env_passthrough: Some(vec!["AMUX_TEST_GEMINI_API_KEY_PT_999".to_string()]),
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
 

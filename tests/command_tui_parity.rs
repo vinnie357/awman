@@ -2235,13 +2235,13 @@ fn autocomplete_claws_chat_hint_describes_attach() {
 
 #[test]
 fn tab_color_claws_init_command_is_magenta() {
-    use amux::tui::state::{App, ExecutionPhase};
+    use amux::tui::state::{App, ExecutionPhase, STUCK_TIMEOUT};
     use ratatui::style::Color;
 
     let mut app = App::new(std::path::PathBuf::new());
     app.active_tab_mut().phase = ExecutionPhase::Running { command: "claws init".to_string() };
     assert_eq!(
-        app.active_tab().tab_color(true),
+        app.active_tab().tab_color(true, STUCK_TIMEOUT),
         Color::Magenta,
         "claws init command should show magenta tab"
     );
@@ -2249,13 +2249,13 @@ fn tab_color_claws_init_command_is_magenta() {
 
 #[test]
 fn tab_color_claws_chat_command_is_magenta() {
-    use amux::tui::state::{App, ExecutionPhase};
+    use amux::tui::state::{App, ExecutionPhase, STUCK_TIMEOUT};
     use ratatui::style::Color;
 
     let mut app = App::new(std::path::PathBuf::new());
     app.active_tab_mut().phase = ExecutionPhase::Running { command: "claws chat".to_string() };
     assert_eq!(
-        app.active_tab().tab_color(true),
+        app.active_tab().tab_color(true, STUCK_TIMEOUT),
         Color::Magenta,
         "claws chat command should show magenta tab"
     );
@@ -2263,13 +2263,13 @@ fn tab_color_claws_chat_command_is_magenta() {
 
 #[test]
 fn tab_color_claws_ready_still_magenta() {
-    use amux::tui::state::{App, ExecutionPhase};
+    use amux::tui::state::{App, ExecutionPhase, STUCK_TIMEOUT};
     use ratatui::style::Color;
 
     let mut app = App::new(std::path::PathBuf::new());
     app.active_tab_mut().phase = ExecutionPhase::Running { command: "claws ready".to_string() };
     assert_eq!(
-        app.active_tab().tab_color(true),
+        app.active_tab().tab_color(true, STUCK_TIMEOUT),
         Color::Magenta,
         "claws ready command should show magenta tab"
     );

@@ -115,19 +115,66 @@ pub fn calculate_container_inner_size(term_cols: u16, term_rows: u16, extra_rows
 
 // --- Tab bar (horizontal, top) ---
 
+/// Compute the uniform tab width for the current number of tabs and area.
+///
+/// Rules:
+/// - 1 tab: shares 1/4 of area width.
+/// - 2 tabs: share 1/2 of area width (evenly).
+/// - 3 tabs: share 3/4 of area width (evenly).
+/// - 4+ tabs: share full area width (evenly).
+///
+/// The natural (content-driven) width is the minimum; the proportional budget is the cap.
+/// No pre-set width numbers — only content-driven minimums are allowed.
+///
+/// "Natural" tab width is derived from the widest title + subcommand pair across all tabs,
+/// computed without truncation to avoid the circular dependency on tab_width.
+pub fn compute_tab_bar_width(num_tabs: usize, area_width: u16, max_natural_content: u16) -> u16 {
+    if num_tabs == 0 || area_width == 0 {
+        return 0;
+    }
+    let n = num_tabs as u16;
+    // 2 border columns + content
+    let natural = max_natural_content + 2;
+
+    let budget = match num_tabs {
+        1 => area_width / 4,
+        2 => area_width / 2,
+        3 => (area_width * 3) / 4,
+        _ => area_width / n,
+    };
+
+    natural.min(budget)
+}
+
 fn draw_tab_bar(frame: &mut Frame, app: &App, area: Rect) {
-    const TAB_WIDTH: u16 = 20;
+    let n = app.tabs.len();
+
+    // Compute the maximum "natural" (untruncated) content width across all tabs.
+    // Uses a large tab_width so tab_subcommand_label does not truncate.
+    let max_natural_content: u16 = app.tabs.iter().enumerate().map(|(i, tab)| {
+        let is_active = i == app.active_tab_idx;
+        let project = tab.tab_project_name();
+        let subcmd_natural = tab.tab_subcommand_label(u16::MAX, is_active, app.stuck_timeout);
+        // title inside border: " ➡ {project} " = project + 4 chars inside, + 2 borders = project + 6
+        let title_inner = project.chars().count() as u16 + 4;
+        // content inside border: " {subcmd} " = subcmd + 2 inside
+        let content_inner = subcmd_natural.chars().count() as u16 + 2;
+        title_inner.max(content_inner)
+    }).max().unwrap_or(18);
+
+    let tab_width = compute_tab_bar_width(n, area.width, max_natural_content);
+
     for (i, tab) in app.tabs.iter().enumerate() {
-        let x = area.x + (i as u16) * TAB_WIDTH;
-        if x + TAB_WIDTH > area.x + area.width {
+        let x = area.x + (i as u16) * tab_width;
+        if x + tab_width > area.x + area.width {
             break;
         }
         let is_active = i == app.active_tab_idx;
         // All tabs share the same 3-row height, flush to the top of the tab bar area.
-        let tab_area = Rect { x, y: area.y, width: TAB_WIDTH, height: 3 };
-        let color = tab.tab_color(is_active);
+        let tab_area = Rect { x, y: area.y, width: tab_width, height: 3 };
+        let color = tab.tab_color(is_active, app.stuck_timeout);
         let project = tab.tab_project_name();
-        let subcmd = tab.tab_subcommand_label(TAB_WIDTH, is_active);
+        let subcmd = tab.tab_subcommand_label(tab_width, is_active, app.stuck_timeout);
 
         let (border_style, title_style, content_style) = if is_active {
             (
@@ -849,6 +896,10 @@ fn draw_dialog(frame: &mut Frame, tab: &TabState, area: Rect) {
         draw_remote_picker(frame, area, " Select Session to Kill ", items, *selected);
         return;
     }
+    if let Dialog::NewTitleInput { kind, title, .. } = &tab.dialog {
+        draw_new_title_dialog(frame, kind, title, area);
+        return;
+    }
     if let Dialog::NewWorkflow(state) = &tab.dialog {
         draw_new_workflow_dialog(frame, area, state);
         return;
@@ -870,15 +921,20 @@ fn draw_dialog(frame: &mut Frame, tab: &TabState, area: Rect) {
                 if *focus_workdir { "█" } else { "" },
             );
 
-            // Render remote sessions section if remote is configured.
-            if let Some(result) = remote_sessions {
+            let remote_configured = crate::config::effective_remote_default_addr().is_some();
+
+            if remote_configured {
                 let host_label = crate::config::effective_remote_default_addr()
                     .map(|a| crate::tui::state::extract_display_host(&a))
                     .unwrap_or_else(|| "remote".to_string());
-                body.push_str(&format!("\n  ─── Remote sessions ({}) ─────────────\n", host_label));
+                body.push_str(&format!(
+                    "\n  Remote sessions ({})\n  {}\n",
+                    host_label,
+                    "─".repeat(38),
+                ));
 
-                match result {
-                    Ok(sessions) => {
+                match remote_sessions {
+                    Some(Ok(sessions)) => {
                         for (i, s) in sessions.iter().enumerate() {
                             let prefix = if !focus_workdir && *remote_selected_idx == Some(i) {
                                 "  > "
@@ -896,18 +952,20 @@ fn draw_dialog(frame: &mut Frame, tab: &TabState, area: Rect) {
                         };
                         body.push_str(&format!("{}+ Create new remote session\n", prefix));
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         body.push_str(&format!("    ⚠ Could not reach remote: {}\n", e));
                     }
-                }
-            } else {
-                // Still loading.
-                if crate::config::effective_remote_default_addr().is_some() {
-                    body.push_str("\n    Loading remote sessions…\n");
+                    None => {
+                        body.push_str("    Loading remote sessions…\n");
+                    }
                 }
             }
 
-            body.push_str("\n  [Enter] confirm  [Esc] cancel  [↓] remote list  ");
+            if remote_configured {
+                body.push_str("\n  [Enter] confirm  [Esc] cancel  [↑↓] navigate  ");
+            } else {
+                body.push_str("\n  [Enter] confirm  [Esc] cancel  ");
+            }
             (" New Tab ", body)
         },
         Dialog::NewRemoteSession { dir_input, saved_dirs, saved_selected_idx, focus_input, creation_error, .. } => {
@@ -961,14 +1019,8 @@ fn draw_dialog(frame: &mut Frame, tab: &TabState, area: Rect) {
             " New Work Item — Type ",
             "  Select work item type:\n\n  1) Feature\n  2) Bug\n  3) Task\n  4) Enhancement\n\n  [1/2/3/4 or Esc to cancel]  ".to_string(),
         ),
-        Dialog::NewTitleInput { kind, title: item_title, .. } => (
-            " New Work Item — Title ",
-            format!(
-                "  Type: {}\n\n  Enter title: {}\n\n  [Enter to confirm, Esc to cancel]  ",
-                kind.as_str(),
-                item_title
-            ),
-        ),
+        // NewTitleInput has a dedicated draw function handled by an early return above.
+        Dialog::NewTitleInput { .. } => return,
         Dialog::ClawsReadyHasForked => (
             " Claws Ready — Fork ",
             "  Have you already forked nanoclaw on GitHub?\n\n  1) Yes\n  2) No (fork first)\n\n  [1/2 or Esc to cancel]  ".to_string(),
@@ -1438,6 +1490,182 @@ fn draw_interview_summary_dialog(
     frame.render_widget(footer, footer_area);
 }
 
+/// Build a styled `Line` for a single-line input field and, when focused, return the
+/// cursor x-column offset (from the inner area's left edge) for `set_cursor_position`.
+fn make_field_line(
+    label: &str,
+    value: &str,
+    focused: bool,
+    cursor_byte: usize,
+) -> (Line<'static>, Option<u16>) {
+    let prefix = if focused { "> " } else { "  " };
+    let text = format!("{}{}: {}", prefix, label, value);
+    let line = if focused {
+        Line::from(Span::styled(
+            text,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(Span::styled(text, Style::default().fg(Color::Gray)))
+    };
+    let cursor_col = if focused {
+        let prefix_chars = 2u16 + label.chars().count() as u16 + 2; // "> {label}: "
+        let char_col = value[..cursor_byte.min(value.len())].chars().count() as u16;
+        Some(prefix_chars + char_col)
+    } else {
+        None
+    };
+    (line, cursor_col)
+}
+
+/// Render a scrollable bordered text area.  When `focused`, the border is cyan and
+/// `frame.set_cursor_position` is called at the logical cursor location.
+fn render_text_area_with_cursor(
+    frame: &mut Frame,
+    area: Rect,
+    text: &str,
+    cursor_byte_pos: usize,
+    focused: bool,
+    label: &str,
+) {
+    let border_color = if focused { Color::Cyan } else { Color::DarkGray };
+    let block = Block::default()
+        .title(format!(" {} ", label))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color));
+    let text_inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if text_inner.height == 0 || text_inner.width == 0 {
+        return;
+    }
+
+    let lines: Vec<&str> = text.split('\n').collect();
+    let before_cursor = &text[..cursor_byte_pos.min(text.len())];
+    let cursor_logical_row = before_cursor.chars().filter(|&c| c == '\n').count();
+    let last_newline_byte = before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let cursor_logical_col = before_cursor[last_newline_byte..].chars().count();
+
+    // -1 for the leading " " padding inside the area
+    let text_width = (text_inner.width.saturating_sub(1) as usize).max(1);
+    let mut all_visual_lines: Vec<String> = Vec::new();
+    let mut cursor_visual_row = 0usize;
+    let mut cursor_visual_col = 0usize;
+
+    for (logical_row, line) in lines.iter().enumerate() {
+        let chars: Vec<char> = line.chars().collect();
+        let line_char_len = chars.len();
+        let num_visual = if line_char_len == 0 { 1 } else { (line_char_len + text_width - 1) / text_width };
+        if logical_row == cursor_logical_row {
+            cursor_visual_row = all_visual_lines.len() + cursor_logical_col / text_width;
+            cursor_visual_col = cursor_logical_col % text_width;
+        }
+        for chunk_idx in 0..num_visual {
+            let start = chunk_idx * text_width;
+            let end = (start + text_width).min(line_char_len);
+            all_visual_lines.push(chars[start..end].iter().collect());
+        }
+    }
+
+    let visible_rows = text_inner.height as usize;
+    let scroll_start = if cursor_visual_row >= visible_rows {
+        cursor_visual_row + 1 - visible_rows
+    } else {
+        0
+    };
+
+    let visible_lines: Vec<Line> = all_visual_lines
+        .iter()
+        .skip(scroll_start)
+        .take(visible_rows)
+        .map(|l| Line::from(format!(" {}", l)))
+        .collect();
+    frame.render_widget(Paragraph::new(visible_lines), text_inner);
+
+    if focused {
+        let cursor_visible_row = cursor_visual_row.saturating_sub(scroll_start);
+        let cx = text_inner.x + 1 + cursor_visual_col as u16;
+        let cy = text_inner.y + cursor_visible_row as u16;
+        if cx < text_inner.x + text_inner.width && cy < text_inner.y + text_inner.height {
+            frame.set_cursor_position((cx, cy));
+        }
+    }
+}
+
+/// Dedicated dialog for `NewTitleInput` — single bordered input with cursor.
+fn draw_new_title_dialog(
+    frame: &mut Frame,
+    kind: &crate::commands::new::WorkItemKind,
+    title_text: &str,
+    area: Rect,
+) {
+    let popup_width = 72u16.min(area.width.saturating_sub(4));
+    // border(2) + header(2) + spacer(1) + input-block(3) + spacer(1) + footer(1) = 10
+    let popup_height = 10u16.min(area.height.saturating_sub(4)).max(9);
+    let popup = centered_rect(popup_width, popup_height, area);
+    frame.render_widget(Clear, popup);
+
+    let outer_block = Block::default()
+        .title(" New Work Item — Title ")
+        .title_alignment(Alignment::Center)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = outer_block.inner(popup);
+    frame.render_widget(outer_block, popup);
+
+    if inner.height < 5 {
+        return;
+    }
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // "  Type: {kind}" + blank
+            Constraint::Length(1), // spacer
+            Constraint::Length(3), // bordered input block
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // footer hints
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                format!("  Type: {}", kind.as_str()),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+        ]),
+        layout[0],
+    );
+
+    let input_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan));
+    let input_inner = input_block.inner(layout[2]);
+    frame.render_widget(input_block, layout[2]);
+    frame.render_widget(Paragraph::new(format!(" {}", title_text)), input_inner);
+
+    // Cursor is always at the end (no left/right movement in this dialog).
+    let cx = input_inner.x + 1 + title_text.chars().count() as u16;
+    if cx < input_inner.x + input_inner.width {
+        frame.set_cursor_position((cx, input_inner.y));
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  [Enter]", Style::default().fg(Color::Green)),
+            Span::raw(" confirm  "),
+            Span::styled("[Esc]", Style::default().fg(Color::DarkGray)),
+            Span::raw(" cancel"),
+        ])),
+        layout[4],
+    );
+}
+
 fn draw_new_workflow_dialog(
     frame: &mut Frame,
     area: Rect,
@@ -1452,11 +1680,7 @@ fn draw_new_workflow_dialog(
     let popup = centered_rect(popup_width, popup_height, area);
     frame.render_widget(Clear, popup);
 
-    let title = if state.interview {
-        " New Workflow — Interview "
-    } else {
-        " New Workflow "
-    };
+    let title = if state.interview { " New Workflow — Interview " } else { " New Workflow " };
     let outer_block = Block::default()
         .title(title)
         .title_alignment(Alignment::Center)
@@ -1470,18 +1694,9 @@ fn draw_new_workflow_dialog(
         return;
     }
 
-    let mut lines: Vec<Line> = Vec::new();
-    let label = |text: &str, focused: bool| -> Line<'static> {
-        let span = if focused {
-            Span::styled(
-                format!("> {}", text),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(format!("  {}", text), Style::default().fg(Color::Gray))
-        };
-        Line::from(span)
-    };
+    // Build top paragraph lines for single-line fields.
+    let mut top_lines: Vec<Line> = Vec::new();
+    let mut cursor_screen: Option<(u16, u16)> = None;
 
     let format_label = match state.format {
         crate::cli::WorkflowFormat::Toml => "toml",
@@ -1489,75 +1704,113 @@ fn draw_new_workflow_dialog(
         crate::cli::WorkflowFormat::Md => "md",
     };
     let scope_label = if state.global { "global" } else { "repo" };
-    lines.push(Line::from(format!("  {} workflow ({})", scope_label, format_label)));
-    lines.push(Line::from(""));
+    top_lines.push(Line::from(Span::styled(
+        format!("  {} workflow ({})", scope_label, format_label),
+        Style::default().fg(Color::DarkGray),
+    )));
+    top_lines.push(Line::from(""));
 
-    // Name field — always shown first in both interview and non-interview modes.
-    lines.push(label(
-        &format!("Name: {}", state.name),
-        state.focused_field == WorkflowField::Name,
-    ));
-
-    if state.interview {
-        lines.push(Line::from(""));
-        lines.push(label("Summary:", state.focused_field == WorkflowField::Summary));
-        lines.push(Line::from(format!("    {}", state.summary)));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  [Tab] next field  [Ctrl-Enter] start interview  [Esc] cancel",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        lines.push(label(
-            &format!("Title: {}", state.title),
-            state.focused_field == WorkflowField::Title,
-        ));
-        lines.push(Line::from(""));
-        if !state.steps.is_empty() {
-            let names: Vec<String> = state.steps.iter().map(|s| s.name.clone()).collect();
-            lines.push(Line::from(format!("  Steps: {}", names.join(" → "))));
-            lines.push(Line::from(""));
+    // Name field
+    {
+        let focused = state.focused_field == WorkflowField::Name;
+        let (line, col) = make_field_line("Name", &state.name, focused, state.name_cursor);
+        if let Some(col) = col {
+            cursor_screen = Some((inner.x + col, inner.y + top_lines.len() as u16));
         }
-        lines.push(label(
-            &format!("Step name: {}", state.step_name),
-            state.focused_field == WorkflowField::StepName,
-        ));
-        lines.push(label(
-            &format!("Agent (optional): {}", state.step_agent),
-            state.focused_field == WorkflowField::StepAgent,
-        ));
-        lines.push(label(
-            &format!("Model (optional): {}", state.step_model),
-            state.focused_field == WorkflowField::StepModel,
-        ));
-        lines.push(label(
-            &format!("Depends-on (csv): {}", state.step_depends_on),
-            state.focused_field == WorkflowField::StepDependsOn,
-        ));
-        lines.push(label(
-            "Prompt:",
-            state.focused_field == WorkflowField::StepPrompt,
-        ));
-        for line in state.step_prompt.split('\n') {
-            lines.push(Line::from(format!("    {}", line)));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  [Tab] next field  [Ctrl-N] add step  [Ctrl-Enter] finish  [Esc] cancel",
-            Style::default().fg(Color::DarkGray),
-        )));
+        top_lines.push(line);
+        top_lines.push(Line::from(""));
     }
 
+    if !state.interview {
+        // Title field
+        {
+            let focused = state.focused_field == WorkflowField::Title;
+            let (line, col) = make_field_line("Title", &state.title, focused, state.title_cursor);
+            if let Some(col) = col {
+                cursor_screen = Some((inner.x + col, inner.y + top_lines.len() as u16));
+            }
+            top_lines.push(line);
+            top_lines.push(Line::from(""));
+        }
+
+        // Completed steps summary
+        if !state.steps.is_empty() {
+            let names: Vec<String> = state.steps.iter().map(|s| s.name.clone()).collect();
+            top_lines.push(Line::from(Span::styled(
+                format!("  Steps: {}", names.join(" → ")),
+                Style::default().fg(Color::Green),
+            )));
+            top_lines.push(Line::from(""));
+        }
+
+        // Current step single-line fields
+        for (label_str, value, cursor_byte, field) in [
+            ("Step name",       state.step_name.as_str(),       state.step_name_cursor,       WorkflowField::StepName),
+            ("Agent",           state.step_agent.as_str(),      state.step_agent_cursor,      WorkflowField::StepAgent),
+            ("Model",           state.step_model.as_str(),      state.step_model_cursor,      WorkflowField::StepModel),
+            ("Depends-on (csv)",state.step_depends_on.as_str(), state.step_depends_on_cursor, WorkflowField::StepDependsOn),
+        ] {
+            let focused = state.focused_field == field;
+            let (line, col) = make_field_line(label_str, value, focused, cursor_byte);
+            if let Some(col) = col {
+                cursor_screen = Some((inner.x + col, inner.y + top_lines.len() as u16));
+            }
+            top_lines.push(line);
+        }
+        top_lines.push(Line::from(""));
+    }
+
+    // Multiline area label + text + cursor
+    let multiline_label  = if state.interview { "Summary" } else { "Prompt" };
+    let multiline_text   = if state.interview { state.summary.as_str() } else { state.step_prompt.as_str() };
+    let multiline_cursor = if state.interview { state.summary_cursor } else { state.step_prompt_cursor };
+    let multiline_focused = if state.interview {
+        state.focused_field == WorkflowField::Summary
+    } else {
+        state.focused_field == WorkflowField::StepPrompt
+    };
+
+    let footer_hint = if state.interview {
+        "  [Tab] next field  [Ctrl-Enter] start interview  [Esc] cancel"
+    } else {
+        "  [Tab] next field  [Ctrl-N] add step  [Ctrl-Enter] finish  [Esc] cancel"
+    };
+
+    let error_height = if state.error.is_some() { 2u16 } else { 0 };
+    let top_h  = top_lines.len() as u16;
+    let foot_h = 1u16 + error_height;
+    let multi_h = inner.height.saturating_sub(top_h + foot_h).max(4);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top_h),
+            Constraint::Length(multi_h),
+            Constraint::Min(foot_h),
+        ])
+        .split(inner);
+
+    frame.render_widget(Paragraph::new(top_lines), layout[0]);
+
+    render_text_area_with_cursor(frame, layout[1], multiline_text, multiline_cursor, multiline_focused, multiline_label);
+
+    let mut footer_lines = vec![
+        Line::from(Span::styled(footer_hint, Style::default().fg(Color::DarkGray))),
+    ];
     if let Some(err) = &state.error {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
+        footer_lines.push(Line::from(""));
+        footer_lines.push(Line::from(Span::styled(
             format!("  ⚠ {}", err),
             Style::default().fg(Color::Red),
         )));
     }
+    frame.render_widget(Paragraph::new(footer_lines), layout[2]);
 
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, inner);
+    if let Some((cx, cy)) = cursor_screen {
+        if cx < inner.x + inner.width && cy < inner.y + inner.height {
+            frame.set_cursor_position((cx, cy));
+        }
+    }
 }
 
 fn draw_new_skill_dialog(
@@ -1574,11 +1827,7 @@ fn draw_new_skill_dialog(
     let popup = centered_rect(popup_width, popup_height, area);
     frame.render_widget(Clear, popup);
 
-    let title = if state.interview {
-        " New Skill — Interview "
-    } else {
-        " New Skill "
-    };
+    let title = if state.interview { " New Skill — Interview " } else { " New Skill " };
     let outer_block = Block::default()
         .title(title)
         .title_alignment(Alignment::Center)
@@ -1592,58 +1841,85 @@ fn draw_new_skill_dialog(
         return;
     }
 
-    let label = |text: &str, focused: bool| -> Line<'static> {
-        let span = if focused {
-            Span::styled(
-                format!("> {}", text),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            )
-        } else {
-            Span::styled(format!("  {}", text), Style::default().fg(Color::Gray))
-        };
-        Line::from(span)
-    };
+    let mut top_lines: Vec<Line> = Vec::new();
+    let mut cursor_screen: Option<(u16, u16)> = None;
 
     let scope_label = if state.global { "global" } else { "repo" };
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(format!("  {} skill", scope_label)));
-    lines.push(Line::from(""));
-    lines.push(label(
-        &format!("Name: {}", state.name),
-        state.focused_field == SkillField::Name,
-    ));
-    lines.push(label(
-        &format!("Description: {}", state.description),
-        state.focused_field == SkillField::Description,
-    ));
-    lines.push(Line::from(""));
-    if state.interview {
-        lines.push(label("Summary:", state.focused_field == SkillField::Summary));
-        for line in state.summary.split('\n') {
-            lines.push(Line::from(format!("    {}", line)));
-        }
-    } else {
-        lines.push(label("Body:", state.focused_field == SkillField::Body));
-        for line in state.body.split('\n') {
-            lines.push(Line::from(format!("    {}", line)));
-        }
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  [Tab] next field  [Ctrl-Enter] finish  [Esc] cancel",
+    top_lines.push(Line::from(Span::styled(
+        format!("  {} skill", scope_label),
         Style::default().fg(Color::DarkGray),
     )));
+    top_lines.push(Line::from(""));
 
+    // Name field
+    {
+        let focused = state.focused_field == SkillField::Name;
+        let (line, col) = make_field_line("Name", &state.name, focused, state.name_cursor);
+        if let Some(col) = col {
+            cursor_screen = Some((inner.x + col, inner.y + top_lines.len() as u16));
+        }
+        top_lines.push(line);
+        top_lines.push(Line::from(""));
+    }
+
+    // Description field
+    {
+        let focused = state.focused_field == SkillField::Description;
+        let (line, col) = make_field_line("Description", &state.description, focused, state.description_cursor);
+        if let Some(col) = col {
+            cursor_screen = Some((inner.x + col, inner.y + top_lines.len() as u16));
+        }
+        top_lines.push(line);
+        top_lines.push(Line::from(""));
+    }
+
+    let multiline_label   = if state.interview { "Summary" } else { "Body" };
+    let multiline_text    = if state.interview { state.summary.as_str() } else { state.body.as_str() };
+    let multiline_cursor  = if state.interview { state.summary_cursor } else { state.body_cursor };
+    let multiline_focused = if state.interview {
+        state.focused_field == SkillField::Summary
+    } else {
+        state.focused_field == SkillField::Body
+    };
+
+    let error_height = if state.error.is_some() { 2u16 } else { 0 };
+    let top_h  = top_lines.len() as u16;
+    let foot_h = 1u16 + error_height;
+    let multi_h = inner.height.saturating_sub(top_h + foot_h).max(4);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top_h),
+            Constraint::Length(multi_h),
+            Constraint::Min(foot_h),
+        ])
+        .split(inner);
+
+    frame.render_widget(Paragraph::new(top_lines), layout[0]);
+
+    render_text_area_with_cursor(frame, layout[1], multiline_text, multiline_cursor, multiline_focused, multiline_label);
+
+    let mut footer_lines = vec![
+        Line::from(Span::styled(
+            "  [Tab] next field  [Ctrl-Enter] finish  [Esc] cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
     if let Some(err) = &state.error {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
+        footer_lines.push(Line::from(""));
+        footer_lines.push(Line::from(Span::styled(
             format!("  ⚠ {}", err),
             Style::default().fg(Color::Red),
         )));
     }
+    frame.render_widget(Paragraph::new(footer_lines), layout[2]);
 
-    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    frame.render_widget(para, inner);
+    if let Some((cx, cy)) = cursor_screen {
+        if cx < inner.x + inner.width && cy < inner.y + inner.height {
+            frame.set_cursor_position((cx, cy));
+        }
+    }
 }
 
 fn draw_worktree_commit_prompt(
@@ -2367,11 +2643,15 @@ fn step_box_label_and_style(
     name: &str,
     status: &StepStatus,
     is_current: bool,
-    _box_width: u16,
+    box_width: u16,
 ) -> (String, Style) {
-    const MAX_NAME: usize = 12;
-    let truncated_name = if name.len() > MAX_NAME {
-        format!("{}…", &name[..MAX_NAME.saturating_sub(1)])
+    // Label format is " ● name " — 4 chars of overhead outside the name.
+    // Content width = box_width - 2 (borders), so max name display cols = box_width - 6.
+    let max_name_chars = (box_width as usize).saturating_sub(6).max(1);
+    let name_chars: Vec<char> = name.chars().collect();
+    let truncated_name = if name_chars.len() > max_name_chars {
+        let truncated: String = name_chars[..max_name_chars.saturating_sub(1)].iter().collect();
+        format!("{}…", truncated)
     } else {
         name.to_string()
     };
@@ -3050,7 +3330,9 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
 
-        // Tab width is 20. Active tab: cols 0..20. Inactive tab: cols 20..40.
+        // Dynamic tab width for 2 empty tabs on 80-wide terminal:
+        // project="?" → 1 char; subcmd="" → 0 chars; natural_content = max(1+4, 0+2) = 5
+        let tab_width = compute_tab_bar_width(2, 80, 5);
         // Row 2 is the bottom row of the 3-row tab area.
         // Active tab (col 0, row 2): no bottom border → should not be "╰".
         let active_bottom_left = buf[(0, 2)].symbol().to_string();
@@ -3060,13 +3342,110 @@ mod tests {
             active_bottom_left
         );
 
-        // Inactive tab (col 20, row 2): should have a bottom border "╰".
-        let inactive_bottom_left = buf[(20, 2)].symbol().to_string();
+        // Inactive tab starts at tab_width, row 2: should have a bottom border "╰".
+        let inactive_bottom_left = buf[(tab_width, 2)].symbol().to_string();
         assert_eq!(
             inactive_bottom_left, "╰",
-            "Inactive tab must have a bottom-left corner. Got: '{}'",
+            "Inactive tab must have a bottom-left corner at col {}. Got: '{}'",
+            tab_width,
             inactive_bottom_left
         );
+    }
+
+    // ─── compute_tab_bar_width ────────────────────────────────────────────────
+
+    #[test]
+    fn tab_width_single_tab_content_driven() {
+        // 1 tab with minimal content → natural width (no hardcoded minimum)
+        let w = compute_tab_bar_width(1, 200, 5);
+        assert_eq!(w, 7, "single tab with minimal content = natural+2=7, got {}", w);
+    }
+
+    #[test]
+    fn tab_width_single_tab_grows_with_content() {
+        // 1 tab with wide content → grows beyond natural, capped at 1/4 of area
+        let w = compute_tab_bar_width(1, 300, 50);
+        assert_eq!(w, 52, "single tab natural+2=52, 1/4 of 300=75, got {}", w);
+    }
+
+    #[test]
+    fn tab_width_single_tab_capped_at_quarter_area() {
+        let w = compute_tab_bar_width(1, 100, 80);
+        assert_eq!(w, 25, "single tab natural=82, 1/4 of 100=25, capped at 25");
+    }
+
+    #[test]
+    fn tab_width_two_tabs_half_area_budget() {
+        // 2 tabs at area 100 → budget = 100/2 = 50 per tab
+        let w = compute_tab_bar_width(2, 100, 40);
+        assert_eq!(w, 42, "2-tab natural width (42) within 1/2 budget (50), got {}", w);
+    }
+
+    #[test]
+    fn tab_width_two_tabs_capped_at_half_area() {
+        // 2 tabs with very wide content → capped at 1/2 of area
+        let w = compute_tab_bar_width(2, 100, 90);
+        assert_eq!(w, 50, "2-tab natural=92, 1/2 of 100=50, capped at 50, got {}", w);
+    }
+
+    #[test]
+    fn tab_width_three_tabs_three_quarter_area() {
+        // 3 tabs at area 100 → budget = 100*3/4 = 75 per tab
+        let w = compute_tab_bar_width(3, 100, 30);
+        assert_eq!(w, 32, "3-tab natural width (32) within 3/4 budget (75), got {}", w);
+    }
+
+    #[test]
+    fn tab_width_three_tabs_capped_at_three_quarter() {
+        // 3 tabs with very wide content → capped at 3/4 of area
+        let w = compute_tab_bar_width(3, 100, 90);
+        assert_eq!(w, 75, "3-tab natural=92, 3/4 of 100=75, capped at 75, got {}", w);
+    }
+
+    #[test]
+    fn tab_width_four_tabs_shares_full_width() {
+        // 4+ tabs share full width: budget = 100/4 = 25, natural = 12, result = 12
+        let w = compute_tab_bar_width(4, 100, 10);
+        assert_eq!(w, 12, "4 tabs with small content = natural+2=12, got {}", w);
+    }
+
+    #[test]
+    fn tab_width_many_tabs_content_driven() {
+        // Many tabs: width is content-driven, no minimum of 16
+        let w = compute_tab_bar_width(20, 100, 2);
+        assert_eq!(w, 4, "4 tabs with tiny content = natural+2=4, no minimum, got {}", w);
+    }
+
+    #[test]
+    fn tab_width_content_driven_for_two_tabs() {
+        // 2 tabs with short content → content-driven (no hardcoded minimum)
+        let w = compute_tab_bar_width(2, 200, 5);
+        // natural = 5+2=7, budget = 200/2=100, result = 7
+        assert_eq!(w, 7, "2 tabs with tiny content should be 7, got {}", w);
+    }
+
+    #[test]
+    fn tab_width_content_driven_for_three_tabs() {
+        // 3 tabs with short content → content-driven (no hardcoded minimum)
+        let w = compute_tab_bar_width(3, 200, 5);
+        // natural = 5+2=7, budget = 200*3/4=150, result = 7
+        assert_eq!(w, 7, "3 tabs with tiny content should be 7, got {}", w);
+    }
+
+    #[test]
+    fn tab_width_two_tabs_dynamic_expansion() {
+        // 2 tabs with medium content → grows with content up to 1/2 cap
+        let w = compute_tab_bar_width(2, 200, 40);
+        // natural = 40+2=42, budget = 200/2=100, result = 42
+        assert_eq!(w, 42, "2 tabs with medium content should be 42, got {}", w);
+    }
+
+    #[test]
+    fn tab_width_three_tabs_dynamic_expansion() {
+        // 3 tabs with medium content → grows with content up to 3/4 cap
+        let w = compute_tab_bar_width(3, 200, 40);
+        // natural = 40+2=42, budget = 200*3/4=150, result = 42
+        assert_eq!(w, 42, "3 tabs with medium content should be 42, got {}", w);
     }
 
     #[test]
@@ -3657,6 +4036,12 @@ mod tests {
     /// workdir, plus the "Create new remote session" sentinel at the end.
     #[test]
     fn new_tab_dialog_renders_session_list_when_sessions_available() {
+        let _guard = REMOTE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = serde_json::json!({"remote": {"defaultAddr": "http://10.0.0.1:9876"}});
+        std::fs::write(tmp.path().join("config.json"), cfg.to_string()).unwrap();
+        unsafe { std::env::set_var("AMUX_CONFIG_HOME", tmp.path().to_str().unwrap()) };
+
         let mut app = new_app();
         app.active_tab_mut().dialog = Dialog::NewTabDirectory {
             input: String::new(),
@@ -3673,6 +4058,8 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        unsafe { std::env::remove_var("AMUX_CONFIG_HOME") };
 
         let text = full_buffer_text(terminal.backend().buffer());
 
@@ -3692,6 +4079,12 @@ mod tests {
     /// last item after the session list.
     #[test]
     fn new_tab_dialog_renders_create_new_session_button() {
+        let _guard = REMOTE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = serde_json::json!({"remote": {"defaultAddr": "http://10.0.0.1:9876"}});
+        std::fs::write(tmp.path().join("config.json"), cfg.to_string()).unwrap();
+        unsafe { std::env::set_var("AMUX_CONFIG_HOME", tmp.path().to_str().unwrap()) };
+
         let mut app = new_app();
         app.active_tab_mut().dialog = Dialog::NewTabDirectory {
             input: String::new(),
@@ -3709,6 +4102,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
 
+        unsafe { std::env::remove_var("AMUX_CONFIG_HOME") };
+
         let text = full_buffer_text(terminal.backend().buffer());
 
         assert!(
@@ -3721,6 +4116,12 @@ mod tests {
     /// New-tab dialog renders the ⚠ warning when `remote_sessions = Some(Err(...))`.
     #[test]
     fn new_tab_dialog_renders_error_when_sessions_fetch_failed() {
+        let _guard = REMOTE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = serde_json::json!({"remote": {"defaultAddr": "http://10.0.0.1:9876"}});
+        std::fs::write(tmp.path().join("config.json"), cfg.to_string()).unwrap();
+        unsafe { std::env::set_var("AMUX_CONFIG_HOME", tmp.path().to_str().unwrap()) };
+
         let mut app = new_app();
         app.active_tab_mut().dialog = Dialog::NewTabDirectory {
             input: String::new(),
@@ -3733,6 +4134,8 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
 
+        unsafe { std::env::remove_var("AMUX_CONFIG_HOME") };
+
         let text = full_buffer_text(terminal.backend().buffer());
 
         assert!(
@@ -3742,6 +4145,41 @@ mod tests {
         assert!(
             text.contains("connection refused"),
             "dialog must render the specific error message; buffer:\n{text}"
+        );
+    }
+
+    /// New-tab dialog omits the remote section entirely when no remote is configured,
+    /// even if `remote_sessions` has a value.
+    #[test]
+    fn new_tab_dialog_hides_remote_section_when_no_remote_configured() {
+        let _guard = REMOTE_ENV_LOCK.lock().unwrap();
+        unsafe { std::env::remove_var("AMUX_CONFIG_HOME") };
+
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::NewTabDirectory {
+            input: String::new(),
+            remote_sessions: None,
+            remote_selected_idx: None,
+            focus_workdir: true,
+        };
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+
+        let text = full_buffer_text(terminal.backend().buffer());
+
+        assert!(
+            !text.contains("Remote sessions"),
+            "dialog must not render remote section when no remote is configured; buffer:\n{text}"
+        );
+        assert!(
+            !text.contains("Create new remote session"),
+            "dialog must not render create-new option when no remote is configured; buffer:\n{text}"
+        );
+        assert!(
+            text.contains("[Enter] confirm"),
+            "dialog must still render key hints; buffer:\n{text}"
         );
     }
 
@@ -3897,6 +4335,125 @@ mod tests {
             text.contains("plan") || text.contains("impl"),
             "workflow strip must render step names for a remote-bound tab; buffer:\n{}",
             &text[..text.len().min(400)]
+        );
+    }
+
+    // ─── Interview dialog cursor and padding tests ─────────────────────────────
+
+    /// `NewTitleInput` dialog renders the bordered input block and key hints.
+    #[test]
+    fn new_title_dialog_renders_input_and_hints() {
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::NewTitleInput {
+            kind: crate::commands::new::WorkItemKind::Feature,
+            title: "my title".to_string(),
+            interview: false,
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = full_buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("my title"),
+            "title dialog must render the current title text; buffer:\n{text}"
+        );
+        assert!(
+            text.contains("Enter"),
+            "title dialog must render key hints; buffer:\n{text}"
+        );
+    }
+
+    /// `NewWorkflow` interview dialog renders the Name field and Summary area.
+    #[test]
+    fn new_workflow_interview_dialog_renders_name_and_summary_area() {
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::NewWorkflow(crate::tui::state::NewWorkflowDialogState {
+            name: "my-flow".to_string(),
+            name_cursor: 7,
+            title: String::new(),
+            title_cursor: 0,
+            steps: vec![],
+            step_name: String::new(),
+            step_name_cursor: 0,
+            step_agent: String::new(),
+            step_agent_cursor: 0,
+            step_model: String::new(),
+            step_model_cursor: 0,
+            step_depends_on: String::new(),
+            step_depends_on_cursor: 0,
+            step_prompt: String::new(),
+            step_prompt_cursor: 0,
+            summary: "describe the workflow".to_string(),
+            summary_cursor: 21,
+            focused_field: crate::tui::state::WorkflowField::Summary,
+            global: false,
+            format: crate::cli::WorkflowFormat::Toml,
+            interview: true,
+            error: None,
+        });
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = full_buffer_text(terminal.backend().buffer());
+        assert!(text.contains("my-flow"), "workflow dialog must show the name; buffer:\n{text}");
+        assert!(text.contains("describe the workflow"), "workflow dialog must show summary text; buffer:\n{text}");
+        assert!(text.contains("Summary"), "workflow dialog must label the summary area; buffer:\n{text}");
+    }
+
+    /// `NewSkill` non-interview dialog renders Name, Description, and Body area.
+    #[test]
+    fn new_skill_non_interview_dialog_renders_fields() {
+        let mut app = new_app();
+        app.active_tab_mut().dialog = Dialog::NewSkill(crate::tui::state::NewSkillDialogState {
+            name: "my-skill".to_string(),
+            name_cursor: 8,
+            description: "A handy skill".to_string(),
+            description_cursor: 13,
+            body: "Run the tests.".to_string(),
+            body_cursor: 14,
+            summary: String::new(),
+            summary_cursor: 0,
+            focused_field: crate::tui::state::SkillField::Body,
+            global: false,
+            interview: false,
+            error: None,
+        });
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let text = full_buffer_text(terminal.backend().buffer());
+        assert!(text.contains("my-skill"),     "skill dialog must show name; buffer:\n{text}");
+        assert!(text.contains("A handy skill"),"skill dialog must show description; buffer:\n{text}");
+        assert!(text.contains("Run the tests"),"skill dialog must show body text; buffer:\n{text}");
+        assert!(text.contains("Body"),          "skill dialog must label the body area; buffer:\n{text}");
+    }
+
+    // ─── Workflow strip dynamic truncation ──────────────────────────────────────
+
+    /// Step names shorter than the dynamic limit render in full.
+    #[test]
+    fn step_box_label_uses_full_name_when_box_is_wide_enough() {
+        use crate::workflow::StepStatus;
+        let (label, _) = step_box_label_and_style("implement", &StepStatus::Running, false, 30);
+        assert!(
+            label.contains("implement"),
+            "wide box must not truncate 'implement'; got: {label:?}"
+        );
+    }
+
+    /// Step names longer than the dynamic limit are truncated with ellipsis.
+    #[test]
+    fn step_box_label_truncates_when_box_is_narrow() {
+        use crate::workflow::StepStatus;
+        // box_width = 10: content width = 8, overhead = 4, max_name = 4
+        let (label, _) = step_box_label_and_style("long-step-name", &StepStatus::Pending, false, 10);
+        assert!(
+            label.contains('…'),
+            "narrow box must truncate with ellipsis; got: {label:?}"
+        );
+        assert!(
+            !label.contains("long-step-name"),
+            "narrow box must not contain the full name; got: {label:?}"
         );
     }
 }

@@ -60,6 +60,10 @@ pub struct RepoConfig {
     /// Overlay configuration for mounting host directories into agent containers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlays: Option<OverlaysConfig>,
+    /// Seconds of container output inactivity before the agent is considered stuck.
+    /// Overrides the global config value and the built-in default (30).
+    #[serde(rename = "agentStuckTimeout", skip_serializing_if = "Option::is_none")]
+    pub agent_stuck_timeout_secs: Option<u64>,
 }
 
 impl RepoConfig {
@@ -154,10 +158,17 @@ pub struct GlobalConfig {
     /// Overlay configuration for mounting host directories into agent containers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlays: Option<OverlaysConfig>,
+    /// Seconds of container output inactivity before the agent is considered stuck.
+    /// Overrides per-repo config when set. Built-in default: 30.
+    #[serde(rename = "agentStuckTimeout", skip_serializing_if = "Option::is_none")]
+    pub agent_stuck_timeout_secs: Option<u64>,
 }
 
 /// Built-in default number of scrollback lines for the container terminal emulator.
 pub const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
+
+/// Built-in default seconds of inactivity before the agent is considered stuck.
+pub const DEFAULT_STUCK_TIMEOUT_SECS: u64 = 30;
 
 /// Returns the effective env passthrough list for a given git root.
 /// Resolution priority: repo config → global config → empty list.
@@ -190,6 +201,17 @@ pub fn effective_scrollback_lines(git_root: &Path) -> usize {
     }
     let global = load_global_config().unwrap_or_default();
     global.terminal_scrollback_lines.unwrap_or(DEFAULT_SCROLLBACK_LINES)
+}
+
+/// Resolve the effective agent-stuck timeout for a given git root.
+/// Checks per-repo config first, then global config, then falls back to the built-in default.
+pub fn effective_agent_stuck_timeout(git_root: &Path) -> std::time::Duration {
+    let repo = load_repo_config(git_root).unwrap_or_default();
+    if let Some(secs) = repo.agent_stuck_timeout_secs {
+        return std::time::Duration::from_secs(secs);
+    }
+    let global = load_global_config().unwrap_or_default();
+    std::time::Duration::from_secs(global.agent_stuck_timeout_secs.unwrap_or(DEFAULT_STUCK_TIMEOUT_SECS))
 }
 
 /// Returns the effective headless work dirs list from global config.
@@ -438,6 +460,7 @@ mod tests {
             env_passthrough: None,
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
         let loaded = load_repo_config(tmp.path()).unwrap();
@@ -474,6 +497,7 @@ mod tests {
             env_passthrough: None,
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
 
@@ -494,6 +518,7 @@ mod tests {
             env_passthrough: None,
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &repo_cfg).unwrap();
 
@@ -516,6 +541,7 @@ mod tests {
             env_passthrough: None,
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
 
@@ -541,10 +567,68 @@ mod tests {
             env_passthrough: None,
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
         let loaded = load_repo_config(tmp.path()).unwrap();
         assert_eq!(loaded.terminal_scrollback_lines, Some(5_000));
+    }
+
+    // ─── effective_agent_stuck_timeout ──────────────────────────────────────────
+
+    #[test]
+    fn effective_agent_stuck_timeout_returns_default_when_no_config() {
+        let tmp = TempDir::new().unwrap();
+        let timeout = effective_agent_stuck_timeout(tmp.path());
+        assert_eq!(
+            timeout,
+            std::time::Duration::from_secs(DEFAULT_STUCK_TIMEOUT_SECS),
+            "should return default 30s when no config file exists"
+        );
+    }
+
+    #[test]
+    fn effective_agent_stuck_timeout_reads_repo_config() {
+        let tmp = TempDir::new().unwrap();
+        let config = RepoConfig {
+            agent: None,
+            auto_agent_auth_accepted: None,
+            terminal_scrollback_lines: None,
+            yolo_disallowed_tools: None,
+            env_passthrough: None,
+            work_items: None,
+            overlays: None,
+            agent_stuck_timeout_secs: Some(60),
+        };
+        save_repo_config(tmp.path(), &config).unwrap();
+        let timeout = effective_agent_stuck_timeout(tmp.path());
+        assert_eq!(timeout, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn effective_agent_stuck_timeout_repo_overrides_global() {
+        let tmp_config = TempDir::new().unwrap();
+        let tmp_repo = TempDir::new().unwrap();
+        std::env::set_var("AMUX_CONFIG_HOME", tmp_config.path());
+        let global = GlobalConfig {
+            agent_stuck_timeout_secs: Some(45),
+            ..GlobalConfig::default()
+        };
+        save_global_config(&global).unwrap();
+        let repo_cfg = RepoConfig {
+            agent: None,
+            auto_agent_auth_accepted: None,
+            terminal_scrollback_lines: None,
+            yolo_disallowed_tools: None,
+            env_passthrough: None,
+            work_items: None,
+            overlays: None,
+            agent_stuck_timeout_secs: Some(120),
+        };
+        save_repo_config(tmp_repo.path(), &repo_cfg).unwrap();
+        let timeout = effective_agent_stuck_timeout(tmp_repo.path());
+        std::env::remove_var("AMUX_CONFIG_HOME");
+        assert_eq!(timeout, std::time::Duration::from_secs(120));
     }
 
     // ─── yolo_disallowed_tools ───────────────────────────────────────────────────
@@ -594,6 +678,7 @@ mod tests {
             env_passthrough: None,
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
         let loaded = load_repo_config(tmp.path()).unwrap();
@@ -614,6 +699,7 @@ mod tests {
             env_passthrough: None,
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
         let tools = effective_yolo_disallowed_tools(tmp.path());
@@ -633,6 +719,7 @@ mod tests {
             env_passthrough: None,
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
         let tools = effective_yolo_disallowed_tools(tmp.path());
@@ -699,6 +786,7 @@ mod tests {
             env_passthrough: Some(vec!["ANTHROPIC_API_KEY".to_string()]),
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
         let loaded = load_repo_config(tmp.path()).unwrap();
@@ -719,6 +807,7 @@ mod tests {
             env_passthrough: Some(vec!["MY_VAR".to_string(), "OTHER_VAR".to_string()]),
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
         let names = effective_env_passthrough(tmp.path());
@@ -738,6 +827,7 @@ mod tests {
             env_passthrough: Some(vec!["REPO_ONLY_VAR".to_string()]),
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
         let names = effective_env_passthrough(tmp.path());
@@ -771,6 +861,7 @@ mod tests {
             env_passthrough: Some(vec![]), // explicit empty array
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
         let names = effective_env_passthrough(tmp.path());
@@ -793,6 +884,7 @@ mod tests {
             env_passthrough: None,
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
         // Since repo.env_passthrough is None, the function must not panic and must

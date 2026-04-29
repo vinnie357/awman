@@ -229,7 +229,9 @@ pub async fn run_new_skill_with_sink(
             )
         } else {
             let mp = confirm_mount_scope_stdin(&git_root)?;
-            (mp, path.to_string_lossy().to_string())
+            let relative = path.strip_prefix(&mp).unwrap_or(path.as_path());
+            let container_path = format!("{}/{}", CONTAINER_WORKSPACE, relative.to_string_lossy());
+            (mp, container_path)
         };
 
         let agent = agent_name_from_config(&git_root)?;
@@ -455,6 +457,19 @@ mod tests {
         assert!(content.contains("Agent will complete"), "skeleton must contain placeholder body");
         // Must NOT have a real body substituted.
         assert!(!content.contains("Run the tests."), "skeleton must not have real body");
+    }
+
+    // ── local container path ──────────────────────────────────────────────────
+
+    #[test]
+    fn local_skill_container_path_is_workspace_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest_dir = dir.path().join(".claude").join("skills").join("my-skill");
+        let path = dest_dir.join("SKILL.md");
+        let mp = dir.path().to_path_buf();
+        let relative = path.strip_prefix(&mp).unwrap_or(path.as_path());
+        let container_path = format!("{}/{}", CONTAINER_WORKSPACE, relative.to_string_lossy());
+        assert_eq!(container_path, "/workspace/.claude/skills/my-skill/SKILL.md");
     }
 
     // ── global mount path ─────────────────────────────────────────────────────

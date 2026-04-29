@@ -444,6 +444,7 @@ mod tests {
             env_passthrough: Some(vec!["AMUX_TEST_PT_INJECT_PRESENT".to_string()]),
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
 
@@ -486,6 +487,7 @@ mod tests {
             env_passthrough: Some(vec![absent_var.to_string()]),
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
 
@@ -520,6 +522,7 @@ mod tests {
             env_passthrough: Some(vec![var_name.to_string()]),
             work_items: None,
             overlays: None,
+            agent_stuck_timeout_secs: None,
         };
         save_repo_config(tmp.path(), &config).unwrap();
         // SAFETY: test-only env mutation; unique var name avoids races with other tests.

@@ -403,7 +403,7 @@ async fn handle_action(app: &mut App, action: Action) {
             let has_remote = crate::config::effective_remote_default_addr().is_some();
             app.active_tab_mut().dialog = Dialog::NewTabDirectory {
                 input: cwd.to_string_lossy().to_string(),
-                remote_sessions: if has_remote { None } else { Some(Ok(vec![])) },
+                remote_sessions: None,
                 remote_selected_idx: None,
                 focus_workdir: true,
             };

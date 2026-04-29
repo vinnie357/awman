@@ -60,13 +60,13 @@ fn active_tab_with_recent_user_activity_is_not_stuck() {
 
     // The tab should not be considered stuck while the user is active.
     assert!(
-        !app.active_tab().is_stuck(true),
+        !app.active_tab().is_stuck(true, STUCK_TIMEOUT),
         "is_stuck(true) must return false when user recently interacted"
     );
 
     // tab_color must not be yellow.
     assert_ne!(
-        app.active_tab().tab_color(true),
+        app.active_tab().tab_color(true, STUCK_TIMEOUT),
         Color::Yellow,
         "tab colour must not be yellow when user is actively interacting"
     );
@@ -139,14 +139,14 @@ fn background_yolo_tab_color_alternates_by_second() {
     // 2 s elapsed → even → Yellow.
     tab.yolo_countdown_started_at = Some(Instant::now() - Duration::from_secs(2));
     assert_eq!(
-        tab.tab_color(false),
+        tab.tab_color(false, STUCK_TIMEOUT),
         Color::Yellow,
         "tab colour must be Yellow for even elapsed seconds"
     );
     // 3 s elapsed → odd → Magenta.
     tab.yolo_countdown_started_at = Some(Instant::now() - Duration::from_secs(3));
     assert_eq!(
-        tab.tab_color(false),
+        tab.tab_color(false, STUCK_TIMEOUT),
         Color::Magenta,
         "tab colour must be Magenta for odd elapsed seconds"
     );
@@ -158,7 +158,7 @@ fn background_yolo_tab_label_shows_countdown() {
     let mut tab = TabState::new(std::path::PathBuf::new());
     // 10 s elapsed → 50 s remaining; even phase.
     tab.yolo_countdown_started_at = Some(Instant::now() - Duration::from_secs(10));
-    let label = tab.tab_subcommand_label(50, false);
+    let label = tab.tab_subcommand_label(50, false, STUCK_TIMEOUT);
     assert!(
         label.contains("yolo in"),
         "label must contain 'yolo in' text, got: {:?}",
@@ -315,7 +315,7 @@ fn background_yolo_countdown_cleared_when_tab_no_longer_stuck() {
     assert!(app.tabs[1].yolo_countdown_started_at.is_some());
 
     // Verify tab is showing a yolo colour (Yellow or Magenta).
-    let yolo_color = app.tabs[1].tab_color(false);
+    let yolo_color = app.tabs[1].tab_color(false, STUCK_TIMEOUT);
     assert!(
         yolo_color == Color::Yellow || yolo_color == Color::Magenta,
         "tab must show yolo colour during countdown, got: {:?}",
@@ -336,7 +336,7 @@ fn background_yolo_countdown_cleared_when_tab_no_longer_stuck() {
     );
     // Tab colour must revert to normal (green for running + container).
     assert_eq!(
-        app.tabs[1].tab_color(false),
+        app.tabs[1].tab_color(false, STUCK_TIMEOUT),
         Color::Green,
         "tab colour must revert to green once the countdown is cleared"
     );

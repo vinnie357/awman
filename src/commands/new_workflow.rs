@@ -350,8 +350,8 @@ pub async fn run_new_workflow_with_sink(
             (wf_dir, container_path)
         } else {
             let mp = confirm_mount_scope_stdin(&git_root)?;
-            // Path inside container == host path (mount root == git root).
-            let container_path = dest.to_string_lossy().to_string();
+            let relative = dest.strip_prefix(&mp).unwrap_or(dest.as_path());
+            let container_path = format!("{}/{}", CONTAINER_WORKSPACE, relative.to_string_lossy());
             (mp, container_path)
         };
 
@@ -817,6 +817,18 @@ mod tests {
         assert!(prompt.contains("/workspace/foo.toml"), "path must be substituted");
         assert!(prompt.contains("foo.toml"), "filename must be substituted");
         assert!(prompt.contains("do stuff"), "summary must be substituted");
+    }
+
+    // ── local container path ──────────────────────────────────────────────────
+
+    #[test]
+    fn local_workflow_container_path_is_workspace_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("aspec").join("workflows").join("my-wf.toml");
+        let mp = dir.path().to_path_buf();
+        let relative = dest.strip_prefix(&mp).unwrap_or(dest.as_path());
+        let container_path = format!("{}/{}", CONTAINER_WORKSPACE, relative.to_string_lossy());
+        assert_eq!(container_path, "/workspace/aspec/workflows/my-wf.toml");
     }
 
     // ── global mount path ─────────────────────────────────────────────────────

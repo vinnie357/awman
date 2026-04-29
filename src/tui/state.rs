@@ -13,8 +13,9 @@ use tracing;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-/// Duration of container output inactivity before a tab is considered "stuck".
-pub const STUCK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default duration of container output inactivity before a tab is considered "stuck".
+/// The runtime default can be overridden via `agentStuckTimeout` in global or repo config.
+pub const STUCK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// After the user dismisses the auto-advance dialog with Esc, wait this long
 /// before showing it again for the same stuck episode.
@@ -1494,20 +1495,20 @@ impl TabState {
     /// the last `STUCK_TIMEOUT` — suppressing stuck detection while the user
     /// is actively reading output.
     /// When `is_active = false`, only `last_output_time` is considered.
-    pub fn is_stuck(&self, is_active: bool) -> bool {
+    pub fn is_stuck(&self, is_active: bool, stuck_timeout: Duration) -> bool {
         if !matches!(&self.phase, ExecutionPhase::Running { .. }) {
             return false;
         }
         if self.container_window == ContainerWindowState::Hidden {
             return false;
         }
-        if !self.last_output_time.map(|t| t.elapsed() > STUCK_TIMEOUT).unwrap_or(false) {
+        if !self.last_output_time.map(|t| t.elapsed() > stuck_timeout).unwrap_or(false) {
             return false;
         }
         // Active-tab suppression: if the user interacted recently, not considered stuck.
         if is_active {
             if let Some(activity) = self.last_user_activity_time {
-                if activity.elapsed() < STUCK_TIMEOUT {
+                if activity.elapsed() < stuck_timeout {
                     return false;
                 }
             }
@@ -1606,14 +1607,14 @@ impl TabState {
     /// Color for the tab indicator based on current phase and container state.
     /// When `is_active = false` and a yolo countdown is running, returns the
     /// alternating background yolo color instead of the normal color.
-    pub fn tab_color(&self, is_active: bool) -> Color {
+    pub fn tab_color(&self, is_active: bool, stuck_timeout: Duration) -> Color {
         // Background yolo countdown overrides normal color for background tabs.
         if !is_active {
             if let Some(color) = self.background_yolo_color() {
                 return color;
             }
         }
-        if self.is_stuck(is_active) {
+        if self.is_stuck(is_active, stuck_timeout) {
             return Color::Yellow;
         }
         // Remote-bound tabs use purple (Magenta) unless stuck or in error.
@@ -1693,7 +1694,7 @@ impl TabState {
     /// Empty string when idle. Prepends "⚠️ " when the tab is stuck.
     /// When `is_active = false` and a yolo countdown is running, returns the
     /// countdown label instead of the normal subcommand label.
-    pub fn tab_subcommand_label(&self, tab_width: u16, is_active: bool) -> String {
+    pub fn tab_subcommand_label(&self, tab_width: u16, is_active: bool, stuck_timeout: Duration) -> String {
         // Background yolo countdown overrides normal label for background tabs.
         if !is_active {
             if let Some(label) = self.background_yolo_label(tab_width) {
@@ -1713,7 +1714,7 @@ impl TabState {
             | ExecutionPhase::Error { command, .. } => command.as_str(),
         };
         // Prepend warning prefix for stuck tabs.
-        let prefix = if self.is_stuck(is_active) { "⚠️ " } else { "" };
+        let prefix = if self.is_stuck(is_active, stuck_timeout) { "⚠️ " } else { "" };
         let prefix_chars = prefix.chars().count();
         // Inner width: tab_width minus 2 borders minus 2 padding spaces.
         let max_chars = tab_width.saturating_sub(4) as usize;
@@ -1730,7 +1731,7 @@ impl TabState {
     /// Combined display name for the tab: "projname" or "projname | cmd".
     pub fn tab_display_name(&self) -> String {
         let proj = self.tab_project_name();
-        let cmd = self.tab_subcommand_label(20, true);
+        let cmd = self.tab_subcommand_label(20, true, STUCK_TIMEOUT);
         if cmd.is_empty() { proj } else { format!("{} | {}", proj, cmd) }
     }
 
@@ -1938,6 +1939,8 @@ pub struct App {
     pub needs_full_redraw: bool,
     /// Container runtime backend (Docker, Apple Containers, etc.).
     pub runtime: Arc<dyn crate::runtime::AgentRuntime>,
+    /// Effective agent-stuck timeout loaded from config at startup.
+    pub stuck_timeout: Duration,
 }
 
 impl App {
@@ -1949,6 +1952,9 @@ impl App {
     }
 
     pub fn new_with_runtime(cwd: std::path::PathBuf, runtime: Arc<dyn crate::runtime::AgentRuntime>) -> Self {
+        let stuck_timeout = crate::commands::init_flow::find_git_root_from(&cwd)
+            .map(|gr| crate::config::effective_agent_stuck_timeout(&gr))
+            .unwrap_or(STUCK_TIMEOUT);
         Self {
             tabs: vec![TabState::new(cwd)],
             active_tab_idx: 0,
@@ -1956,6 +1962,7 @@ impl App {
             tui_tabs_shared: Arc::new(Mutex::new(vec![])),
             needs_full_redraw: false,
             runtime,
+            stuck_timeout,
         }
     }
 
@@ -1999,9 +2006,10 @@ impl App {
         // Uses a captured index to avoid borrow-checker conflicts.
         let active = self.active_tab_idx;
 
+        let stuck_timeout = self.stuck_timeout;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             let is_active = i == active;
-            let stuck = tab.is_stuck(is_active);
+            let stuck = tab.is_stuck(is_active, stuck_timeout);
 
             // Active-tab: if no longer stuck (user activity suppression), close any open
             // yolo dialog and clear the countdown so the tab returns to its normal state.
@@ -2084,7 +2092,7 @@ impl App {
                 container_name: tab.container_info.as_ref()
                     .map(|ci| ci.container_name.clone())
                     .unwrap_or_default(),
-                is_stuck: tab.is_stuck(i == active),
+                is_stuck: tab.is_stuck(i == active, stuck_timeout),
             })
             .collect();
         if let Ok(mut guard) = self.tui_tabs_shared.lock() {
@@ -2523,14 +2531,14 @@ mod tests {
     #[test]
     fn tab_color_idle_is_dark_gray() {
         let tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
-        assert_eq!(tab.tab_color(true), Color::DarkGray);
+        assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::DarkGray);
     }
 
     #[test]
     fn tab_color_running_no_container_is_blue() {
         let mut tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
         tab.phase = ExecutionPhase::Running { command: "chat".into() };
-        assert_eq!(tab.tab_color(true), Color::Blue);
+        assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::Blue);
     }
 
     #[test]
@@ -2538,21 +2546,21 @@ mod tests {
         let mut tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
         tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
         tab.container_window = ContainerWindowState::Maximized;
-        assert_eq!(tab.tab_color(true), Color::Green);
+        assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::Green);
     }
 
     #[test]
     fn tab_color_error_is_red() {
         let mut tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
         tab.phase = ExecutionPhase::Error { command: "ready".into(), exit_code: 1 };
-        assert_eq!(tab.tab_color(true), Color::Red);
+        assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::Red);
     }
 
     #[test]
     fn tab_color_claws_command_no_container_is_magenta() {
         let mut tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
         tab.phase = ExecutionPhase::Running { command: "claws ready".into() };
-        assert_eq!(tab.tab_color(true), Color::Magenta);
+        assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::Magenta);
     }
 
     #[test]
@@ -2560,7 +2568,7 @@ mod tests {
         let mut tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
         tab.phase = ExecutionPhase::Running { command: "claws ready (attached)".into() };
         tab.container_window = ContainerWindowState::Maximized;
-        assert_eq!(tab.tab_color(true), Color::Magenta);
+        assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::Magenta);
     }
 
     #[test]
@@ -2568,7 +2576,7 @@ mod tests {
         let mut tab = TabState::new(std::path::PathBuf::from("/tmp/proj"));
         tab.phase = ExecutionPhase::Running { command: "claws ready".into() };
         tab.claws_phase = ClawsPhase::Setup;
-        assert_eq!(tab.tab_color(true), Color::Magenta);
+        assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::Magenta);
     }
 
     #[test]
@@ -2640,7 +2648,7 @@ mod tests {
     #[test]
     fn is_stuck_false_when_idle() {
         let tab = new_tab();
-        assert!(!tab.is_stuck(false));
+        assert!(!tab.is_stuck(false, STUCK_TIMEOUT));
     }
 
     #[test]
@@ -2648,7 +2656,7 @@ mod tests {
         let mut tab = new_tab();
         tab.phase = ExecutionPhase::Running { command: "init".into() };
         // No container → never stuck.
-        assert!(!tab.is_stuck(false));
+        assert!(!tab.is_stuck(false, STUCK_TIMEOUT));
     }
 
     #[test]
@@ -2657,17 +2665,17 @@ mod tests {
         tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
         tab.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
         // last_output_time was just set → not yet stuck.
-        assert!(!tab.is_stuck(false));
+        assert!(!tab.is_stuck(false, STUCK_TIMEOUT));
     }
 
     #[test]
-    fn is_stuck_true_when_container_silent_over_10s() {
+    fn is_stuck_true_when_container_silent_over_threshold() {
         let mut tab = new_tab();
         tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
         tab.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
         // Wind the clock back past the timeout.
         tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
-        assert!(tab.is_stuck(false));
+        assert!(tab.is_stuck(false, STUCK_TIMEOUT));
     }
 
     #[test]
@@ -2675,9 +2683,9 @@ mod tests {
         let mut tab = new_tab();
         tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
         tab.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
-        // 9 seconds elapsed — just under the 10s threshold.
-        tab.last_output_time = Some(Instant::now() - Duration::from_secs(9));
-        assert!(!tab.is_stuck(false));
+        // 29 seconds elapsed — just under the 30s threshold.
+        tab.last_output_time = Some(Instant::now() - Duration::from_secs(29));
+        assert!(!tab.is_stuck(false, STUCK_TIMEOUT));
     }
 
     #[test]
@@ -2686,7 +2694,7 @@ mod tests {
         tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
         tab.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
         tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
-        assert_eq!(tab.tab_color(true), Color::Yellow);
+        assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::Yellow);
     }
 
     #[test]
@@ -2695,12 +2703,12 @@ mod tests {
         tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
         tab.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
         tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
-        assert_eq!(tab.tab_color(true), Color::Yellow);
+        assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::Yellow);
 
         tab.acknowledge_stuck();
         // After acknowledging, last_output_time is reset to now → no longer stuck.
-        assert_ne!(tab.tab_color(true), Color::Yellow);
-        assert_eq!(tab.tab_color(true), Color::Green); // running + container = green
+        assert_ne!(tab.tab_color(true, STUCK_TIMEOUT), Color::Yellow);
+        assert_eq!(tab.tab_color(true, STUCK_TIMEOUT), Color::Green); // running + container = green
     }
 
     #[test]
@@ -2710,7 +2718,7 @@ mod tests {
         tab.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
         tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
 
-        let label = tab.tab_subcommand_label(30, true);
+        let label = tab.tab_subcommand_label(30, true, STUCK_TIMEOUT);
         assert!(
             label.contains("⚠️"),
             "expected warning emoji in stuck label, got: {:?}",
@@ -2723,7 +2731,7 @@ mod tests {
     fn tab_subcommand_label_no_warning_prefix_when_not_stuck() {
         let mut tab = new_tab();
         tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
-        let label = tab.tab_subcommand_label(30, true);
+        let label = tab.tab_subcommand_label(30, true, STUCK_TIMEOUT);
         assert!(!label.contains('⚠'), "expected no warning in non-stuck label, got: {:?}", label);
         assert_eq!(label, "implement 0001");
     }
@@ -2736,11 +2744,11 @@ mod tests {
         tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(1)));
 
         // Stuck → warning present.
-        assert!(tab.tab_subcommand_label(30, true).contains('⚠'));
+        assert!(tab.tab_subcommand_label(30, true, STUCK_TIMEOUT).contains('⚠'));
 
         // After acknowledgment → warning gone.
         tab.acknowledge_stuck();
-        assert!(!tab.tab_subcommand_label(30, true).contains('⚠'));
+        assert!(!tab.tab_subcommand_label(30, true, STUCK_TIMEOUT).contains('⚠'));
     }
 
     #[test]
@@ -2778,10 +2786,10 @@ mod tests {
         tab.phase = ExecutionPhase::Running { command: "implement 0001".into() };
         tab.start_container("amux-test".into(), "Claude Code".into(), 80, 24);
         tab.last_output_time = Some(Instant::now() - (STUCK_TIMEOUT + Duration::from_secs(5)));
-        assert!(tab.is_stuck(false));
+        assert!(tab.is_stuck(false, STUCK_TIMEOUT));
 
         tab.finish_command(0);
-        assert!(!tab.is_stuck(false));
+        assert!(!tab.is_stuck(false, STUCK_TIMEOUT));
     }
 
     // --- Workflow auto-advance (0031) tests ---
@@ -2807,8 +2815,8 @@ mod tests {
     // --- Unit: threshold constant ---
 
     #[test]
-    fn stuck_timeout_is_10s() {
-        assert_eq!(STUCK_TIMEOUT, Duration::from_secs(10));
+    fn stuck_timeout_default_is_30s() {
+        assert_eq!(STUCK_TIMEOUT, Duration::from_secs(30));
     }
 
     // --- Unit: workflow_stuck_dialog_opened field ---
@@ -3163,7 +3171,7 @@ mod tests {
         tab.last_user_activity_time = Some(Instant::now());
         // Active-tab check must return false despite stale output.
         assert!(
-            !tab.is_stuck(true),
+            !tab.is_stuck(true, STUCK_TIMEOUT),
             "is_stuck(true) must return false when user just interacted, even if output is stale"
         );
     }
@@ -3177,7 +3185,7 @@ mod tests {
         // Very recent user activity — should be ignored for background tabs.
         tab.last_user_activity_time = Some(Instant::now());
         assert!(
-            tab.is_stuck(false),
+            tab.is_stuck(false, STUCK_TIMEOUT),
             "is_stuck(false) must return true based only on last_output_time, ignoring user activity"
         );
     }
@@ -3559,12 +3567,12 @@ mod tests {
         });
         tab.phase = ExecutionPhase::Idle;
         assert_eq!(
-            tab.tab_color(true),
+            tab.tab_color(true, STUCK_TIMEOUT),
             Color::Magenta,
             "remote-bound tab must be Magenta (active, idle)"
         );
         assert_eq!(
-            tab.tab_color(false),
+            tab.tab_color(false, STUCK_TIMEOUT),
             Color::Magenta,
             "remote-bound tab must be Magenta (inactive, idle)"
         );
@@ -3581,7 +3589,7 @@ mod tests {
         });
         tab.phase = ExecutionPhase::Running { command: "implement 0001".to_string() };
         assert_eq!(
-            tab.tab_color(true),
+            tab.tab_color(true, STUCK_TIMEOUT),
             Color::Magenta,
             "remote-bound tab must remain Magenta when running"
         );
