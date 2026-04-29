@@ -22,7 +22,7 @@ run `amux new workflow` and be guided step-by-step through naming a workflow and
 So I can:
 produce a valid `.toml` (or `.md`/`.yaml`) workflow file without having to remember the schema by heart.
 
-## User Story 2:
+### User Story 2:
 As a: user
 
 I want to:
@@ -279,14 +279,8 @@ pub fn workflow_interview_agent_entrypoint_non_interactive(...) -> Vec<String>
 
 **Mount strategy (`--global` + `--interview`):**
 - When `global == false`: mount the git root (existing behaviour, same as `specs new --interview`).
-- When `global == true`: do **not** mount the git root. Instead, construct a `DirectoryOverlay`:
-  ```
-  host_path:      ~/.amux/workflows/          (the directory containing the new file)
-  container_path: /var/amux-workflows/
-  permission:     ReadWrite
-  ```
-  Pass this as the sole overlay to `run_agent_with_sink`. The `mount_path` argument should be `None`; the overlay is sufficient. Update the prompt's `{path}` substitution to use `/var/amux-workflows/<filename>`.
-- The agent only has write access to the new workflows directory — not the whole home directory, not any repo.
+- When `global == true`: pass `mount_override: Some(global_workflows_dir())` to `run_agent_with_sink`. The agent's workspace is the `~/.amux/workflows/` directory — it does not see the git repo at all. The git root is still required for agent-image lookup (`.amux/Dockerfile.<agent>`), so `--global --interview` requires running inside a git repo. Update the prompt's `{path}` substitution to use `/workspace/<filename>` (the default container workspace path when mounting a non-repo directory).
+- The agent only has write access to the global workflows directory — not the whole home directory, not the repo.
 
 ### 4. Skill creation: `src/commands/new_skill.rs`
 
@@ -396,13 +390,7 @@ pub fn skill_interview_agent_entrypoint_non_interactive(...) -> Vec<String>
 
 **Mount strategy (`--global` + `--interview`):**
 - `global == false`: mount the git root (existing behaviour).
-- `global == true`: construct a `DirectoryOverlay`:
-  ```
-  host_path:      ~/.amux/skills/<name>/      (the new skill's directory)
-  container_path: /var/amux-skills-<name>/
-  permission:     ReadWrite
-  ```
-  Pass as the sole overlay; `mount_path` is `None`. Update `{path}` in the prompt to `/var/amux-skills-<name>/SKILL.md`.
+- `global == true`: pass `mount_override: Some(global_skills_dir().join(&name))` to `run_agent_with_sink`. The agent's workspace is the `~/.amux/skills/<name>/` directory only — it does not see the git repo. The git root is still required for agent-image lookup, so `--global --interview` requires running inside a git repo. Update `{path}` in the prompt to `/workspace/SKILL.md`.
 - The agent only has write access to the single skill directory.
 
 ### 5. Shared helpers
@@ -415,18 +403,6 @@ pub fn global_skills_dir() -> Result<PathBuf>       // ~/.amux/skills/
 ```
 
 Both use `dirs::home_dir()` (already a transitive dependency via WI-63) and create the directory with `std::fs::create_dir_all` if absent.
-
-**Overlay construction for global interview** (reuse `DirectoryOverlay` from `src/overlays/directory.rs`):
-
-```rust
-pub fn overlay_for_global_dir(host_dir: &Path, container_path: &str) -> DirectoryOverlay {
-    DirectoryOverlay {
-        host_path: host_dir.to_path_buf(),
-        container_path: PathBuf::from(container_path),
-        permission: MountPermission::ReadWrite,
-    }
-}
-```
 
 ### 6. `src/commands/mod.rs` dispatch
 
@@ -462,13 +438,13 @@ In `src/tui/render.rs`, add rendering for `Dialog::NewWorkflow` and `Dialog::New
 - **Global directory creation**: `~/.amux/workflows/` and `~/.amux/skills/` may not yet exist; create them with `create_dir_all` before writing. Do not error if they already exist.
 - **No git root for non-global mode**: If the user is not inside a git repository and `--global` is not passed, bail with a clear message ("Not inside a git repository. Use --global to write to ~/.amux/").
 - **`--interview` without an agent configured**: If no agent is configured and none can be inferred, fall back to `"claude"` (matching existing `specs new` behaviour).
-- **`--global --interview` overlay mount**: The skill/workflow directory must exist (and contain the skeleton file) before the agent is launched. Create it synchronously before calling `run_agent_with_sink`.
+- **`--global --interview` directory mount**: The skill/workflow directory must exist (and contain the skeleton file) before the agent is launched. Create it synchronously before calling `run_agent_with_sink`. Requires being inside a git repo (for agent-image lookup); if not, bail with "Not inside a git repository. The agent image requires a git repo with `.amux/Dockerfile.<agent>`. Use --global without --interview to create without an agent."
 - **Multi-line period termination (CLI)**: If the user types a prompt/body that is legitimately empty (only `.`), treat it as an empty string and emit a warning ("Prompt is empty. Continuing with empty prompt.") rather than erroring.
 - **TUI `Ctrl-N` with empty step name**: Validate that `step_name` is non-empty before committing a step; show an inline error in the dialog (`error: Some("Step name cannot be empty")`) and keep the dialog open.
 - **TUI `Ctrl-Enter` with no steps**: If the user presses `Ctrl-Enter` on the workflow dialog without adding any steps, show an inline error ("At least one step is required") and keep the dialog open.
 - **Format extension mapping**: `--format toml` → `.toml`, `--format yaml` → `.yaml`, `--format md` → `.md`. The YAML writer uses `serde_yaml`; confirm this crate is already in `Cargo.toml` (it is used by the workflow parser).
 - **`depends_on` referencing non-existent steps (CLI/TUI interactive)**: Warn the user but do not block completion — the workflow file may reference steps that will be added later or renamed.
-- **Container path collisions (global interview)**: `/var/amux-workflows/` and `/var/amux-skills-<name>/` must not conflict with any existing container paths. These are chosen to avoid collisions with `/workspace` (git root mount) and `/root` (home).
+- **Container workspace (global interview)**: For `--global --interview`, the mounted directory (e.g., `~/.amux/workflows/`) becomes `/workspace` inside the container. Prompt templates use `/workspace/<filename>` as the `{path}` substitution.
 
 
 ## Test Considerations:
@@ -486,10 +462,9 @@ In `src/tui/render.rs`, add rendering for `Dialog::NewWorkflow` and `Dialog::New
   - `skill_interview_agent_entrypoint` substitutes `{path}` and `{summary}` correctly for all three agents.
   - Skeleton file written in interview mode contains correct frontmatter but placeholder body.
 
-- **Overlay construction**:
-  - `overlay_for_global_dir` produces a `DirectoryOverlay` with `ReadWrite` permission and correct paths.
-  - For `--global --interview` workflow: overlay `host_path` equals `~/.amux/workflows/`, `container_path` equals `/var/amux-workflows/`.
-  - For `--global --interview` skill named `"foo"`: overlay `host_path` equals `~/.amux/skills/foo/`, `container_path` equals `/var/amux-skills-foo/`.
+- **Global mount paths**:
+  - For `--global --interview` workflow: `mount_override` equals `~/.amux/workflows/`.
+  - For `--global --interview` skill named `"foo"`: `mount_override` equals `~/.amux/skills/foo/`.
 
 ### Integration tests
 
@@ -497,10 +472,10 @@ In `src/tui/render.rs`, add rendering for `Dialog::NewWorkflow` and `Dialog::New
 - `amux new workflow` (non-interview) with stdin simulation writes a valid TOML file to `aspec/workflows/` in the test repo.
 - `amux new workflow --format yaml` writes a `.yaml` file.
 - `amux new workflow --global` writes to a temp `~/.amux/workflows/` directory (use env override in test).
-- `amux new workflow --interview --global` writes a skeleton file and constructs the correct `DirectoryOverlay` (verify by inspecting `run_agent_with_sink` arguments).
+- `amux new workflow --interview --global` writes a skeleton file and calls `run_agent_with_sink` with `mount_override` set to `~/.amux/workflows/`.
 - `amux new skill` (non-interview) writes a valid `SKILL.md` to `.claude/skills/<name>/`.
 - `amux new skill --global` writes to `~/.amux/skills/<name>/SKILL.md`.
-- `amux new skill --interview --global` writes skeleton and constructs overlay with `host_path = ~/.amux/skills/<name>/` and `container_path = /var/amux-skills-<name>/`.
+- `amux new skill --interview --global` writes skeleton and calls `run_agent_with_sink` with `mount_override` set to `~/.amux/skills/<name>/`.
 
 ### TUI dialog tests (`src/tui/`)
 
@@ -520,8 +495,7 @@ In `src/tui/render.rs`, add rendering for `Dialog::NewWorkflow` and `Dialog::New
 - New modules (`new_cmd.rs`, `new_workflow.rs`, `new_skill.rs`) go in `src/commands/`; declare them in `src/commands/mod.rs`.
 - Reuse `prompt_kind`, `prompt_title`, `create_file_return_number` from `src/commands/new.rs` for the `new spec` alias; do not duplicate logic.
 - Reuse the existing `run_agent_with_sink` from `src/commands/agent.rs` for all interview modes — same signature, same container lifecycle.
-- Reuse `DirectoryOverlay` and `MountPermission` from `src/overlays/directory.rs` (introduced in WI-63) for the `--global --interview` overlay construction.
-- Reuse `dirs::home_dir()` (transitive dependency confirmed in WI-63) for `~/.amux/` path resolution.
+- Reuse `dirs::home_dir()` (already a direct dependency in `Cargo.toml`) for `~/.amux/` path resolution.
 - The `serde_yaml` crate is already a dependency (used in `src/workflow/parser.rs`); use it for YAML output without adding a new dependency.
 - The `toml` crate is already a dependency; use it for TOML output.
 - New dialog state variants (`Dialog::NewWorkflow`, `Dialog::NewSkill`) in `src/tui/state.rs` must follow the same naming and field conventions as adjacent variants (`NewTitleInput`, `NewInterviewSummary`, etc.).
