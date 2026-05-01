@@ -49,7 +49,7 @@ Layer 0: data      Session, config, filesystem, database, typed data
 |-------|----------|--------|
 | 0 — data | `src/data/` | Complete (work item 0066) |
 | 1 — engine | `src/engine/` | Complete (work item 0067) |
-| 2 — command | `src/command/` | Stub — populated in 0068 |
+| 2 — command | `src/command/` | Complete (work item 0068) |
 | 3 — frontend | `src/frontend/` | Stub — populated in 0069 |
 | 4 — binary | `src/main.rs` | Stub — wired in 0069 |
 | Legacy binary | `oldsrc/` | Frozen, ships to users |
@@ -138,7 +138,43 @@ src/
       frontend.rs         ClawsFrontend trait
       summary.rs          ClawsSummary
   command/
-    mod.rs                (stub — populated in 0068)
+    mod.rs                Re-exports: CommandCatalogue, Dispatch, CommandFrontend, CommandOutcome, CommandError
+    error.rs              CommandError (wraps EngineError and DataError)
+    dispatch/
+      mod.rs              Dispatch<F>, Engines, CommandFrontend, CommandOutcome, BuiltCommand
+      catalogue.rs        CommandCatalogue, CommandSpec, FlagSpec, ArgumentSpec, FlagKind, FlagDefault, ArgumentKind, FrontendVisibility
+      parsed_input.rs     ParsedCommandBoxInput (TUI command-box tokenized result)
+      projections/
+        mod.rs            Re-exports
+        clap.rs           CommandCatalogue::build_clap_command()
+        tui_hints.rs      CommandCatalogue::tui_hint_for(), tui_completions()
+        headless_schema.rs CommandCatalogue::openapi_schema(), rest_route_table()
+    commands/
+      mod.rs              Re-exports all *Command types
+      command_trait.rs    Command trait (run_with_frontend)
+      agent_auth.rs       AgentAuthFrontend trait, AgentAuthDecision
+      agent_setup.rs      AgentSetupFrontend trait, AgentSetupDecision
+      auth.rs             AuthCommand, AuthCommandFrontend, AuthOutcome
+      chat.rs             ChatCommand, ChatCommandFrontend, ChatCommandFlags, ChatOutcome
+      claws.rs            ClawsCommand, ClawsCommandFrontend, ClawsCommandFlags, ClawsCommandMode, ClawsOutcome
+      config.rs           ConfigCommand, ConfigSubcommand, ConfigShowFlags, ConfigGetFlags, ConfigSetFlags, ConfigOutcome
+      download.rs         DownloadCommand, DownloadOutcome
+      exec_prompt.rs      ExecPromptCommand, ExecPromptCommandFrontend, ExecPromptCommandFlags, ExecPromptOutcome
+      exec_workflow.rs    ExecWorkflowCommand, ExecWorkflowCommandFrontend, ExecWorkflowCommandFlags, ExecWorkflowOutcome, WorkflowSummary
+      headless.rs         HeadlessCommand, HeadlessSubcommand, HeadlessStartFlags, HeadlessKillFlags, HeadlessLogsFlags, HeadlessStatusFlags, HeadlessOutcome
+      headless/
+        banner.rs         Legacy headless banner format constants
+      implement.rs        ImplementCommand, ImplementCommandFrontend, ImplementCommandFlags, ImplementOutcome
+      implement_prompts.rs DEFAULT_IMPLEMENT_PROMPT constant
+      init.rs             InitCommand, InitCommandFrontend, InitCommandFlags, InitOutcome
+      mount_scope.rs      MountScope, MountScopeFrontend, MountScopeDecision
+      new.rs              NewCommand, NewSubcommand, NewSkillFlags, NewSpecFlags, NewWorkflowFlags, NewOutcome
+      ready.rs            ReadyCommand, ReadyCommandFrontend, ReadyCommandFlags, ReadyOutcome
+      remote.rs           RemoteCommand, RemoteSubcommand, RemoteRunFlags, RemoteSessionStartFlags, RemoteSessionKillFlags, RemoteOutcome
+      remote_client.rs    RemoteClient, RemoteResponse, RemoteEventSink
+      specs.rs            SpecsCommand, SpecsSubcommand, SpecsAmendFlags, SpecsNewFlags, SpecsOutcome
+      status.rs           StatusCommand, StatusCommandFrontend, StatusCommandFlags, StatusCommandTuiContext, TuiTabSnapshot, StatusOutcome
+      worktree_lifecycle.rs WorktreeLifecycle, WorktreeLifecycleFrontend, PreWorktreeDecision, ExistingWorktreeDecision, PostWorkflowWorktreeAction
   frontend/
     mod.rs                (stub — populated in 0069)
 ```
@@ -1442,6 +1478,598 @@ impl WorkflowStateStore {
 
 ---
 
+## Layer 2: Command (`src/command/`)
+
+Layer 2 is the command layer: typed objects that own every piece of business logic a frontend needs to express. It is built on top of Layer 0 (data) and Layer 1 (engine) and never calls into Layer 3 (frontends) or Layer 4 (the binary). When a command needs user input or output it accepts a **frontend trait defined by Layer 2** — Layer 3 implements that trait and passes it in at invocation time.
+
+Four rules govern this layer:
+
+1. **Layer 2 consumes Layer 0 and Layer 1 only.** No upward calls into frontends or the binary.
+2. **Frontends contain no business logic.** Every command knob — every flag, every prompt, every dialog — flows through Layer 2's `Dispatch` system or a per-command frontend trait.
+3. **Typed objects over `pub fn`.** Each command is a `*Command` struct that implements `Command` and exposes `run_with_frontend(frontend) -> Result<Outcome, CommandError>`.
+4. **The full list of available commands and flags lives only in `CommandCatalogue`.** Frontends never hard-code command names, flag names, or defaults; they ask the catalogue (or its projections) for what's available. This is the single most important guarantee against mode drift across CLI, TUI, and headless.
+
+---
+
+### `Command` trait (`src/command/commands/command_trait.rs`)
+
+Every `*Command` struct implements this trait:
+
+```rust
+#[async_trait]
+pub trait Command {
+    type Frontend: Send;
+    type Outcome;
+
+    async fn run_with_frontend(
+        self,
+        frontend: Self::Frontend,
+    ) -> Result<Self::Outcome, CommandError>;
+}
+```
+
+`Frontend` is the per-command associated type — e.g. `Box<dyn ExecWorkflowCommandFrontend>`. `Outcome` is the typed value the command returns on success, always `Serialize`-able for `--json` callers.
+
+---
+
+### `CommandError` (`src/command/error.rs`)
+
+All Layer 2 failures are variants of `CommandError`. It wraps `EngineError` (Layer 1) and `DataError` (Layer 0) for failures from below. Layer 3 wraps `CommandError` in its own user-facing presentation.
+
+Key variants:
+
+| Variant | Meaning |
+|---------|---------|
+| `Engine(EngineError)` | Propagated from Layer 1 |
+| `Data(DataError)` | Propagated from Layer 0 |
+| `UnknownCommand { path }` | `Dispatch::run_command` received an unrecognised path |
+| `UnknownFlag { command, flag }` | Frontend supplied a flag not in the catalogue |
+| `MissingRequiredFlag { command, flag }` | Required flag was absent |
+| `MissingRequiredArgument { command, argument }` | Required positional argument was absent |
+| `MutuallyExclusive { command, a, b }` | Two conflicting flags were both supplied |
+| `InvalidFlagValue { command, flag, reason }` | Flag value failed type/enum validation |
+| `InvalidArgumentValue { command, argument, reason }` | Positional argument failed validation |
+| `CommandBoxParse(String)` | TUI command-box input could not be tokenised |
+| `Aborted` | User chose to abort in an interactive prompt |
+| `MergeConflict { branch, worktree_path }` | `WorktreeLifecycle::finalize` encountered a git merge conflict |
+| `MissingRemoteAddress` | No `--remote-addr` / `AMUX_REMOTE_ADDR` supplied |
+| `MissingApiKey` | API key could not be resolved from any source |
+| `RemoteTimeout` | HTTP request to remote server timed out |
+| `RemoteConnectionRefused(String)` | Connection to remote server was refused |
+| `RemoteHttpStatus { status, body }` | Remote returned a non-2xx HTTP status |
+| `MalformedSseEvent(String)` | SSE stream contained an unparseable event |
+| `RemoteTransport(String)` | Underlying HTTP transport error |
+| `HeadlessWorkdirNotFound { path }` | A workdir path supplied to `headless start` does not exist |
+| `HeadlessAlreadyRunning { pid }` | Headless server is already running on the given PID |
+
+Convenience constructors: `CommandError::unknown_command`, `missing_required_flag`, `missing_required_argument`, `unknown_flag`, `mutually_exclusive`.
+
+---
+
+### `CommandCatalogue` (`src/command/dispatch/catalogue.rs`)
+
+`CommandCatalogue` is a single static (via `OnceLock`) data structure that enumerates every command, subcommand, argument, and flag exactly once. It is the sole source of truth for the command surface; no frontend or projection may hard-code names, defaults, or types independently.
+
+#### Supporting types
+
+```rust
+pub enum FrontendVisibility {
+    All,          // CLI, TUI, and headless
+    CliOnly,
+    TuiOnly,
+    CliAndTui,
+    Hidden,
+}
+
+pub enum FlagKind {
+    Bool,
+    String,
+    OptionalString,
+    Enum(&'static [&'static str]),
+    VecString,    // repeatable: --foo a --foo b
+    Path,
+    OptionalPath,
+    U16,
+}
+
+pub enum FlagDefault { None, Bool(bool), Str(&'static str), U16(u16), EmptyVec }
+
+pub struct FlagSpec {
+    pub long: &'static str,
+    pub short: Option<char>,
+    pub help: &'static str,
+    pub kind: FlagKind,
+    pub default: FlagDefault,
+    pub frontends: FrontendVisibility,
+    pub conflicts_with: &'static [&'static str],
+    pub implies: &'static [&'static str],
+    pub optional: bool,
+}
+
+pub enum ArgumentKind {
+    String,
+    OptionalString,
+    Path,
+    OptionalPath,
+    TrailingVarArgs,  // <COMMAND>... style; triggers trailing_var_arg + allow_hyphen_values
+}
+
+pub struct ArgumentSpec {
+    pub name: &'static str,
+    pub help: &'static str,
+    pub kind: ArgumentKind,
+    pub optional: bool,
+}
+
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],    // string aliases ("wf" for "exec workflow")
+    pub path_aliases: &'static [&'static [&'static str]],  // path aliases (["specs","new"] → ["new","spec"])
+    pub help: &'static str,
+    pub long_help: Option<&'static str>,
+    pub arguments: &'static [ArgumentSpec],
+    pub flags: &'static [FlagSpec],
+    pub subcommands: &'static [&'static CommandSpec],
+}
+```
+
+#### Catalogue API
+
+```rust
+impl CommandCatalogue {
+    pub fn get() -> &'static CommandCatalogue;
+    pub fn root() -> &'static CommandSpec;
+    pub fn lookup(path: &[&str]) -> Option<&'static CommandSpec>;
+    pub fn lookup_with_aliases(path: &[&str]) -> Option<&'static CommandSpec>;
+}
+```
+
+`lookup_with_aliases` resolves both string aliases (`"wf"` → `["exec", "workflow"]`) and path aliases (`["specs", "new"]` → `["new", "spec"]`) so frontends get the canonical spec regardless of invocation form.
+
+#### Commands enumerated
+
+The catalogue covers every command defined in `oldsrc/cli.rs` with the same names, aliases, flag names, flag kinds, and defaults:
+
+`init`, `ready`, `implement`, `chat`, `specs` (with `amend`, `new`), `claws` (with `init`, `ready`, `chat`), `status`, `config` (with `show`, `get`, `set`), `exec` (with `prompt`, `workflow`/`wf`), `headless` (with `start`, `kill`, `logs`, `status`), `remote` (with `run`, `session start`, `session kill`), `new` (with `spec`, `workflow`, `skill`).
+
+`specs new` is preserved as a path alias for `new spec`; both produce identical behavior. `implement` is preserved as a top-level command (most-used user surface, delegates internally to `ExecWorkflowCommand`).
+
+---
+
+### Catalogue Projections (`src/command/dispatch/projections/`)
+
+Frontends never build their own argument parsers or schema documents. Instead they call projection methods on `CommandCatalogue` that derive the frontend-specific structure from the single catalogue definition. Adding a flag is a one-line edit in the catalogue; every projection updates automatically.
+
+#### `clap.rs`
+
+```rust
+impl CommandCatalogue {
+    pub fn build_clap_command(&self) -> clap::Command;
+}
+```
+
+Walks the catalogue tree and produces a `clap::Command` with all subcommands, flags, arguments, aliases, help text, `conflicts_with` constraints, and `requires` chains. `ArgumentSpec::TrailingVarArgs` sets `trailing_var_arg(true)` and `allow_hyphen_values(true)` (used by `remote run <COMMAND>...`). The CLI frontend calls this once and passes the resulting `ArgMatches` to a `CliCommandFrontend`.
+
+#### `tui_hints.rs`
+
+```rust
+impl CommandCatalogue {
+    pub fn tui_hint_for(&self, path: &[&str]) -> Option<TuiHint>;
+    pub fn tui_completions(&self, partial: &str) -> Vec<TuiCompletion>;
+}
+```
+
+Generates the hint string shown above the TUI command box for the currently typed command path, and the autocomplete entries shown as the user types. The TUI frontend never maintains its own hint or completion lists.
+
+#### `headless_schema.rs`
+
+```rust
+impl CommandCatalogue {
+    pub fn openapi_schema(&self) -> serde_json::Value;
+    pub fn rest_route_table(&self) -> Vec<RestRoute>;
+}
+```
+
+Generates the OpenAPI JSON schema and the REST route table used by the headless server. The headless frontend derives its API surface entirely from these projections.
+
+#### Projection consistency guarantee
+
+A suite of catalogue unit tests (`catalogue_clap_consistency`, `catalogue_tui_consistency`, `catalogue_headless_consistency`) walks every `Arg` in the clap output, every hint entry, and every route in the REST table and asserts each is present in the catalogue with a matching kind, default, and help string. If a flag exists in a projection but not the catalogue (or vice versa), the test fails.
+
+---
+
+### `Dispatch` (`src/command/dispatch/mod.rs`)
+
+`Dispatch` is the gateway through which frontends invoke commands. It reads flag values from the frontend, applies catalogue-driven validation, enforces implication rules, and constructs a typed `*Command` struct populated with all the engines and flag values it needs.
+
+#### `Engines` bundle
+
+```rust
+#[derive(Clone)]
+pub struct Engines {
+    pub runtime: Arc<ContainerRuntime>,
+    pub git_engine: Arc<GitEngine>,
+    pub overlay_engine: Arc<OverlayEngine>,
+    pub auth_engine: Arc<AuthEngine>,
+    pub agent_engine: Arc<AgentEngine>,
+    pub workflow_state_store: Arc<WorkflowStateStore>,
+}
+```
+
+`ReadyEngine`, `InitEngine`, and `ClawsEngine` are **not** pre-constructed on `Dispatch` — their constructors accept per-invocation flag values. The corresponding commands construct them fresh from the `Engines` references above.
+
+#### `CommandFrontend` trait
+
+Implemented by Layer 3 (CLI, TUI, headless). Supplies flag values and positional arguments to Dispatch, and extends `UserMessageSink` so commands can write status messages through the same frontend object.
+
+```rust
+pub trait CommandFrontend: UserMessageSink + Send + Sync {
+    fn flag_bool(&self, command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError>;
+    fn flag_string(&self, command_path: &[&str], flag: &str) -> Result<Option<String>, CommandError>;
+    fn flag_strings(&self, command_path: &[&str], flag: &str) -> Result<Vec<String>, CommandError>;
+    fn flag_path(&self, command_path: &[&str], flag: &str) -> Result<Option<PathBuf>, CommandError>;
+    fn flag_enum(&self, command_path: &[&str], flag: &str) -> Result<Option<String>, CommandError>;
+    fn flag_u16(&self, command_path: &[&str], flag: &str) -> Result<Option<u16>, CommandError>;
+    fn argument(&self, command_path: &[&str], name: &str) -> Result<Option<String>, CommandError>;
+    fn arguments(&self, command_path: &[&str], name: &str) -> Result<Vec<String>, CommandError>;
+}
+```
+
+Validation (type checking, required vs. optional, mutual exclusion, implication) lives entirely in Dispatch — Layer 3 never validates user input.
+
+#### `Dispatch` struct
+
+```rust
+pub struct Dispatch<F: CommandFrontend> {
+    catalogue: &'static CommandCatalogue,
+    frontend: F,
+    session: Arc<RwLock<Session>>,
+    engines: Engines,
+}
+
+impl<F: CommandFrontend> Dispatch<F> {
+    pub fn new(frontend: F, session: Arc<RwLock<Session>>, engines: Engines) -> Self;
+    pub fn catalogue(&self) -> &'static CommandCatalogue;
+    pub fn frontend(&self) -> &F;
+    pub async fn run_command(self, path: &[&str]) -> Result<CommandOutcome, CommandError>;
+    pub fn build_command(self, path: &[&str]) -> Result<BuiltCommand, CommandError>;
+    pub fn parse_command_box_input(raw: &str) -> Result<ParsedCommandBoxInput, CommandError>;
+}
+```
+
+`build_command` resolves aliases, reads flag values, applies implication rules (e.g. `--yolo` implies `--worktree` for `exec workflow`; `--json` implies `--non-interactive` for `ready`), and constructs the typed `BuiltCommand`. `run_command` calls `build_command` then dispatches to the command's `run_with_frontend`.
+
+`parse_command_box_input` tokenises a raw TUI command-box string against the catalogue and returns a `ParsedCommandBoxInput { path, flags, arguments }`. All command-string interpretation lives here, never in the TUI.
+
+#### `CommandOutcome` and `BuiltCommand`
+
+```rust
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", content = "payload")]
+pub enum CommandOutcome {
+    Init(InitOutcome),
+    Ready(ReadyOutcome),
+    Implement(ImplementOutcome),
+    Chat(ChatOutcome),
+    Claws(ClawsOutcome),
+    Status(StatusOutcome),
+    Config(ConfigOutcome),
+    ExecPrompt(ExecPromptOutcome),
+    ExecWorkflow(ExecWorkflowOutcome),
+    Headless(HeadlessOutcome),
+    Remote(RemoteOutcome),
+    New(NewOutcome),
+    Specs(SpecsOutcome),
+    Auth(AuthOutcome),
+    Download(DownloadOutcome),
+    Empty,
+}
+
+pub enum BuiltCommand {
+    Init(InitCommand),
+    Ready(ReadyCommand),
+    Implement(ImplementCommand),
+    Chat(ChatCommand),
+    /* … one variant per command … */
+}
+```
+
+Every `*Outcome` derives `Serialize`. JSON serialisation is a frontend concern (Layer 3 renders the outcome as JSON when `--json` is active); the command itself is unaware of the output format.
+
+---
+
+### Per-Command Structs (`src/command/commands/`)
+
+Each amux command is one module under `src/command/commands/` containing:
+
+- A `*Command` struct that owns every flag value and engine reference it needs.
+- A `*CommandFlags` struct carrying the typed flag values.
+- A `*CommandFrontend` trait listing the per-command user-input and reporting methods.
+- An `impl Command for *Command` block.
+- Colocated unit tests using fake engines and a recording frontend.
+
+#### Command roster
+
+| Module | Command(s) | Notes |
+|--------|-----------|-------|
+| `init.rs` | `amux init` | Thin wrapper over `InitEngine`; `InitCommandFrontend: InitFrontend + Send` |
+| `ready.rs` | `amux ready` | Thin wrapper over `ReadyEngine`; `ReadyCommandFrontend: ReadyFrontend + Send`; `--json` implies `--non-interactive` |
+| `implement.rs` | `amux implement` | Top-level command preserved; delegates to shared agent-launching pattern; uses `DEFAULT_IMPLEMENT_PROMPT` when `--workflow` absent |
+| `chat.rs` | `amux chat` | Agent-launching command |
+| `exec_prompt.rs` | `amux exec prompt` | Agent-launching command with inline prompt |
+| `exec_workflow.rs` | `amux exec workflow` | Agent-launching command with full workflow file; `--yolo`/`--auto` imply `--worktree` |
+| `claws.rs` | `amux claws {init,ready,chat}` | Thin wrapper over `ClawsEngine`; `ClawsCommandFrontend: ClawsFrontend + Send` |
+| `status.rs` | `amux status` | Accepts optional `StatusCommandTuiContext` for tab annotations; `--watch` for continuous refresh |
+| `specs.rs` | `amux specs {amend,new}` | `specs new` is an alias for `new spec` |
+| `config.rs` | `amux config {show,get,set}` | Config read/write; `config set --global` writes to global config |
+| `headless.rs` | `amux headless {start,kill,logs,status}` | Daemonization, PID management, workdir allowlist; delegates HTTP server boot to Layer 3 frontend |
+| `remote.rs` | `amux remote {run, session start, session kill}` | Uses `RemoteClient` for HTTP + SSE |
+| `new.rs` | `amux new {spec,workflow,skill}` | Work-item and artefact creation |
+| `auth.rs` | `amux auth` | Keychain credential accept/decline per-repo |
+| `download.rs` | `amux download` | Internal helper for Dockerfile downloads |
+
+#### Agent-launching command canonical order
+
+Every command that launches an agent (`implement`, `chat`, `exec prompt`, `exec workflow`, `specs amend`, `claws *`, `init` audit, `ready` audit) follows this sequence in `run_with_frontend`:
+
+1. Resolve mount path via `MountScope::resolve`.
+2. Resolve effective agent + model (flags > repo config > global config).
+3. If agent is not available: call `AgentSetupFrontend::ask_agent_setup`. On `Setup` → `AgentEngine::ensure_available`. On `FallbackToDefault` → swap agent. On `Abort` → `CommandError::Aborted`.
+4. Check `EffectiveConfig::auto_agent_auth_accepted`: if `None`, call `AgentAuthFrontend::ask_agent_auth_consent`; persist the result.
+5. If `--worktree`: call `WorktreeLifecycle::prepare(frontend)` → use the returned worktree path as the mount root.
+6. Build `ContainerOption` list via `AgentEngine::build_options`; run via `WorkflowEngine` or `ContainerRuntime`.
+7. If worktree was used: call `WorktreeLifecycle::finalize(frontend, had_error)`.
+8. Map exit info to `*Outcome`.
+
+---
+
+### `WorktreeLifecycle` (`src/command/commands/worktree_lifecycle.rs`)
+
+Worktree lifecycle is a command-layer concern, not a `WorkflowEngine` concern. `WorkflowEngine` operates on a given directory and is unaware of whether it is a worktree.
+
+#### Decision types
+
+```rust
+pub enum PreWorktreeDecision {
+    Commit { message: String },
+    UseLastCommit,
+    Abort,
+}
+
+pub enum ExistingWorktreeDecision { Resume, Recreate }
+
+pub enum PostWorkflowWorktreeAction { Merge, Discard, Keep }
+```
+
+#### `WorktreeLifecycleFrontend` trait
+
+Defined by Layer 2, implemented by Layer 3:
+
+```rust
+pub trait WorktreeLifecycleFrontend: UserMessageSink + Send + Sync {
+    fn ask_pre_worktree_uncommitted_files(&mut self, files: &[String]) -> Result<PreWorktreeDecision, CommandError>;
+    fn ask_existing_worktree(&mut self, path: &Path, branch: &str) -> Result<ExistingWorktreeDecision, CommandError>;
+    fn report_worktree_created(&mut self, path: &Path, branch: &str);
+    fn ask_post_workflow_action(&mut self, branch: &str, had_error: bool) -> Result<PostWorkflowWorktreeAction, CommandError>;
+    fn ask_worktree_commit_before_merge(&mut self, branch: &str, files: &[String]) -> Result<Option<String>, CommandError>;
+    fn confirm_squash_merge(&mut self, branch: &str) -> Result<bool, CommandError>;
+    fn confirm_worktree_cleanup(&mut self, branch: &str, path: &Path) -> Result<bool, CommandError>;
+    fn report_merge_conflict(&mut self, branch: &str, worktree_path: &Path, git_root: &Path);
+    fn report_worktree_discarded(&mut self, branch: &str);
+    fn report_worktree_kept(&mut self, path: &Path, branch: &str);
+}
+```
+
+#### `WorktreeLifecycle` struct
+
+```rust
+pub struct WorktreeLifecycle {
+    git_engine: Arc<GitEngine>,
+    git_root: PathBuf,
+    worktree_path: PathBuf,
+    branch: String,
+}
+
+impl WorktreeLifecycle {
+    /// Branch name: `amux/workflow-<name>`; path: `~/.amux/worktrees/<repo>/wf-<name>/`
+    pub fn for_workflow(git_engine: Arc<GitEngine>, git_root: PathBuf, workflow_name: &str) -> Self;
+
+    pub fn worktree_path(&self) -> &Path;
+    pub fn branch(&self) -> &str;
+
+    /// Pre-creation checks and worktree setup. Returns the worktree path (= mount root).
+    pub async fn prepare(&self, frontend: &mut dyn WorktreeLifecycleFrontend) -> Result<PathBuf, CommandError>;
+
+    /// Post-completion merge / discard / keep flow.
+    pub async fn finalize(&self, frontend: &mut dyn WorktreeLifecycleFrontend, had_error: bool) -> Result<(), CommandError>;
+}
+```
+
+`prepare` steps: check for existing worktree → if exists call `ask_existing_worktree` (Resume or Recreate); check for uncommitted files → if present call `ask_pre_worktree_uncommitted_files`; create worktree; report.
+
+`finalize` steps: call `ask_post_workflow_action`; on Merge → optional commit → squash-merge → optional cleanup; on Discard → remove worktree + branch; on Keep → report.
+
+Merge conflicts are non-fatal: `finalize` catches `EngineError::MergeConflict`, calls `report_merge_conflict`, and returns `Ok(())`. The user resolves the conflict manually.
+
+This module is `pub(super)` within `src/command/commands/` — not re-exported from `src/command/mod.rs`.
+
+---
+
+### `MountScope` (`src/command/commands/mount_scope.rs`)
+
+When the process `cwd` differs from the git root, every agent-launching command must ask the user which directory to mount into the container.
+
+```rust
+pub enum MountScopeDecision { MountGitRoot, MountCurrentDirOnly, Abort }
+
+pub trait MountScopeFrontend: UserMessageSink + Send + Sync {
+    fn ask_mount_scope(&mut self, git_root: &Path, cwd: &Path) -> Result<MountScopeDecision, CommandError>;
+}
+
+pub struct MountScope;
+
+impl MountScope {
+    /// Returns `git_root` when `cwd == git_root`; otherwise calls `ask_mount_scope`.
+    pub fn resolve(cwd: &Path, git_root: &Path, frontend: &mut dyn MountScopeFrontend) -> Result<PathBuf, CommandError>;
+}
+```
+
+Default behaviors per frontend (implemented by Layer 3): CLI prompts with `[r]oot / [c]urrent dir / [a]bort`; TUI shows the `MountScope` modal dialog; headless returns `MountGitRoot` unless the request body specifies `mount_scope: "cwd"`.
+
+Every agent-launching command frontend trait adds `MountScopeFrontend` as a supertrait bound.
+
+---
+
+### `AgentSetupFrontend` (`src/command/commands/agent_setup.rs`)
+
+When `AgentEngine::ensure_available` would download or build (the agent is not yet ready), Layer 2 commands interpose a user decision before calling the engine. `AgentEngine` reports state; the choice belongs to the command layer.
+
+```rust
+pub enum AgentSetupDecision { Setup, FallbackToDefault, Abort }
+
+pub trait AgentSetupFrontend: UserMessageSink + Send + Sync {
+    fn ask_agent_setup(
+        &mut self,
+        requested: &AgentName,
+        default: &AgentName,
+        default_available: bool,
+        image_only: bool,  // true = Dockerfile exists, only image build needed
+    ) -> Result<AgentSetupDecision, CommandError>;
+
+    fn record_fallback(&mut self, requested: &AgentName, fallback: &AgentName);
+}
+```
+
+Per-step / per-tab caching of fallback decisions (`workflow_agent_fallbacks`) lives in the `ExecWorkflowCommand` body, not in the engine. The command consults its own cache before calling `ask_agent_setup`.
+
+Added as a supertrait bound on every agent-launching command frontend trait.
+
+---
+
+### `AgentAuthFrontend` (`src/command/commands/agent_auth.rs`)
+
+On first run (`auto_agent_auth_accepted: None` in repo config), Layer 2 commands prompt the user before silently injecting keychain credentials into containers.
+
+```rust
+pub enum AgentAuthDecision { Accept, Decline, DeclineOnce }
+
+pub trait AgentAuthFrontend: UserMessageSink + Send + Sync {
+    fn ask_agent_auth_consent(
+        &mut self,
+        agent: &AgentName,
+        env_var_names: &[&str],
+    ) -> Result<AgentAuthDecision, CommandError>;
+}
+```
+
+Decision handling by commands:
+- `Some(true)` → silently inject credentials via `AgentEngine::resolve_agent_auth`.
+- `Some(false)` → do not inject (no prompt).
+- `None` → call `ask_agent_auth_consent`. On `Accept`/`Decline`, persist via `RepoConfig::update` **before** the agent container launches. `DeclineOnce` does not persist.
+
+---
+
+### `RemoteClient` (`src/command/commands/remote_client.rs`)
+
+A typed HTTP client for communicating with a remote amux headless server. Constructed fresh per `RemoteCommand` invocation; not exported beyond `src/command/commands/`.
+
+```rust
+pub struct RemoteClient {
+    base_url: String,
+    http: reqwest::Client,
+}
+
+pub struct RemoteResponse {
+    pub status: u16,
+    pub body: serde_json::Value,
+}
+
+pub trait RemoteEventSink: Send + Sync {
+    fn on_event(&mut self, event_type: &str, data: &str);
+    fn on_done(&mut self);
+}
+
+impl RemoteClient {
+    pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    pub const READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+    pub fn new(base_url: &str, api_key: Option<&ApiKey>) -> Result<Self, CommandError>;
+
+    /// Resolution order: explicit arg > AMUX_API_KEY env > GlobalConfig::remote.default_api_key
+    /// (only when target_addr matches GlobalConfig::remote.default_addr after URL canonicalization).
+    /// Returns None when no key is available (server may have --dangerously-skip-auth).
+    pub fn resolve_api_key(session: &Session, target_addr: &str, explicit: Option<&str>) -> Result<Option<ApiKey>, CommandError>;
+
+    pub async fn send_command(&self, path: &[&str], flags: &[(&str, serde_json::Value)]) -> Result<RemoteResponse, CommandError>;
+    pub async fn stream_command(&self, path: &[&str], flags: &[(&str, serde_json::Value)], sink: &mut dyn RemoteEventSink) -> Result<(), CommandError>;
+}
+```
+
+The API key sent as `Authorization: Bearer <key>` on every request. `stream_command` disables the read timeout (or uses a generous value) so SSE streams don't hit the 600 s ceiling. URL canonicalization for the `resolve_api_key` config match normalises scheme case, hostname case, default-port elision, and trailing slash.
+
+All HTTP error variants map to specific `CommandError` variants: timeout → `RemoteTimeout`; connection refused → `RemoteConnectionRefused`; non-2xx → `RemoteHttpStatus`; malformed SSE → `MalformedSseEvent`; transport error → `RemoteTransport`.
+
+---
+
+### `StatusCommand` — TUI tab annotations
+
+`StatusCommand` accepts an optional `StatusCommandTuiContext` populated by the TUI before invocation:
+
+```rust
+pub struct StatusCommandTuiContext {
+    pub tabs: Vec<TuiTabSnapshot>,
+}
+
+pub struct TuiTabSnapshot {
+    pub tab_number: u32,
+    pub container_name: Option<String>,
+    pub is_stuck: bool,
+    pub command_label: String,
+}
+```
+
+In CLI and headless mode the context is `None` and the status output contains no tab annotation columns. In TUI mode the frontend provides the context via `StatusCommandFrontend::tui_context()`.
+
+---
+
+### `HeadlessLifecycle` — server process management
+
+The headless server process lifecycle (PID files, daemonization, log rotation, SIGTERM) is encapsulated in `HeadlessLifecycle` in `src/engine/headless/` (Layer 1, introduced alongside work item 0068):
+
+```rust
+pub struct HeadlessLifecycle { paths: HeadlessPaths }
+
+impl HeadlessLifecycle {
+    pub fn new(session: &Session) -> Self;
+    pub fn current_pid(&self) -> Result<Option<u32>, CommandError>;
+    pub fn write_pid(&self) -> Result<(), CommandError>;
+    pub fn clear_pid(&self) -> Result<(), CommandError>;
+    pub async fn kill(&self, timeout: Duration) -> Result<KillOutcome, CommandError>;
+    pub fn daemonize(&self, args: &[OsString]) -> Result<u32, CommandError>;
+    pub fn open_log_for_append(&self) -> Result<File, CommandError>;
+}
+
+pub enum KillOutcome { ExitedCleanly, ExitedAfterSigKill, NotRunning }
+```
+
+`HeadlessStartCommand` (Layer 2) uses this lifecycle to: refuse if already running; generate/refresh the API key; optionally daemonize; write the PID file; hand the assembled `HeadlessServeConfig` to the frontend (which boots the actual HTTP server in Layer 3).
+
+The `--workdirs` flag is merged with `GlobalConfig::headless.work_dirs`, canonicalized via `OverlayPathResolver`, deduplicated, and validated (non-existent paths → `CommandError::HeadlessWorkdirNotFound`).
+
+---
+
+### What is forbidden in Layer 2
+
+- No `eprintln!`, `println!`, or direct console I/O. All status messages flow through `UserMessageSink::write_message`; all structured output flows through per-command `report_*` frontend trait methods.
+- No `clap::ArgMatches` references inside `*Command` bodies. Flag values arrive as typed fields in `*CommandFlags`, populated by Dispatch.
+- No `crossterm`, no `ratatui`, no `axum`. Those are Layer 3.
+- No "if this is CLI vs TUI vs headless" checks. Commands never know which frontend is on the other side of the trait object.
+- No git worktree calls (`create_worktree`, `merge_branch`, `remove_worktree`) directly from command bodies. All worktree operations must flow through `WorktreeLifecycle::prepare` and `WorktreeLifecycle::finalize`.
+- No business logic in projections. Projections derive structure from the catalogue; they do not interpret flag semantics.
+- No upward calls into Layer 3 or Layer 4 types.
+
+---
+
 ## Legacy Architecture (`oldsrc/`)
 
 The following describes the user-facing `amux` binary, which continues to build from `oldsrc/` until work item 0070. The `oldsrc/` tree is frozen — no edits are allowed.
@@ -1907,6 +2535,12 @@ Background daemonization: systemd-run on Linux, launchd plist on macOS, double-f
 | Layer | Location | What is tested |
 |-------|----------|----------------|
 | Layer 0 unit | `src/data/**/#[cfg(test)]` | Session, SessionManager, all config types, all fs stores |
+| Layer 2 — catalogue | `src/command/dispatch/catalogue.rs` | Every command and flag present with correct name, kind, default, frontends; lookup happy/error paths; alias resolution |
+| Layer 2 — projections | `src/command/dispatch/projections/**` | `catalogue_clap_consistency`, `catalogue_tui_consistency`, `catalogue_headless_consistency` (catalogue ↔ projection agreement) |
+| Layer 2 — Dispatch | `src/command/dispatch/mod.rs` | `run_command` builds expected `*Command`; missing/unknown/mutually-exclusive flags; implication rules; `parse_command_box_input` happy/error paths; `--non-interactive` from flag and config |
+| Layer 2 — WorktreeLifecycle | `src/command/commands/worktree_lifecycle.rs` | All `prepare` paths (happy, uncommitted files, existing worktree, abort); all `finalize` paths (merge, discard, keep, conflict) |
+| Layer 2 — RemoteClient | `src/command/commands/remote_client.rs` | `resolve_api_key` precedence; `send_command` 200 + non-2xx; `stream_command` valid SSE + malformed; timeout + connection-refused mapping |
+| Layer 2 — per-command | `src/command/commands/<name>.rs` | Happy path; all frontend interactions; error mapping; `*Outcome` serde round-trip |
 | Unit — per module | `oldsrc/**/#[cfg(test)]` | Individual functions, data structures |
 | Unit — border colors | `oldsrc/tui::state::tests` | All 6 combinations of phase × focus |
 | Unit — PTY data | `oldsrc/tui::state::tests` | `\r`/`\n`/`\r\n` processing, live-line updates |

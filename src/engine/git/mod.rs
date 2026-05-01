@@ -180,18 +180,23 @@ impl GitEngine {
     }
 
     /// Squash-merge `branch` into the current branch and commit `Implement <branch>`.
-    pub fn merge_branch(&self, git_root: &Path, branch: &str) -> Result<(), EngineError> {
+    /// Returns `EngineError::MergeConflict` when the merge produces conflicts.
+    pub fn merge_branch(
+        &self,
+        git_root: &Path,
+        branch: &str,
+        worktree_path: &Path,
+    ) -> Result<(), EngineError> {
         let output = Command::new("git")
             .args(["merge", "--squash", branch])
             .current_dir(git_root)
             .output()
             .map_err(|e| EngineError::Git(format!("invoke `git merge --squash`: {e}")))?;
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(EngineError::Git(format!(
-                "git merge --squash failed: {}",
-                stderr.trim()
-            )));
+            return Err(EngineError::MergeConflict {
+                branch: branch.to_string(),
+                worktree_path: worktree_path.to_path_buf(),
+            });
         }
         let message = format!("Implement {branch}");
         let output = Command::new("git")

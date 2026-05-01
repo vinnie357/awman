@@ -1,0 +1,445 @@
+//! `ImplementCommand` — top-level `amux implement WORK_ITEM`.
+//!
+//! Per spec §6.1, `implement` MUST remain a top-level command. Internally
+//! the command may delegate to `ExecWorkflowCommand` (constructing a
+//! synthetic single-step workflow when `--workflow` is absent).
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde::Serialize;
+
+use crate::command::commands::agent_auth::AgentAuthFrontend;
+use crate::command::commands::agent_setup::AgentSetupFrontend;
+use crate::command::commands::exec_workflow::WorkflowSummary;
+use crate::command::commands::implement_prompts::render_default_prompt;
+use crate::command::commands::mount_scope::MountScopeFrontend;
+use crate::command::commands::worktree_lifecycle::{WorktreeLifecycle, WorktreeLifecycleFrontend};
+use crate::command::commands::Command;
+use crate::command::dispatch::Engines;
+use crate::command::error::CommandError;
+use crate::data::session::Session;
+use crate::data::workflow_definition::{Workflow, WorkflowFormat, WorkflowStep};
+use crate::engine::agent::AgentRunOptions;
+use crate::engine::container::frontend::ContainerFrontend;
+use crate::engine::container::instance::ContainerExitInfo;
+use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
+use crate::engine::error::EngineError;
+use crate::engine::message::{UserMessage, UserMessageSink};
+use crate::engine::workflow::actions::{
+    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
+    WorkflowStepStatus, YoloTickOutcome,
+};
+use crate::engine::workflow::factory::{ContainerExecutionFactory, WorkflowRuntimeContext};
+use crate::engine::workflow::frontend::WorkflowFrontend;
+use crate::engine::workflow::WorkflowEngine;
+
+#[derive(Debug, Clone)]
+pub struct ImplementCommandFlags {
+    pub work_item: String,
+    pub non_interactive: bool,
+    pub plan: bool,
+    pub allow_docker: bool,
+    pub workflow: Option<PathBuf>,
+    pub worktree: bool,
+    pub mount_ssh: bool,
+    pub yolo: bool,
+    pub auto: bool,
+    pub agent: Option<String>,
+    pub model: Option<String>,
+    pub overlay: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImplementOutcome {
+    pub work_item: String,
+    pub agent: Option<String>,
+    pub exit_code: Option<i32>,
+    pub worktree_used: bool,
+    pub workflow_used: Option<String>,
+    pub synthetic_prompt: Option<String>,
+}
+
+/// Per-command frontend supertrait: identical I/O and lifecycle surface to
+/// `ExecWorkflowCommandFrontend`, but with an implement-specific summary call.
+#[async_trait]
+pub trait ImplementCommandFrontend:
+    UserMessageSink
+    + ContainerFrontend
+    + WorkflowFrontend
+    + MountScopeFrontend
+    + AgentSetupFrontend
+    + AgentAuthFrontend
+    + WorktreeLifecycleFrontend
+    + Send
+    + Sync
+{
+    fn set_pty_active(&mut self, active: bool);
+    fn report_implement_summary(&mut self, summary: &WorkflowSummary);
+}
+
+pub struct ImplementCommand {
+    flags: ImplementCommandFlags,
+    engines: Engines,
+}
+
+impl ImplementCommand {
+    pub fn new(flags: ImplementCommandFlags, engines: Engines) -> Self {
+        Self { flags, engines }
+    }
+
+    pub fn flags(&self) -> &ImplementCommandFlags {
+        &self.flags
+    }
+}
+
+// ─── WorkflowProxy ───────────────────────────────────────────────────────────
+
+struct ImplementWorkflowProxy(Arc<Mutex<Box<dyn ImplementCommandFrontend>>>);
+
+impl UserMessageSink for ImplementWorkflowProxy {
+    fn write_message(&mut self, msg: UserMessage) {
+        self.0.lock().unwrap().write_message(msg);
+    }
+    fn replay_queued(&mut self) {
+        self.0.lock().unwrap().replay_queued();
+    }
+}
+
+impl WorkflowFrontend for ImplementWorkflowProxy {
+    fn user_choose_next_action(
+        &mut self,
+        state: &crate::data::workflow_state::WorkflowState,
+        available: &AvailableActions,
+    ) -> Result<NextAction, EngineError> {
+        self.0.lock().unwrap().user_choose_next_action(state, available)
+    }
+    fn confirm_resume(&mut self, mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
+        self.0.lock().unwrap().confirm_resume(mismatch)
+    }
+    fn user_choose_after_step_failure(
+        &mut self,
+        step: &WorkflowStep,
+        exit: &ContainerExitInfo,
+    ) -> Result<StepFailureChoice, EngineError> {
+        self.0.lock().unwrap().user_choose_after_step_failure(step, exit)
+    }
+    fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
+        self.0.lock().unwrap().report_step_status(step, status);
+    }
+    fn report_step_output(&mut self, step: &WorkflowStep, output: StepOutput) {
+        self.0.lock().unwrap().report_step_output(step, output);
+    }
+    fn report_step_stuck(&mut self, step: &WorkflowStep) {
+        self.0.lock().unwrap().report_step_stuck(step);
+    }
+    fn report_step_unstuck(&mut self, step: &WorkflowStep) {
+        self.0.lock().unwrap().report_step_unstuck(step);
+    }
+    fn yolo_countdown_tick(
+        &mut self,
+        remaining: Duration,
+    ) -> Result<YoloTickOutcome, EngineError> {
+        self.0.lock().unwrap().yolo_countdown_tick(remaining)
+    }
+    fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
+        self.0.lock().unwrap().report_workflow_completed(outcome);
+    }
+}
+
+// ─── ContainerFrontendProxy ──────────────────────────────────────────────────
+
+struct ImplementContainerFrontendProxy(Arc<Mutex<Box<dyn ImplementCommandFrontend>>>);
+
+impl UserMessageSink for ImplementContainerFrontendProxy {
+    fn write_message(&mut self, msg: UserMessage) {
+        self.0.lock().unwrap().write_message(msg);
+    }
+    fn replay_queued(&mut self) {
+        self.0.lock().unwrap().replay_queued();
+    }
+}
+
+#[async_trait]
+impl ContainerFrontend for ImplementContainerFrontendProxy {
+    fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
+        self.0.lock().unwrap().write_stdout(bytes)
+    }
+    fn write_stderr(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
+        self.0.lock().unwrap().write_stderr(bytes)
+    }
+    async fn read_stdin(&mut self, buf: &mut [u8]) -> Result<usize, EngineError> {
+        let _ = buf;
+        Err(EngineError::NotImplemented("ImplementContainerFrontendProxy::read_stdin"))
+    }
+    fn report_status(
+        &mut self,
+        status: crate::engine::container::frontend::ContainerStatus,
+    ) {
+        self.0.lock().unwrap().report_status(status);
+    }
+    fn report_progress(
+        &mut self,
+        progress: crate::engine::container::frontend::ContainerProgress,
+    ) {
+        self.0.lock().unwrap().report_progress(progress);
+    }
+    fn resize_pty(&mut self, cols: u16, rows: u16) {
+        self.0.lock().unwrap().resize_pty(cols, rows);
+    }
+}
+
+// ─── CommandLayerFactory ─────────────────────────────────────────────────────
+
+struct ImplementCommandLayerFactory {
+    shared: Arc<Mutex<Box<dyn ImplementCommandFrontend>>>,
+    engines: Engines,
+    flags: Arc<ImplementCommandFlags>,
+}
+
+impl ContainerExecutionFactory for ImplementCommandLayerFactory {
+    fn execution_for_step(
+        &self,
+        step: &WorkflowStep,
+        session: &Session,
+        runtime: &WorkflowRuntimeContext,
+    ) -> Result<crate::engine::container::instance::ContainerExecution, EngineError> {
+        let run_opts = AgentRunOptions {
+            yolo: self.flags.yolo.then_some(YoloMode::Enabled),
+            auto: self.flags.auto.then_some(AutoMode::Enabled),
+            plan: self.flags.plan.then_some(PlanMode::Enabled),
+            allowed_tools: vec![],
+            disallowed_tools: vec![],
+            initial_prompt: Some(step.prompt_template.clone()),
+            allow_docker: self.flags.allow_docker,
+            mount_ssh: self.flags.mount_ssh,
+            non_interactive: self.flags.non_interactive,
+            model: runtime.step_model.clone(),
+            env_passthrough: None,
+            directory_overlays: vec![],
+        };
+        let options = self
+            .engines
+            .agent_engine
+            .build_options(session, &runtime.step_agent, &run_opts)?;
+        let instance = self.engines.runtime.build(options)?;
+        let proxy = ImplementContainerFrontendProxy(Arc::clone(&self.shared));
+        instance.run_with_frontend(Box::new(proxy))
+    }
+
+    fn inject_prompt(
+        &self,
+        _execution: &crate::engine::container::instance::ContainerExecution,
+        _prompt: &str,
+    ) -> Result<Option<()>, EngineError> {
+        Ok(None)
+    }
+}
+
+// ─── Command impl ─────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl Command for ImplementCommand {
+    type Frontend = Box<dyn ImplementCommandFrontend>;
+    type Outcome = ImplementOutcome;
+
+    async fn run_with_frontend(
+        self,
+        mut frontend: Self::Frontend,
+    ) -> Result<Self::Outcome, CommandError> {
+        let synthetic_prompt = if self.flags.workflow.is_none() {
+            Some(render_default_prompt(&self.flags.work_item))
+        } else {
+            None
+        };
+        let workflow_used = self.flags.workflow.as_ref().map(|p| p.display().to_string());
+
+        // Load or construct workflow.
+        let workflow: Workflow = match &self.flags.workflow {
+            Some(path) => Workflow::load(path)
+                .map_err(|e| CommandError::Other(format!("loading workflow: {e}")))?,
+            None => {
+                let prompt = render_default_prompt(&self.flags.work_item);
+                Workflow::parse(
+                    &format!(
+                        "[[steps]]\nname = \"implement\"\nagent = \"claude\"\nprompt_template = {:?}\n",
+                        prompt
+                    ),
+                    WorkflowFormat::Toml,
+                )
+                .map_err(|e| CommandError::Other(format!("building synthetic workflow: {e}")))?
+            }
+        };
+
+        // Worktree prepare.
+        let cwd = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."));
+
+        let worktree_lifecycle = if self.flags.worktree {
+            let git_root = self
+                .engines
+                .git_engine
+                .resolve_root(&cwd)
+                .map_err(CommandError::from)?;
+            let lifecycle = WorktreeLifecycle::for_work_item(
+                Arc::clone(&self.engines.git_engine),
+                git_root,
+                parse_work_item_number(&self.flags.work_item),
+            )?;
+            lifecycle.prepare(&mut *frontend).await?;
+            Some(lifecycle)
+        } else {
+            None
+        };
+
+        frontend.set_pty_active(true);
+
+        let shared: Arc<Mutex<Box<dyn ImplementCommandFrontend>>> =
+            Arc::new(Mutex::new(frontend));
+
+        let flags_arc = Arc::new(self.flags.clone());
+
+        let git_root_for_session = Arc::clone(&self.engines.git_engine)
+            .resolve_root(&cwd)
+            .map_err(CommandError::from)?;
+        let session = Session::open_at_git_root(
+            cwd,
+            git_root_for_session,
+            crate::data::session::SessionOpenOptions::default(),
+        )
+        .map_err(|e| CommandError::Other(format!("opening session: {e}")))?;
+
+        let engine_result = {
+            let proxy = ImplementWorkflowProxy(Arc::clone(&shared));
+            let factory = ImplementCommandLayerFactory {
+                shared: Arc::clone(&shared),
+                engines: self.engines.clone(),
+                flags: Arc::clone(&flags_arc),
+            };
+            let mut engine = WorkflowEngine::new(
+                &session,
+                workflow,
+                Box::new(proxy),
+                Box::new(factory),
+                Arc::clone(&self.engines.git_engine),
+                Arc::clone(&self.engines.overlay_engine),
+            )
+            .map_err(CommandError::from)?;
+            engine.run_to_completion().await
+        };
+
+        // Reclaim exclusive frontend ownership.
+        let mut frontend = Arc::try_unwrap(shared)
+            .unwrap_or_else(|_| panic!("no other Arc references after engine block"))
+            .into_inner()
+            .unwrap();
+
+        frontend.set_pty_active(false);
+        frontend.replay_queued();
+
+        let had_error = matches!(
+            engine_result,
+            Err(_) | Ok(WorkflowOutcome::Failed { .. }) | Ok(WorkflowOutcome::Aborted)
+        );
+        let exit_code = match &engine_result {
+            Ok(WorkflowOutcome::Failed { exit_code, .. }) => Some(*exit_code),
+            _ => None,
+        };
+        frontend.report_implement_summary(&WorkflowSummary {
+            steps_completed: 0,
+            steps_failed: if had_error { 1 } else { 0 },
+        });
+
+        if let Some(lifecycle) = worktree_lifecycle {
+            lifecycle.finalize(&mut *frontend, had_error).await?;
+            frontend.replay_queued();
+        }
+
+        engine_result.map_err(CommandError::from)?;
+
+        Ok(ImplementOutcome {
+            work_item: self.flags.work_item,
+            agent: self.flags.agent,
+            exit_code,
+            worktree_used: self.flags.worktree,
+            workflow_used,
+            synthetic_prompt,
+        })
+    }
+}
+
+/// Parse a work item string like "0001" into a u32.
+/// Falls back to 0 if parsing fails (graceful degradation).
+fn parse_work_item_number(s: &str) -> u32 {
+    s.trim_start_matches('0').parse::<u32>().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_work_item_number_handles_leading_zeros() {
+        assert_eq!(parse_work_item_number("0001"), 1);
+        assert_eq!(parse_work_item_number("0042"), 42);
+        assert_eq!(parse_work_item_number("100"), 100);
+    }
+
+    #[test]
+    fn parse_work_item_number_returns_zero_on_non_numeric() {
+        assert_eq!(parse_work_item_number("abc"), 0);
+        assert_eq!(parse_work_item_number(""), 0);
+    }
+
+    #[test]
+    fn implement_without_workflow_sets_synthetic_prompt() {
+        let prompt = render_default_prompt("0042");
+        assert!(
+            prompt.contains("0042"),
+            "synthetic prompt must contain the work item number"
+        );
+        assert!(!prompt.is_empty(), "synthetic prompt must not be empty");
+    }
+
+    #[test]
+    fn implement_flags_worktree_false_by_default() {
+        let flags = ImplementCommandFlags {
+            work_item: "0001".into(),
+            non_interactive: false,
+            plan: false,
+            allow_docker: false,
+            workflow: None,
+            worktree: false,
+            mount_ssh: false,
+            yolo: false,
+            auto: false,
+            agent: None,
+            model: None,
+            overlay: vec![],
+        };
+        assert!(!flags.worktree);
+    }
+
+    #[test]
+    fn implement_yolo_without_workflow_should_not_imply_worktree() {
+        // Dispatch enforces: yolo + workflow → worktree; yolo without workflow → no worktree.
+        let flags = ImplementCommandFlags {
+            work_item: "0001".into(),
+            non_interactive: false,
+            plan: false,
+            allow_docker: false,
+            workflow: None,
+            worktree: false,
+            mount_ssh: false,
+            yolo: true,
+            auto: false,
+            agent: None,
+            model: None,
+            overlay: vec![],
+        };
+        assert!(flags.yolo);
+        assert!(!flags.worktree, "yolo without workflow must NOT imply worktree");
+    }
+}

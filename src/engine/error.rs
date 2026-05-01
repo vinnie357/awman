@@ -25,6 +25,12 @@ pub enum EngineError {
     #[error("git operation failed: {0}")]
     Git(String),
 
+    #[error("merge conflict on branch '{branch}'; resolve manually in worktree at {worktree_path}")]
+    MergeConflict {
+        branch: String,
+        worktree_path: PathBuf,
+    },
+
     #[error("container backend error: {0}")]
     Container(String),
 
