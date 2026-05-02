@@ -34,6 +34,10 @@ pub struct AvailableActions {
     pub can_finish_workflow: bool,
     pub can_pause: bool,
     pub can_abort: bool,
+    /// The prompt to inject when the user chooses `ContinueInCurrentContainer`.
+    /// Set by the engine from the next step's resolved prompt template whenever
+    /// `can_continue_in_current_container` is true.
+    pub continue_prompt: Option<String>,
     pub continue_unavailable_reason: Option<String>,
     pub cancel_to_previous_unavailable_reason: Option<String>,
     pub finish_workflow_unavailable_reason: Option<String>,

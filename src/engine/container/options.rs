@@ -186,7 +186,7 @@ pub struct ResolvedContainerOptions {
 }
 
 impl ResolvedContainerOptions {
-    pub fn from_iter(
+    pub fn resolve(
         options: impl IntoIterator<Item = ContainerOption>,
     ) -> Result<Self, ResolveError> {
         let mut r = Self {
@@ -258,7 +258,7 @@ mod tests {
 
     #[test]
     fn yolo_and_plan_conflict_returns_error() {
-        let result = ResolvedContainerOptions::from_iter([
+        let result = ResolvedContainerOptions::resolve([
             ContainerOption::Yolo(YoloMode::Enabled),
             ContainerOption::Plan(PlanMode::Enabled),
         ]);
@@ -272,7 +272,7 @@ mod tests {
     fn all_options_round_trip_to_resolved() {
         let image = ImageRef::new("my-image:latest");
         let entrypoint = Entrypoint::new(["claude", "--print"]);
-        let result = ResolvedContainerOptions::from_iter([
+        let result = ResolvedContainerOptions::resolve([
             ContainerOption::Image(image.clone()),
             ContainerOption::Entrypoint(entrypoint.clone()),
             ContainerOption::Interactive(true),
@@ -296,7 +296,7 @@ mod tests {
             container_path: container.clone(),
             permission: OverlayPermission::ReadOnly,
         };
-        let result = ResolvedContainerOptions::from_iter([
+        let result = ResolvedContainerOptions::resolve([
             ContainerOption::Overlay(spec.clone()),
             ContainerOption::Overlay(spec.clone()),
             ContainerOption::Overlay(spec.clone()),

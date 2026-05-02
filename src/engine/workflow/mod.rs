@@ -171,19 +171,13 @@ impl WorkflowEngine {
                 return Ok(outcome);
             }
             let outcome = self.step_once().await?;
-            match outcome.status {
-                WorkflowStepStatus::Failed { .. } => {
-                    let outcome = WorkflowOutcome::Failed {
-                        last_step: outcome.step_name,
-                        exit_code: match outcome.status {
-                            WorkflowStepStatus::Failed { exit_code } => exit_code,
-                            _ => 1,
-                        },
-                    };
-                    self.frontend.report_workflow_completed(&outcome);
-                    return Ok(outcome);
-                }
-                _ => {}
+            if let WorkflowStepStatus::Failed { exit_code } = outcome.status {
+                let final_outcome = WorkflowOutcome::Failed {
+                    last_step: outcome.step_name,
+                    exit_code,
+                };
+                self.frontend.report_workflow_completed(&final_outcome);
+                return Ok(final_outcome);
             }
             // Ask the user what to do next when there are remaining steps.
             if !self.state.is_complete() {
@@ -407,6 +401,7 @@ impl WorkflowEngine {
             };
             if ok && self.current_execution.is_some() {
                 a.can_continue_in_current_container = true;
+                a.continue_prompt = Some(next.prompt_template.clone());
             } else {
                 a.continue_unavailable_reason = Some(if self.current_step_agent.is_none() {
                     "no current container".into()
@@ -673,7 +668,7 @@ mod tests {
         }
 
         fn always_success() -> Self {
-            Self::new(std::iter::repeat(0).take(100))
+            Self::new(std::iter::repeat_n(0, 100))
         }
 
         /// Variant whose `inject_prompt` returns `Some(())` (injection supported).
@@ -898,7 +893,7 @@ mod tests {
             Some("claude"),
             vec![make_step("a", &[], None), make_step("b", &["a"], None)],
         );
-        let factory = FakeContainerExecutionFactory::new(std::iter::repeat(0).take(10));
+        let factory = FakeContainerExecutionFactory::new(std::iter::repeat_n(0, 10));
         let factory_arc: Arc<FakeContainerExecutionFactory> = Arc::new(factory);
 
         struct CountingFactory(Arc<FakeContainerExecutionFactory>);
@@ -1271,7 +1266,7 @@ mod tests {
         );
         // Factory supports injection (inject_result = Some(())).
         let factory = FakeContainerExecutionFactory::with_inject_support(
-            std::iter::repeat(0).take(100),
+            std::iter::repeat_n(0, 100),
         );
         let factory_arc: Arc<FakeContainerExecutionFactory> = Arc::new(factory);
 
@@ -1341,7 +1336,7 @@ mod tests {
                 make_step("c", &["b"], None),
             ],
         );
-        let factory = FakeContainerExecutionFactory::new(std::iter::repeat(0).take(100));
+        let factory = FakeContainerExecutionFactory::new(std::iter::repeat_n(0, 100));
         let factory_arc: Arc<FakeContainerExecutionFactory> = Arc::new(factory);
 
         struct CountingFactory(Arc<FakeContainerExecutionFactory>);

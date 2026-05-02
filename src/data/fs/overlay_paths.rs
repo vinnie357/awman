@@ -55,7 +55,7 @@ impl OverlayPathResolver {
             match component {
                 std::path::Component::CurDir => {}
                 std::path::Component::ParentDir => {
-                    match result.components().last() {
+                    match result.components().next_back() {
                         Some(std::path::Component::Normal(_)) => {
                             result.pop();
                         }

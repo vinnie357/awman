@@ -27,6 +27,6 @@ pub mod remote;
 pub(super) mod remote_client;
 pub mod specs;
 pub mod status;
-pub(super) mod worktree_lifecycle;
+pub mod worktree_lifecycle;
 
 pub use command_trait::Command;

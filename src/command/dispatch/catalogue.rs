@@ -72,7 +72,7 @@ pub struct FlagSpec {
 
 impl FlagSpec {
     pub fn conflicts_with(&self, other: &str) -> bool {
-        self.conflicts_with.iter().any(|c| *c == other)
+        self.conflicts_with.contains(&other)
     }
 }
 
@@ -115,7 +115,7 @@ pub struct CommandSpec {
 impl CommandSpec {
     pub fn find_subcommand(&self, name: &str) -> Option<&'static CommandSpec> {
         for sub in self.subcommands {
-            if sub.name == name || sub.aliases.iter().any(|a| *a == name) {
+            if sub.name == name || sub.aliases.contains(&name) {
                 return Some(*sub);
             }
         }
@@ -169,12 +169,12 @@ impl CommandCatalogue {
     /// the descent.
     pub fn lookup_with_aliases(&self, path: &[&str]) -> Option<&'static CommandSpec> {
         let canonical = self.canonical_path(path);
-        self.lookup(&canonical.iter().map(|s| *s).collect::<Vec<_>>())
+        self.lookup(&canonical)
     }
 
     /// Apply path-alias rewrites to a user-supplied path. Returns the
     /// canonical path or the input path unchanged.
-    pub fn canonical_path<'a>(&self, path: &[&'a str]) -> Vec<&'static str> {
+    pub fn canonical_path(&self, path: &[&str]) -> Vec<&'static str> {
         // First check registered aliases.
         for (alias, canonical) in self.path_aliases {
             if alias.len() == path.len() && alias.iter().zip(path).all(|(a, b)| *a == *b) {
@@ -756,7 +756,7 @@ const REMOTE_RUN: CommandSpec = CommandSpec {
         kind: ArgumentKind::TrailingVarArgs,
         optional: false,
     }],
-    flags: &REMOTE_RUN_FLAGS,
+    flags: REMOTE_RUN_FLAGS,
     subcommands: &[],
 };
 

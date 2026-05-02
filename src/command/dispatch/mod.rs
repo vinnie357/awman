@@ -11,35 +11,43 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::command::commands::auth::AuthCommand;
-use crate::command::commands::chat::{ChatCommand, ChatCommandFlags};
-use crate::command::commands::claws::{ClawsCommand, ClawsCommandFlags, ClawsCommandMode};
-use crate::command::commands::config::{
-    ConfigCommand, ConfigGetFlags, ConfigSetFlags, ConfigShowFlags, ConfigSubcommand,
+use crate::command::commands::auth::{AuthCommand, AuthCommandFrontend};
+use crate::command::commands::chat::{ChatCommand, ChatCommandFlags, ChatCommandFrontend};
+use crate::command::commands::claws::{
+    ClawsCommand, ClawsCommandFlags, ClawsCommandFrontend, ClawsCommandMode,
 };
-use crate::command::commands::download::DownloadCommand;
-use crate::command::commands::exec_prompt::{ExecPromptCommand, ExecPromptCommandFlags};
+use crate::command::commands::config::{
+    ConfigCommand, ConfigCommandFrontend, ConfigGetFlags, ConfigSetFlags, ConfigShowFlags,
+    ConfigSubcommand,
+};
+use crate::command::commands::download::{DownloadCommand, DownloadCommandFrontend};
+use crate::command::commands::exec_prompt::{
+    ExecPromptCommand, ExecPromptCommandFlags, ExecPromptCommandFrontend,
+};
 use crate::command::commands::exec_workflow::{
-    ExecWorkflowCommand, ExecWorkflowCommandFlags,
+    ExecWorkflowCommand, ExecWorkflowCommandFlags, ExecWorkflowCommandFrontend,
 };
 use crate::command::commands::headless::{
-    HeadlessCommand, HeadlessKillFlags, HeadlessLogsFlags, HeadlessStartFlags,
-    HeadlessStatusFlags, HeadlessSubcommand,
+    HeadlessCommand, HeadlessCommandFrontend, HeadlessKillFlags, HeadlessLogsFlags,
+    HeadlessStartFlags, HeadlessStatusFlags, HeadlessSubcommand,
 };
-use crate::command::commands::implement::{ImplementCommand, ImplementCommandFlags};
-use crate::command::commands::init::{InitCommand, InitCommandFlags};
+use crate::command::commands::implement::{
+    ImplementCommand, ImplementCommandFlags, ImplementCommandFrontend,
+};
+use crate::command::commands::init::{InitCommand, InitCommandFlags, InitCommandFrontend};
 use crate::command::commands::new::{
-    NewCommand, NewSkillFlags, NewSpecFlags, NewSubcommand, NewWorkflowFlags,
+    NewCommand, NewCommandFrontend, NewSkillFlags, NewSpecFlags, NewSubcommand, NewWorkflowFlags,
 };
-use crate::command::commands::ready::{ReadyCommand, ReadyCommandFlags};
+use crate::command::commands::ready::{ReadyCommand, ReadyCommandFlags, ReadyCommandFrontend};
 use crate::command::commands::remote::{
-    RemoteCommand, RemoteRunFlags, RemoteSessionKillFlags, RemoteSessionStartFlags,
-    RemoteSubcommand,
+    RemoteCommand, RemoteCommandFrontend, RemoteRunFlags, RemoteSessionKillFlags,
+    RemoteSessionStartFlags, RemoteSubcommand,
 };
 use crate::command::commands::specs::{
-    SpecsAmendFlags, SpecsCommand, SpecsNewFlags, SpecsSubcommand,
+    SpecsAmendFlags, SpecsCommand, SpecsCommandFrontend, SpecsNewFlags, SpecsSubcommand,
 };
-use crate::command::commands::status::{StatusCommand, StatusCommandFlags};
+use crate::command::commands::status::{StatusCommand, StatusCommandFlags, StatusCommandFrontend};
+use crate::command::commands::Command;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FlagKind, FlagSpec};
 use crate::command::error::CommandError;
 use crate::data::session::Session;
@@ -124,6 +132,57 @@ pub trait CommandFrontend: UserMessageSink + Send + Sync {
         command_path: &[&str],
         name: &str,
     ) -> Result<Vec<String>, CommandError>;
+}
+
+// ─── Frontend supertrait ────────────────────────────────────────────────────
+
+/// Frontend type accepted by [`Dispatch::run_command`]. A single concrete
+/// frontend (CLI, TUI, or headless) implements every per-command frontend
+/// trait via this supertrait so that dispatch can move the frontend value
+/// into the matching `Box<dyn *CommandFrontend>` for whichever variant
+/// `build_command` returned. Layer 3 frontends typically derive this
+/// automatically via a blanket impl over a single struct that implements
+/// each trait.
+pub trait DispatchFrontend:
+    CommandFrontend
+    + InitCommandFrontend
+    + ReadyCommandFrontend
+    + ImplementCommandFrontend
+    + ChatCommandFrontend
+    + ClawsCommandFrontend
+    + StatusCommandFrontend
+    + ConfigCommandFrontend
+    + ExecPromptCommandFrontend
+    + ExecWorkflowCommandFrontend
+    + HeadlessCommandFrontend
+    + RemoteCommandFrontend
+    + NewCommandFrontend
+    + AuthCommandFrontend
+    + DownloadCommandFrontend
+    + SpecsCommandFrontend
+    + 'static
+{
+}
+
+impl<T> DispatchFrontend for T where
+    T: CommandFrontend
+        + InitCommandFrontend
+        + ReadyCommandFrontend
+        + ImplementCommandFrontend
+        + ChatCommandFrontend
+        + ClawsCommandFrontend
+        + StatusCommandFrontend
+        + ConfigCommandFrontend
+        + ExecPromptCommandFrontend
+        + ExecWorkflowCommandFrontend
+        + HeadlessCommandFrontend
+        + RemoteCommandFrontend
+        + NewCommandFrontend
+        + AuthCommandFrontend
+        + DownloadCommandFrontend
+        + SpecsCommandFrontend
+        + 'static
+{
 }
 
 // ─── Outcome / error wrappers ───────────────────────────────────────────────
@@ -219,7 +278,7 @@ impl<F: CommandFrontend> Dispatch<F> {
             .canonical_path(path)
             .into_iter()
             .collect();
-        let canonical_refs: Vec<&str> = canonical.iter().copied().collect();
+        let canonical_refs: Vec<&str> = canonical.to_vec();
         let spec = self
             .catalogue
             .lookup(&canonical_refs)
@@ -526,6 +585,100 @@ impl<F: CommandFrontend> Dispatch<F> {
         raw: &str,
     ) -> Result<ParsedCommandBoxInput, CommandError> {
         parsed_input::parse(raw, CommandCatalogue::get())
+    }
+}
+
+impl<F: DispatchFrontend> Dispatch<F> {
+    /// Build the requested command and drive it to completion, moving the
+    /// owned frontend into the matching `Box<dyn *CommandFrontend>`.
+    pub async fn run_command(
+        self,
+        path: &[&str],
+    ) -> Result<CommandOutcome, CommandError> {
+        let built = self.build_command(path)?;
+        let frontend = self.frontend;
+        match built {
+            BuiltCommand::Init(cmd) => {
+                let boxed: Box<dyn InitCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed).await.map(CommandOutcome::Init)
+            }
+            BuiltCommand::Ready(cmd) => {
+                let boxed: Box<dyn ReadyCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed).await.map(CommandOutcome::Ready)
+            }
+            BuiltCommand::Implement(cmd) => {
+                let boxed: Box<dyn ImplementCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed)
+                    .await
+                    .map(CommandOutcome::Implement)
+            }
+            BuiltCommand::Chat(cmd) => {
+                let boxed: Box<dyn ChatCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed).await.map(CommandOutcome::Chat)
+            }
+            BuiltCommand::Specs(cmd) => {
+                let boxed: Box<dyn SpecsCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed)
+                    .await
+                    .map(CommandOutcome::Specs)
+            }
+            BuiltCommand::Claws(cmd) => {
+                let boxed: Box<dyn ClawsCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed)
+                    .await
+                    .map(CommandOutcome::Claws)
+            }
+            BuiltCommand::Status(cmd) => {
+                let boxed: Box<dyn StatusCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed)
+                    .await
+                    .map(CommandOutcome::Status)
+            }
+            BuiltCommand::Config(cmd) => {
+                let boxed: Box<dyn ConfigCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed)
+                    .await
+                    .map(CommandOutcome::Config)
+            }
+            BuiltCommand::ExecPrompt(cmd) => {
+                let boxed: Box<dyn ExecPromptCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed)
+                    .await
+                    .map(CommandOutcome::ExecPrompt)
+            }
+            BuiltCommand::ExecWorkflow(cmd) => {
+                let boxed: Box<dyn ExecWorkflowCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed)
+                    .await
+                    .map(CommandOutcome::ExecWorkflow)
+            }
+            BuiltCommand::Headless(cmd) => {
+                let boxed: Box<dyn HeadlessCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed)
+                    .await
+                    .map(CommandOutcome::Headless)
+            }
+            BuiltCommand::Remote(cmd) => {
+                let boxed: Box<dyn RemoteCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed)
+                    .await
+                    .map(CommandOutcome::Remote)
+            }
+            BuiltCommand::New(cmd) => {
+                let boxed: Box<dyn NewCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed).await.map(CommandOutcome::New)
+            }
+            BuiltCommand::Auth(cmd) => {
+                let boxed: Box<dyn AuthCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed).await.map(CommandOutcome::Auth)
+            }
+            BuiltCommand::Download(cmd) => {
+                let boxed: Box<dyn DownloadCommandFrontend> = Box::new(frontend);
+                cmd.run_with_frontend(boxed)
+                    .await
+                    .map(CommandOutcome::Download)
+            }
+        }
     }
 }
 

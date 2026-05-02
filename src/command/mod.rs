@@ -11,6 +11,7 @@ pub mod error;
 
 pub use dispatch::catalogue::{CommandCatalogue, CommandSpec, FlagSpec, FrontendVisibility};
 pub use dispatch::{
-    BuiltCommand, CommandFrontend, CommandOutcome, Dispatch, Engines, ParsedCommandBoxInput,
+    BuiltCommand, CommandFrontend, CommandOutcome, Dispatch, DispatchFrontend, Engines,
+    ParsedCommandBoxInput,
 };
 pub use error::CommandError;

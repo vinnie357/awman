@@ -1,11 +1,20 @@
 # Work Item: Task
 
-Title: grand architecture refactor — part 4/5 — Layer 3 frontends (CLI, TUI, Headless) + Layer 4 binary; swap entrypoint
-Issue: n/a — fourth of five work items implementing `aspec/architecture/2026-grand-architecture.md`
+Title: grand architecture refactor — Layer 3 CLI frontend + Layer 4 binary; swap entrypoint
+Issue: n/a — fourth-of-seven work item implementing `aspec/architecture/2026-grand-architecture.md`
+
+> **Scope note (post-split):** the original 0069 bundled CLI, TUI, and Headless frontends. That proved too large to land in a single pass, so the bundle was split:
+>
+> - `0069-…` (this work item) — CLI frontend + Layer 4 binary + `Cargo.toml` swap.
+> - `0070-grand-architecture-tui-frontend.md` — TUI frontend.
+> - `0071-grand-architecture-headless-frontend.md` — Headless frontend.
+> - `0072-grand-architecture-finalize-and-remove-oldsrc.md` — Final parity validation, oldsrc removal, docs and aspec refresh.
+>
+> The TUI and Headless sections (§2, §3, §7a–§7u) below are **out of scope for this work item** but kept inline as historical context for 0070/0071. The CLI section (§1) and the Layer 4 / `Cargo.toml` sections (§4, §5) are the in-scope deliverables.
 
 ## Required reading before starting
 
-This work item is the fourth of five executing the grand architecture refactor described in `aspec/architecture/2026-grand-architecture.md`. The implementing agent **MUST** read that document, the previous three work items (`0066-…`, `0067-…`, `0068-…`), and the current state of `src/data/`, `src/engine/`, and `src/command/` before writing any code.
+This work item is the fourth of seven executing the grand architecture refactor described in `aspec/architecture/2026-grand-architecture.md`. The implementing agent **MUST** read that document, the previous three work items (`0066-…`, `0067-…`, `0068-…`), and the current state of `src/data/`, `src/engine/`, and `src/command/` before writing any code.
 
 The four tenets, again:
 

@@ -4,10 +4,10 @@
 
 amux has two coexisting source trees:
 
-- **`src/`** — the new five-layer architecture (in progress; Layer 0 complete). The `amux-next` binary is built from here.
-- **`oldsrc/`** — the frozen pre-refactor source. The user-facing `amux` binary continues to build from here until the refactor is complete in work item 0070.
+- **`src/`** — the new five-layer architecture. The user-facing `amux` binary is built from `src/main.rs` (work item 0069 completed the Cargo.toml swap).
+- **`oldsrc/`** — the frozen pre-refactor source. No longer compiled by Cargo; kept as reference material until work item 0072 removes it.
 
-The `oldsrc/` tree is frozen: no edits are allowed. It will be deleted when `amux-next` reaches full parity in work item 0070. The rest of this document covers both trees: the new layered architecture first, then the legacy architecture that currently ships to users.
+The `oldsrc/` tree is frozen: no edits are allowed. It will be deleted when the grand architecture refactor is fully signed off in work item 0072. The rest of this document covers both trees: the new layered architecture first, then the legacy architecture preserved as historical reference.
 
 ---
 
@@ -39,9 +39,9 @@ Layer 0: data      Session, config, filesystem, database, typed data
 
 **Layer 2 (command)** owns higher-level business logic: the `Dispatch` type that routes input to typed command objects, and command-specific types (`ChatCommand`, `InitCommand`, etc.). Implemented in work item 0068.
 
-**Layer 3 (frontend)** contains the CLI, TUI, and headless server. Each is a presentation layer only: it translates user input into `Dispatch` calls and renders command output. Implemented in work item 0069.
+**Layer 3 (frontend)** contains the CLI, TUI, and headless server. Each is a presentation layer only: it translates user input into `Dispatch` calls and renders command output. The CLI frontend is complete; the TUI and headless are placeholders (work items 0070 and 0071 respectively). See [Layer 3 reference](#layer-3-frontend-srcfrontend) below.
 
-**Layer 4 (binary)** is `src/main.rs` — currently a stub. It becomes the real entrypoint in work item 0069.
+**Layer 4 (binary)** is `src/main.rs` — the real entrypoint that builds clap from `CommandCatalogue`, constructs engines, opens a `Session`, and routes to the CLI or TUI frontend. See [Layer 4 reference](#layer-4-binary-srcmainrs) below.
 
 ### Current Status
 
@@ -50,9 +50,9 @@ Layer 0: data      Session, config, filesystem, database, typed data
 | 0 — data | `src/data/` | Complete (work item 0066) |
 | 1 — engine | `src/engine/` | Complete (work item 0067) |
 | 2 — command | `src/command/` | Complete (work item 0068) |
-| 3 — frontend | `src/frontend/` | Stub — populated in 0069 |
-| 4 — binary | `src/main.rs` | Stub — wired in 0069 |
-| Legacy binary | `oldsrc/` | Frozen, ships to users |
+| 3 — frontend | `src/frontend/` | CLI complete (0069); TUI placeholder (→ 0070); Headless placeholder (→ 0071) |
+| 4 — binary | `src/main.rs` | Complete (work item 0069) |
+| Legacy binary | `oldsrc/` | Frozen, no longer compiled (binary swap complete in 0069) |
 
 ---
 
@@ -176,7 +176,33 @@ src/
       status.rs           StatusCommand, StatusCommandFrontend, StatusCommandFlags, StatusCommandTuiContext, TuiTabSnapshot, StatusOutcome
       worktree_lifecycle.rs WorktreeLifecycle, WorktreeLifecycleFrontend, PreWorktreeDecision, ExistingWorktreeDecision, PostWorkflowWorktreeAction
   frontend/
-    mod.rs                (stub — populated in 0069)
+    mod.rs                Declares cli, tui, headless sub-modules
+    cli/
+      mod.rs              RuntimeContext; run() entry point; render_outcome/render_error; error_exit_code
+      command_frontend.rs CliFrontend (implements CommandFrontend + all *CommandFrontend marker traits); command_path_from_matches
+      output.rs           stderr_is_tty(), stdin_is_tty() — pure TTY detection helpers
+      user_message.rs     CliUserMessageQueue — UserMessageSink with PTY-active queueing
+      per_command/
+        mod.rs
+        chat.rs           ChatCommandFrontend impl
+        claws.rs          ClawsCommandFrontend + ClawsFrontend impls
+        exec_prompt.rs    ExecPromptCommandFrontend impl
+        exec_workflow.rs  ExecWorkflowCommandFrontend + ContainerFrontend + WorkflowFrontend impls
+        headless.rs       HeadlessStartCommandFrontend impl (calls frontend::headless::serve)
+        implement.rs      ImplementCommandFrontend impl
+        init.rs           InitCommandFrontend + InitFrontend impls
+        ready.rs          ReadyCommandFrontend + ReadyFrontend impls
+        agent_auth.rs     AgentAuthFrontend impl
+        agent_setup.rs    AgentSetupFrontend impl
+        container_frontend_marker.rs  ContainerFrontend marker impl
+        mount_scope.rs    MountScopeFrontend impl
+        workflow_frontend_marker.rs   WorkflowFrontend marker impl
+        worktree_lifecycle_marker.rs  WorktreeLifecycleFrontend marker impl
+    tui/
+      mod.rs              Placeholder run() — prints notice; real TUI ships in 0070
+    headless/
+      mod.rs              HeadlessServeConfig; placeholder serve() — ships in 0071
+  main.rs                 Layer 4 binary entrypoint
 ```
 
 ---
@@ -2070,9 +2096,228 @@ The `--workdirs` flag is merged with `GlobalConfig::headless.work_dirs`, canonic
 
 ---
 
+## Layer 3: Frontend (`src/frontend/`)
+
+Layer 3 is the presentation layer. It has three sub-modules — `cli`, `tui`, and `headless` — each of which translates user input into `Dispatch` calls and renders the typed outcomes back to the user. Frontends contain **no business logic**: any behavioral decision lives in Layer 2 (`command`) or below.
+
+Layer 3 is the only layer that may:
+
+- Read from and write to terminal I/O (stdout, stderr, stdin)
+- Allocate PTYs or open raw-mode terminal sessions
+- Bind HTTP server sockets (headless mode)
+- Render Ratatui widgets (TUI mode)
+
+Layer 3 may call into Layer 0 (`data`), Layer 1 (`engine`), and Layer 2 (`command`), but **never into Layer 4** (no upward calls).
+
+---
+
+### `src/frontend/mod.rs`
+
+Declares the three sub-modules: `pub mod cli; pub mod headless; pub mod tui;`. All public symbols used by `main.rs` are re-exported from here.
+
+---
+
+### CLI Frontend (`src/frontend/cli/`)
+
+The CLI frontend is the fully implemented Layer 3 sub-module for `amux <subcommand>` invocations. Its entry point is `run(matches, ctx)`. It extracts the command path from clap's `ArgMatches`, constructs a `CliFrontend`, hands it to `Dispatch`, and renders the resulting `CommandOutcome` or `CommandError` to stdout/stderr.
+
+#### `RuntimeContext` (`mod.rs`)
+
+```rust
+pub struct RuntimeContext {
+    pub session: Arc<RwLock<Session>>,
+    pub engines: Engines,
+}
+```
+
+The bundle that `main.rs` constructs once at startup and passes to either `cli::run` or `tui::run`. Contains the current `Session` (wrapped for shared ownership) and all six engine handles. Constructed via `RuntimeContext::new(session, engines)`.
+
+#### Entry point (`mod.rs`)
+
+```rust
+pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode
+```
+
+Extracts the command path via `command_path_from_matches`, builds a `CliFrontend`, creates a `Dispatch`, calls `dispatch.run_command(&path)`, and routes the result to `render_outcome` or `render_error`. The function body is intentionally small — all behavioral decisions live in Layer 2.
+
+```rust
+fn render_outcome(outcome: &CommandOutcome) -> ExitCode
+fn render_error(err: &CommandError) -> ExitCode
+pub(crate) fn error_exit_code(err: &CommandError) -> u8
+```
+
+`render_outcome` pattern-matches on typed outcome variants and writes to stdout. The initial scaffold serializes outcomes to pretty-printed JSON; per-variant terminal rendering is a WI 0072 deliverable. `render_error` writes the error message to stderr. `error_exit_code` is the pure mapping factored out for unit testing:
+
+| Error category | Exit code |
+|----------------|-----------|
+| `Aborted` | 130 |
+| Usage errors (`UnknownCommand`, `UnknownFlag`, `MissingRequiredFlag`, `MissingRequiredArgument`, `MutuallyExclusive`, `InvalidFlagValue`, `InvalidArgumentValue`, `CommandBoxParse`) | 2 |
+| All other errors | 1 |
+
+#### `CliFrontend` (`command_frontend.rs`)
+
+```rust
+pub struct CliFrontend {
+    matches: ArgMatches,
+    command_path: Vec<String>,
+    messages: CliUserMessageQueue,
+}
+```
+
+The single CLI frontend struct. Implements `CommandFrontend` (flag extraction from `ArgMatches`), `UserMessageSink` (via the message queue), and every `*CommandFrontend` trait — either as marker impls (`AuthCommandFrontend`, `ConfigCommandFrontend`, `DownloadCommandFrontend`, `NewCommandFrontend`, `RemoteCommandFrontend`, `SpecsCommandFrontend`, `HeadlessCommandFrontend`, `StatusCommandFrontend`) or via richer per-command modules.
+
+`CliFrontend::new(matches)` pre-computes `command_path` so it doesn't re-traverse the matches tree on every call.
+
+**`CommandFrontend` flag methods:**
+
+| Method | clap equivalent | Notes |
+|--------|----------------|-------|
+| `flag_bool(path, flag)` | `get_flag(flag)` | Returns `Some(false)` for known Bool flags absent from argv; `None` for unknown paths |
+| `flag_string(path, flag)` | `get_one::<String>(flag)` | Returns `None` when absent |
+| `flag_strings(path, flag)` | `get_many::<String>(flag)` | Returns empty `Vec` when absent |
+| `flag_path(path, flag)` | `get_one::<String>(flag)` then `PathBuf::from` | Returns `None` when absent |
+| `flag_enum(path, flag)` | delegates to `flag_string` | Enum flags are stored as strings in the clap projection |
+| `flag_u16(path, flag)` | `get_one::<u16>(flag)` | Used for `--port` on `headless start` |
+| `argument(path, name)` | `get_one::<String>(name)` or `get_many` joined | `TrailingVarArgs` arguments are joined with spaces |
+| `arguments(path, name)` | `get_many::<String>(name)` | Returns the raw token vector |
+
+`matches_for(path)` resolves the correct `ArgMatches` sub-tree for nested subcommands by walking the clap matches tree one segment at a time.
+
+**`command_path_from_matches(matches) -> Vec<String>`** (exported):
+
+Walks `ArgMatches::subcommand()` recursively and collects the subcommand names into a path vector. The resulting vector is what `Dispatch::run_command` consumes. A bare invocation returns an empty vector.
+
+#### Output helpers (`output.rs`)
+
+```rust
+pub fn stderr_is_tty() -> bool
+pub fn stdin_is_tty() -> bool
+```
+
+Pure TTY-detection helpers used by per-command frontends to decide whether to apply ANSI color codes and whether to fall back to safe defaults when stdin is not a TTY (e.g., piped). No business logic — the _decision_ of what to do with the detection result lives in the per-command module.
+
+#### Message queue (`user_message.rs`)
+
+```rust
+pub struct CliUserMessageQueue {
+    pty_active: bool,
+    queue: Vec<UserMessage>,
+}
+```
+
+Implements `UserMessageSink`. The `pty_active` flag controls two modes:
+
+- **`pty_active = false`** (default): `write_message` writes immediately to stderr with a level-prefixed format (`amux:`, `amux warning:`, `amux error:`).
+- **`pty_active = true`**: `write_message` pushes to the queue instead. Used when a PTY-bound container owns the terminal — messages accumulated during container execution are replayed after the container exits via `replay_queued`.
+
+`replay_queued` drains the queue to stderr in insertion order and clears it. `set_pty_active(bool)` toggles the mode; the per-command frontends for container-running commands call this before and after `ContainerExecution::wait`.
+
+#### Per-command modules (`per_command/`)
+
+Each module in this directory implements the richer `*CommandFrontend` trait (and related engine frontend traits) for commands that require more than just flag extraction:
+
+| Module | Traits implemented | Key behavior |
+|--------|--------------------|-------------|
+| `chat.rs` | `ChatCommandFrontend` | Marker (no extra methods beyond `UserMessageSink`) |
+| `claws.rs` | `ClawsCommandFrontend`, `ClawsFrontend` | Reports `ClawsPhase` transitions to stderr; prompts on stdin for clone-replacement and audit decisions; falls back to safe defaults when stdin is not a TTY |
+| `exec_prompt.rs` | `ExecPromptCommandFrontend` | Marker |
+| `exec_workflow.rs` | `ExecWorkflowCommandFrontend`, `ContainerFrontend`, `WorkflowFrontend` | Integrates container output, workflow control, and worktree lifecycle for the exec-workflow command path |
+| `headless.rs` | `HeadlessStartCommandFrontend` | Calls `crate::frontend::headless::serve(config)` — a peer Layer 3 call, not an upward call |
+| `implement.rs` | `ImplementCommandFrontend` | Marker |
+| `init.rs` | `InitCommandFrontend`, `InitFrontend` | Reports `InitPhase` transitions to stderr; prompts on stdin for aspec replacement, audit, and work-items config |
+| `ready.rs` | `ReadyCommandFrontend`, `ReadyFrontend` | Reports `ReadyPhase` transitions to stderr; prompts for Dockerfile creation and legacy-migration decisions |
+| `agent_auth.rs` | `AgentAuthFrontend` | Asks auth consent on stdin; defaults to `DeclineOnce` when stdin is not a TTY |
+| `agent_setup.rs` | `AgentSetupFrontend` | Asks agent setup decision on stdin; defaults to `Setup` when stdin is not a TTY |
+| `container_frontend_marker.rs` | `ContainerFrontend` | Shared marker impl for commands that don't use a PTY container |
+| `mount_scope.rs` | `MountScopeFrontend` | Asks mount scope on stdin; defaults to `MountGitRoot` when stdin is not a TTY |
+| `workflow_frontend_marker.rs` | `WorkflowFrontend` | Shared marker impl for commands that don't use workflows |
+| `worktree_lifecycle_marker.rs` | `WorktreeLifecycleFrontend` | Shared marker impl for commands that don't use worktrees |
+
+The **safe default policy** (applied when `stdin_is_tty()` returns `false`) matches the headless defaults from WI 0069 §7u: interactive prompts return the non-destructive option rather than blocking.
+
+---
+
+### TUI Frontend (`src/frontend/tui/`)
+
+Placeholder. `tui::run(matches, ctx)` prints a one-line notice and returns `ExitCode(0)`. The full Ratatui event loop (porting and adapting the ~21k-line `oldsrc/tui/` implementation to the layered architecture) is the deliverable of work item 0070.
+
+The public signature of `tui::run` is the contract that WI 0070 must preserve:
+
+```rust
+pub async fn run(_matches: clap::ArgMatches, _ctx: RuntimeContext) -> ExitCode
+```
+
+`main.rs` routes to this function whenever `argv` contains no subcommand.
+
+---
+
+### Headless Frontend (`src/frontend/headless/`)
+
+Placeholder. `headless::serve(config)` returns `CommandError::NotImplemented`. The full HTTP server (porting `oldsrc/commands/headless/server.rs` to dispatch through `Dispatch::run_command` instead of spawning a child `amux` process) is the deliverable of work item 0071.
+
+`HeadlessServeConfig` is the fully-specified configuration type that the CLI's `HeadlessStartCommandFrontend` impl will populate and pass into `serve`:
+
+```rust
+pub struct HeadlessServeConfig {
+    pub port: u16,
+    pub workdirs: Vec<PathBuf>,
+    pub dangerously_skip_auth: bool,
+}
+```
+
+The `serve(config)` function signature is the public contract that WI 0071 must preserve:
+
+```rust
+pub async fn serve(config: HeadlessServeConfig) -> Result<(), CommandError>
+```
+
+---
+
+## Layer 4: Binary (`src/main.rs`)
+
+`main.rs` is the Layer 4 binary entrypoint. It contains no business logic: its sole responsibility is to construct the runtime context and route to the appropriate frontend.
+
+### Startup sequence
+
+1. **Build clap**: `CommandCatalogue::get().build_clap_command()` — the clap command is derived entirely from the catalogue; `main.rs` does not hard-code any subcommand or flag name.
+2. **Parse argv**: `clap_cmd.get_matches()` — clap handles `--help`, `--version`, and error formatting.
+3. **Load global config**: `GlobalConfig::load()` — used to select the container runtime.
+4. **Construct engines**:
+   - `ContainerRuntime::detect(&global_config)` — selects Docker or Apple Containers
+   - `GitEngine::new()` — used to resolve the git root
+   - `Session::open(working_dir, &git_engine, SessionOpenOptions::default())` — resolves git root, loads per-repo and global config, records timestamps
+   - `OverlayEngine::new(&session)` — resolves overlay paths from config
+   - `AuthEngine::new(&session)` — sets up the keychain credential path
+   - `AgentEngine::new(overlay_engine, runtime)` — wraps the overlay and runtime for agent execution
+   - `EngineWorkflowStateStore::at_git_root(session.git_root())` — filesystem workflow state store
+5. **Construct `RuntimeContext`**: `RuntimeContext::new(session, engines)` — wraps the session in `Arc<RwLock<Session>>`.
+6. **Route**: `matches.subcommand_name().is_some()` → `cli::run(matches, ctx)` (CLI); otherwise → `tui::run(matches, ctx)` (TUI or, currently, the TUI placeholder).
+
+### Routing rule
+
+```rust
+if matches.subcommand_name().is_some() {
+    cli::run(matches, ctx).await
+} else {
+    tui::run(matches, ctx).await
+}
+```
+
+The headless server is launched by the `headless start` *command* (Layer 2 → Layer 3), not by `main.rs`. `main.rs` never branches on `headless`.
+
+### Size constraint
+
+Per the architecture tenet, the `main.rs` function body must remain small (under ~100 lines). Any logic that wants to live in `main.rs` belongs in Layer 2 or below. This is enforced by code review, not by the compiler.
+
+### `#![forbid(unsafe_code)]`
+
+The binary crate opts out of all unsafe code at the crate level. Layer 3 and Layer 4 are entirely safe Rust.
+
+---
+
 ## Legacy Architecture (`oldsrc/`)
 
-The following describes the user-facing `amux` binary, which continues to build from `oldsrc/` until work item 0070. The `oldsrc/` tree is frozen — no edits are allowed.
+The following describes the legacy `amux` source that was the user-facing binary before work item 0069. The `oldsrc/` tree is frozen — no edits are allowed — and is no longer compiled by Cargo. It will be removed in work item 0072.
 
 ### High-level Overview
 
@@ -2541,18 +2786,24 @@ Background daemonization: systemd-run on Linux, launchd plist on macOS, double-f
 | Layer 2 — WorktreeLifecycle | `src/command/commands/worktree_lifecycle.rs` | All `prepare` paths (happy, uncommitted files, existing worktree, abort); all `finalize` paths (merge, discard, keep, conflict) |
 | Layer 2 — RemoteClient | `src/command/commands/remote_client.rs` | `resolve_api_key` precedence; `send_command` 200 + non-2xx; `stream_command` valid SSE + malformed; timeout + connection-refused mapping |
 | Layer 2 — per-command | `src/command/commands/<name>.rs` | Happy path; all frontend interactions; error mapping; `*Outcome` serde round-trip |
-| Unit — per module | `oldsrc/**/#[cfg(test)]` | Individual functions, data structures |
-| Unit — border colors | `oldsrc/tui::state::tests` | All 6 combinations of phase × focus |
-| Unit — PTY data | `oldsrc/tui::state::tests` | `\r`/`\n`/`\r\n` processing, live-line updates |
-| Unit — container window | `oldsrc/tui::state::tests` | Container state transitions, PTY routing, summary generation |
-| Unit — CLI/spec parity | `oldsrc/cli::tests` | Every clap flag for each subcommand is present in `spec::*_FLAGS` and vice versa |
-| Unit — flag parser | `oldsrc/tui::flag_parser::tests` | `parse_flags()` with every flag in both forms |
-| Unit — init flow | `oldsrc/commands::init_flow::tests` | Each stage via mock InitQa + InitContainerLauncher |
-| Unit — headless db | `oldsrc/commands::headless::db::tests` | Schema creation, session/command CRUD |
-| Integration — CLI | `tests/cli_integration.rs` | Binary-level: help, version, flags, work items |
-| Integration — parity | `tests/command_tui_parity.rs` | Shared logic between command/TUI modes |
-| Integration — headless HTTP | `oldsrc/commands::headless::server::tests` | Full session + command lifecycle |
-| End-to-end — headless | `tests/headless_integration.rs` | `amux headless start` subprocess; HTTP requests via reqwest |
+| Layer 3 — CLI routing | `src/frontend/cli/mod.rs` | `error_exit_code` data-table (all `CommandError` variants); `subcommand_present_routes_to_cli`; `bare_invocation_routes_to_tui`; `render_outcome_empty_is_success` |
+| Layer 3 — CliFrontend | `src/frontend/cli/command_frontend.rs` | `command_path_from_matches` (top-level, nested, bare, 3-level); `flag_bool` data-table; `flag_string`/`flag_enum`; `flag_strings` (single, repeated, absent); `flag_path`; `flag_u16`; `argument` (positional, TrailingVarArgs single + multi); `arguments`; cross-flag independence; parent-path isolation |
+| Layer 3 — CliUserMessageQueue | `src/frontend/cli/user_message.rs` | Queue-when-active; write-through-when-inactive; `replay_queued` drains; PTY toggle changes behavior |
+| Layer 3 — TUI placeholder | `src/frontend/tui/mod.rs` | Bare invocation has no subcommand; any subcommand routes away from TUI |
+| Layer 3 — Headless placeholder | `src/frontend/headless/mod.rs` | `serve()` returns `NotImplemented`; `HeadlessServeConfig` struct fields are valid |
+| Layer 4 — binary routing | `src/main.rs` | Subcommand presence signals CLI branch (data-table over representative argv); bare invocation signals TUI branch; `exec workflow` alias resolves correctly |
+| Unit — per module | `oldsrc/**/#[cfg(test)]` | Individual functions, data structures (legacy reference only — not compiled) |
+| Unit — border colors | `oldsrc/tui::state::tests` | All 6 combinations of phase × focus (legacy reference) |
+| Unit — PTY data | `oldsrc/tui::state::tests` | `\r`/`\n`/`\r\n` processing, live-line updates (legacy reference) |
+| Unit — container window | `oldsrc/tui::state::tests` | Container state transitions, PTY routing, summary generation (legacy reference) |
+| Unit — CLI/spec parity | `oldsrc/cli::tests` | Every clap flag for each subcommand is present in `spec::*_FLAGS` and vice versa (legacy reference) |
+| Unit — flag parser | `oldsrc/tui::flag_parser::tests` | `parse_flags()` with every flag in both forms (legacy reference) |
+| Unit — init flow | `oldsrc/commands::init_flow::tests` | Each stage via mock InitQa + InitContainerLauncher (legacy reference) |
+| Unit — headless db | `oldsrc/commands::headless::db::tests` | Schema creation, session/command CRUD (legacy reference) |
+| Integration — CLI | `tests/cli_integration.rs` | Binary-level: help, version, flags, work items (rebuilt in WI 0072) |
+| Integration — parity | `tests/command_tui_parity.rs` | Shared logic between command/TUI modes (rebuilt in WI 0072) |
+| Integration — headless HTTP | `oldsrc/commands::headless::server::tests` | Full session + command lifecycle (legacy reference) |
+| End-to-end — headless | `tests/headless_integration.rs` | `amux headless start` subprocess; HTTP requests via reqwest (rebuilt in WI 0072) |
 
 ---
 

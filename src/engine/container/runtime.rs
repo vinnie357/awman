@@ -68,7 +68,7 @@ impl ContainerRuntime {
         &self,
         options: impl IntoIterator<Item = ContainerOption>,
     ) -> Result<Box<dyn ContainerInstance>, EngineError> {
-        let resolved = ResolvedContainerOptions::from_iter(options).map_err(|e| match e {
+        let resolved = ResolvedContainerOptions::resolve(options).map_err(|e| match e {
             crate::engine::container::options::ResolveError::Conflict(msg) => {
                 EngineError::ConflictingOptions(msg)
             }

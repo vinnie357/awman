@@ -145,11 +145,12 @@ impl AgentEngine {
         let image = ImageRef::new(agent_image_tag(session.git_root(), agent.as_str()));
         let entrypoint = agent_matrix::entrypoint_for(&matrix, run.non_interactive);
 
-        let mut options: Vec<ContainerOption> = Vec::new();
-        options.push(ContainerOption::Image(image));
-        options.push(ContainerOption::Entrypoint(entrypoint));
-        options.push(ContainerOption::Interactive(!run.non_interactive));
-        options.push(ContainerOption::AllowDocker(run.allow_docker));
+        let mut options = vec![
+            ContainerOption::Image(image),
+            ContainerOption::Entrypoint(entrypoint),
+            ContainerOption::Interactive(!run.non_interactive),
+            ContainerOption::AllowDocker(run.allow_docker),
+        ];
 
         if run.mount_ssh {
             if let Some(home) = dirs::home_dir() {

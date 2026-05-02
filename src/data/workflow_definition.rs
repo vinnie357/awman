@@ -98,7 +98,7 @@ fn parse_markdown(content: &str) -> Result<Workflow, DataError> {
             title = Some(line[2..].trim().to_string());
             continue;
         }
-        if line.starts_with("## Step:") {
+        if let Some(step_name) = line.strip_prefix("## Step:") {
             flush_md(
                 &mut steps,
                 &mut current_name,
@@ -108,7 +108,7 @@ fn parse_markdown(content: &str) -> Result<Workflow, DataError> {
                 &mut current_body,
                 &mut in_prompt,
             );
-            current_name = Some(line["## Step:".len()..].trim().to_string());
+            current_name = Some(step_name.trim().to_string());
             continue;
         }
         if line.starts_with("## ") && current_name.is_some() {

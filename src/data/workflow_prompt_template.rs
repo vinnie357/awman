@@ -103,13 +103,7 @@ pub fn extract_section(content: &str, name: &str) -> Option<String> {
     let mut iter = content.lines().peekable();
     while let Some(line) = iter.next() {
         let trimmed = line.trim();
-        let heading = if let Some(rest) = trimmed.strip_prefix("## ") {
-            Some(rest)
-        } else if let Some(rest) = trimmed.strip_prefix("# ") {
-            Some(rest)
-        } else {
-            None
-        };
+        let heading = trimmed.strip_prefix("## ").or_else(|| trimmed.strip_prefix("# "));
         let Some(h) = heading else {
             continue;
         };

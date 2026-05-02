@@ -157,7 +157,7 @@ mod tests {
     // Walk every leaf command in the catalogue and assert it appears in both
     // the rest_route_table and the openapi_schema paths.
     fn walk_and_verify_headless_leaf(
-        cat: &CommandCatalogue,
+        _cat: &CommandCatalogue,
         spec: &'static crate::command::dispatch::catalogue::CommandSpec,
         path: Vec<String>,
         routes: &[RestRoute],
@@ -186,7 +186,7 @@ mod tests {
         for sub in spec.subcommands {
             let mut new_path = path.clone();
             new_path.push(sub.name.to_string());
-            walk_and_verify_headless_leaf(cat, sub, new_path, routes, schema_paths);
+            walk_and_verify_headless_leaf(_cat, sub, new_path, routes, schema_paths);
         }
     }
 

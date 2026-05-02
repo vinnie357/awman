@@ -173,7 +173,7 @@ mod tests {
         assert_eq!(loaded.steps[0].name, "step-one");
         assert_eq!(loaded.steps[1].name, "step-two");
         assert_eq!(loaded.steps[1].depends_on, vec!["step-one"]);
-        assert_eq!(loaded.yolo, true);
+        assert!(loaded.yolo);
         assert_eq!(loaded.current_step, Some(0));
     }
 

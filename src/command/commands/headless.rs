@@ -163,7 +163,7 @@ mod tests {
     fn resolve_workdirs_dedupes_overlapping_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let s = tmp.path().to_str().unwrap().to_string();
-        let merged = resolve_workdirs(&[s.clone()], &[s.clone()]).unwrap();
+        let merged = resolve_workdirs(std::slice::from_ref(&s), std::slice::from_ref(&s)).unwrap();
         assert_eq!(merged.len(), 1);
     }
 
