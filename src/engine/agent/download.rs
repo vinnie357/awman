@@ -40,7 +40,11 @@ fn atomic_write(dest: &Path, body: &[u8]) -> Result<(), EngineError> {
 /// downloaded (or bundled) Dockerfile content.
 pub async fn download_agent_dockerfile(agent: &str, dest: &Path, project_base_tag: &str) -> Result<(), EngineError> {
     let url = dockerfile_url_for(agent);
-    let client_result = reqwest::Client::builder().user_agent("amux").build();
+    let client_result = reqwest::Client::builder()
+        .user_agent("amux")
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
+        .build();
 
     let download_attempt: Result<Vec<u8>, String> = match client_result {
         Err(e) => Err(format!("client init: {e}")),

@@ -526,6 +526,11 @@ mod tests {
     // -- Helpers --------------------------------------------------------------
 
     fn make_engine(git_root: &std::path::Path) -> InitEngine {
+        // Pre-create agent Dockerfile so the engine does not attempt a network
+        // download during tests.
+        let amux_dir = git_root.join(".amux");
+        let _ = std::fs::create_dir_all(&amux_dir);
+        let _ = std::fs::write(amux_dir.join("Dockerfile.claude"), "FROM scratch\n");
         let resolver = StaticGitRootResolver::new(git_root);
         let session = Arc::new(
             crate::data::session::Session::open(
@@ -545,7 +550,7 @@ mod tests {
         ));
         let options = InitEngineOptions {
             agent: AgentName::new("claude").unwrap(),
-            run_aspec_setup: true,
+            run_aspec_setup: false,
             git_root: git_root.to_path_buf(),
         };
         InitEngine::new(

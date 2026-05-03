@@ -575,6 +575,15 @@ mod tests {
         run_audit: bool,
     ) -> (ReadyEngine, FakeReadyFrontend, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
+        // Pre-create .amux/Dockerfile.claude so the ready engine does not
+        // attempt a network download during tests.
+        let amux_dir = tmp.path().join(".amux");
+        std::fs::create_dir_all(&amux_dir).unwrap();
+        std::fs::write(
+            amux_dir.join("Dockerfile.claude"),
+            "FROM scratch\n",
+        )
+        .unwrap();
         let resolver = StaticGitRootResolver::new(tmp.path());
         let session = Arc::new(
             crate::data::session::Session::open(
@@ -662,6 +671,10 @@ mod tests {
     #[tokio::test]
     async fn awaiting_legacy_migration_false_sets_summary_skipped() {
         let tmp = tempfile::tempdir().unwrap();
+        // Pre-create agent Dockerfile to avoid network download during test.
+        let amux_dir = tmp.path().join(".amux");
+        std::fs::create_dir_all(&amux_dir).unwrap();
+        std::fs::write(amux_dir.join("Dockerfile.claude"), "FROM scratch\n").unwrap();
         let resolver = StaticGitRootResolver::new(tmp.path());
         let session = Arc::new(
             crate::data::session::Session::open(
@@ -846,6 +859,10 @@ mod tests {
         // skip straight past the decision and the create step.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+        // Pre-create agent Dockerfile to avoid network download during test.
+        let amux_dir = tmp.path().join(".amux");
+        std::fs::create_dir_all(&amux_dir).unwrap();
+        std::fs::write(amux_dir.join("Dockerfile.claude"), "FROM scratch\n").unwrap();
         let resolver = StaticGitRootResolver::new(tmp.path());
         let session = Arc::new(
             crate::data::session::Session::open(
