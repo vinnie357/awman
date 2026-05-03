@@ -10,7 +10,7 @@
 //! `ExecPrompt`, `ExecWorkflow`, `Headless` — which require additional
 //! Q&A, reporting, or container-frontend hooks.
 
-mod helpers;
+pub(crate) mod helpers;
 pub(crate) mod render;
 
 mod chat;

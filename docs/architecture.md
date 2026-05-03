@@ -39,7 +39,7 @@ Layer 0: data      Session, config, filesystem, database, typed data
 
 **Layer 2 (command)** owns higher-level business logic: the `Dispatch` type that routes input to typed command objects, and command-specific types (`ChatCommand`, `InitCommand`, etc.). Implemented in work item 0068.
 
-**Layer 3 (frontend)** contains the CLI, TUI, and headless server. Each is a presentation layer only: it translates user input into `Dispatch` calls and renders command output. The CLI frontend is complete; the TUI and headless are placeholders (work items 0070 and 0071 respectively). See [Layer 3 reference](#layer-3-frontend-srcfrontend) below.
+**Layer 3 (frontend)** contains the CLI, TUI, and headless server. Each is a presentation layer only: it translates user input into `Dispatch` calls and renders command output. The CLI frontend is fully functional; the TUI and headless are placeholders (work items 0071 and 0072 respectively). See [Layer 3 reference](#layer-3-frontend-srcfrontend) below.
 
 **Layer 4 (binary)** is `src/main.rs` — the real entrypoint that builds clap from `CommandCatalogue`, constructs engines, opens a `Session`, and routes to the CLI or TUI frontend. See [Layer 4 reference](#layer-4-binary-srcmainrs) below.
 
@@ -50,7 +50,7 @@ Layer 0: data      Session, config, filesystem, database, typed data
 | 0 — data | `src/data/` | Complete (work item 0066) |
 | 1 — engine | `src/engine/` | Complete (work item 0067) |
 | 2 — command | `src/command/` | Complete (work item 0068) |
-| 3 — frontend | `src/frontend/` | CLI complete (0069); TUI placeholder (→ 0070); Headless placeholder (→ 0071) |
+| 3 — frontend | `src/frontend/` | CLI fully functional (0070); TUI placeholder (→ 0071); Headless placeholder (→ 0072) |
 | 4 — binary | `src/main.rs` | Complete (work item 0069) |
 | Legacy binary | `oldsrc/` | Frozen, no longer compiled (binary swap complete in 0069) |
 
@@ -199,9 +199,9 @@ src/
         workflow_frontend_marker.rs   WorkflowFrontend marker impl
         worktree_lifecycle_marker.rs  WorktreeLifecycleFrontend marker impl
     tui/
-      mod.rs              Placeholder run() — prints notice; real TUI ships in 0070
+      mod.rs              Placeholder run() — prints notice; real TUI ships in 0071
     headless/
-      mod.rs              HeadlessServeConfig; placeholder serve() — ships in 0071
+      mod.rs              HeadlessServeConfig; placeholder serve() — ships in 0072
   main.rs                 Layer 4 binary entrypoint
 ```
 
@@ -2146,7 +2146,7 @@ fn render_error(err: &CommandError) -> ExitCode
 pub(crate) fn error_exit_code(err: &CommandError) -> u8
 ```
 
-`render_outcome` pattern-matches on typed outcome variants and writes to stdout. The initial scaffold serializes outcomes to pretty-printed JSON; per-variant terminal rendering is a WI 0072 deliverable. `render_error` writes the error message to stderr. `error_exit_code` is the pure mapping factored out for unit testing:
+`render_outcome` pattern-matches on typed outcome variants and writes to stdout; every variant has a dedicated human-readable rendering completed in work item 0070. `render_error` writes the error message to stderr. `error_exit_code` is the pure mapping factored out for unit testing:
 
 | Error category | Exit code |
 |----------------|-----------|
@@ -2239,9 +2239,9 @@ The **safe default policy** (applied when `stdin_is_tty()` returns `false`) matc
 
 ### TUI Frontend (`src/frontend/tui/`)
 
-Placeholder. `tui::run(matches, ctx)` prints a one-line notice and returns `ExitCode(0)`. The full Ratatui event loop (porting and adapting the ~21k-line `oldsrc/tui/` implementation to the layered architecture) is the deliverable of work item 0070.
+Placeholder. `tui::run(matches, ctx)` prints a one-line notice and returns `ExitCode(0)`. The full Ratatui event loop (porting and adapting the `oldsrc/tui/` implementation to the layered architecture) is the deliverable of work item 0071.
 
-The public signature of `tui::run` is the contract that WI 0070 must preserve:
+The public signature of `tui::run` is the contract that WI 0071 must preserve:
 
 ```rust
 pub async fn run(_matches: clap::ArgMatches, _ctx: RuntimeContext) -> ExitCode
@@ -2253,7 +2253,7 @@ pub async fn run(_matches: clap::ArgMatches, _ctx: RuntimeContext) -> ExitCode
 
 ### Headless Frontend (`src/frontend/headless/`)
 
-Placeholder. `headless::serve(config)` returns `CommandError::NotImplemented`. The full HTTP server (porting `oldsrc/commands/headless/server.rs` to dispatch through `Dispatch::run_command` instead of spawning a child `amux` process) is the deliverable of work item 0071.
+Placeholder. `headless::serve(config)` returns `CommandError::NotImplemented`. The full HTTP server (porting `oldsrc/commands/headless/server.rs` to dispatch through `Dispatch::run_command` instead of spawning a child `amux` process) is the deliverable of work item 0072.
 
 `HeadlessServeConfig` is the fully-specified configuration type that the CLI's `HeadlessStartCommandFrontend` impl will populate and pass into `serve`:
 
@@ -2265,7 +2265,7 @@ pub struct HeadlessServeConfig {
 }
 ```
 
-The `serve(config)` function signature is the public contract that WI 0071 must preserve:
+The `serve(config)` function signature is the public contract that WI 0072 must preserve:
 
 ```rust
 pub async fn serve(config: HeadlessServeConfig) -> Result<(), CommandError>

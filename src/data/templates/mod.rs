@@ -1,0 +1,34 @@
+//! Layer 0 template inclusions — embedded Dockerfile templates and audit
+//! prompts. These exist as a single Layer-0 module so callers everywhere
+//! can resolve the templates without having to redefine paths.
+
+pub mod audit_prompts;
+
+pub use audit_prompts::{init_audit_prompt, ready_audit_prompt};
+
+/// The project base Dockerfile. Written by `amux init` and `amux ready`
+/// when no `Dockerfile.dev` exists at the git root.
+pub fn project_dockerfile_dev() -> &'static str {
+    include_str!("../../../templates/Dockerfile.project")
+}
+
+/// Per-agent Dockerfile template (fallback when network download fails).
+pub fn agent_dockerfile_for(agent: &str) -> Option<&'static str> {
+    Some(match agent {
+        "claude" => include_str!("../../../templates/Dockerfile.claude"),
+        "codex" => include_str!("../../../templates/Dockerfile.codex"),
+        "opencode" => include_str!("../../../templates/Dockerfile.opencode"),
+        "maki" => include_str!("../../../templates/Dockerfile.maki"),
+        "gemini" => include_str!("../../../templates/Dockerfile.gemini"),
+        "copilot" => include_str!("../../../templates/Dockerfile.copilot"),
+        "crush" => include_str!("../../../templates/Dockerfile.crush"),
+        "cline" => include_str!("../../../templates/Dockerfile.cline"),
+        _ => return None,
+    })
+}
+
+/// Bundled nanoclaw Dockerfile — used by `amux claws init` when network
+/// download is unavailable.
+pub fn nanoclaw_dockerfile() -> &'static str {
+    include_str!("../../../templates/Dockerfile.nanoclaw")
+}

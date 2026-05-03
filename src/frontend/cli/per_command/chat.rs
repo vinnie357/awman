@@ -5,13 +5,20 @@
 //! AgentAuthFrontend`. The supertraits are already implemented on
 //! `CliFrontend`; we only need to provide the accessor here.
 
+use crate::command::commands::agent_setup::HasContainerFrontend;
 use crate::command::commands::chat::ChatCommandFrontend;
 use crate::engine::container::frontend::ContainerFrontend;
 
 use crate::frontend::cli::command_frontend::CliFrontend;
 
-impl ChatCommandFrontend for CliFrontend {
+impl HasContainerFrontend for CliFrontend {
     fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
         Box::new(super::container_frontend_marker::CliContainerProxy)
+    }
+}
+
+impl ChatCommandFrontend for CliFrontend {
+    fn set_pty_active(&mut self, active: bool) {
+        self.messages.set_pty_active(active);
     }
 }

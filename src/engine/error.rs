@@ -70,6 +70,18 @@ pub enum EngineError {
     #[error("invalid configuration: {0}")]
     Config(String),
 
+    #[error("container runtime '{binary}' not found on PATH; install Docker and retry")]
+    ContainerRuntimeUnavailable { binary: String },
+
+    #[error("failed to download Dockerfile for agent '{agent}': {message}")]
+    AgentDockerfileDownloadFailed { agent: String, message: String },
+
+    #[error("agent image build failed for agent '{agent}' (exit code {exit_code})")]
+    AgentImageBuildFailed { agent: String, exit_code: i32 },
+
+    #[error("image build for tag '{tag}' exited with code {exit_code}")]
+    ImageBuildExitNonzero { tag: String, exit_code: i32 },
+
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
 

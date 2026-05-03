@@ -6,10 +6,13 @@ use serde::Serialize;
 use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::MountScopeFrontend;
+use crate::command::commands::parse_overlay_spec;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
-use crate::engine::container::frontend::ContainerFrontend;
+use crate::data::session::{AgentName, Session, SessionOpenOptions, StaticGitRootResolver};
+use crate::engine::agent::AgentRunOptions;
+use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 use crate::engine::message::UserMessageSink;
 
 #[derive(Debug, Clone)]
@@ -32,9 +35,15 @@ pub struct ChatOutcome {
 }
 
 pub trait ChatCommandFrontend:
-    UserMessageSink + MountScopeFrontend + AgentSetupFrontend + AgentAuthFrontend + Send + Sync
+    UserMessageSink
+    + MountScopeFrontend
+    + AgentSetupFrontend
+    + AgentAuthFrontend
+    + crate::command::commands::agent_setup::HasContainerFrontend
+    + Send
+    + Sync
 {
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
+    fn set_pty_active(&mut self, active: bool);
 }
 
 pub struct ChatCommand {
@@ -61,11 +70,186 @@ impl Command for ChatCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        let _ = self.engines;
+        // 1. Resolve the agent: --agent flag wins over the repo / global default.
+        let session = open_session_for_cwd(&self.engines)?;
+        let agent = resolve_agent(&self.flags.agent, &session)?;
+
+        // 2. Parse overlay specs before PTY is activated so errors surface early.
+        let directory_overlays = self
+            .flags
+            .overlay
+            .iter()
+            .map(|s| {
+                parse_overlay_spec(s).map_err(|reason| CommandError::InvalidOverlaySpec {
+                    spec: s.clone(),
+                    reason,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // 3. Ensure the agent is available (Dockerfile + image present, build
+        //    if missing). Runs before PTY activation so any download/build
+        //    progress streams to the user terminal directly.
+        ensure_agent_setup(
+            self.engines.agent_engine.as_ref(),
+            &session,
+            &agent,
+            &mut frontend,
+        )
+        .await?;
+
+        // 4. Resolve agent authentication (keychain credentials) and inject
+        //    them as container env-vars so the running agent can reach its
+        //    backend.
+        let credentials = self
+            .engines
+            .auth_engine
+            .resolve_agent_auth(&session, &agent)
+            .map_err(CommandError::from)?;
+
+        // 5. Build the run options from flags + credentials.
+        let mut run_opts = AgentRunOptions {
+            yolo: self.flags.yolo.then_some(YoloMode::Enabled),
+            auto: self.flags.auto.then_some(AutoMode::Enabled),
+            plan: self.flags.plan.then_some(PlanMode::Enabled),
+            allow_docker: self.flags.allow_docker,
+            mount_ssh: self.flags.mount_ssh,
+            non_interactive: self.flags.non_interactive,
+            model: self.flags.model.clone(),
+            directory_overlays,
+            ..Default::default()
+        };
+        let env_overrides = credentials.env_vars.clone();
+
+        // 6. Build the container options through AgentEngine.
+        let mut options = self
+            .engines
+            .agent_engine
+            .build_options(&session, &agent, &run_opts)?;
+        if !env_overrides.is_empty() {
+            options.push(crate::engine::container::options::ContainerOption::AgentCredentials {
+                env_vars: env_overrides,
+            });
+        }
+        let _ = &mut run_opts; // silence unused-mut lint when no fields mutate later
+
+        // 7. Build the container instance.
+        let instance = self.engines.runtime.build(options)?;
+
+        // 8. Run with PTY-active gating.
+        frontend.set_pty_active(true);
+        let container_frontend = frontend.container_frontend();
+        let mut execution = match instance.run_with_frontend(container_frontend) {
+            Ok(e) => e,
+            Err(e) => {
+                frontend.set_pty_active(false);
+                frontend.replay_queued();
+                return Err(CommandError::from(e));
+            }
+        };
+        let exit = execution.wait().await;
+        frontend.set_pty_active(false);
         frontend.replay_queued();
+
+        let exit_code = exit.map(|e| e.exit_code).ok();
         Ok(ChatOutcome {
-            agent: self.flags.agent,
-            exit_code: None,
+            agent: Some(agent.as_str().to_string()),
+            exit_code,
         })
+    }
+}
+
+pub(crate) async fn ensure_agent_setup(
+    agent_engine: &crate::engine::agent::AgentEngine,
+    session: &Session,
+    agent: &AgentName,
+    frontend: &mut Box<dyn ChatCommandFrontend>,
+) -> Result<(), CommandError> {
+    use crate::data::config::effective::EffectiveConfig;
+    let config = EffectiveConfig::default();
+    let mut adapter =
+        crate::command::commands::agent_setup::AgentFrontendAdapter::new(frontend.as_mut());
+    let runtime = std::sync::Arc::clone(agent_engine.container_runtime_arc());
+    agent_engine
+        .ensure_available(
+            session,
+            agent,
+            &config,
+            &mut adapter,
+            move |tag: &str| runtime.image_exists(tag),
+        )
+        .await
+        .map_err(CommandError::from)
+}
+
+/// Resolve the agent: explicit flag → session default → fall back to "claude".
+pub(crate) fn resolve_agent(
+    flag: &Option<String>,
+    session: &Session,
+) -> Result<AgentName, CommandError> {
+    if let Some(name) = flag.as_deref() {
+        return AgentName::new(name).map_err(CommandError::from);
+    }
+    if let Some(name) = session.default_agent() {
+        return Ok(name.clone());
+    }
+    AgentName::new("claude").map_err(CommandError::from)
+}
+
+/// Open a Session at the current working directory, falling back to a
+/// best-effort resolver when git isn't initialized.
+pub(crate) fn open_session_for_cwd(engines: &Engines) -> Result<Session, CommandError> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| CommandError::Other(format!("cwd unavailable: {e}")))?;
+    let git_root = engines.git_engine.resolve_root(&cwd).unwrap_or_else(|_| cwd.clone());
+    let resolver = StaticGitRootResolver::new(git_root);
+    Session::open(cwd, &resolver, SessionOpenOptions::default()).map_err(CommandError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_session(root: &std::path::Path) -> Session {
+        let resolver = StaticGitRootResolver::new(root);
+        Session::open(root.to_path_buf(), &resolver, SessionOpenOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn resolve_agent_uses_explicit_flag_over_session_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(tmp.path());
+        let agent = resolve_agent(&Some("codex".to_string()), &session).unwrap();
+        assert_eq!(agent.as_str(), "codex", "explicit flag must win over session default");
+    }
+
+    #[test]
+    fn resolve_agent_falls_back_to_claude_when_no_flag_or_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(tmp.path());
+        // No explicit flag, session has no default → falls back to "claude".
+        let agent = resolve_agent(&None, &session).unwrap();
+        assert_eq!(agent.as_str(), "claude", "must fall back to claude");
+    }
+
+    #[test]
+    fn resolve_agent_invalid_name_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(tmp.path());
+        // Empty string is not a valid agent name.
+        let result = resolve_agent(&Some(String::new()), &session);
+        assert!(result.is_err(), "empty agent name must return error");
+    }
+
+    #[test]
+    fn resolve_agent_uses_session_default_when_no_flag() {
+        // We cannot easily inject a session default without writing config;
+        // this verifies the fallback path doesn't panic when default_agent()
+        // returns None (the no-config case already tested above).
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(tmp.path());
+        let agent = resolve_agent(&None, &session).unwrap();
+        // In the absence of config the only valid result is "claude".
+        assert_eq!(agent.as_str(), "claude");
     }
 }

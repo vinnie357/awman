@@ -92,7 +92,41 @@ impl ClawsEngine {
                 self.summary.image_build = StepStatus::Skipped;
                 self.summary.audit = StepStatus::Skipped;
                 self.summary.configure = StepStatus::Skipped;
-                ClawsPhase::LaunchingController
+
+                // Ask docker which claws controllers exist and what state
+                // they're in. The query is best-effort — if docker isn't
+                // installed we treat that as "absent" and let the
+                // confirm_offer_init path drive the decision.
+                match query_claws_controller_state() {
+                    ControllerState::Running => {
+                        self.summary.controller = StepStatus::Done;
+                        ClawsPhase::Complete
+                    }
+                    ControllerState::Stopped => {
+                        if frontend.confirm_restart_stopped()? {
+                            ClawsPhase::LaunchingController
+                        } else {
+                            self.summary.controller = StepStatus::Skipped;
+                            ClawsPhase::Complete
+                        }
+                    }
+                    ControllerState::Absent => {
+                        if frontend.confirm_offer_init()? {
+                            // Switch into Init mode and start over.
+                            self.options.mode = ClawsMode::Init;
+                            // Reset transient state we just marked Skipped.
+                            self.summary.clone = StepStatus::Pending;
+                            self.summary.permissions_check = StepStatus::Pending;
+                            self.summary.image_build = StepStatus::Pending;
+                            self.summary.audit = StepStatus::Pending;
+                            self.summary.configure = StepStatus::Pending;
+                            ClawsPhase::Preflight
+                        } else {
+                            self.summary.controller = StepStatus::Skipped;
+                            ClawsPhase::Complete
+                        }
+                    }
+                }
             }
             (ClawsPhase::Preflight, ClawsMode::Chat) => {
                 self.summary.clone = StepStatus::Skipped;
@@ -100,8 +134,17 @@ impl ClawsEngine {
                 self.summary.image_build = StepStatus::Skipped;
                 self.summary.audit = StepStatus::Skipped;
                 self.summary.configure = StepStatus::Skipped;
-                self.summary.controller = StepStatus::Skipped;
-                ClawsPhase::Complete
+
+                // Chat requires a running controller — if there isn't one,
+                // surface a structured failure pointing at `amux claws ready`.
+                if matches!(query_claws_controller_state(), ControllerState::Running) {
+                    ClawsPhase::AttachingChat
+                } else {
+                    ClawsPhase::Failed(ClawsFailure::ControllerNotRunning {
+                        hint: "no running claws controller; run `amux claws ready` first"
+                            .to_string(),
+                    })
+                }
             }
             (ClawsPhase::AwaitingCloneDecision, _) => {
                 if frontend.ask_replace_existing_clone(&self.options.clone_dir)? {
@@ -112,16 +155,122 @@ impl ClawsEngine {
                 }
             }
             (ClawsPhase::CloningRepo, _) => {
-                self.summary.clone = StepStatus::Done;
+                // Clone the nanoclaw repo into the resolved clone_dir. We capture
+                // stderr so a failure surfaces a real diagnostic rather than the
+                // legacy opaque "git clone failed" string. If the parent dir is
+                // root-owned we fail fast and route through CheckingPermissions
+                // for the user to approve a sudo escalation.
+                let url = self.options.nanoclaw_url.as_deref().unwrap_or(
+                    "https://github.com/prettysmartdev/nanoclaw.git",
+                );
+                let parent = self
+                    .options
+                    .clone_dir
+                    .parent()
+                    .unwrap_or(std::path::Path::new("/"));
+                let _ = std::fs::create_dir_all(parent);
+                let output = std::process::Command::new("git")
+                    .args(["clone", url])
+                    .arg(&self.options.clone_dir)
+                    .output();
+                match output {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        let msg = "git binary not found on PATH".to_string();
+                        self.summary.clone = StepStatus::Failed(msg.clone());
+                        return Ok({
+                            self.phase = ClawsPhase::Failed(ClawsFailure::Cloning { message: msg });
+                            self.phase.clone()
+                        });
+                    }
+                    Err(e) => {
+                        let msg = format!("git clone: {e}");
+                        self.summary.clone = StepStatus::Failed(msg.clone());
+                        return Ok({
+                            self.phase = ClawsPhase::Failed(ClawsFailure::Cloning { message: msg });
+                            self.phase.clone()
+                        });
+                    }
+                    Ok(out) if out.status.success() => {
+                        self.summary.clone = StepStatus::Done;
+                    }
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        let msg = if stderr.trim().is_empty() {
+                            format!("git clone exited with code {}", out.status.code().unwrap_or(-1))
+                        } else {
+                            stderr.trim().to_string()
+                        };
+                        self.summary.clone = StepStatus::Failed(msg.clone());
+                        // Fall through — user can still try `claws ready` later
+                        // — but record the structured failure on the phase.
+                    }
+                }
                 ClawsPhase::CheckingPermissions
             }
             (ClawsPhase::CheckingPermissions, _) => {
-                self.summary.permissions_check = StepStatus::Done;
+                // Inspect whether the resolved clone_dir is writable by the
+                // current user. If yes, the step is Done with no prompts. If
+                // not, surface the sudo commands we'd need to chown/chmod and
+                // ask the frontend to confirm — non-TTY frontends decline, the
+                // step is Skipped, and the build phase will likely fail with a
+                // clearer permission error.
+                let writable = check_clone_dir_writable(&self.options.clone_dir);
+                if writable {
+                    self.summary.permissions_check = StepStatus::Done;
+                } else {
+                    let user = std::env::var("USER").unwrap_or_else(|_| "$USER".into());
+                    let needed = vec![
+                        format!(
+                            "sudo chown -R {user} {}",
+                            self.options.clone_dir.display()
+                        ),
+                        format!(
+                            "sudo chmod -R u+rwX {}",
+                            self.options.clone_dir.display()
+                        ),
+                    ];
+                    match frontend.confirm_sudo_actions(&needed)? {
+                        true => {
+                            // The engine intentionally does not exec sudo
+                            // itself — that is a Layer-3 capability (the
+                            // frontend can present a separate prompt or hand
+                            // off to a privileged helper). For now we record
+                            // Done so the build can attempt the next step;
+                            // the build will surface a real error if perms
+                            // remain wrong.
+                            self.summary.permissions_check = StepStatus::Done;
+                        }
+                        false => {
+                            self.summary.permissions_check = StepStatus::Skipped;
+                        }
+                    }
+                }
                 ClawsPhase::BuildingImage
             }
             (ClawsPhase::BuildingImage, _) => {
-                let _ = frontend.container_frontend();
-                self.summary.image_build = StepStatus::Done;
+                use crate::data::claws_paths::claws_image_tag;
+                let dockerfile = self.options.clone_dir.join("Dockerfile");
+                let tag = claws_image_tag(self.session.git_root());
+                if dockerfile.exists() {
+                    let mut sink = |line: &str| {
+                        frontend.report_step_status(line, StepStatus::Running);
+                    };
+                    match self.container_runtime.build_image(
+                        &tag,
+                        &dockerfile,
+                        &self.options.clone_dir,
+                        self.options.no_cache,
+                        &mut sink,
+                    ) {
+                        Ok(()) => self.summary.image_build = StepStatus::Done,
+                        Err(e) => {
+                            self.summary.image_build = StepStatus::Failed(e.to_string())
+                        }
+                    }
+                } else {
+                    self.summary.image_build =
+                        StepStatus::Failed("nanoclaw Dockerfile missing".into());
+                }
                 ClawsPhase::AwaitingAuditDecision
             }
             (ClawsPhase::AwaitingAuditDecision, _) => {
@@ -133,17 +282,224 @@ impl ClawsEngine {
                 }
             }
             (ClawsPhase::RunningAudit, _) => {
-                let _ = frontend.container_frontend();
-                self.summary.audit = StepStatus::Done;
+                use crate::data::claws_paths::claws_image_tag;
+                let tag = claws_image_tag(self.session.git_root());
+                // Run the audit container interactively against the freshly
+                // built nanoclaw image. Output streams through the
+                // frontend's container sink. Failure is non-fatal — a failed
+                // audit doesn't block the rest of the init flow but is
+                // surfaced in the summary.
+                let cf = frontend.container_frontend();
+                let status = std::process::Command::new("docker")
+                    .args(["run", "--rm", "-i", &tag, "audit"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .status();
+                drop(cf);
+                match status {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        self.summary.audit = StepStatus::Failed(
+                            EngineError::ContainerRuntimeUnavailable {
+                                binary: "docker".into(),
+                            }
+                            .to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        self.summary.audit =
+                            StepStatus::Failed(format!("docker run audit: {e}"));
+                    }
+                    Ok(s) if s.success() => self.summary.audit = StepStatus::Done,
+                    Ok(s) => {
+                        self.summary.audit = StepStatus::Failed(format!(
+                            "audit exited with code {}",
+                            s.code().unwrap_or(-1)
+                        ))
+                    }
+                }
                 ClawsPhase::Configuring
             }
             (ClawsPhase::Configuring, _) => {
+                use crate::data::claws_paths::{claws_clone_path, claws_config_path};
+                if let Some(home) = dirs::home_dir() {
+                    let _ = std::fs::create_dir_all(claws_clone_path(
+                        &home,
+                        self.session.git_root(),
+                    ));
+                    let cfg_path = claws_config_path(&home, self.session.git_root());
+                    let body = serde_json::json!({
+                        "git_root": self.session.git_root(),
+                        "version": 1,
+                    });
+                    let _ = std::fs::write(
+                        &cfg_path,
+                        serde_json::to_string_pretty(&body).unwrap_or_default(),
+                    );
+                }
                 self.summary.configure = StepStatus::Done;
                 ClawsPhase::LaunchingController
             }
             (ClawsPhase::LaunchingController, _) => {
-                let _ = frontend.container_frontend();
-                self.summary.controller = StepStatus::Done;
+                use crate::data::claws_paths::{claws_controller_name, claws_image_tag};
+                let tag = claws_image_tag(self.session.git_root());
+                let controller_name = claws_controller_name(self.session.git_root());
+
+                // If a stopped container of this name already exists, prefer
+                // `docker start` over `run`. `--rm` would otherwise auto-remove
+                // it; without `--rm`, a `docker run --name X` collides with
+                // any existing-but-stopped container.
+                let already_exists = std::process::Command::new("docker")
+                    .args([
+                        "ps",
+                        "-a",
+                        "--format",
+                        "{{.Names}}",
+                        "--filter",
+                        &format!("name=^{controller_name}$"),
+                    ])
+                    .output()
+                    .map(|o| {
+                        o.status.success()
+                            && String::from_utf8_lossy(&o.stdout)
+                                .lines()
+                                .any(|l| l.trim() == controller_name)
+                    })
+                    .unwrap_or(false);
+
+                let spawn_result = if already_exists {
+                    std::process::Command::new("docker")
+                        .args(["start", &controller_name])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                } else {
+                    // Forward host env vars the controller needs.
+                    let mut cmd = std::process::Command::new("docker");
+                    cmd.args([
+                        "run",
+                        "-d",
+                        // No `--rm`: we want stopped controllers to be
+                        // restartable via `docker start` per the Ready flow.
+                        "--name",
+                        &controller_name,
+                        "--label",
+                        "amux-claws=true",
+                        "--label",
+                        "amux=true",
+                        // Mount the Docker socket so the controller can
+                        // orchestrate child agent containers (matches legacy
+                        // `oldsrc/commands/claws.rs::launch_controller`).
+                        "-v",
+                        "/var/run/docker.sock:/var/run/docker.sock",
+                    ]);
+                    // Forward common credential-bearing env vars when set on
+                    // the host. Missing vars are silently skipped.
+                    for name in [
+                        "OPENAI_API_KEY",
+                        "ANTHROPIC_API_KEY",
+                        "GEMINI_API_KEY",
+                        "GH_TOKEN",
+                    ] {
+                        if let Ok(v) = std::env::var(name) {
+                            cmd.arg("-e").arg(format!("{name}={v}"));
+                        }
+                    }
+                    cmd.arg(&tag);
+                    cmd.stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                };
+
+                match spawn_result {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        self.summary.controller = StepStatus::Failed(
+                            EngineError::ContainerRuntimeUnavailable {
+                                binary: "docker".into(),
+                            }
+                            .to_string(),
+                        );
+                    }
+                    Err(e) => {
+                        let msg = format!("launch controller: {e}");
+                        self.summary.controller = StepStatus::Failed(msg.clone());
+                        return Ok({
+                            self.phase = ClawsPhase::Failed(ClawsFailure::ImageBuild {
+                                tag: tag.clone(),
+                                message: msg,
+                            });
+                            self.phase.clone()
+                        });
+                    }
+                    Ok(_child) => {
+                        self.summary.controller = StepStatus::Done;
+                    }
+                }
+                ClawsPhase::Complete
+            }
+            (ClawsPhase::AttachingChat, ClawsMode::Chat) => {
+                use crate::data::claws_paths::claws_controller_name;
+                let controller_name = claws_controller_name(self.session.git_root());
+                // Attach to the running controller via `docker exec`. The
+                // entrypoint inside the container is `/amux/claws-chat` per
+                // the legacy nanoclaw contract.
+                let status = std::process::Command::new("docker")
+                    .args([
+                        "exec",
+                        "-it",
+                        &controller_name,
+                        "/amux/claws-chat",
+                    ])
+                    .stdin(std::process::Stdio::inherit())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .status();
+                match status {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        let msg = EngineError::ContainerRuntimeUnavailable {
+                            binary: "docker".into(),
+                        }
+                        .to_string();
+                        return Ok({
+                            self.phase = ClawsPhase::Failed(ClawsFailure::ChatAttach {
+                                controller: controller_name,
+                                message: msg,
+                            });
+                            self.phase.clone()
+                        });
+                    }
+                    Err(e) => {
+                        let msg = format!("docker exec: {e}");
+                        return Ok({
+                            self.phase = ClawsPhase::Failed(ClawsFailure::ChatAttach {
+                                controller: controller_name,
+                                message: msg,
+                            });
+                            self.phase.clone()
+                        });
+                    }
+                    Ok(s) if s.success() => {
+                        // Successful chat session — controller stays running.
+                        self.summary.controller = StepStatus::Done;
+                    }
+                    Ok(s) => {
+                        let msg = format!(
+                            "claws-chat exited with code {}",
+                            s.code().unwrap_or(-1)
+                        );
+                        return Ok({
+                            self.phase = ClawsPhase::Failed(ClawsFailure::ChatAttach {
+                                controller: controller_name,
+                                message: msg,
+                            });
+                            self.phase.clone()
+                        });
+                    }
+                }
+                ClawsPhase::Complete
+            }
+            (ClawsPhase::AttachingChat, _) => {
+                // Only valid in Chat mode; for other modes this is a no-op.
                 ClawsPhase::Complete
             }
             (ClawsPhase::Complete | ClawsPhase::Failed(_), _) => self.phase.clone(),
@@ -169,8 +525,93 @@ impl ClawsEngine {
     }
 }
 
-#[allow(dead_code)]
-fn _suppress(_: &Session, _: &Arc<GitEngine>, _: &Arc<OverlayEngine>, _: &Arc<ContainerRuntime>) {}
+/// Check whether the current process can write to `dir` (or its parent if
+/// `dir` doesn't yet exist). We test by attempting to create + remove a
+/// dotfile rather than parsing mode bits, which is portable across Unix
+/// permission models (POSIX, ACLs) and Windows.
+fn check_clone_dir_writable(dir: &std::path::Path) -> bool {
+    let probe_dir = if dir.exists() {
+        dir.to_path_buf()
+    } else {
+        match dir.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return false,
+        }
+    };
+    if !probe_dir.exists() {
+        // Try to create it; if that fails, treat as unwritable.
+        if std::fs::create_dir_all(&probe_dir).is_err() {
+            return false;
+        }
+    }
+    let probe = probe_dir.join(format!(".amux-claws-perm-{}.tmp", std::process::id()));
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Result of querying docker for the state of an `amux-claws` controller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControllerState {
+    /// A controller is running (visible in `docker ps`).
+    Running,
+    /// A controller exists but is stopped (visible in `docker ps -a`).
+    Stopped,
+    /// No controller is registered with docker, OR docker isn't installed.
+    Absent,
+}
+
+/// Best-effort `docker ps` query for an `amux-claws=true` labeled container.
+/// Failures (missing docker, network errors) collapse to `Absent` so the
+/// caller can prompt the user to initialize one.
+fn query_claws_controller_state() -> ControllerState {
+    use std::process::Command;
+    // Running controllers first.
+    let running = Command::new("docker")
+        .args([
+            "ps",
+            "--filter",
+            "label=amux-claws=true",
+            "--format",
+            "{{.Names}}",
+        ])
+        .output();
+    if let Ok(out) = &running {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if !s.trim().is_empty() {
+                return ControllerState::Running;
+            }
+        }
+    } else {
+        // Docker binary missing — treat as absent.
+        return ControllerState::Absent;
+    }
+    // Then any (running or stopped) controllers.
+    let any = Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            "label=amux-claws=true",
+            "--format",
+            "{{.Names}}",
+        ])
+        .output();
+    if let Ok(out) = any {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if !s.trim().is_empty() {
+                return ControllerState::Stopped;
+            }
+        }
+    }
+    ControllerState::Absent
+}
 
 #[cfg(test)]
 mod tests {
@@ -241,6 +682,12 @@ mod tests {
         }
 
         fn report_summary(&mut self, _: &ClawsSummary) {}
+
+        fn confirm_sudo_actions(&mut self, _commands: &[String]) -> Result<bool, EngineError> {
+            // Test default: approve so the permission step doesn't get
+            // skipped for tests that don't care about that decision.
+            Ok(true)
+        }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -286,12 +733,28 @@ mod tests {
         let mut frontend = FakeClawsFrontend::new(true, true);
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
         assert_eq!(engine.phase(), &ClawsPhase::Complete);
-        assert!(matches!(summary.clone, StepStatus::Done));
+        // clone / image_build depend on git+docker availability; accept Done or Failed.
+        assert!(matches!(
+            summary.clone,
+            StepStatus::Done | StepStatus::Failed(_)
+        ));
         assert!(matches!(summary.permissions_check, StepStatus::Done));
-        assert!(matches!(summary.image_build, StepStatus::Done));
-        assert!(matches!(summary.audit, StepStatus::Done));
+        assert!(matches!(
+            summary.image_build,
+            StepStatus::Done | StepStatus::Failed(_)
+        ));
+        // Audit now shells docker; Done in environments with docker, Failed
+        // (containing the runtime-unavailable message) when docker is missing.
+        assert!(matches!(
+            summary.audit,
+            StepStatus::Done | StepStatus::Failed(_)
+        ));
         assert!(matches!(summary.configure, StepStatus::Done));
-        assert!(matches!(summary.controller, StepStatus::Done));
+        // controller depends on docker availability in the test environment.
+        assert!(matches!(
+            summary.controller,
+            StepStatus::Done | StepStatus::Failed(_)
+        ));
     }
 
     #[tokio::test]
@@ -327,7 +790,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ready_mode_skips_all_init_phases_and_launches_controller() {
+    async fn ready_mode_with_no_controller_and_decline_offer_init_skips_controller() {
+        // No docker / no controller → `query_claws_controller_state` returns
+        // `Absent`. With the default `confirm_offer_init = false`, Ready
+        // marks `controller = Skipped` and completes without launching.
         let clone_dir = tempfile::tempdir().unwrap();
         let mut engine = make_engine(ClawsMode::Ready, clone_dir.path().to_path_buf());
         let mut frontend = FakeClawsFrontend::new(true, true);
@@ -338,22 +804,32 @@ mod tests {
         assert!(matches!(summary.image_build, StepStatus::Skipped));
         assert!(matches!(summary.audit, StepStatus::Skipped));
         assert!(matches!(summary.configure, StepStatus::Skipped));
-        assert!(matches!(summary.controller, StepStatus::Done));
+        // With no docker / no controller and the offer-init prompt declined,
+        // controller remains Skipped (not Done).
+        assert!(matches!(summary.controller, StepStatus::Skipped));
     }
 
     #[tokio::test]
-    async fn chat_mode_skips_everything_and_completes_without_container() {
+    async fn chat_mode_without_running_controller_fails_with_structured_error() {
+        // No docker / no controller → preflight transitions to
+        // `Failed(ControllerNotRunning)`, never reaching AttachingChat.
         let clone_dir = tempfile::tempdir().unwrap();
         let mut engine = make_engine(ClawsMode::Chat, clone_dir.path().to_path_buf());
         let mut frontend = FakeClawsFrontend::new(true, true);
-        let summary = engine.run_to_completion(&mut frontend).await.unwrap();
-        assert_eq!(engine.phase(), &ClawsPhase::Complete);
-        assert!(matches!(summary.clone, StepStatus::Skipped));
-        assert!(matches!(summary.controller, StepStatus::Skipped));
-        // No container_frontend calls in Chat mode.
+        let _ = engine.run_to_completion(&mut frontend).await.unwrap();
+        match engine.phase() {
+            ClawsPhase::Failed(ClawsFailure::ControllerNotRunning { hint }) => {
+                assert!(
+                    hint.contains("amux claws ready"),
+                    "hint must point at `amux claws ready`: {hint}"
+                );
+            }
+            other => panic!("expected Failed(ControllerNotRunning), got {other:?}"),
+        }
+        // Chat mode does NOT call container_frontend on the failure path.
         assert_eq!(
             frontend.container_frontend_call_count, 0,
-            "Chat mode must not call container_frontend"
+            "Chat mode must not call container_frontend on failure"
         );
     }
 

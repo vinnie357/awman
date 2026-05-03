@@ -154,6 +154,9 @@ pub enum ContainerOption {
     /// Container-side `$HOME` remapped from `/root` when a non-root `USER`
     /// directive is detected in the agent's Dockerfile.
     DockerfileUser(String),
+    /// Session identifier — emitted as `--label amux.session=<id>` so
+    /// `list_running` can attribute containers to a specific amux session.
+    SessionLabel(String),
 }
 
 /// Resolved option bag — all options merged into a single struct that the
@@ -183,6 +186,7 @@ pub struct ResolvedContainerOptions {
     pub model: Option<ModelFlagForm>,
     pub non_interactive_flag: Option<String>,
     pub dockerfile_user: Option<String>,
+    pub session_label: Option<String>,
 }
 
 impl ResolvedContainerOptions {
@@ -229,6 +233,7 @@ impl ResolvedContainerOptions {
             ContainerOption::Model { flag } => self.model = Some(flag),
             ContainerOption::NonInteractivePrintFlag(v) => self.non_interactive_flag = Some(v),
             ContainerOption::DockerfileUser(v) => self.dockerfile_user = Some(v),
+            ContainerOption::SessionLabel(v) => self.session_label = Some(v),
         }
         Ok(())
     }

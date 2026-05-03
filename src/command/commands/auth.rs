@@ -1,13 +1,9 @@
 //! `AuthCommand` — accept/decline keychain consent for the current repo.
-//!
-//! Today this is not a top-level CLI command; it exists in the catalogue
-//! only as a small structural helper that 0069's TUI / headless can invoke
-//! during the agent-launch flow. Per spec §4 (auth row), the per-repo
-//! `auto_agent_auth_accepted` flag is read/written here.
 
 use async_trait::async_trait;
 use serde::Serialize;
 
+use crate::command::commands::chat::open_session_for_cwd;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
@@ -21,9 +17,30 @@ pub struct AuthCommandFlags {
 #[derive(Debug, Clone, Serialize)]
 pub struct AuthOutcome {
     pub accepted: bool,
+    /// `true` when the choice was persisted to the per-repo config.
+    #[serde(default)]
+    pub persisted: bool,
 }
 
-pub trait AuthCommandFrontend: UserMessageSink + Send + Sync {}
+pub trait AuthCommandFrontend: UserMessageSink + Send + Sync {
+    /// Prompt the user for [y/n/o]nce. CLI implementations gate on stdin TTY
+    /// and return `accept` as a safe default when not a TTY.
+    fn ask_consent(&mut self, default: bool) -> Result<AuthConsentChoice, CommandError> {
+        Ok(if default {
+            AuthConsentChoice::Accept
+        } else {
+            AuthConsentChoice::Decline
+        })
+    }
+}
+
+/// Tri-state user choice for agent auth consent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthConsentChoice {
+    Accept,
+    Decline,
+    Once,
+}
 
 pub struct AuthCommand {
     flags: AuthCommandFlags,
@@ -49,10 +66,25 @@ impl Command for AuthCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        let _ = self.engines;
+        let choice = frontend.ask_consent(self.flags.accept)?;
+        let (accepted, persist) = match choice {
+            AuthConsentChoice::Accept => (true, true),
+            AuthConsentChoice::Decline => (false, true),
+            AuthConsentChoice::Once => (true, false),
+        };
+        let mut persisted = false;
+        if persist {
+            // Persist on the per-repo config so future agent launches respect
+            // the choice without re-prompting.
+            if let Ok(session) = open_session_for_cwd(&self.engines) {
+                let mut cfg = session.repo_config().clone();
+                cfg.auto_agent_auth_accepted = Some(accepted);
+                if cfg.save(session.git_root()).is_ok() {
+                    persisted = true;
+                }
+            }
+        }
         frontend.replay_queued();
-        Ok(AuthOutcome {
-            accepted: self.flags.accept,
-        })
+        Ok(AuthOutcome { accepted, persisted })
     }
 }

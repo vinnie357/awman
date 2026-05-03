@@ -31,6 +31,16 @@ pub struct AgentMatrix {
     pub allowed_tools_flag: Option<&'static str>,
     /// How model is delivered (`--model NAME` for most).
     pub model_flag: ModelFlagDelivery,
+    /// Whether the agent supports mid-session prompt injection over its
+    /// already-running container's stdin. Used by the workflow engine to
+    /// decide between reusing a long-lived container (when `true`) and
+    /// spinning up a fresh one per step (when `false`).
+    ///
+    /// Currently `false` for every shipped agent. Set to `true` once an agent
+    /// CLI is verified to accept a newline-terminated prompt on its existing
+    /// stdin without losing state. The wiring on the Docker side keeps the
+    /// spawned subprocess's stdin alive for re-injection.
+    pub supports_stdin_injection: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,7 +65,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             auto_flag: Some(&["--permission-mode", "auto"]),
             disallowed_tools_flag: Some("--disallowedTools"),
             allowed_tools_flag: Some("--allowedTools"),
-            model_flag: ModelFlagDelivery::SpaceArg,
+            model_flag: ModelFlagDelivery::SpaceArg, supports_stdin_injection: false,
         },
         "codex" => AgentMatrix {
             agent: "codex",
@@ -66,7 +76,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             auto_flag: None,
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
-            model_flag: ModelFlagDelivery::SpaceArg,
+            model_flag: ModelFlagDelivery::SpaceArg, supports_stdin_injection: false,
         },
         "opencode" => AgentMatrix {
             agent: "opencode",
@@ -77,7 +87,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             auto_flag: None,
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
-            model_flag: ModelFlagDelivery::SpaceArg,
+            model_flag: ModelFlagDelivery::SpaceArg, supports_stdin_injection: false,
         },
         "maki" => AgentMatrix {
             agent: "maki",
@@ -88,7 +98,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             auto_flag: None,
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
-            model_flag: ModelFlagDelivery::SpaceArg,
+            model_flag: ModelFlagDelivery::SpaceArg, supports_stdin_injection: false,
         },
         "gemini" => AgentMatrix {
             agent: "gemini",
@@ -99,7 +109,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             auto_flag: None,
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
-            model_flag: ModelFlagDelivery::SpaceArg,
+            model_flag: ModelFlagDelivery::SpaceArg, supports_stdin_injection: false,
         },
         "copilot" => AgentMatrix {
             agent: "copilot",
@@ -110,7 +120,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             auto_flag: None,
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
-            model_flag: ModelFlagDelivery::SpaceArg,
+            model_flag: ModelFlagDelivery::SpaceArg, supports_stdin_injection: false,
         },
         "crush" => AgentMatrix {
             agent: "crush",
@@ -121,7 +131,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             auto_flag: None,
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
-            model_flag: ModelFlagDelivery::SpaceArg,
+            model_flag: ModelFlagDelivery::SpaceArg, supports_stdin_injection: false,
         },
         "cline" => AgentMatrix {
             agent: "cline",
@@ -132,7 +142,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             auto_flag: None,
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
-            model_flag: ModelFlagDelivery::SpaceArg,
+            model_flag: ModelFlagDelivery::SpaceArg, supports_stdin_injection: false,
         },
         other => {
             return Err(EngineError::Other(format!(

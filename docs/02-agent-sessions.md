@@ -505,6 +505,132 @@ cat ~/.cline/data/secrets.json
 
 ---
 
+## `amux auth`
+
+```sh
+amux auth [--accept]
+```
+
+The `amux auth` command manages whether amux may automatically pass your agent's credentials into containers. This consent is per-repo and persisted in `aspec/.amux.json`.
+
+Run it at any time to set or update your preference:
+
+```sh
+amux auth
+```
+
+When stdin is a TTY, a consent dialog appears:
+
+```
+amux needs permission to automatically pass your agent credentials into containers.
+
+  [y] Accept — save this choice for the current repo
+  [n] Decline — save this choice for the current repo
+  [o] Once — accept for this session only (not saved)
+```
+
+| Choice | Key | Behaviour |
+|--------|-----|-----------|
+| Accept | `y` | Saves `auto_agent_auth_accepted = true` in `aspec/.amux.json`. Future sessions use auto-passthrough without prompting. |
+| Decline | `n` | Saves `auto_agent_auth_accepted = false` in `aspec/.amux.json`. Future sessions do not auto-pass credentials. |
+| Once | `o` | Accepts for this session only — no change to config. |
+
+The result is confirmed on stdout:
+
+```
+auth: accepted; persisted=true
+```
+
+```
+auth: declined; persisted=true
+```
+
+```
+auth: accepted; persisted=false    # once mode — not saved
+```
+
+### Non-interactive accept
+
+```sh
+amux auth --accept
+```
+
+Accepts without showing the dialog. Useful in CI or scripts where stdin is not a TTY. When `--accept` is not provided and stdin is not a TTY, `amux auth` defaults to declining without prompting.
+
+### Viewing the stored choice
+
+The persisted choice is visible in `amux config show` under the `auto_agent_auth_accepted` field (marked read-only — it is managed exclusively by `amux auth`):
+
+```sh
+amux config get auto_agent_auth_accepted
+```
+
+```
+Field: auto_agent_auth_accepted
+  Global:     N/A
+  Repo:       true
+  Effective:  true (read-only)
+```
+
+Attempting to set this field via `amux config set` exits with an error.
+
+---
+
+## `amux download`
+
+```sh
+amux download <asset>
+```
+
+Downloads a static asset from the amux distribution servers into the current repo. Useful for:
+
+- Manually fetching an agent Dockerfile before customizing or building it
+- Refreshing the `aspec/` template folder without re-running `amux init`
+- Auditing the exact Dockerfile template that amux uses for a given agent
+
+### Supported assets
+
+| Asset identifier | Example | Destination |
+|------------------|---------|-------------|
+| `aspec` or `aspec-tarball` | `amux download aspec` | `<git_root>/aspec/` (tarball extracted in-place) |
+| `dockerfile-<agent>` | `amux download dockerfile-claude` | `<git_root>/.amux/Dockerfile.<agent>` |
+
+Valid agent names for Dockerfile download: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, `cline`.
+
+### Examples
+
+```sh
+# Download the Claude agent Dockerfile into .amux/
+amux download dockerfile-claude
+
+# Download the aspec template folder
+amux download aspec
+
+# Download the Codex Dockerfile to inspect it before building
+amux download dockerfile-codex
+```
+
+### Output
+
+```
+downloaded dockerfile-claude -> /home/user/myproject/.amux/Dockerfile.claude (4231 bytes)
+```
+
+```
+downloaded aspec -> /home/user/myproject/aspec (218432 bytes)
+```
+
+### Edge cases
+
+| Situation | Behaviour |
+|-----------|-----------|
+| Network unavailable | Exits with `amux: network error: ...` and exit code 1 |
+| Unknown agent name in `dockerfile-<agent>` | Exits with error listing valid agent names |
+| Destination file already exists | Overwrites silently (Dockerfiles replaced atomically via a temporary file rename) |
+| Run outside a git repo | Exits with `amux: not in a git repository` and exit code 1 |
+
+---
+
 ## Reference: `amux init`
 
 ```sh

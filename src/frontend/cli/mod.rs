@@ -81,8 +81,190 @@ pub(crate) fn format_outcome(outcome: &CommandOutcome) -> Option<String> {
 }
 
 /// Format a [`CommandError`] to the user-visible stderr string.
+///
+/// Each variant gets a friendly message + an optional "next step" hint
+/// where actionable. The "amux: " prefix is always present so user output
+/// is consistent across error types.
 pub(crate) fn format_error(err: &CommandError) -> String {
-    format!("amux: {err}")
+    let body = match err {
+        CommandError::Aborted => "command aborted by user".to_string(),
+        CommandError::UnknownCommand { path } => {
+            format!(
+                "unknown command: {}\n  try `amux --help` for the full command list",
+                path.join(" ")
+            )
+        }
+        CommandError::UnknownFlag { command, flag } => {
+            format!(
+                "unknown flag '--{flag}' for command `{}`\n  try `amux {} --help`",
+                command.join(" "),
+                command.join(" ")
+            )
+        }
+        CommandError::MissingRequiredFlag { command, flag } => {
+            format!(
+                "missing required flag --{flag} for command `{}`",
+                command.join(" ")
+            )
+        }
+        CommandError::MissingRequiredArgument { command, argument } => {
+            format!(
+                "missing required argument {argument} for command `{}`",
+                command.join(" ")
+            )
+        }
+        CommandError::MutuallyExclusive { command, a, b } => {
+            format!(
+                "flags --{a} and --{b} cannot be used together on `{}`",
+                command.join(" ")
+            )
+        }
+        CommandError::InvalidFlagValue { command, flag, reason } => {
+            format!(
+                "invalid value for --{flag} on `{}`: {reason}",
+                command.join(" ")
+            )
+        }
+        CommandError::InvalidArgumentValue {
+            command,
+            argument,
+            reason,
+        } => {
+            format!(
+                "invalid value for {argument} on `{}`: {reason}",
+                command.join(" ")
+            )
+        }
+        CommandError::CommandBoxParse(msg) => format!("could not parse command-box input: {msg}"),
+        CommandError::MergeConflict {
+            branch,
+            worktree_path,
+        } => format!(
+            "merge conflict on branch {branch}; resolve in worktree at {}",
+            worktree_path.display()
+        ),
+        CommandError::MissingRemoteAddress => {
+            "remote target address is missing or invalid; pass --remote-addr or set defaultAddr in config".into()
+        }
+        CommandError::MissingApiKey => {
+            "remote API key is missing; pass --api-key or set defaultAPIKey in config".into()
+        }
+        CommandError::RemoteTimeout => "remote request timed out".into(),
+        CommandError::RemoteConnectionRefused(reason) => {
+            format!("remote connection refused: {reason}")
+        }
+        CommandError::RemoteHttpStatus { status, body } => {
+            format!("remote returned HTTP {status}: {body}")
+        }
+        CommandError::MalformedSseEvent(msg) => format!("malformed SSE event from remote: {msg}"),
+        CommandError::RemoteTransport(msg) => format!("remote transport error: {msg}"),
+        CommandError::HeadlessWorkdirNotFound { path } => {
+            format!("headless workdir not found: {}", path.display())
+        }
+        CommandError::HeadlessAlreadyRunning { pid } => {
+            format!(
+                "headless server is already running on PID {pid}; run `amux headless kill` first"
+            )
+        }
+        CommandError::NotImplemented(msg) => format!("not yet implemented: {msg}"),
+        CommandError::Other(msg) => msg.to_string(),
+        CommandError::WorkItemNotFound { number } => {
+            format!("work item {number} not found in aspec/work-items/")
+        }
+        CommandError::SpecTemplateMissing { path } => {
+            format!(
+                "spec template missing at {}; run `amux init --aspec` to create it",
+                path.display()
+            )
+        }
+        CommandError::InvalidOverlaySpec { spec, reason } => {
+            format!("invalid overlay spec '{spec}': {reason}")
+        }
+        CommandError::UnknownConfigField { name, suggestions } => {
+            format!("unknown config field '{name}'; similar fields: {suggestions}")
+        }
+        CommandError::InteractiveInputUnavailable { prompt } => {
+            format!("stdin is not a TTY; provide --{prompt} on the command line")
+        }
+        CommandError::WorkflowFileNotFound { path } => {
+            format!("workflow file not found: {}", path.display())
+        }
+        CommandError::Engine(e) => match e {
+            crate::engine::error::EngineError::AgentRequiresProjectImage { tag } => format!(
+                "agent image build requires the project base image first ({tag}); run `amux ready --build`"
+            ),
+            crate::engine::error::EngineError::Container(msg) => format!(
+                "container backend error: {msg}\n  amux requires Docker; install Docker Desktop / docker-engine and retry"
+            ),
+            crate::engine::error::EngineError::Network(msg) => {
+                format!("network error: {msg}")
+            }
+            crate::engine::error::EngineError::PlanModeUnsupported { agent } => {
+                format!("plan mode is not supported by agent {agent}")
+            }
+            crate::engine::error::EngineError::ConflictingOptions(msg) => {
+                format!("conflicting container options: {msg}")
+            }
+            crate::engine::error::EngineError::MissingRequiredOption(opt) => {
+                format!("missing required container option: {opt}")
+            }
+            crate::engine::error::EngineError::MergeConflict {
+                branch,
+                worktree_path,
+            } => format!(
+                "merge conflict on branch {branch}; resolve in worktree at {}",
+                worktree_path.display()
+            ),
+            crate::engine::error::EngineError::ContainerRuntimeUnavailable { binary } => {
+                format!(
+                    "container runtime '{binary}' not found on PATH; install Docker and retry"
+                )
+            }
+            crate::engine::error::EngineError::AgentDockerfileDownloadFailed { agent, message } => {
+                format!("failed to download Dockerfile for agent '{agent}': {message}")
+            }
+            crate::engine::error::EngineError::AgentImageBuildFailed { agent, exit_code } => {
+                format!("agent image build failed for agent '{agent}' (exit code {exit_code})")
+            }
+            crate::engine::error::EngineError::ImageBuildExitNonzero { tag, exit_code } => {
+                format!("image build for tag '{tag}' exited with code {exit_code}")
+            }
+            crate::engine::error::EngineError::Data(e) => format!("{e}"),
+            crate::engine::error::EngineError::Io { path, source } => {
+                format!("io error at {}: {source}", path.display())
+            }
+            crate::engine::error::EngineError::Git(msg) => {
+                format!("git operation failed: {msg}")
+            }
+            crate::engine::error::EngineError::OptionNotSupportedByBackend { option, backend } => {
+                format!("container option {option} is not supported by backend {backend}")
+            }
+            crate::engine::error::EngineError::BackendUnsupportedOnPlatform { backend, platform } => {
+                format!("backend {backend} is not supported on platform {platform}")
+            }
+            crate::engine::error::EngineError::InvalidAdvanceAction(msg) => {
+                format!("invalid advance action: {msg}")
+            }
+            crate::engine::error::EngineError::UnsupportedWorkflowSchemaVersion { found, supported } => {
+                format!("workflow state schema version {found} is newer than supported version {supported}")
+            }
+            crate::engine::error::EngineError::WorkflowResumeIncompatible(msg) => {
+                format!("workflow resume incompatible: {msg}")
+            }
+            crate::engine::error::EngineError::Auth(msg) => {
+                format!("auth error: {msg}")
+            }
+            crate::engine::error::EngineError::Config(msg) => {
+                format!("invalid configuration: {msg}")
+            }
+            crate::engine::error::EngineError::NotImplemented(msg) => {
+                format!("not implemented: {msg}")
+            }
+            crate::engine::error::EngineError::Other(msg) => msg.to_string(),
+        },
+        CommandError::Data(e) => format!("{e}"),
+    };
+    format!("amux: {body}")
 }
 
 /// Render a successful [`CommandOutcome`] to stdout and return the
@@ -103,9 +285,18 @@ fn render_error(err: &CommandError) -> ExitCode {
 
 /// Pure mapping from a [`CommandError`] to a process exit code `u8`.
 /// Factored out so the mapping is unit-testable without capturing stderr.
+///
+/// Mapping per `aspec/uxui/cli.md`:
+///   2 — invalid usage / parse / flag conflict
+///   3 — missing Docker / container backend
+///   4 — missing referenced work item
+///   130 — user aborted (Ctrl-C)
+///   1 — every other failure
 pub(crate) fn error_exit_code(err: &CommandError) -> u8 {
     match err {
         CommandError::Aborted => 130,
+
+        // Exit 2 — invalid usage / parse / flag conflict
         CommandError::UnknownCommand { .. }
         | CommandError::UnknownFlag { .. }
         | CommandError::MissingRequiredFlag { .. }
@@ -113,8 +304,35 @@ pub(crate) fn error_exit_code(err: &CommandError) -> u8 {
         | CommandError::MutuallyExclusive { .. }
         | CommandError::InvalidFlagValue { .. }
         | CommandError::InvalidArgumentValue { .. }
-        | CommandError::CommandBoxParse(_) => 2,
-        _ => 1,
+        | CommandError::CommandBoxParse(_)
+        | CommandError::InvalidOverlaySpec { .. }
+        | CommandError::UnknownConfigField { .. }
+        | CommandError::InteractiveInputUnavailable { .. } => 2,
+
+        // Exit 4 — missing referenced resource
+        CommandError::WorkItemNotFound { .. }
+        | CommandError::SpecTemplateMissing { .. }
+        | CommandError::WorkflowFileNotFound { .. }
+        | CommandError::HeadlessWorkdirNotFound { .. } => 4,
+
+        // Exit 3 — missing container runtime
+        CommandError::Engine(crate::engine::error::EngineError::Container(_))
+        | CommandError::Engine(crate::engine::error::EngineError::ContainerRuntimeUnavailable { .. }) => 3,
+
+        // Exit 1 — every other failure (each variant explicit; no catch-all)
+        CommandError::Engine(_) => 1,
+        CommandError::Data(_) => 1,
+        CommandError::MergeConflict { .. } => 1,
+        CommandError::MissingRemoteAddress
+        | CommandError::MissingApiKey
+        | CommandError::RemoteTimeout
+        | CommandError::RemoteConnectionRefused(_)
+        | CommandError::RemoteHttpStatus { .. }
+        | CommandError::MalformedSseEvent(_)
+        | CommandError::RemoteTransport(_) => 1,
+        CommandError::HeadlessAlreadyRunning { .. } => 1,
+        CommandError::NotImplemented(_) => 1,
+        CommandError::Other(_) => 1,
     }
 }
 
@@ -225,6 +443,7 @@ mod tests {
         let outcome = CommandOutcome::Status(StatusOutcome {
             containers: vec![],
             watched: false,
+            tip: "test tip".into(),
         });
         let s = format_outcome(&outcome).expect("status must render text");
         assert!(s.contains("AMUX STATUS DASHBOARD"));

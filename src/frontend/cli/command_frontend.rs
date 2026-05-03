@@ -231,14 +231,145 @@ impl CommandFrontend for CliFrontend {
 // `Chat`, `ExecPrompt`, `ExecWorkflow`, `Headless`) gain method bodies in
 // the per-command modules under `src/frontend/cli/per_command/`.
 
-impl AuthCommandFrontend for CliFrontend {}
+impl AuthCommandFrontend for CliFrontend {
+    fn ask_consent(
+        &mut self,
+        default: bool,
+    ) -> Result<crate::command::commands::auth::AuthConsentChoice, CommandError> {
+        use crate::command::commands::auth::AuthConsentChoice;
+        // TTY-aware: when stdin is not a TTY, use the default. Otherwise
+        // prompt for [y]es / [n]o / [o]nce.
+        if !crate::frontend::cli::output::stdin_is_tty() {
+            return Ok(if default {
+                AuthConsentChoice::Accept
+            } else {
+                AuthConsentChoice::Decline
+            });
+        }
+        let suffix = if default { "[Y/n/o]" } else { "[y/N/o]" };
+        eprintln!("amux: persist agent auth consent for this repo? {suffix}");
+        let mut buf = String::new();
+        if std::io::stdin().read_line(&mut buf).is_err() {
+            return Ok(if default {
+                AuthConsentChoice::Accept
+            } else {
+                AuthConsentChoice::Decline
+            });
+        }
+        Ok(match buf.trim() {
+            "y" | "Y" => AuthConsentChoice::Accept,
+            "n" | "N" => AuthConsentChoice::Decline,
+            "o" | "O" => AuthConsentChoice::Once,
+            _ => {
+                if default {
+                    AuthConsentChoice::Accept
+                } else {
+                    AuthConsentChoice::Decline
+                }
+            }
+        })
+    }
+}
 impl ConfigCommandFrontend for CliFrontend {}
 impl DownloadCommandFrontend for CliFrontend {}
-impl NewCommandFrontend for CliFrontend {}
+impl NewCommandFrontend for CliFrontend {
+    fn ask_workflow_name(&mut self) -> Result<String, CommandError> {
+        require_named_input("workflow name?")
+    }
+    fn ask_skill_name(&mut self) -> Result<String, CommandError> {
+        require_named_input("skill name?")
+    }
+    fn ask_skill_body(&mut self) -> Result<String, CommandError> {
+        // Body may be empty, but the read itself must succeed; non-TTY must
+        // surface the structured "no input available" error rather than block
+        // or invent text.
+        require_optional_input("skill body (one line)?")
+    }
+}
 impl RemoteCommandFrontend for CliFrontend {}
-impl SpecsCommandFrontend for CliFrontend {}
+impl SpecsCommandFrontend for CliFrontend {
+    fn ask_spec_title(&mut self) -> Result<String, CommandError> {
+        require_named_input("spec title?")
+    }
+    fn ask_spec_summary(&mut self) -> Result<String, CommandError> {
+        require_optional_input("spec summary (one line)?")
+    }
+}
+
+/// Read a non-empty line from stdin, or surface
+/// `CommandError::InteractiveInputUnavailable` when stdin is not a TTY (or
+/// the user submitted an empty value). Used for prompts where there is no
+/// safe default — callers expect *something* to come back.
+fn require_named_input(prompt: &str) -> Result<String, CommandError> {
+    match super::per_command::helpers::read_line(prompt) {
+        Some(s) if !s.is_empty() => Ok(s),
+        _ => Err(CommandError::InteractiveInputUnavailable {
+            prompt: prompt.to_string(),
+        }),
+    }
+}
+
+/// Read a (possibly empty) line from stdin, but require a TTY so callers that
+/// expect a real answer don't silently get `""` from a piped invocation.
+fn require_optional_input(prompt: &str) -> Result<String, CommandError> {
+    match super::per_command::helpers::read_line(prompt) {
+        Some(s) => Ok(s),
+        None => Err(CommandError::InteractiveInputUnavailable {
+            prompt: prompt.to_string(),
+        }),
+    }
+}
 impl HeadlessCommandFrontend for CliFrontend {}
-impl StatusCommandFrontend for CliFrontend {}
+
+impl StatusCommandFrontend for CliFrontend {
+    /// Watch loop continues until the user presses Ctrl+C.
+    ///
+    /// First invocation spawns a tokio task that awaits a SIGINT and flips a
+    /// process-global atomic; subsequent invocations only read the flag, so
+    /// the loop exits cleanly on the next tick.
+    fn should_continue_watching(&mut self) -> bool {
+        use std::sync::atomic::Ordering;
+        ensure_watch_signal_handler_installed();
+        !WATCH_INTERRUPTED.load(Ordering::Relaxed)
+    }
+
+    /// Clear the screen between watch ticks (ANSI clear + cursor home).
+    fn write_clear_marker(&mut self) {
+        use std::io::Write;
+        let _ = write!(std::io::stdout(), "\x1b[2J\x1b[H");
+        let _ = std::io::stdout().flush();
+    }
+}
+
+// ─── Watch-loop Ctrl+C handler ───────────────────────────────────────────────
+
+/// Process-global flag flipped to `true` when SIGINT arrives. Only consulted
+/// by `StatusCommandFrontend::should_continue_watching` for the CLI; other
+/// frontends manage their own interrupt semantics.
+static WATCH_INTERRUPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the SIGINT-watcher task has been spawned yet (it must be spawned
+/// inside an async runtime, and we only want one instance).
+static WATCH_HANDLER_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Install a tokio task that awaits Ctrl+C and flips `WATCH_INTERRUPTED`.
+/// Idempotent — safe to call on every tick.
+fn ensure_watch_signal_handler_installed() {
+    use std::sync::atomic::Ordering;
+    if WATCH_HANDLER_INSTALLED
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        // Spawn only succeeds when called inside a tokio runtime, which is
+        // always the case at this point (the StatusCommand body is async).
+        tokio::spawn(async {
+            let _ = tokio::signal::ctrl_c().await;
+            WATCH_INTERRUPTED.store(true, Ordering::SeqCst);
+        });
+    }
+}
 
 // `HeadlessStartCommandFrontend` requires a `serve_until_shutdown` method
 // — provided in `per_command::headless`.

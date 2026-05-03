@@ -80,6 +80,98 @@ impl ContainerRuntime {
         self.backend.list_running(session)
     }
 
+    /// Shell out to the underlying CLI to build a container image. Streams
+    /// stdout+stderr line-by-line through `on_line`. Returns an error when the
+    /// build fails.
+    pub fn build_image(
+        &self,
+        tag: &str,
+        dockerfile: &std::path::Path,
+        context: &std::path::Path,
+        no_cache: bool,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<(), EngineError> {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        let cli = self.backend.name();
+        // Both "docker" and "container" share the same `build` argv shape.
+        let cli_bin = match cli {
+            "apple-containers" => "container",
+            _ => "docker",
+        };
+        let mut args: Vec<String> = vec!["build".into()];
+        if no_cache {
+            args.push("--no-cache".into());
+        }
+        args.extend([
+            "-t".into(),
+            tag.to_string(),
+            "-f".into(),
+            dockerfile.display().to_string(),
+            context.display().to_string(),
+        ]);
+        let mut child = Command::new(cli_bin)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| EngineError::Container(format!("spawn {cli_bin} build: {e}")))?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        // Combine stdout + stderr into a single sequenced stream by spawning two
+        // threads that funnel into a channel.
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let tx_out = tx.clone();
+        let stdout_handle = std::thread::spawn(move || {
+            if let Some(out) = stdout {
+                let r = BufReader::new(out);
+                for line in r.lines().map_while(Result::ok) {
+                    let _ = tx_out.send(line);
+                }
+            }
+        });
+        let stderr_handle = std::thread::spawn(move || {
+            if let Some(err) = stderr {
+                let r = BufReader::new(err);
+                for line in r.lines().map_while(Result::ok) {
+                    let _ = tx.send(line);
+                }
+            }
+        });
+        for line in rx {
+            on_line(&line);
+        }
+        let _ = stdout_handle.join();
+        let _ = stderr_handle.join();
+        let status = child
+            .wait()
+            .map_err(|e| EngineError::Container(format!("wait {cli_bin} build: {e}")))?;
+        if !status.success() {
+            return Err(EngineError::ImageBuildExitNonzero {
+                tag: tag.to_string(),
+                exit_code: status.code().unwrap_or(-1),
+            });
+        }
+        Ok(())
+    }
+
+    /// Best-effort check whether an image tag exists locally on the runtime.
+    pub fn image_exists(&self, tag: &str) -> bool {
+        use std::process::{Command, Stdio};
+        let cli_bin = match self.backend.name() {
+            "apple-containers" => "container",
+            _ => "docker",
+        };
+        Command::new(cli_bin)
+            .args(["image", "inspect", tag])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
     pub fn stats(&self, handle: &ContainerHandle) -> Result<ContainerStats, EngineError> {
         self.backend.stats(handle)
     }

@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::data::session::{AgentName, Session};
+use crate::engine::agent::AgentEngine;
 use crate::engine::container::ContainerRuntime;
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
@@ -30,6 +31,7 @@ pub struct InitEngine {
     git_engine: Arc<GitEngine>,
     overlay_engine: Arc<OverlayEngine>,
     container_runtime: Arc<ContainerRuntime>,
+    agent_engine: Arc<AgentEngine>,
     options: InitEngineOptions,
     phase: InitPhase,
     summary: InitSummary,
@@ -41,6 +43,7 @@ impl InitEngine {
         git_engine: Arc<GitEngine>,
         overlay_engine: Arc<OverlayEngine>,
         container_runtime: Arc<ContainerRuntime>,
+        agent_engine: Arc<AgentEngine>,
         options: InitEngineOptions,
     ) -> Self {
         Self {
@@ -48,6 +51,7 @@ impl InitEngine {
             git_engine,
             overlay_engine,
             container_runtime,
+            agent_engine,
             options,
             phase: InitPhase::Preflight,
             summary: InitSummary::default(),
@@ -66,9 +70,20 @@ impl InitEngine {
         &mut self,
         frontend: &mut dyn InitFrontend,
     ) -> Result<InitPhase, EngineError> {
+        use crate::data::config::repo::RepoConfig;
+        use crate::data::image_tags::project_image_tag;
+        use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
+        use crate::data::templates;
+
         frontend.report_phase(&self.phase);
+        let git_root = self.options.git_root.clone();
+
         let next = match &self.phase {
-            InitPhase::Preflight => InitPhase::AwaitingAspecDecision,
+            InitPhase::Preflight => {
+                let _ = self.git_engine;
+                let _ = self.overlay_engine;
+                InitPhase::AwaitingAspecDecision
+            }
             InitPhase::AwaitingAspecDecision => {
                 if frontend.ask_replace_aspec()? {
                     InitPhase::CreatingAspecFolder
@@ -78,14 +93,65 @@ impl InitEngine {
                 }
             }
             InitPhase::CreatingAspecFolder => {
+                let aspec_dir = git_root.join("aspec");
+                let mut downloaded = false;
+                if self.options.run_aspec_setup {
+                    match crate::data::network::download_aspec_tarball().await {
+                        Ok(bytes) => {
+                            match crate::data::network::extract_aspec_tarball(&bytes, &aspec_dir) {
+                                Ok(()) => downloaded = true,
+                                Err(e) => {
+                                    frontend.write_message(crate::engine::message::UserMessage {
+                                        level: crate::engine::message::MessageLevel::Warning,
+                                        text: format!("aspec download failed: {e}; using empty aspec directory"),
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            frontend.write_message(crate::engine::message::UserMessage {
+                                level: crate::engine::message::MessageLevel::Warning,
+                                text: format!("aspec download failed: {e}; using empty aspec directory"),
+                            });
+                        }
+                    }
+                }
+                if !downloaded {
+                    // Fall back to creating an empty aspec dir so subsequent
+                    // engines can write into it.
+                    if !aspec_dir.exists() {
+                        std::fs::create_dir_all(&aspec_dir)
+                            .map_err(|e| EngineError::io(aspec_dir.clone(), e))?;
+                    }
+                }
                 self.summary.aspec_folder = StepStatus::Done;
                 InitPhase::SettingUpDockerfile
             }
             InitPhase::SettingUpDockerfile => {
+                let paths = RepoDockerfilePaths::new(&git_root);
+                let dockerfile_path = paths.project_dockerfile();
+                if !dockerfile_path.exists() {
+                    std::fs::write(&dockerfile_path, templates::project_dockerfile_dev())
+                        .map_err(|e| EngineError::io(dockerfile_path.clone(), e))?;
+                }
                 self.summary.dockerfile = StepStatus::Done;
                 InitPhase::WritingConfig
             }
             InitPhase::WritingConfig => {
+                let config_path = RepoConfig::path(&git_root);
+                if !config_path.exists() {
+                    let cfg = RepoConfig {
+                        agent: Some(self.options.agent.as_str().to_string()),
+                        ..Default::default()
+                    };
+                    cfg.save(&git_root)?;
+                } else {
+                    frontend.write_message(crate::engine::message::UserMessage {
+                        level: crate::engine::message::MessageLevel::Info,
+                        text: "aspec/.amux.json already present — preserving existing config."
+                            .to_string(),
+                    });
+                }
                 self.summary.config = StepStatus::Done;
                 InitPhase::AwaitingAuditDecision
             }
@@ -99,18 +165,117 @@ impl InitEngine {
                 }
             }
             InitPhase::BuildingImage => {
-                let _ = frontend.container_frontend();
-                self.summary.image_build = StepStatus::Done;
-                InitPhase::RunningAudit
+                let paths = RepoDockerfilePaths::new(&git_root);
+                let dockerfile_path = paths.project_dockerfile();
+                let tag = project_image_tag(&git_root);
+                frontend.report_step_status("Build base image", StepStatus::Running);
+                let mut sink = |line: &str| {
+                    frontend.report_step_status(line, StepStatus::Running);
+                };
+                let result = self.container_runtime.build_image(
+                    &tag,
+                    &dockerfile_path,
+                    &git_root,
+                    false,
+                    &mut sink,
+                );
+                match result {
+                    Ok(()) => {
+                        self.summary.image_build = StepStatus::Done;
+                        frontend.report_step_status("Build base image", StepStatus::Done);
+                        InitPhase::RunningAudit
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        self.summary.image_build = StepStatus::Failed(msg.clone());
+                        frontend
+                            .report_step_status("Build base image", StepStatus::Failed(msg.clone()));
+                        // Skip audit; nothing to audit without a base image.
+                        self.summary.audit = StepStatus::Skipped;
+                        InitPhase::AwaitingWorkItemsDecision
+                    }
+                }
             }
             InitPhase::RunningAudit => {
-                let _ = frontend.container_frontend();
-                self.summary.audit = StepStatus::Done;
+                use crate::data::templates::init_audit_prompt;
+                use crate::engine::agent::AgentRunOptions;
+
+                // Route through `AgentEngine::build_options` so overlays,
+                // agent settings, env passthrough, and the standard /workspace
+                // working dir all apply — matching `ReadyEngine::RunningAudit`.
+                let run_opts = AgentRunOptions {
+                    yolo: None,
+                    auto: None,
+                    plan: None,
+                    allowed_tools: vec![],
+                    disallowed_tools: vec![],
+                    initial_prompt: Some(init_audit_prompt().to_string()),
+                    allow_docker: false,
+                    mount_ssh: false,
+                    non_interactive: true,
+                    model: None,
+                    env_passthrough: None,
+                    directory_overlays: vec![],
+                };
+                match self
+                    .agent_engine
+                    .build_options(&self.session, &self.options.agent, &run_opts)
+                {
+                    Err(e) => {
+                        // Unknown agent or option-build failure — skip audit
+                        // gracefully (init flow continues).
+                        self.summary.audit = StepStatus::Skipped;
+                        frontend.write_message(crate::engine::message::UserMessage {
+                            level: crate::engine::message::MessageLevel::Warning,
+                            text: format!("skipping audit: {e}"),
+                        });
+                    }
+                    Ok(options) => {
+                        match self.container_runtime.build(options) {
+                            Err(e) => {
+                                self.summary.audit = StepStatus::Skipped;
+                                frontend.write_message(crate::engine::message::UserMessage {
+                                    level: crate::engine::message::MessageLevel::Warning,
+                                    text: format!("skipping audit: {e}"),
+                                });
+                            }
+                            Ok(instance) => {
+                                let container_fe = frontend.container_frontend();
+                                match instance.run_with_frontend(container_fe) {
+                                    Err(e) => {
+                                        self.summary.audit = StepStatus::Skipped;
+                                        frontend.write_message(crate::engine::message::UserMessage {
+                                            level: crate::engine::message::MessageLevel::Warning,
+                                            text: format!("skipping audit: {e}"),
+                                        });
+                                    }
+                                    Ok(mut exec) => match exec.wait().await {
+                                        Err(e) => {
+                                            self.summary.audit = StepStatus::Failed(e.to_string());
+                                        }
+                                        Ok(exit) => {
+                                            if exit.exit_code == 0 {
+                                                self.summary.audit = StepStatus::Done;
+                                            } else {
+                                                self.summary.audit = StepStatus::Failed(
+                                                    format!("audit exited with code {}", exit.exit_code),
+                                                );
+                                            }
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
                 InitPhase::AwaitingWorkItemsDecision
             }
             InitPhase::AwaitingWorkItemsDecision => {
                 let cfg = frontend.ask_work_items_setup()?;
-                if cfg.is_some() {
+                if let Some(work_items) = cfg {
+                    let mut repo_cfg = RepoConfig::load(&git_root)?;
+                    repo_cfg.set_work_items_config(Some(work_items));
+                    repo_cfg.save(&git_root)?;
                     InitPhase::WritingWorkItemsConfig
                 } else {
                     self.summary.work_items_setup = StepStatus::Skipped;
@@ -144,8 +309,6 @@ impl InitEngine {
     }
 }
 
-#[allow(dead_code)]
-fn _suppress(_: &Session, _: &Arc<GitEngine>, _: &Arc<OverlayEngine>, _: &Arc<ContainerRuntime>) {}
 
 #[cfg(test)]
 mod tests {
@@ -241,12 +404,23 @@ mod tests {
             crate::data::fs::auth_paths::AuthPathResolver::at_home(git_root),
         ));
         let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
+        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+            Arc::clone(&overlay),
+            Arc::clone(&runtime),
+        ));
         let options = InitEngineOptions {
             agent: AgentName::new("claude").unwrap(),
             run_aspec_setup: true,
             git_root: git_root.to_path_buf(),
         };
-        InitEngine::new(session, Arc::new(GitEngine::new()), overlay, runtime, options)
+        InitEngine::new(
+            session,
+            Arc::new(GitEngine::new()),
+            overlay,
+            runtime,
+            agent_engine,
+            options,
+        )
     }
 
     // ── Tests ────────────────────────────────────────────────────────────────
@@ -258,11 +432,22 @@ mod tests {
         let mut frontend = FakeInitFrontend::all_yes();
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
         assert_eq!(engine.phase(), &InitPhase::Complete);
+        // The aspec download will fail with no network and fall back to the
+        // bundled aspec dir; structurally it lands at Done.
         assert!(matches!(summary.aspec_folder, StepStatus::Done));
         assert!(matches!(summary.dockerfile, StepStatus::Done));
         assert!(matches!(summary.config, StepStatus::Done));
-        assert!(matches!(summary.audit, StepStatus::Done));
-        assert!(matches!(summary.image_build, StepStatus::Done));
+        // image_build may be Done, Skipped, or Failed depending on whether
+        // docker is available in the test environment.
+        assert!(matches!(
+            summary.image_build,
+            StepStatus::Done | StepStatus::Skipped | StepStatus::Failed(_)
+        ));
+        // The audit only runs when image_build succeeds.
+        assert!(matches!(
+            summary.audit,
+            StepStatus::Done | StepStatus::Skipped
+        ));
         assert!(matches!(summary.work_items_setup, StepStatus::Done));
     }
 
@@ -316,5 +501,73 @@ mod tests {
         assert_eq!(engine.phase(), &InitPhase::CreatingAspecFolder);
         engine.step(&mut frontend).await.unwrap();
         assert_eq!(engine.phase(), &InitPhase::SettingUpDockerfile);
+    }
+
+    #[tokio::test]
+    async fn writing_config_creates_config_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_engine(tmp.path());
+        let mut frontend = FakeInitFrontend {
+            replace_aspec: true,
+            run_audit: false,
+            work_items_config: None,
+            phases: Vec::new(),
+        };
+        let summary = engine.run_to_completion(&mut frontend).await.unwrap();
+        assert!(matches!(summary.config, StepStatus::Done));
+        // Config file must exist after WritingConfig phase.
+        let config_path = crate::data::config::repo::RepoConfig::path(tmp.path());
+        assert!(
+            config_path.exists(),
+            "WritingConfig phase must create the repo config file"
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_config_is_idempotent() {
+        // Running init twice on the same repo must not corrupt the config.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut frontend = FakeInitFrontend {
+            replace_aspec: false,
+            run_audit: false,
+            work_items_config: None,
+            phases: Vec::new(),
+        };
+        // First run.
+        let mut engine = make_engine(tmp.path());
+        engine.run_to_completion(&mut frontend).await.unwrap();
+        // Second run.
+        let mut engine2 = make_engine(tmp.path());
+        let summary2 = engine2.run_to_completion(&mut frontend).await.unwrap();
+        assert_eq!(engine2.phase(), &InitPhase::Complete);
+        assert!(matches!(summary2.config, StepStatus::Done));
+    }
+
+    #[tokio::test]
+    async fn writing_work_items_config_persists_when_some() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_engine(tmp.path());
+        let wi_cfg = crate::data::config::repo::WorkItemsConfig {
+            dir: Some("my-work-items".to_string()),
+            template: None,
+        };
+        let mut frontend = FakeInitFrontend {
+            replace_aspec: true,
+            run_audit: false,
+            work_items_config: Some(wi_cfg),
+            phases: Vec::new(),
+        };
+        let summary = engine.run_to_completion(&mut frontend).await.unwrap();
+        assert!(matches!(summary.work_items_setup, StepStatus::Done));
+        // Load the saved config and confirm work_items was persisted.
+        let saved = crate::data::config::repo::RepoConfig::load(tmp.path()).unwrap_or_default();
+        assert!(
+            saved.work_items.is_some(),
+            "work_items config must be persisted when user accepts"
+        );
+        assert_eq!(
+            saved.work_items.as_ref().and_then(|w| w.dir.as_deref()),
+            Some("my-work-items")
+        );
     }
 }

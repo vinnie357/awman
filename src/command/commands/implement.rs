@@ -16,6 +16,7 @@ use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::exec_workflow::WorkflowSummary;
 use crate::command::commands::implement_prompts::render_default_prompt;
 use crate::command::commands::mount_scope::MountScopeFrontend;
+use crate::command::commands::parse_overlay_spec;
 use crate::command::commands::worktree_lifecycle::{WorktreeLifecycle, WorktreeLifecycleFrontend};
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
@@ -171,8 +172,28 @@ impl ContainerFrontend for ImplementContainerFrontendProxy {
         self.0.lock().unwrap().write_stderr(bytes)
     }
     async fn read_stdin(&mut self, buf: &mut [u8]) -> Result<usize, EngineError> {
-        let _ = buf;
-        Err(EngineError::NotImplemented("ImplementContainerFrontendProxy::read_stdin"))
+        // Inherit-stdio mode owns the host TTY directly during the container
+        // run; this proxy is only consulted when the backend explicitly pipes
+        // stdin through us. Read from the host's stdin via spawn_blocking so
+        // we don't block the async runtime.
+        let len = buf.len();
+        let bytes = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut local = vec![0u8; len];
+            match std::io::stdin().read(&mut local) {
+                Ok(n) => {
+                    local.truncate(n);
+                    Ok::<Vec<u8>, std::io::Error>(local)
+                }
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .map_err(|e| EngineError::Container(format!("stdin task: {e}")))?
+        .map_err(|e| EngineError::Container(format!("read stdin: {e}")))?;
+        let n = bytes.len().min(buf.len());
+        buf[..n].copy_from_slice(&bytes[..n]);
+        Ok(n)
     }
     fn report_status(
         &mut self,
@@ -197,6 +218,7 @@ struct ImplementCommandLayerFactory {
     shared: Arc<Mutex<Box<dyn ImplementCommandFrontend>>>,
     engines: Engines,
     flags: Arc<ImplementCommandFlags>,
+    directory_overlays: Vec<crate::engine::overlay::DirectorySpec>,
 }
 
 impl ContainerExecutionFactory for ImplementCommandLayerFactory {
@@ -218,7 +240,7 @@ impl ContainerExecutionFactory for ImplementCommandLayerFactory {
             non_interactive: self.flags.non_interactive,
             model: runtime.step_model.clone(),
             env_passthrough: None,
-            directory_overlays: vec![],
+            directory_overlays: self.directory_overlays.clone(),
         };
         let options = self
             .engines
@@ -234,6 +256,16 @@ impl ContainerExecutionFactory for ImplementCommandLayerFactory {
         _execution: &crate::engine::container::instance::ContainerExecution,
         _prompt: &str,
     ) -> Result<Option<()>, EngineError> {
+        // Documented contract per `ContainerExecutionFactory::inject_prompt`:
+        // returning `Ok(None)` tells the workflow engine that this backend
+        // doesn't support mid-session stdin re-injection, and the engine then
+        // spins up a fresh container for the next step.
+        //
+        // `AgentMatrix::supports_stdin_injection` is `false` for every shipped
+        // agent — none have been verified to keep state when re-prompted on
+        // an existing stdin. Once an agent is verified to support this, flip
+        // the matrix bit and wire `ContainerExecution::write_stdin` (currently
+        // not exposed by Layer 1) on the same change.
         Ok(None)
     }
 }
@@ -294,6 +326,19 @@ impl Command for ImplementCommand {
             None
         };
 
+        // Parse overlay specs before any async work so errors surface early.
+        let directory_overlays = self
+            .flags
+            .overlay
+            .iter()
+            .map(|s| {
+                parse_overlay_spec(s).map_err(|reason| CommandError::InvalidOverlaySpec {
+                    spec: s.clone(),
+                    reason,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         frontend.set_pty_active(true);
 
         let shared: Arc<Mutex<Box<dyn ImplementCommandFrontend>>> =
@@ -311,12 +356,13 @@ impl Command for ImplementCommand {
         )
         .map_err(|e| CommandError::Other(format!("opening session: {e}")))?;
 
-        let engine_result = {
+        let (engine_result, step_counts) = {
             let proxy = ImplementWorkflowProxy(Arc::clone(&shared));
             let factory = ImplementCommandLayerFactory {
                 shared: Arc::clone(&shared),
                 engines: self.engines.clone(),
                 flags: Arc::clone(&flags_arc),
+                directory_overlays,
             };
             let mut engine = WorkflowEngine::new(
                 &session,
@@ -327,7 +373,18 @@ impl Command for ImplementCommand {
                 Arc::clone(&self.engines.overlay_engine),
             )
             .map_err(CommandError::from)?;
-            engine.run_to_completion().await
+            let result = engine.run_to_completion().await;
+            let mut completed = 0usize;
+            let mut failed = 0usize;
+            for state in engine.state().step_states.values() {
+                match state {
+                    crate::data::workflow_state::StepState::Succeeded
+                    | crate::data::workflow_state::StepState::Skipped => completed += 1,
+                    crate::data::workflow_state::StepState::Failed { .. } => failed += 1,
+                    _ => {}
+                }
+            }
+            (result, (completed, failed))
         };
 
         // Reclaim exclusive frontend ownership.
@@ -348,8 +405,8 @@ impl Command for ImplementCommand {
             _ => None,
         };
         frontend.report_implement_summary(&WorkflowSummary {
-            steps_completed: 0,
-            steps_failed: if had_error { 1 } else { 0 },
+            steps_completed: step_counts.0,
+            steps_failed: step_counts.1.max(if had_error { 1 } else { 0 }),
         });
 
         if let Some(lifecycle) = worktree_lifecycle {

@@ -3,7 +3,9 @@
 
 use crate::command::error::CommandError;
 use crate::data::session::AgentName;
-use crate::engine::message::UserMessageSink;
+use crate::engine::container::frontend::ContainerFrontend;
+use crate::engine::message::{UserMessage, UserMessageSink};
+use crate::engine::step_status::StepStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentSetupDecision {
@@ -22,4 +24,59 @@ pub trait AgentSetupFrontend: UserMessageSink + Send + Sync {
     ) -> Result<AgentSetupDecision, CommandError>;
 
     fn record_fallback(&mut self, requested: &AgentName, fallback: &AgentName);
+}
+
+/// Marker trait implemented by every per-command frontend that needs to
+/// hand a `ContainerFrontend` down to Layer-1 engines. Lets the
+/// `AgentFrontendAdapter` below stay generic without each per-command frontend
+/// trait having to be its own bound.
+pub trait HasContainerFrontend: UserMessageSink + Send {
+    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
+}
+
+/// Adapter that wraps any per-command frontend implementing
+/// [`HasContainerFrontend`] and exposes the engine's `AgentFrontend` trait.
+/// Used by `chat`, `exec prompt`, etc. to call `AgentEngine::ensure_available`
+/// without each per-command frontend trait having to implement
+/// `report_step_status` itself.
+pub struct AgentFrontendAdapter<'a, F: ?Sized + HasContainerFrontend> {
+    inner: &'a mut F,
+}
+
+impl<'a, F: ?Sized + HasContainerFrontend> AgentFrontendAdapter<'a, F> {
+    pub fn new(inner: &'a mut F) -> Self {
+        Self { inner }
+    }
+}
+
+impl<F: ?Sized + HasContainerFrontend> UserMessageSink for AgentFrontendAdapter<'_, F> {
+    fn write_message(&mut self, msg: UserMessage) {
+        self.inner.write_message(msg);
+    }
+    fn replay_queued(&mut self) {
+        self.inner.replay_queued();
+    }
+}
+
+impl<F: ?Sized + HasContainerFrontend> crate::engine::agent::AgentFrontend
+    for AgentFrontendAdapter<'_, F>
+{
+    fn report_step_status(&mut self, step: &str, status: StepStatus) {
+        let level = match &status {
+            StepStatus::Failed(_) => crate::engine::message::MessageLevel::Error,
+            _ => crate::engine::message::MessageLevel::Info,
+        };
+        let text = match status {
+            StepStatus::Failed(msg) => format!("{step}: failed — {msg}"),
+            StepStatus::Done => format!("{step}: done"),
+            StepStatus::Running => format!("{step}: running"),
+            StepStatus::Skipped => format!("{step}: skipped"),
+            StepStatus::Pending => format!("{step}: pending"),
+        };
+        self.inner.write_message(UserMessage { level, text });
+    }
+
+    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+        self.inner.container_frontend()
+    }
 }

@@ -17,6 +17,8 @@ pub struct StatusCommandFlags {
 pub struct StatusOutcome {
     pub containers: Vec<StatusContainerRow>,
     pub watched: bool,
+    /// A randomly-selected hint for the user, refreshed each tick.
+    pub tip: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -28,6 +30,12 @@ pub struct StatusContainerRow {
     pub tab_number: Option<u32>,
     pub stuck: bool,
     pub command_label: Option<String>,
+    /// Live CPU percent reported by the runtime. `None` when stats lookup
+    /// failed for this container (transient errors are not fatal — the row
+    /// still renders).
+    pub cpu_percent: Option<f64>,
+    /// Live memory usage in MB.
+    pub memory_mb: Option<f64>,
 }
 
 /// Optional context supplied by the TUI; CLI / headless leave this `None`.
@@ -54,6 +62,10 @@ pub trait StatusCommandFrontend: UserMessageSink + Send + Sync {
     fn should_continue_watching(&mut self) -> bool {
         false
     }
+
+    /// Emit a clear-screen marker so the CLI can redraw the status table in
+    /// place. No-op for TUI / headless frontends.
+    fn write_clear_marker(&mut self) {}
 }
 
 pub struct StatusCommand {
@@ -81,42 +93,68 @@ impl Command for StatusCommand {
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
         let session = open_session()?;
-        let handles = self
-            .engines
-            .runtime
-            .list_running(&session)
-            .map_err(CommandError::from)?;
-        let context = frontend.tui_context().cloned();
-        let containers = handles
-            .into_iter()
-            .map(|h| {
-                let mut row = StatusContainerRow {
-                    id: h.id.clone(),
-                    name: h.name.clone(),
-                    image: h.image_tag.clone(),
-                    started_at: h.started_at.to_rfc3339(),
-                    tab_number: None,
-                    stuck: false,
-                    command_label: None,
-                };
-                if let Some(ctx) = context.as_ref() {
-                    if let Some(t) = ctx
-                        .tabs
-                        .iter()
-                        .find(|t| t.container_name.as_deref() == Some(&h.name))
-                    {
-                        row.tab_number = Some(t.tab_number);
-                        row.stuck = t.is_stuck;
-                        row.command_label = Some(t.command_label.clone());
+        let mut last_containers: Vec<StatusContainerRow>;
+        let mut tick: u32 = 0;
+
+        loop {
+            let handles = self
+                .engines
+                .runtime
+                .list_running(&session)
+                .map_err(CommandError::from)?;
+            let context = frontend.tui_context().cloned();
+            let containers: Vec<StatusContainerRow> = handles
+                .into_iter()
+                .map(|h| {
+                    // Best-effort live stats; transient runtime errors are
+                    // recorded as `None` rather than failing the row.
+                    let stats = self.engines.runtime.stats(&h).ok();
+                    let mut row = StatusContainerRow {
+                        id: h.id.clone(),
+                        name: h.name.clone(),
+                        image: h.image_tag.clone(),
+                        started_at: h.started_at.to_rfc3339(),
+                        tab_number: None,
+                        stuck: false,
+                        command_label: None,
+                        cpu_percent: stats.as_ref().map(|s| s.cpu_percent),
+                        memory_mb: stats.as_ref().map(|s| s.memory_mb),
+                    };
+                    if let Some(ctx) = context.as_ref() {
+                        if let Some(t) = ctx
+                            .tabs
+                            .iter()
+                            .find(|t| t.container_name.as_deref() == Some(&h.name))
+                        {
+                            row.tab_number = Some(t.tab_number);
+                            row.stuck = t.is_stuck;
+                            row.command_label = Some(t.command_label.clone());
+                        }
                     }
-                }
-                row
-            })
-            .collect();
+                    row
+                })
+                .collect();
+
+            // Only emit the clear-screen marker on watch ticks 2+ (the first
+            // paint should not blow away whatever the user had above).
+            if self.flags.watch && tick > 0 {
+                frontend.write_clear_marker();
+            }
+            tick = tick.saturating_add(1);
+            last_containers = containers;
+
+            if !self.flags.watch || !frontend.should_continue_watching() {
+                break;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+
         frontend.replay_queued();
         Ok(StatusOutcome {
-            containers,
+            containers: last_containers,
             watched: self.flags.watch,
+            tip: crate::command::commands::status_tips::select_random_tip().to_string(),
         })
     }
 }
@@ -137,4 +175,110 @@ fn open_session() -> Result<crate::data::session::Session, CommandError> {
         crate::data::session::SessionOpenOptions::default(),
     )
     .map_err(CommandError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tui_context_new_stores_tabs() {
+        let tabs = vec![
+            TuiTabSnapshot {
+                tab_number: 1,
+                container_name: Some("amux-abc".into()),
+                is_stuck: false,
+                command_label: "chat".into(),
+            },
+            TuiTabSnapshot {
+                tab_number: 2,
+                container_name: None,
+                is_stuck: true,
+                command_label: "implement".into(),
+            },
+        ];
+        let ctx = StatusCommandTuiContext::new(tabs.clone());
+        assert_eq!(ctx.tabs.len(), 2);
+        assert_eq!(ctx.tabs[0].tab_number, 1);
+        assert_eq!(ctx.tabs[1].tab_number, 2);
+    }
+
+    #[test]
+    fn tui_context_enriches_row_with_matching_tab() {
+        // Simulate the enrichment logic from run_with_frontend by building
+        // a row and applying the TUI context logic directly.
+        let ctx = StatusCommandTuiContext::new(vec![
+            TuiTabSnapshot {
+                tab_number: 3,
+                container_name: Some("amux-mycontainer".into()),
+                is_stuck: true,
+                command_label: "implement 0042".into(),
+            },
+        ]);
+        let name = "amux-mycontainer".to_string();
+        let mut row = StatusContainerRow {
+            id: "deadbeef1234".into(),
+            name: name.clone(),
+            image: "amux/dev:latest".into(),
+            started_at: "2025-01-01T00:00:00Z".into(),
+            tab_number: None,
+            stuck: false,
+            command_label: None, cpu_percent: None, memory_mb: None,
+        };
+        // Apply the same matching logic used in run_with_frontend.
+        if let Some(t) = ctx.tabs.iter().find(|t| t.container_name.as_deref() == Some(&row.name)) {
+            row.tab_number = Some(t.tab_number);
+            row.stuck = t.is_stuck;
+            row.command_label = Some(t.command_label.clone());
+        }
+        assert_eq!(row.tab_number, Some(3));
+        assert!(row.stuck);
+        assert_eq!(row.command_label.as_deref(), Some("implement 0042"));
+    }
+
+    #[test]
+    fn no_tui_context_leaves_row_fields_none() {
+        // When no TUI context is supplied, tab_number, stuck, and
+        // command_label stay at their default values.
+        let row = StatusContainerRow {
+            id: "abc".into(),
+            name: "amux-x".into(),
+            image: "img".into(),
+            started_at: "2025-01-01T00:00:00Z".into(),
+            tab_number: None,
+            stuck: false,
+            command_label: None, cpu_percent: None, memory_mb: None,
+        };
+        assert_eq!(row.tab_number, None);
+        assert!(!row.stuck);
+        assert_eq!(row.command_label, None);
+    }
+
+    #[test]
+    fn tui_context_no_match_leaves_row_unchanged() {
+        let ctx = StatusCommandTuiContext::new(vec![
+            TuiTabSnapshot {
+                tab_number: 1,
+                container_name: Some("amux-other".into()),
+                is_stuck: false,
+                command_label: "chat".into(),
+            },
+        ]);
+        let mut row = StatusContainerRow {
+            id: "abc".into(),
+            name: "amux-mine".into(),
+            image: "img".into(),
+            started_at: "2025-01-01T00:00:00Z".into(),
+            tab_number: None,
+            stuck: false,
+            command_label: None, cpu_percent: None, memory_mb: None,
+        };
+        // The name doesn't match → row stays unchanged.
+        if let Some(t) = ctx.tabs.iter().find(|t| t.container_name.as_deref() == Some(&row.name)) {
+            row.tab_number = Some(t.tab_number);
+            row.stuck = t.is_stuck;
+            row.command_label = Some(t.command_label.clone());
+        }
+        assert_eq!(row.tab_number, None, "no match must leave tab_number None");
+    }
 }

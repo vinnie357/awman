@@ -50,6 +50,20 @@ impl ClawsFrontend for CliFrontend {
         Box::new(super::container_frontend_marker::CliContainerProxy)
     }
 
+    fn confirm_sudo_actions(&mut self, commands: &[String]) -> Result<bool, EngineError> {
+        if commands.is_empty() {
+            return Ok(true);
+        }
+        let mut prompt = String::from(
+            "amux needs to run the following sudo commands to fix permissions:\n",
+        );
+        for c in commands {
+            prompt.push_str(&format!("  {c}\n"));
+        }
+        prompt.push_str("Proceed?");
+        Ok(yes_no(&prompt, false))
+    }
+
     fn report_summary(&mut self, summary: &ClawsSummary) {
         let rows: Vec<(&str, &StepStatus)> = vec![
             ("Clone", &summary.clone),

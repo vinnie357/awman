@@ -86,6 +86,7 @@ impl Command for InitCommand {
             self.engines.git_engine.clone(),
             self.engines.overlay_engine.clone(),
             self.engines.runtime.clone(),
+            self.engines.agent_engine.clone(),
             options,
         );
         let summary = engine

@@ -105,6 +105,25 @@ pub enum CommandError {
     #[error("headless server already running on PID {pid}")]
     HeadlessAlreadyRunning { pid: u32 },
 
+    // ── Work item / spec ──────────────────────────────────────────────────────
+    #[error("work item {number} not found in aspec/work-items/")]
+    WorkItemNotFound { number: u32 },
+
+    #[error("spec template missing at {path}; run `amux init --aspec` to create it")]
+    SpecTemplateMissing { path: std::path::PathBuf },
+
+    #[error("invalid overlay spec '{spec}': {reason}")]
+    InvalidOverlaySpec { spec: String, reason: String },
+
+    #[error("unknown config field '{name}'; similar fields: {suggestions}")]
+    UnknownConfigField { name: String, suggestions: String },
+
+    #[error("stdin is not a TTY; provide --{prompt} on the command line")]
+    InteractiveInputUnavailable { prompt: String },
+
+    #[error("workflow file not found: {path}")]
+    WorkflowFileNotFound { path: std::path::PathBuf },
+
     // ── Catch-all ─────────────────────────────────────────────────────────
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),

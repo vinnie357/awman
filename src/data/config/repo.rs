@@ -179,6 +179,12 @@ impl RepoConfig {
             Some(git_root.join(p))
         }
     }
+
+    /// Replace the `workItems` config block. The chained `save(git_root)` call
+    /// persists the change. Pass `None` to clear the block entirely.
+    pub fn set_work_items_config(&mut self, cfg: Option<WorkItemsConfig>) {
+        self.work_items = cfg;
+    }
 }
 
 #[cfg(test)]

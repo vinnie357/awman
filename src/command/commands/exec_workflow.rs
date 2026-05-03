@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::MountScopeFrontend;
+use crate::command::commands::parse_overlay_spec;
 use crate::command::commands::worktree_lifecycle::{WorktreeLifecycle, WorktreeLifecycleFrontend};
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
@@ -178,11 +179,28 @@ impl ContainerFrontend for ContainerFrontendProxy {
     }
 
     async fn read_stdin(&mut self, buf: &mut [u8]) -> Result<usize, EngineError> {
-        // Unlock before awaiting to avoid holding the guard across an await
-        // point. Since the current backend never calls read_stdin (it discards
-        // the frontend immediately), this branch is never reached.
-        let _ = buf;
-        Err(EngineError::NotImplemented("ContainerFrontendProxy::read_stdin"))
+        // Inherit-stdio mode owns the host TTY directly during the container
+        // run; this proxy is only consulted when the backend explicitly pipes
+        // stdin through us. Read from the host's stdin via spawn_blocking so
+        // we don't block the async runtime.
+        let len = buf.len();
+        let bytes = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut local = vec![0u8; len];
+            match std::io::stdin().read(&mut local) {
+                Ok(n) => {
+                    local.truncate(n);
+                    Ok::<Vec<u8>, std::io::Error>(local)
+                }
+                Err(e) => Err(e),
+            }
+        })
+        .await
+        .map_err(|e| EngineError::Container(format!("stdin task: {e}")))?
+        .map_err(|e| EngineError::Container(format!("read stdin: {e}")))?;
+        let n = bytes.len().min(buf.len());
+        buf[..n].copy_from_slice(&bytes[..n]);
+        Ok(n)
     }
 
     fn report_status(
@@ -224,6 +242,7 @@ struct CommandLayerFactory {
     shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
     engines: Engines,
     flags: Arc<ExecWorkflowCommandFlags>,
+    directory_overlays: Vec<crate::engine::overlay::DirectorySpec>,
 }
 
 impl ContainerExecutionFactory for CommandLayerFactory {
@@ -245,7 +264,7 @@ impl ContainerExecutionFactory for CommandLayerFactory {
             non_interactive: self.flags.non_interactive,
             model: runtime.step_model.clone(),
             env_passthrough: None,
-            directory_overlays: vec![],
+            directory_overlays: self.directory_overlays.clone(),
         };
         let options = self
             .engines
@@ -261,6 +280,11 @@ impl ContainerExecutionFactory for CommandLayerFactory {
         _execution: &crate::engine::container::instance::ContainerExecution,
         _prompt: &str,
     ) -> Result<Option<()>, EngineError> {
+        // See `ContainerExecutionFactory::inject_prompt` for the contract:
+        // `Ok(None)` requests a fresh container per step. No agent in
+        // `AgentMatrix` currently advertises mid-session stdin re-injection
+        // support (`supports_stdin_injection: false`), so this is the
+        // documented and safe behavior for every shipped agent.
         Ok(None)
     }
 }
@@ -279,6 +303,11 @@ impl Command for ExecWorkflowCommand {
         let workflow_path = self.flags.workflow.display().to_string();
 
         // 1. Load the workflow file.
+        if !self.flags.workflow.exists() {
+            return Err(CommandError::WorkflowFileNotFound {
+                path: self.flags.workflow.clone(),
+            });
+        }
         let workflow = Workflow::load(&self.flags.workflow)
             .map_err(|e| CommandError::Other(format!("loading workflow: {e}")))?;
 
@@ -313,17 +342,30 @@ impl Command for ExecWorkflowCommand {
             None
         };
 
-        // 4. Set PTY active — queues user messages during the engine run.
+        // 4. Parse overlay specs early so errors surface before PTY is activated.
+        let directory_overlays = self
+            .flags
+            .overlay
+            .iter()
+            .map(|s| {
+                parse_overlay_spec(s).map_err(|reason| CommandError::InvalidOverlaySpec {
+                    spec: s.clone(),
+                    reason,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // 5. Set PTY active — queues user messages during the engine run.
         frontend.set_pty_active(true);
 
-        // 5. Wrap the frontend in Arc<Mutex> so both WorkflowProxy and
+        // 6. Wrap the frontend in Arc<Mutex> so both WorkflowProxy and
         //    CommandLayerFactory can share it for the duration of the engine run.
         let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> =
             Arc::new(Mutex::new(frontend));
 
         let flags_arc = Arc::new(self.flags.clone());
 
-        // 6. Build a temporary session from cwd for the engine.
+        // 7. Build a temporary session from cwd for the engine.
         let git_root_for_session = Arc::clone(&self.engines.git_engine)
             .resolve_root(&cwd)
             .map_err(CommandError::from)?;
@@ -334,14 +376,15 @@ impl Command for ExecWorkflowCommand {
         )
         .map_err(|e| CommandError::Other(format!("opening session: {e}")))?;
 
-        // 7. Run the engine. The engine block is scoped so proxy + factory are
+        // 8. Run the engine. The engine block is scoped so proxy + factory are
         //    dropped before we reclaim the frontend via Arc::try_unwrap.
-        let engine_result = {
+        let (engine_result, step_counts) = {
             let proxy = WorkflowProxy(Arc::clone(&shared));
             let factory = CommandLayerFactory {
                 shared: Arc::clone(&shared),
                 engines: self.engines.clone(),
                 flags: Arc::clone(&flags_arc),
+                directory_overlays,
             };
             let mut engine = WorkflowEngine::new(
                 &session,
@@ -352,7 +395,18 @@ impl Command for ExecWorkflowCommand {
                 Arc::clone(&self.engines.overlay_engine),
             )
             .map_err(CommandError::from)?;
-            engine.run_to_completion().await
+            let result = engine.run_to_completion().await;
+            let mut completed = 0usize;
+            let mut failed = 0usize;
+            for state in engine.state().step_states.values() {
+                match state {
+                    crate::data::workflow_state::StepState::Succeeded
+                    | crate::data::workflow_state::StepState::Skipped => completed += 1,
+                    crate::data::workflow_state::StepState::Failed { .. } => failed += 1,
+                    _ => {}
+                }
+            }
+            (result, (completed, failed))
         };
 
         // 8. Reclaim exclusive ownership of the frontend after proxy + factory drop.
@@ -377,8 +431,8 @@ impl Command for ExecWorkflowCommand {
             _ => None,
         };
         frontend.report_workflow_summary(&WorkflowSummary {
-            steps_completed: 0,
-            steps_failed: if had_error { 1 } else { 0 },
+            steps_completed: step_counts.0,
+            steps_failed: step_counts.1.max(if had_error { 1 } else { 0 }),
         });
 
         // 12. Worktree finalize.

@@ -60,19 +60,41 @@ pub struct DirectoryOverlay {
     pub permission: OverlayPermission,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OverlayEngine {
     auth_resolver: AuthPathResolver,
+    /// Sanitized temp directories that back agent-settings overlays. Held
+    /// here so the directories live as long as this engine instance and are
+    /// removed on `Drop` (RAII via `tempfile::TempDir`). This prevents the
+    /// sanitized `~/.claude.json` and copied `~/.claude/` contents from
+    /// leaking to `/tmp` after process exit.
+    sanitized: std::sync::Mutex<Vec<tempfile::TempDir>>,
 }
 
 impl OverlayEngine {
     pub fn new(_session: &Session) -> Result<Self, EngineError> {
         let auth_resolver = AuthPathResolver::from_process_env().map_err(EngineError::Data)?;
-        Ok(Self { auth_resolver })
+        Ok(Self {
+            auth_resolver,
+            sanitized: std::sync::Mutex::new(Vec::new()),
+        })
     }
 
     pub fn with_auth_resolver(auth_resolver: AuthPathResolver) -> Self {
-        Self { auth_resolver }
+        Self {
+            auth_resolver,
+            sanitized: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Track a sanitized tempdir so its cleanup is deferred until this
+    /// engine is dropped.
+    fn retain_tempdir(&self, dir: tempfile::TempDir) -> PathBuf {
+        let path = dir.path().to_path_buf();
+        if let Ok(mut guard) = self.sanitized.lock() {
+            guard.push(dir);
+        }
+        path
     }
 
     /// Build the resolved overlay set for a request. Deduplicated by
@@ -91,9 +113,10 @@ impl OverlayEngine {
             insert_or_merge(&mut by_key, key, resolved);
         }
 
-        // 2. Agent settings overlays.
+        // 2. Agent settings overlays. Forward the yolo flag so Claude's
+        //    settings sanitization can inject the bypass-permissions overlay.
         if let Some(agent) = &request.agent {
-            for spec in self.agent_settings_overlays(agent)? {
+            for spec in self.agent_settings_overlays_with(agent, request.yolo)? {
                 let key = OverlayPathResolver::conflict_key(&spec.host_path);
                 insert_or_merge(&mut by_key, key, spec);
             }
@@ -130,26 +153,60 @@ impl OverlayEngine {
         &self,
         agent: &AgentName,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
+        self.agent_settings_overlays_with(agent, false)
+    }
+
+    /// Like `agent_settings_overlays` but threading the `yolo` flag so the
+    /// Claude agent path can inject the bypass-permissions setting.
+    pub fn agent_settings_overlays_with(
+        &self,
+        agent: &AgentName,
+        yolo: bool,
+    ) -> Result<Vec<OverlaySpec>, EngineError> {
         let home = self.auth_resolver.home();
         let paths = self.auth_resolver.resolve(agent.as_str());
         let mut out = Vec::new();
-        let container_home = "/root";
+        let container_home = detect_container_home(home, agent.as_str())
+            .unwrap_or_else(|| "/root".to_string());
 
         match agent.as_str() {
             "claude" => {
                 if let Some(cfg) = paths.config_file.as_ref() {
                     if cfg.exists() {
+                        // Produce a sanitized copy of `.claude.json` (oauthAccount
+                        // stripped, trust dialog accepted for /workspace) under a
+                        // tempdir; mount that instead of the raw host file. The
+                        // tempdir is retained on the engine so RAII cleanup runs
+                        // when the engine drops (process exit).
+                        let host_path = match sanitize_claude_config(cfg) {
+                            Ok((dir, path)) => {
+                                let _retained = self.retain_tempdir(dir);
+                                path
+                            }
+                            Err(_) => cfg.clone(),
+                        };
                         out.push(OverlaySpec {
-                            host_path: cfg.clone(),
-                            container_path: PathBuf::from(format!("{container_home}/.claude.json")),
+                            host_path,
+                            container_path: PathBuf::from(format!(
+                                "{container_home}/.claude.json"
+                            )),
                             permission: OverlayPermission::ReadWrite,
                         });
                     }
                 }
                 if let Some(dir) = paths.settings_dir.as_ref() {
                     if dir.exists() {
+                        // Sanitize the settings dir: filter denylisted entries
+                        // and optionally inject yolo + LSP-banner suppression.
+                        let host_path = match sanitize_claude_settings_dir(dir, yolo) {
+                            Ok((tmp, path)) => {
+                                let _retained = self.retain_tempdir(tmp);
+                                path
+                            }
+                            Err(_) => dir.clone(),
+                        };
                         out.push(OverlaySpec {
-                            host_path: dir.clone(),
+                            host_path,
                             container_path: PathBuf::from(format!("{container_home}/.claude")),
                             permission: OverlayPermission::ReadWrite,
                         });
@@ -221,6 +278,159 @@ impl OverlayEngine {
     }
 }
 
+/// Strip `oauthAccount` from `~/.claude.json`, inject
+/// `projects["/workspace"]["hasTrustDialogAccepted"] = true` to suppress the
+/// in-container trust dialog, and write the result to a `TempDir` whose
+/// lifetime is owned by the caller. The sanitized path is `<tempdir>/claude.json`.
+fn sanitize_claude_config(src: &Path) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
+    let raw = std::fs::read_to_string(src)?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(obj) = &mut value {
+        obj.remove("oauthAccount");
+
+        // Mark `/workspace` as a trusted project so Claude does not prompt for
+        // trust inside the container. Mirrors legacy
+        // `oldsrc/runtime/mod.rs::sanitize_claude_config`.
+        let projects = obj
+            .entry("projects".to_string())
+            .or_insert_with(|| serde_json::Value::Object(Default::default()));
+        if let serde_json::Value::Object(p) = projects {
+            let project = p
+                .entry("/workspace".to_string())
+                .or_insert_with(|| serde_json::Value::Object(Default::default()));
+            if let serde_json::Value::Object(pobj) = project {
+                pobj.insert(
+                    "hasTrustDialogAccepted".into(),
+                    serde_json::Value::Bool(true),
+                );
+            }
+        }
+    }
+
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("amux-claude-")
+        .tempdir()?;
+    let dest = tmp_dir.path().join("claude.json");
+    let body = serde_json::to_string_pretty(&value).unwrap_or(raw);
+    std::fs::write(&dest, body)?;
+    Ok((tmp_dir, dest))
+}
+
+/// Sanitize `~/.claude/`: filter out denylisted entries, optionally inject
+/// the yolo-mode settings file, and suppress the LSP recommendation banner.
+/// Returns the `TempDir` (cleaned on drop) and its path.
+fn sanitize_claude_settings_dir(
+    src: &Path,
+    yolo: bool,
+) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
+    let tmp = tempfile::Builder::new()
+        .prefix("amux-claude-dir-")
+        .tempdir()?;
+    let tmp_root = tmp.path().to_path_buf();
+    // Mirror only the entries that are not on the denylist.
+    let denylist: std::collections::HashSet<&str> = CLAUDE_DENYLIST.iter().copied().collect();
+    if let Ok(entries) = std::fs::read_dir(src) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if denylist.contains(name_str.as_ref()) {
+                continue;
+            }
+            let dest = tmp_root.join(&name);
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                copy_dir_all(&entry.path(), &dest)?;
+            } else {
+                std::fs::copy(entry.path(), dest)?;
+            }
+        }
+    }
+    // Inject (or update) settings.json to suppress LSP banner and optionally
+    // grant yolo bypass-permissions.
+    let settings_path = tmp_root.join("settings.json");
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        std::fs::read_to_string(&settings_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if let serde_json::Value::Object(obj) = &mut settings {
+        obj.insert(
+            "skipDangerousModePermissionPrompt".into(),
+            serde_json::Value::Bool(true),
+        );
+        obj.insert(
+            "lspRecommendationDismissed".into(),
+            serde_json::Value::Bool(true),
+        );
+        if yolo {
+            obj.insert(
+                "permissionMode".into(),
+                serde_json::Value::String("bypassPermissions".into()),
+            );
+        }
+    }
+    let body = serde_json::to_string_pretty(&settings).unwrap_or_default();
+    let _ = std::fs::write(&settings_path, body);
+    Ok((tmp, tmp_root))
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    if let Ok(entries) = std::fs::read_dir(src) {
+        for entry in entries.flatten() {
+            let target = dst.join(entry.file_name());
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                copy_dir_all(&entry.path(), &target)?;
+            } else {
+                std::fs::copy(entry.path(), target)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Detect the container home directory by inspecting `Dockerfile.<agent>`.
+///
+/// Looks for a `USER <name>` directive (where `<name>` is not "root" or "0")
+/// in `Dockerfile.<agent>` files under `<cwd>/.amux/` and `<home>/.amux/`.
+/// Returns `Some("/home/<name>")` when found, `None` otherwise.
+fn detect_container_home(home: &Path, agent: &str) -> Option<String> {
+    let dockerfile_name = format!("Dockerfile.{agent}");
+    let search_dirs: Vec<PathBuf> = [
+        std::env::current_dir().ok()?.join(".amux"),
+        home.join(".amux"),
+    ]
+    .into_iter()
+    .collect();
+
+    for dir in &search_dirs {
+        let path = dir.join(&dockerfile_name);
+        if !path.exists() {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                // Look for "USER <name>" (case-insensitive directive).
+                let upper = trimmed.to_uppercase();
+                if let Some(rest) = upper.strip_prefix("USER ") {
+                    let name = rest.split_whitespace().next().unwrap_or("").trim();
+                    if !name.is_empty() && name != "ROOT" && name != "0" {
+                        // Use original case from the line.
+                        let orig_rest = &trimmed[5..]; // skip "USER "
+                        let orig_name = orig_rest.split_whitespace().next().unwrap_or("root");
+                        return Some(format!("/home/{orig_name}"));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn insert_or_merge(map: &mut HashMap<String, OverlaySpec>, key: String, spec: OverlaySpec) {
     use std::collections::hash_map::Entry;
     match map.entry(key) {
@@ -280,9 +490,15 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
         let overlays = engine.agent_settings_overlays(&agent).unwrap();
+        // The overlay engine sanitizes the .claude.json file (strips
+        // oauthAccount) and writes it to a temp path; we expect at least one
+        // overlay mounting a file as `/root/.claude.json`.
         assert!(
-            overlays.iter().any(|o| o.host_path == config_file),
-            "expected overlay for ~/.claude.json, got {overlays:?}"
+            overlays.iter().any(|o| o
+                .container_path
+                .to_string_lossy()
+                .ends_with("/.claude.json")),
+            "expected overlay targeting /root/.claude.json, got {overlays:?}"
         );
     }
 
@@ -344,5 +560,252 @@ mod tests {
             permission: OverlayPermission::ReadOnly,
         };
         assert!(engine.resolve_user_overlay(&spec).is_err());
+    }
+
+    #[test]
+    fn sanitize_claude_config_strips_oauth_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join(".claude.json");
+        std::fs::write(
+            &config_file,
+            r#"{"model":"claude-sonnet-4-6","oauthAccount":{"token":"secret"}}"#,
+        )
+        .unwrap();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let overlays = engine.agent_settings_overlays(&agent).unwrap();
+        // One overlay for the config file.
+        let config_overlay = overlays
+            .iter()
+            .find(|o| o.container_path.to_string_lossy().ends_with("/.claude.json"))
+            .expect("must have .claude.json overlay");
+        // The sanitized file must not contain oauthAccount.
+        let sanitized = std::fs::read_to_string(&config_overlay.host_path).unwrap();
+        assert!(
+            !sanitized.contains("oauthAccount"),
+            "oauthAccount must be stripped from sanitized config: {sanitized}"
+        );
+        assert!(
+            sanitized.contains("claude-sonnet-4-6"),
+            "model field must be preserved: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn sanitize_claude_config_injects_workspace_trust_dialog_accepted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join(".claude.json");
+        std::fs::write(&config_file, r#"{"model":"claude-sonnet-4-6"}"#).unwrap();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let overlays = engine.agent_settings_overlays(&agent).unwrap();
+        let config_overlay = overlays
+            .iter()
+            .find(|o| o.container_path.to_string_lossy().ends_with("/.claude.json"))
+            .expect("must have .claude.json overlay");
+        let sanitized = std::fs::read_to_string(&config_overlay.host_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&sanitized).unwrap();
+        assert_eq!(
+            parsed["projects"]["/workspace"]["hasTrustDialogAccepted"],
+            serde_json::Value::Bool(true),
+            "trust dialog must be accepted for /workspace: {sanitized}"
+        );
+    }
+
+    #[test]
+    fn sanitize_claude_settings_dir_filters_denylist_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        // Create a denylisted entry.
+        std::fs::create_dir_all(claude_dir.join("projects")).unwrap();
+        // Create an allowed entry.
+        std::fs::write(claude_dir.join("allowed.json"), r#"{"foo":"bar"}"#).unwrap();
+
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let overlays = engine.agent_settings_overlays(&agent).unwrap();
+        let dir_overlay = overlays
+            .iter()
+            .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))
+            .expect("must have .claude dir overlay");
+
+        let sanitized_root = &dir_overlay.host_path;
+        assert!(
+            !sanitized_root.join("projects").exists(),
+            "denylisted 'projects' dir must be excluded from sanitized overlay"
+        );
+        assert!(
+            sanitized_root.join("allowed.json").exists(),
+            "allowed file must be present in sanitized overlay"
+        );
+    }
+
+    #[test]
+    fn sanitize_claude_settings_dir_suppresses_lsp_banner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let overlays = engine.agent_settings_overlays(&agent).unwrap();
+        let dir_overlay = overlays
+            .iter()
+            .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))
+            .expect("must have .claude dir overlay");
+
+        let settings_path = dir_overlay.host_path.join("settings.json");
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            settings["lspRecommendationDismissed"],
+            serde_json::Value::Bool(true),
+            "lspRecommendationDismissed must be true in sanitized settings"
+        );
+    }
+
+    #[test]
+    fn sanitize_claude_settings_dir_injects_yolo_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let overlays = engine.agent_settings_overlays_with(&agent, true).unwrap();
+        let dir_overlay = overlays
+            .iter()
+            .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))
+            .expect("must have .claude dir overlay");
+
+        let settings_path = dir_overlay.host_path.join("settings.json");
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            settings["permissionMode"],
+            serde_json::Value::String("bypassPermissions".into()),
+            "permissionMode must be bypassPermissions when yolo=true"
+        );
+    }
+
+    #[test]
+    fn detect_container_home_finds_user_directive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let amux_dir = tmp.path().join(".amux");
+        std::fs::create_dir_all(&amux_dir).unwrap();
+        std::fs::write(
+            amux_dir.join("Dockerfile.claude"),
+            "FROM ubuntu:22.04\nRUN apt-get update\nUSER appuser\nWORKDIR /home/appuser\n",
+        )
+        .unwrap();
+
+        // Temporarily change cwd to tmp so detect_container_home can find the file.
+        let prev = std::env::current_dir().ok();
+        std::env::set_current_dir(tmp.path()).ok();
+
+        let result = detect_container_home(tmp.path(), "claude");
+
+        // Restore cwd.
+        if let Some(p) = prev {
+            let _ = std::env::set_current_dir(p);
+        }
+
+        assert_eq!(
+            result,
+            Some("/home/appuser".to_string()),
+            "detect_container_home must return /home/appuser for USER appuser"
+        );
+    }
+
+    #[test]
+    fn detect_container_home_returns_none_when_no_dockerfile() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Change cwd to the empty temp dir so the cwd-based search finds nothing.
+        let prev = std::env::current_dir().ok();
+        std::env::set_current_dir(tmp.path()).ok();
+        let result = detect_container_home(tmp.path(), "claude");
+        if let Some(p) = prev {
+            let _ = std::env::set_current_dir(p);
+        }
+        assert!(
+            result.is_none(),
+            "detect_container_home must return None when no Dockerfile found"
+        );
+    }
+
+    #[test]
+    fn detect_container_home_returns_none_for_root_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let amux_dir = tmp.path().join(".amux");
+        std::fs::create_dir_all(&amux_dir).unwrap();
+        std::fs::write(
+            amux_dir.join("Dockerfile.claude"),
+            "FROM ubuntu:22.04\nUSER root\n",
+        )
+        .unwrap();
+
+        let prev = std::env::current_dir().ok();
+        std::env::set_current_dir(tmp.path()).ok();
+
+        let result = detect_container_home(tmp.path(), "claude");
+
+        if let Some(p) = prev {
+            let _ = std::env::set_current_dir(p);
+        }
+
+        assert!(
+            result.is_none(),
+            "detect_container_home must return None when USER is root"
+        );
+    }
+
+    #[test]
+    fn detect_container_home_returns_none_for_user_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let amux_dir = tmp.path().join(".amux");
+        std::fs::create_dir_all(&amux_dir).unwrap();
+        std::fs::write(
+            amux_dir.join("Dockerfile.claude"),
+            "FROM ubuntu:22.04\nUSER 0\n",
+        )
+        .unwrap();
+
+        let prev = std::env::current_dir().ok();
+        std::env::set_current_dir(tmp.path()).ok();
+
+        let result = detect_container_home(tmp.path(), "claude");
+
+        if let Some(p) = prev {
+            let _ = std::env::set_current_dir(p);
+        }
+
+        assert!(
+            result.is_none(),
+            "detect_container_home must return None when USER is 0"
+        );
+    }
+
+    #[test]
+    fn sanitize_claude_settings_dir_no_yolo_when_false() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let overlays = engine.agent_settings_overlays_with(&agent, false).unwrap();
+        let dir_overlay = overlays
+            .iter()
+            .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))
+            .expect("must have .claude dir overlay");
+
+        let settings_path = dir_overlay.host_path.join("settings.json");
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert!(
+            settings.get("permissionMode").is_none(),
+            "permissionMode must NOT be set when yolo=false"
+        );
     }
 }
