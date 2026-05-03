@@ -988,7 +988,7 @@ mod tests {
         ));
         let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
         let auth_paths = crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path());
-        let headless_paths = crate::data::fs::headless_paths::HeadlessPaths::at_home(tmp.path());
+        let headless_paths = crate::data::fs::headless_paths::HeadlessPaths::at_root(tmp.path());
         let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(auth_paths, headless_paths));
         ClawsEngine::new(
             session,
@@ -998,7 +998,7 @@ mod tests {
             auth_engine,
             ClawsEngineOptions {
                 mode,
-                nanoclaw_url: None,
+                nanoclaw_url: Some("file:///nonexistent/repo.git".to_string()),
                 refresh: false,
                 no_cache: false,
                 clone_dir,

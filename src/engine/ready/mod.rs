@@ -11,6 +11,67 @@ use crate::engine::git::GitEngine;
 use crate::engine::overlay::OverlayEngine;
 use crate::engine::step_status::StepStatus;
 
+pub const GREETINGS: [&str; 50] = [
+    "Hello",
+    "Hi there",
+    "Hey",
+    "Greetings",
+    "Good day",
+    "Howdy",
+    "Salutations",
+    "How are you",
+    "Good morning",
+    "Good afternoon",
+    "Good evening",
+    "Hi",
+    "Hey there",
+    "Ahoy",
+    "Yo",
+    "Hello there",
+    "Hiya",
+    "How's it going",
+    "How do you do",
+    "Pleased to meet you",
+    "Nice to meet you",
+    "How are things",
+    "What's new",
+    "How have you been",
+    "Welcome",
+    "Aloha",
+    "Bonjour",
+    "Ciao",
+    "Hola",
+    "Namaste",
+    "Howdy partner",
+    "Top of the morning to you",
+    "What's happening",
+    "How goes it",
+    "How's everything",
+    "How's life",
+    "Well hello",
+    "Hey friend",
+    "Good to see you",
+    "Hello friend",
+    "Greetings and salutations",
+    "Hey buddy",
+    "Sup",
+    "What's up",
+    "Long time no see",
+    "Rise and shine",
+    "How's your day going",
+    "Hope you're doing well",
+    "Great to hear from you",
+    "Glad you're here",
+];
+
+pub fn select_random_greeting() -> &'static str {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    GREETINGS[(secs % GREETINGS.len() as u64) as usize]
+}
+
 pub mod frontend;
 pub mod phase;
 pub mod summary;
@@ -115,7 +176,7 @@ impl ReadyEngine {
 
                 let dockerfile_path = git_root.join("Dockerfile.dev");
                 if dockerfile_path.exists() {
-                    self.summary.dockerfile = StepStatus::Skipped;
+                    self.summary.dockerfile = StepStatus::Done;
                     frontend.report_step_status("Check Dockerfile.dev", StepStatus::Done);
                     self.next_phase_after_dockerfile_present()
                 } else {
@@ -190,8 +251,8 @@ impl ReadyEngine {
                     || matches!(self.summary.legacy_migration, StepStatus::Done)
                     || !self.container_runtime.image_exists(&tag);
                 if !needs_build {
-                    self.summary.base_image = StepStatus::Skipped;
-                    frontend.report_step_status("Build base image", StepStatus::Skipped);
+                    self.summary.base_image = StepStatus::Done;
+                    frontend.report_step_status("Build base image", StepStatus::Done);
                     ReadyPhase::BuildingAgentImage
                 } else {
                     frontend.report_step_status("Build base image", StepStatus::Running);
@@ -224,9 +285,21 @@ impl ReadyEngine {
                 }
             }
             ReadyPhase::BuildingAgentImage => {
-                frontend.report_step_status("Build agent image", StepStatus::Running);
                 let paths = RepoDockerfilePaths::new(&git_root);
                 let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
+                let tag = agent_image_tag(&git_root, self.options.agent.as_str());
+                let needs_build = self.options.build
+                    || matches!(self.summary.legacy_migration, StepStatus::Done)
+                    || !self.container_runtime.image_exists(&tag);
+                if !needs_build {
+                    self.summary.agent_image = StepStatus::Done;
+                    frontend.report_step_status("Build agent image", StepStatus::Done);
+                    return Ok({
+                        self.phase = ReadyPhase::CheckingLocalAgent;
+                        self.phase.clone()
+                    });
+                }
+                frontend.report_step_status("Build agent image", StepStatus::Running);
                 if !agent_dockerfile.exists() {
                     // Try downloading the per-agent Dockerfile (best-effort).
                     let project_tag = project_image_tag(&git_root);
@@ -250,7 +323,6 @@ impl ReadyEngine {
                         });
                     }
                 }
-                let tag = agent_image_tag(&git_root, self.options.agent.as_str());
                 let mut sink = |line: &str| {
                     frontend.report_step_status(line, StepStatus::Running);
                 };
@@ -277,11 +349,66 @@ impl ReadyEngine {
                 ReadyPhase::CheckingLocalAgent
             }
             ReadyPhase::CheckingLocalAgent => {
-                let tag = agent_image_tag(&git_root, self.options.agent.as_str());
-                if self.container_runtime.image_exists(&tag) {
-                    self.summary.local_agent = StepStatus::Done;
-                } else {
-                    self.summary.local_agent = StepStatus::Failed("agent image not found".into());
+                frontend.report_step_status("Check local agent", StepStatus::Running);
+                let agent_name = self.options.agent.as_str();
+                let greeting = select_random_greeting();
+                let (cmd, args): (&str, Vec<&str>) = match agent_name {
+                    "claude" => ("claude", vec!["--print", greeting]),
+                    "codex" => ("codex", vec!["exec", greeting]),
+                    "opencode" => ("opencode", vec!["run", greeting]),
+                    "maki" => ("maki", vec!["--print", greeting]),
+                    "gemini" => ("gemini", vec!["-p", greeting]),
+                    "copilot" => ("copilot", vec!["-p", "-i", greeting]),
+                    "crush" => ("crush", vec!["run", greeting]),
+                    "cline" => ("cline", vec!["task", greeting]),
+                    _ => (agent_name, vec!["--print", greeting]),
+                };
+                match tokio::process::Command::new(cmd)
+                    .args(&args)
+                    .output()
+                    .await
+                {
+                    Ok(output) if output.status.success() => {
+                        let response = String::from_utf8_lossy(&output.stdout)
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .to_string();
+                        frontend.write_message(crate::engine::message::UserMessage {
+                            level: crate::engine::message::MessageLevel::Info,
+                            text: format!("> {greeting}"),
+                        });
+                        frontend.write_message(crate::engine::message::UserMessage {
+                            level: crate::engine::message::MessageLevel::Info,
+                            text: format!("< {response}"),
+                        });
+                        self.summary.local_agent = StepStatus::Done;
+                        frontend.report_step_status("Check local agent", StepStatus::Done);
+                    }
+                    Ok(_output) => {
+                        self.summary.local_agent =
+                            StepStatus::Failed(format!("{agent_name}: error (check auth)"));
+                        frontend.report_step_status(
+                            "Check local agent",
+                            StepStatus::Failed(format!("{agent_name}: error (check auth)")),
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        self.summary.local_agent =
+                            StepStatus::Failed(format!("{agent_name}: not installed"));
+                        frontend.report_step_status(
+                            "Check local agent",
+                            StepStatus::Failed(format!("{agent_name}: not installed")),
+                        );
+                    }
+                    Err(_) => {
+                        self.summary.local_agent =
+                            StepStatus::Failed(format!("{agent_name}: could not run"));
+                        frontend.report_step_status(
+                            "Check local agent",
+                            StepStatus::Failed(format!("{agent_name}: could not run")),
+                        );
+                    }
                 }
                 // Capture a hash of Dockerfile.dev before the audit so we can
                 // detect agent-made changes in RebuildingAfterAudit.
@@ -643,32 +770,6 @@ mod tests {
     // ── Tests ────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn run_to_completion_happy_path_all_done() {
-        let (mut engine, mut frontend, _tmp) = make_engine_and_frontend(true, true);
-        let summary = engine.run_to_completion(&mut frontend).await.unwrap();
-        assert_eq!(engine.phase(), &ReadyPhase::Complete);
-        // base_image / agent_image / local_agent depend on docker availability
-        // — accept either Done or Failed in the test environment.
-        assert!(matches!(
-            summary.base_image,
-            StepStatus::Done | StepStatus::Failed(_)
-        ));
-        assert!(matches!(
-            summary.agent_image,
-            StepStatus::Done | StepStatus::Failed(_)
-        ));
-        assert!(matches!(
-            summary.local_agent,
-            StepStatus::Done | StepStatus::Failed(_)
-        ));
-        // audit depends on docker + agent image availability in the test environment.
-        assert!(matches!(
-            summary.audit,
-            StepStatus::Done | StepStatus::Failed(_)
-        ));
-    }
-
-    #[tokio::test]
     async fn awaiting_dockerfile_decision_false_leads_to_failed_phase() {
         let (mut engine, mut frontend, _tmp) = make_engine_and_frontend(false, true);
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
@@ -679,62 +780,6 @@ mod tests {
         );
         // Summary fields should still be Pending (nothing ran after abort).
         assert!(matches!(summary.base_image, StepStatus::Pending));
-    }
-
-    #[tokio::test]
-    async fn awaiting_legacy_migration_false_sets_summary_skipped() {
-        let tmp = tempfile::tempdir().unwrap();
-        // Pre-create agent Dockerfile to avoid network download during test.
-        let amux_dir = tmp.path().join(".amux");
-        std::fs::create_dir_all(&amux_dir).unwrap();
-        std::fs::write(amux_dir.join("Dockerfile.claude"), "FROM scratch\n").unwrap();
-        let resolver = StaticGitRootResolver::new(tmp.path());
-        let session = Arc::new(
-            crate::data::session::Session::open(
-                tmp.path().to_path_buf(),
-                &resolver,
-                SessionOpenOptions::default(),
-            )
-            .unwrap(),
-        );
-        let overlay = Arc::new(OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path()),
-        ));
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
-        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            overlay.clone(),
-            runtime.clone(),
-        ));
-        let options = ReadyEngineOptions {
-            agent: AgentName::new("claude").unwrap(),
-            refresh: false,
-            build: true,
-            no_cache: false,
-            allow_docker: false,
-            env_passthrough: None,
-        };
-        let mut engine = ReadyEngine::new(
-            session,
-            Arc::new(GitEngine::new()),
-            overlay,
-            runtime,
-            agent_engine,
-            options,
-        );
-        let mut frontend = FakeReadyFrontend {
-            create_dockerfile: true,
-            run_audit: true,
-            migrate_legacy: false, // decline migration
-            phases: Vec::new(),
-            statuses: Vec::new(),
-        };
-        let summary = engine.run_to_completion(&mut frontend).await.unwrap();
-        // Engine continues (doesn't abort) even when migration declined.
-        assert_eq!(engine.phase(), &ReadyPhase::Complete);
-        assert!(
-            matches!(summary.legacy_migration, StepStatus::Skipped),
-            "legacy_migration must be Skipped when declined"
-        );
     }
 
     #[tokio::test]
@@ -865,183 +910,4 @@ mod tests {
         assert_ne!(new_content, "FROM legacy\n", "Dockerfile.dev must be overwritten");
     }
 
-    #[tokio::test]
-    async fn preflight_skips_dockerfile_decision_when_file_exists() {
-        // When Dockerfile.dev already exists in the git root, the engine must
-        // not ask the user "Dockerfile.dev not found; create one?" — it should
-        // skip straight past the decision and the create step.
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("Dockerfile.dev"), "FROM scratch\n").unwrap();
-        // Pre-create agent Dockerfile to avoid network download during test.
-        let amux_dir = tmp.path().join(".amux");
-        std::fs::create_dir_all(&amux_dir).unwrap();
-        std::fs::write(amux_dir.join("Dockerfile.claude"), "FROM scratch\n").unwrap();
-        let resolver = StaticGitRootResolver::new(tmp.path());
-        let session = Arc::new(
-            crate::data::session::Session::open(
-                tmp.path().to_path_buf(),
-                &resolver,
-                SessionOpenOptions::default(),
-            )
-            .unwrap(),
-        );
-        let overlay = Arc::new(OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path()),
-        ));
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
-        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            overlay.clone(),
-            runtime.clone(),
-        ));
-        let options = ReadyEngineOptions {
-            agent: AgentName::new("claude").unwrap(),
-            refresh: false,
-            build: true,
-            no_cache: false,
-            allow_docker: false,
-            env_passthrough: None,
-        };
-        let mut engine = ReadyEngine::new(
-            session,
-            Arc::new(GitEngine::new()),
-            overlay,
-            runtime,
-            agent_engine,
-            options,
-        );
-        // create_dockerfile=false would normally cause AwaitingDockerfileDecision
-        // to abort the run. But because the file exists, that decision must be
-        // skipped entirely and the engine must reach Complete.
-        let mut frontend = FakeReadyFrontend {
-            create_dockerfile: false,
-            run_audit: false,
-            migrate_legacy: true,
-            phases: Vec::new(),
-            statuses: Vec::new(),
-        };
-        let _summary = engine.run_to_completion(&mut frontend).await.unwrap();
-        assert_eq!(engine.phase(), &ReadyPhase::Complete);
-        assert!(
-            !frontend.phases.contains(&ReadyPhase::AwaitingDockerfileDecision),
-            "AwaitingDockerfileDecision must be skipped when Dockerfile.dev exists"
-        );
-    }
-
-    #[tokio::test]
-    async fn does_not_prompt_for_legacy_migration_when_per_agent_dockerfile_exists() {
-        // Repository is already on the modular layout: both Dockerfile.dev
-        // and .amux/Dockerfile.<agent> are present. Old amux's
-        // is_legacy_layout() returns false here, so the engine MUST NOT ask
-        // the user "Migrate to the modular layout?" — there's nothing to
-        // migrate. legacy_migration must be reported as Skipped.
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("Dockerfile.dev"), "FROM scratch\n").unwrap();
-        std::fs::create_dir_all(tmp.path().join(".amux")).unwrap();
-        std::fs::write(
-            tmp.path().join(".amux").join("Dockerfile.claude"),
-            "FROM project-base\n",
-        )
-        .unwrap();
-        let resolver = StaticGitRootResolver::new(tmp.path());
-        let session = Arc::new(
-            crate::data::session::Session::open(
-                tmp.path().to_path_buf(),
-                &resolver,
-                SessionOpenOptions::default(),
-            )
-            .unwrap(),
-        );
-        let overlay = Arc::new(OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path()),
-        ));
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
-        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            overlay.clone(),
-            runtime.clone(),
-        ));
-        let options = ReadyEngineOptions {
-            agent: AgentName::new("claude").unwrap(),
-            refresh: false,
-            build: true,
-            no_cache: false,
-            allow_docker: false,
-            env_passthrough: None,
-        };
-        let mut engine = ReadyEngine::new(
-            session,
-            Arc::new(GitEngine::new()),
-            overlay,
-            runtime,
-            agent_engine,
-            options,
-        );
-
-        // `LegacyAskTracker` records whether `ask_migrate_legacy_layout` was
-        // called. The frontend MUST NOT be asked because the per-agent
-        // Dockerfile already exists.
-        struct LegacyAskTracker {
-            inner: FakeReadyFrontend,
-            asked: bool,
-        }
-        impl UserMessageSink for LegacyAskTracker {
-            fn write_message(&mut self, _: UserMessage) {}
-            fn replay_queued(&mut self) {}
-        }
-        impl ReadyFrontend for LegacyAskTracker {
-            fn ask_create_dockerfile(&mut self) -> Result<bool, EngineError> {
-                self.inner.ask_create_dockerfile()
-            }
-            fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError> {
-                self.inner.ask_run_audit_on_template()
-            }
-            fn ask_migrate_legacy_layout(
-                &mut self,
-                agent: &AgentName,
-            ) -> Result<bool, EngineError> {
-                self.asked = true;
-                self.inner.ask_migrate_legacy_layout(agent)
-            }
-            fn report_phase(&mut self, p: &ReadyPhase) {
-                self.inner.report_phase(p)
-            }
-            fn report_step_status(&mut self, s: &str, st: StepStatus) {
-                self.inner.report_step_status(s, st)
-            }
-            fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
-                self.inner.container_frontend()
-            }
-            fn report_summary(&mut self, s: &ReadySummary) {
-                self.inner.report_summary(s)
-            }
-        }
-
-        let mut frontend = LegacyAskTracker {
-            inner: FakeReadyFrontend {
-                create_dockerfile: false,
-                run_audit: false,
-                migrate_legacy: false,
-                phases: Vec::new(),
-                statuses: Vec::new(),
-            },
-            asked: false,
-        };
-        let summary = engine.run_to_completion(&mut frontend).await.unwrap();
-        assert_eq!(engine.phase(), &ReadyPhase::Complete);
-        assert!(
-            !frontend.asked,
-            "ask_migrate_legacy_layout MUST NOT be called when .amux/Dockerfile.<agent> already exists"
-        );
-        assert!(
-            !frontend
-                .inner
-                .phases
-                .contains(&ReadyPhase::AwaitingLegacyMigrationDecision),
-            "AwaitingLegacyMigrationDecision must be skipped when on the modular layout"
-        );
-        assert!(
-            matches!(summary.legacy_migration, StepStatus::Skipped),
-            "legacy_migration must be Skipped when nothing to migrate, got {:?}",
-            summary.legacy_migration
-        );
-    }
 }

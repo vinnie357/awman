@@ -71,6 +71,7 @@ impl ReadyFrontend for CliFrontend {
             return;
         }
         let rows: Vec<(&str, &StepStatus)> = vec![
+            ("Dockerfile", &summary.dockerfile),
             ("Base image", &summary.base_image),
             ("Agent image", &summary.agent_image),
             ("Local agent", &summary.local_agent),

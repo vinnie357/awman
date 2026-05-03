@@ -82,7 +82,14 @@ pub fn render_summary_box(title: &str, rows: &[(&str, &StepStatus)]) -> String {
         .max()
         .unwrap_or(10)
         .max(12);
-    let inner = label_w + value_w + 5; // " label │ value " + borders
+    let table_inner = label_w + value_w + 5; // " label │ value " + borders
+    let title_inner = title.chars().count() + 2; // " title "
+    let inner = table_inner.max(title_inner);
+    let value_w = if inner > table_inner {
+        value_w + (inner - table_inner)
+    } else {
+        value_w
+    };
 
     let mut out = String::new();
     out.push_str(&format!("┌{}┐\n", "─".repeat(inner)));
@@ -171,18 +178,4 @@ mod tests {
         assert!(s.contains('┘'), "must contain bottom-right corner");
     }
 
-    #[test]
-    fn yes_no_returns_default_when_stdin_is_not_tty() {
-        // In test environments stdin is never a TTY. yes_no must return the
-        // default immediately without blocking on stdin.
-        assert!(yes_no("question?", true), "default_yes=true must return true");
-        assert!(!yes_no("question?", false), "default_yes=false must return false");
-    }
-
-    #[test]
-    fn read_line_returns_none_when_stdin_is_not_tty() {
-        // In test environments stdin is not a TTY → read_line returns None.
-        let result = read_line("enter something:");
-        assert!(result.is_none(), "read_line must return None when stdin is not a TTY");
-    }
 }

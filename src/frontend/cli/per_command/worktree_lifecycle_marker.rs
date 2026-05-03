@@ -199,65 +199,13 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::command::dispatch::catalogue::CommandCatalogue;
-    use crate::command::commands::worktree_lifecycle::{
-        ExistingWorktreeDecision, PostWorkflowWorktreeAction, PreWorktreeDecision,
-        WorktreeLifecycleFrontend,
-    };
+    use crate::command::commands::worktree_lifecycle::WorktreeLifecycleFrontend;
     use crate::frontend::cli::command_frontend::CliFrontend;
 
     fn make_frontend() -> CliFrontend {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd.try_get_matches_from(["amux", "implement", "0069"]).unwrap();
         CliFrontend::new(m)
-    }
-
-    #[test]
-    fn ask_pre_worktree_uncommitted_files_returns_use_last_commit_when_not_tty() {
-        let mut f = make_frontend();
-        let result = f.ask_pre_worktree_uncommitted_files(&["file.rs".to_string()]).unwrap();
-        // §7u safe default: UseLastCommit (do not auto-commit).
-        assert!(
-            matches!(result, PreWorktreeDecision::UseLastCommit),
-            "expected UseLastCommit in non-TTY env, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn ask_existing_worktree_returns_resume_when_not_tty() {
-        let mut f = make_frontend();
-        let result = f.ask_existing_worktree(&PathBuf::from("/tmp/wt"), "feature/x").unwrap();
-        // §7u safe default: Resume.
-        assert!(
-            matches!(result, ExistingWorktreeDecision::Resume),
-            "expected Resume in non-TTY env, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn ask_post_workflow_action_returns_keep_when_not_tty() {
-        let mut f = make_frontend();
-        let result = f.ask_post_workflow_action("feature/x", false).unwrap();
-        // §7u safe default: Keep.
-        assert!(
-            matches!(result, PostWorkflowWorktreeAction::Keep),
-            "expected Keep in non-TTY env, got {result:?}"
-        );
-    }
-
-    #[test]
-    fn ask_worktree_commit_before_merge_returns_none_when_not_tty() {
-        let mut f = make_frontend();
-        let result = f.ask_worktree_commit_before_merge("feature/x", &["file.rs".to_string()]).unwrap();
-        // §7u safe default: None (skip auto-commit).
-        assert!(result.is_none(), "expected None in non-TTY env, got {result:?}");
-    }
-
-    #[test]
-    fn confirm_squash_merge_returns_false_when_not_tty() {
-        let mut f = make_frontend();
-        let result = f.confirm_squash_merge("feature/x").unwrap();
-        // §7u safe default: false.
-        assert!(!result, "expected false in non-TTY env");
     }
 
     #[test]

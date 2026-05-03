@@ -156,19 +156,24 @@ impl ContainerRuntime {
     }
 
     /// Best-effort check whether an image tag exists locally on the runtime.
+    /// Times out after 10 seconds to avoid hanging when the daemon is unresponsive.
     pub fn image_exists(&self, tag: &str) -> bool {
         use std::process::{Command, Stdio};
         let cli_bin = match self.backend.name() {
             "apple-containers" => "container",
             _ => "docker",
         };
-        Command::new(cli_bin)
+        let child = Command::new(cli_bin)
             .args(["image", "inspect", tag])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .spawn();
+        match child {
+            Ok(child) => wait_with_timeout(child, std::time::Duration::from_secs(10))
+                .map(|s| s.success())
+                .unwrap_or(false),
+            Err(_) => false,
+        }
     }
 
     pub fn stats(&self, handle: &ContainerHandle) -> Result<ContainerStats, EngineError> {
@@ -201,25 +206,54 @@ impl ContainerRuntime {
     }
 
     /// Best-effort check whether the container runtime daemon is reachable.
-    /// Returns `false` when `docker info` (or equivalent) fails.
+    /// Returns `false` when `docker info` (or equivalent) fails or times out.
     pub fn is_available(&self) -> bool {
+        use std::process::Stdio;
         let (cli_bin, args): (&str, &[&str]) = match self.backend.name() {
             "apple-containers" => ("container", &["system", "status"]),
             _ => ("docker", &["info", "--format", "{{.ServerVersion}}"]),
         };
-        std::process::Command::new(cli_bin)
+        let child = std::process::Command::new(cli_bin)
             .args(args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match child {
+            Ok(child) => wait_with_timeout(child, std::time::Duration::from_secs(10))
+                .map(|s| s.success())
+                .unwrap_or(false),
+            Err(_) => false,
+        }
     }
 }
 
 enum Backend {
     Docker,
     Apple,
+}
+
+/// Wait for a child process with a timeout. Kills the process and returns
+/// `None` if the deadline elapses. Prevents unit tests and readiness checks
+/// from hanging indefinitely when the Docker daemon is unresponsive.
+pub(super) fn wait_with_timeout(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 #[cfg(test)]

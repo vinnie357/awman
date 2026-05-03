@@ -266,10 +266,27 @@ impl ContainerExecutionFactory for CommandLayerFactory {
             env_passthrough: Some(session.effective_config().env_passthrough()),
             directory_overlays: self.directory_overlays.clone(),
         };
-        let options = self
+        let mut options = self
             .engines
             .agent_engine
             .build_options(session, &runtime.step_agent, &run_opts)?;
+
+        // Inject keychain credentials so the agent can reach its backend.
+        // Mirrors the same step in `chat` and `exec_prompt`.
+        if let Ok(credentials) = self
+            .engines
+            .auth_engine
+            .resolve_agent_auth(session, &runtime.step_agent)
+        {
+            if !credentials.env_vars.is_empty() {
+                options.push(
+                    crate::engine::container::options::ContainerOption::AgentCredentials {
+                        env_vars: credentials.env_vars,
+                    },
+                );
+            }
+        }
+
         let instance = self.engines.runtime.build(options)?;
         let proxy = ContainerFrontendProxy(Arc::clone(&self.shared));
         instance.run_with_frontend(Box::new(proxy))

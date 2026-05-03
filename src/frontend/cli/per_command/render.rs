@@ -674,9 +674,12 @@ mod tests {
     #[test]
     fn render_remote_run_includes_session_when_present() {
         let s = render_remote_run(&RemoteRunOutcome {
+            command_id: "cmd-1".into(),
             command: vec!["status".into()],
-            session: Some("abc123".into()),
-            remote_addr: None,
+            session: "abc123".into(),
+            remote_addr: "localhost:9876".into(),
+            status: None,
+            exit_code: None,
         });
         assert!(s.contains("status"));
         assert!(s.contains("abc123"));
@@ -1122,38 +1125,39 @@ mod tests {
     #[test]
     fn render_remote_session_start_with_dir() {
         let s = render_remote_session_start(&RemoteSessionStartOutcome {
-            dir: Some("/my/repo".into()),
-            remote_addr: None,
+            session_id: "sess-1".into(),
+            dir: "/my/repo".into(),
+            remote_addr: "localhost:9876".into(),
         });
         assert!(s.contains("/my/repo"), "dir must appear: {s}");
     }
 
     #[test]
-    fn render_remote_session_start_without_dir_shows_cwd_placeholder() {
+    fn render_remote_session_start_shows_remote_addr() {
         let s = render_remote_session_start(&RemoteSessionStartOutcome {
-            dir: None,
-            remote_addr: Some("localhost:9876".into()),
+            session_id: "sess-2".into(),
+            dir: "/work".into(),
+            remote_addr: "localhost:9876".into(),
         });
-        assert!(s.contains("<cwd>"), "must show <cwd> placeholder: {s}");
         assert!(s.contains("localhost:9876"), "remote_addr must appear: {s}");
     }
 
     #[test]
     fn render_remote_session_kill_with_session_id() {
         let s = render_remote_session_kill(&RemoteSessionKillOutcome {
-            session_id: Some("abc123".into()),
-            remote_addr: None,
+            session_id: "abc123".into(),
+            remote_addr: "localhost:9876".into(),
         });
         assert!(s.contains("abc123"), "session id must appear: {s}");
     }
 
     #[test]
-    fn render_remote_session_kill_without_id_shows_latest() {
+    fn render_remote_session_kill_shows_remote_addr() {
         let s = render_remote_session_kill(&RemoteSessionKillOutcome {
-            session_id: None,
-            remote_addr: None,
+            session_id: "sess-1".into(),
+            remote_addr: "localhost:9876".into(),
         });
-        assert!(s.contains("<latest>"), "must show <latest> placeholder: {s}");
+        assert!(s.contains("localhost:9876"), "remote_addr must appear: {s}");
     }
 
     // ── render_status (tip flows from outcome) ───────────────────────────────

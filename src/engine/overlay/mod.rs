@@ -570,12 +570,15 @@ mod tests {
     }
 
     #[test]
-    fn agent_settings_empty_when_no_files_present() {
+    fn agent_settings_synthesized_when_no_files_present() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
         let out = engine.agent_settings_overlays(&agent).unwrap();
-        assert!(out.is_empty());
+        assert!(
+            out.iter().any(|o| o.container_path.to_string_lossy().ends_with("/.claude.json")),
+            "expected synthesized .claude.json overlay for first-time user, got {out:?}"
+        );
     }
 
     #[test]

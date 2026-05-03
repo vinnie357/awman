@@ -38,15 +38,22 @@ impl DockerBackend {
     }
 
     /// Probe whether the docker daemon is reachable. Returns `false` quietly
-    /// when the binary is missing or the daemon is down.
+    /// when the binary is missing, the daemon is down, or the probe times out.
     pub(super) fn is_available() -> bool {
-        Command::new("docker")
+        let child = Command::new("docker")
             .args(["info", "--format", "{{.ServerVersion}}"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
+            .spawn();
+        match child {
+            Ok(child) => super::runtime::wait_with_timeout(
+                child,
+                std::time::Duration::from_secs(10),
+            )
             .map(|s| s.success())
-            .unwrap_or(false)
+            .unwrap_or(false),
+            Err(_) => false,
+        }
     }
 }
 
@@ -335,11 +342,12 @@ pub(super) fn build_run_argv(
     if options.remove_on_exit {
         args.push("--rm".into());
     }
-    if options.interactive {
-        args.push("-it".into());
-    } else if options.seeded_prompt.is_some() {
-        // Allocate stdin for seeded prompts even when not interactive.
+    if options.seeded_prompt.is_some() {
+        // Seeded prompts pipe stdin; allocating a PTY (-t) fails when no host
+        // TTY is available (ENOTTY / "Inappropriate ioctl for device").
         args.push("-i".into());
+    } else if options.interactive {
+        args.push("-it".into());
     }
 
     args.push("--name".into());
@@ -747,6 +755,22 @@ mod tests {
         );
         assert!(argv.contains(&"-i".to_string()), "seeded prompt needs -i flag");
         assert!(!argv.contains(&"-it".to_string()), "seeded prompt must NOT add -it");
+    }
+
+    #[test]
+    fn build_run_argv_seeded_prompt_with_interactive_still_uses_i_not_it() {
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::Interactive(true),
+            ContainerOption::SeededPrompt("hello".into()),
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        assert!(argv.contains(&"-i".to_string()), "seeded prompt with interactive needs -i flag");
+        assert!(!argv.contains(&"-it".to_string()), "seeded prompt must NOT add -it even when interactive is true");
     }
 
     #[test]

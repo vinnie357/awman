@@ -145,7 +145,8 @@
       "Bash(rm /tmp/symlink-probe/cargo /tmp/symlink-probe/rustc)",
       "Bash(rmdir /tmp/symlink-probe)",
       "Bash(./target/release/amux --version)",
-      "Bash(./target/release/amux --help)"
+      "Bash(./target/release/amux --help)",
+      "Bash(sudo chown *)"
     ]
   }
 }
