@@ -17,6 +17,7 @@ use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::Session;
 use crate::data::workflow_definition::{Workflow, WorkflowStep};
+use crate::data::workflow_prompt_template::{substitute_prompt, WorkItemContext};
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::container::frontend::ContainerFrontend;
 use crate::engine::container::instance::ContainerExitInfo;
@@ -243,6 +244,7 @@ struct CommandLayerFactory {
     engines: Engines,
     flags: Arc<ExecWorkflowCommandFlags>,
     directory_overlays: Vec<crate::engine::overlay::DirectorySpec>,
+    work_item_context: Option<WorkItemContext>,
 }
 
 impl ContainerExecutionFactory for CommandLayerFactory {
@@ -252,13 +254,19 @@ impl ContainerExecutionFactory for CommandLayerFactory {
         session: &Session,
         runtime: &WorkflowRuntimeContext,
     ) -> Result<crate::engine::container::instance::ContainerExecution, EngineError> {
+        // Substitute work item template tokens in the step prompt.
+        let substitution = substitute_prompt(
+            &step.prompt_template,
+            self.work_item_context.as_ref(),
+        );
+
         let run_opts = AgentRunOptions {
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),
             allowed_tools: vec![],
             disallowed_tools: vec![],
-            initial_prompt: Some(step.prompt_template.clone()),
+            initial_prompt: Some(substitution.rendered),
             allow_docker: self.flags.allow_docker,
             mount_ssh: self.flags.mount_ssh,
             non_interactive: self.flags.non_interactive,
@@ -338,33 +346,78 @@ impl Command for ExecWorkflowCommand {
             .unwrap_or_else(|_| cwd.clone());
         let _mount_path = MountScope::resolve(&cwd, &git_root_for_scope, frontend.as_mut())?;
 
-        // 3. Worktree prepare (if --worktree is set).
+        // 3. Load work item context when --work-item is supplied.
+        let work_item_context = if let Some(wi_str) = &self.flags.work_item {
+            match parse_work_item_number(wi_str) {
+                Some(number) => {
+                    let path = find_work_item_file(&git_root_for_scope, number);
+                    match path.and_then(|p| std::fs::read_to_string(&p).ok()) {
+                        Some(content) => Some(WorkItemContext { number, content }),
+                        None => {
+                            frontend.write_message(crate::engine::message::UserMessage {
+                                level: crate::engine::message::MessageLevel::Warning,
+                                text: format!(
+                                    "work item file for {:04} not found; \
+                                     {{{{work_item_*}}}} placeholders will be empty",
+                                    number
+                                ),
+                            });
+                            None
+                        }
+                    }
+                }
+                None => {
+                    frontend.write_message(crate::engine::message::UserMessage {
+                        level: crate::engine::message::MessageLevel::Warning,
+                        text: format!(
+                            "could not parse work item number from {:?}; \
+                             {{{{work_item_*}}}} placeholders will be empty",
+                            wi_str
+                        ),
+                    });
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // 4. Worktree prepare (if --worktree is set).
         let worktree_lifecycle = if self.flags.worktree {
-            let name = self
-                .flags
-                .workflow
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("workflow")
-                .to_string();
-            // Derive git root from cwd via the git engine.
             let git_root = self
                 .engines
                 .git_engine
                 .resolve_root(&cwd)
                 .map_err(CommandError::from)?;
-            let lifecycle = WorktreeLifecycle::for_workflow(
-                Arc::clone(&self.engines.git_engine),
-                git_root,
-                &name,
-            )?;
+            // When --work-item is supplied, name the worktree/branch after the
+            // work item number rather than the workflow filename.
+            let lifecycle = if let Some(ctx) = &work_item_context {
+                WorktreeLifecycle::for_work_item(
+                    Arc::clone(&self.engines.git_engine),
+                    git_root,
+                    ctx.number,
+                )?
+            } else {
+                let name = self
+                    .flags
+                    .workflow
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("workflow")
+                    .to_string();
+                WorktreeLifecycle::for_workflow(
+                    Arc::clone(&self.engines.git_engine),
+                    git_root,
+                    &name,
+                )?
+            };
             let _worktree_path = lifecycle.prepare(&mut *frontend).await?;
             Some(lifecycle)
         } else {
             None
         };
 
-        // 4. Parse CLI overlay specs early so errors surface before PTY is activated.
+        // 5. Parse CLI overlay specs early so errors surface before PTY is activated.
         let cli_overlays = self
             .flags
             .overlay
@@ -377,17 +430,17 @@ impl Command for ExecWorkflowCommand {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // 5. Set PTY active — queues user messages during the engine run.
+        // 6. Set PTY active — queues user messages during the engine run.
         frontend.set_pty_active(true);
 
-        // 6. Wrap the frontend in Arc<Mutex> so both WorkflowProxy and
+        // 7. Wrap the frontend in Arc<Mutex> so both WorkflowProxy and
         //    CommandLayerFactory can share it for the duration of the engine run.
         let shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>> =
             Arc::new(Mutex::new(frontend));
 
         let flags_arc = Arc::new(self.flags.clone());
 
-        // 7. Build a temporary session from cwd for the engine.
+        // 8. Build a temporary session from cwd for the engine.
         let git_root_for_session = Arc::clone(&self.engines.git_engine)
             .resolve_root(&cwd)
             .map_err(CommandError::from)?;
@@ -401,8 +454,9 @@ impl Command for ExecWorkflowCommand {
         // Merge CLI overlays with config/env sources now that session is available.
         let directory_overlays = collect_all_overlay_specs(&session, cli_overlays);
 
-        // 8. Run the engine. The engine block is scoped so proxy + factory are
+        // 9. Run the engine. The engine block is scoped so proxy + factory are
         //    dropped before we reclaim the frontend via Arc::try_unwrap.
+        let yolo = self.flags.yolo;
         let (engine_result, step_counts) = {
             let proxy = WorkflowProxy(Arc::clone(&shared));
             let factory = CommandLayerFactory {
@@ -410,6 +464,7 @@ impl Command for ExecWorkflowCommand {
                 engines: self.engines.clone(),
                 flags: Arc::clone(&flags_arc),
                 directory_overlays,
+                work_item_context,
             };
             let mut engine = WorkflowEngine::new(
                 &session,
@@ -420,6 +475,7 @@ impl Command for ExecWorkflowCommand {
                 Arc::clone(&self.engines.overlay_engine),
             )
             .map_err(CommandError::from)?;
+            engine.set_yolo(yolo);
             let result = engine.run_to_completion().await;
             let mut completed = 0usize;
             let mut failed = 0usize;
@@ -475,6 +531,41 @@ impl Command for ExecWorkflowCommand {
             worktree_used: self.flags.worktree,
         })
     }
+}
+
+/// Extract a numeric work item number from strings like "0069", "69", "WI-69",
+/// etc. Returns the first run of decimal digits found in `s`, parsed as `u32`.
+fn parse_work_item_number(s: &str) -> Option<u32> {
+    let digits: String = s
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u32>().ok()
+}
+
+/// Find a work item file whose filename starts with the zero-padded four-digit
+/// number (e.g. `0069-*.md`). The search directory is determined by the repo
+/// config's `workItems.dir` setting; falls back to `<git_root>/aspec/work-items/`.
+fn find_work_item_file(git_root: &std::path::Path, number: u32) -> Option<std::path::PathBuf> {
+    let repo_cfg = crate::data::config::repo::RepoConfig::load(git_root).unwrap_or_default();
+    let dir = repo_cfg
+        .work_items_dir(git_root)
+        .unwrap_or_else(|| git_root.join("aspec").join("work-items"));
+    let prefix = format!("{:04}-", number);
+    std::fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(&prefix))
+                .unwrap_or(false)
+        })
 }
 
 #[cfg(test)]

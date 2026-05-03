@@ -79,48 +79,58 @@ impl ContainerBackend for DockerBackend {
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<ContainerHandle>, EngineError> {
-        let output = Command::new("docker")
-            .args([
-                "ps",
-                "--filter",
-                "label=amux=true",
-                "--format",
-                "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        let output = match output {
-            Ok(o) => o,
-            // Docker binary missing: no containers from our perspective.
-            Err(_) => return Ok(Vec::new()),
-        };
-        if !output.status.success() {
-            return Ok(Vec::new());
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut handles = Vec::new();
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.splitn(4, '\t').collect();
-            if parts.len() < 4 {
-                continue;
+        // Query by label AND by name prefix so old-amux containers (which may
+        // lack the label) and nanoclaw workers are included. Results from all
+        // queries are merged and deduplicated by container ID.
+        let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
+        let queries: &[&[&str]] = &[
+            &["ps", "--filter", "label=amux=true", "--format", format],
+            &["ps", "--filter", "name=amux-",      "--format", format],
+            &["ps", "--filter", "name=nanoclaw",   "--format", format],
+        ];
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut handles: Vec<ContainerHandle> = Vec::new();
+
+        for args in queries {
+            let output = Command::new("docker")
+                .args(*args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output();
+            let output = match output {
+                Ok(o) if o.status.success() => o,
+                // Docker missing or query failed: skip this filter, try next.
+                _ => continue,
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.splitn(4, '\t').collect();
+                if parts.len() < 4 {
+                    continue;
+                }
+                let id = parts[0].to_string();
+                if !seen.insert(id.clone()) {
+                    continue; // already added from a previous query
+                }
+                let name = parts[1].to_string();
+                let image_tag = parts[2].to_string();
+                let created = parts[3];
+                // Docker's "CreatedAt" format is locale-formatted; fall back to
+                // now() when parsing fails — better to surface the row than drop it.
+                let started_at =
+                    chrono::DateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S %z %Z")
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now());
+                handles.push(ContainerHandle {
+                    id,
+                    image_tag,
+                    name,
+                    started_at,
+                });
             }
-            let id = parts[0].to_string();
-            let name = parts[1].to_string();
-            let image_tag = parts[2].to_string();
-            let created = parts[3];
-            // Docker's "CreatedAt" format is locale-formatted; fall back to
-            // now() when parsing fails — better to surface the row than drop it.
-            let started_at = chrono::DateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S %z %Z")
-                .map(|dt| dt.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now());
-            handles.push(ContainerHandle {
-                id,
-                image_tag,
-                name,
-                started_at,
-            });
         }
+
         Ok(handles)
     }
 

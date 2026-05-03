@@ -21,7 +21,7 @@ use crate::engine::git::GitEngine;
 use crate::engine::overlay::OverlayEngine;
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutcome,
-    WorkflowOutcome, WorkflowStepStatus,
+    WorkflowOutcome, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::factory::{ContainerExecutionFactory, WorkflowRuntimeContext};
 use crate::engine::workflow::frontend::WorkflowFrontend;
@@ -57,6 +57,9 @@ pub struct WorkflowEngine {
     current_step_agent: Option<AgentName>,
     /// The model the in-flight execution targets.
     current_step_model: Option<String>,
+    /// When true, skip the inter-step user prompt and auto-advance after a
+    /// 60-second countdown (giving the user a chance to intervene).
+    yolo: bool,
 }
 
 impl WorkflowEngine {
@@ -92,7 +95,14 @@ impl WorkflowEngine {
             current_step_name: None,
             current_step_agent: None,
             current_step_model: None,
+            yolo: false,
         })
+    }
+
+    /// Enable yolo mode: auto-advance between steps after a 60-second
+    /// countdown instead of prompting the user.
+    pub fn set_yolo(&mut self, yolo: bool) {
+        self.yolo = yolo;
     }
 
     /// Resume from persisted state. Calls `confirm_resume` on the frontend if
@@ -168,6 +178,7 @@ impl WorkflowEngine {
             current_step_name: None,
             current_step_agent: None,
             current_step_model: None,
+            yolo: false,
         })
     }
 
@@ -195,6 +206,20 @@ impl WorkflowEngine {
             }
             // Ask the user what to do next when there are remaining steps.
             if !self.state.is_complete() {
+                // In yolo mode, replace the interactive prompt with a 60-second
+                // countdown that auto-advances unless the user cancels.
+                if self.yolo {
+                    let advance = self.run_yolo_countdown().await?;
+                    if advance {
+                        continue;
+                    } else {
+                        self.persist()?;
+                        let outcome = WorkflowOutcome::Paused;
+                        self.frontend.report_workflow_completed(&outcome);
+                        return Ok(outcome);
+                    }
+                }
+
                 let available = self.compute_available_actions()?;
                 let action = self
                     .frontend
@@ -405,6 +430,30 @@ impl WorkflowEngine {
             status,
             remaining,
         })
+    }
+
+    /// Run the 60-second yolo countdown, ticking through the frontend every
+    /// second. Returns `true` to advance to the next step, `false` to pause.
+    async fn run_yolo_countdown(&mut self) -> Result<bool, EngineError> {
+        let total = std::time::Duration::from_secs(60);
+        let start = std::time::Instant::now();
+        loop {
+            let elapsed = start.elapsed();
+            let remaining = if elapsed >= total {
+                std::time::Duration::ZERO
+            } else {
+                total - elapsed
+            };
+            match self.frontend.yolo_countdown_tick(remaining)? {
+                YoloTickOutcome::AdvanceNow => return Ok(true),
+                YoloTickOutcome::Cancel => return Ok(false),
+                YoloTickOutcome::Continue => {}
+            }
+            if remaining.is_zero() {
+                return Ok(true);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
     }
 
     /// Compute the set of valid `NextAction`s given the current state.

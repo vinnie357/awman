@@ -37,6 +37,12 @@ pub struct CliFrontend {
     /// Cached canonical command path (resolved via `command_path_from_matches`).
     pub(crate) command_path: Vec<String>,
     pub(crate) messages: CliUserMessageQueue,
+    /// Receiver end of the background stdin-reader thread spawned for yolo
+    /// countdown input. `None` until the first `yolo_countdown_tick` call on a
+    /// TTY; consumed lines are mapped to `YoloTickOutcome` by the
+    /// `WorkflowFrontend` impl. Wrapped in `Mutex` to satisfy the `Sync` bound
+    /// on frontend traits (access is single-threaded in practice).
+    pub(crate) yolo_stdin_rx: Option<std::sync::Mutex<std::sync::mpsc::Receiver<String>>>,
 }
 
 impl CliFrontend {
@@ -46,6 +52,7 @@ impl CliFrontend {
             matches,
             command_path,
             messages: CliUserMessageQueue::new(),
+            yolo_stdin_rx: None,
         }
     }
 

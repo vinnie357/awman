@@ -87,7 +87,10 @@ impl ContainerBackend for AppleBackend {
                 .or_else(|| row.get("name"))
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            if !labels.contains("amux") && !row_name.starts_with("amux-") {
+            if !labels.contains("amux")
+                && !row_name.starts_with("amux-")
+                && !row_name.contains("nanoclaw")
+            {
                 continue;
             }
 

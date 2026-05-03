@@ -131,8 +131,67 @@ impl WorkflowFrontend for CliFrontend {
 
     fn yolo_countdown_tick(
         &mut self,
-        _remaining: Duration,
+        remaining: Duration,
     ) -> Result<YoloTickOutcome, EngineError> {
+        use std::io::Write as _;
+
+        if remaining.is_zero() {
+            // Countdown expired: print a final message and a newline to move
+            // off the countdown line before the engine prints the next step.
+            eprintln!("\r  yolo: auto-advancing to next step...                            ");
+            return Ok(YoloTickOutcome::Continue);
+        }
+
+        let secs = remaining.as_secs();
+        eprint!(
+            "\r  yolo: auto-advancing in {:2}s  [n] now  [a] abort  [p] pause    ",
+            secs
+        );
+        let _ = std::io::stderr().flush();
+
+        if !stdin_is_tty() {
+            return Ok(YoloTickOutcome::Continue);
+        }
+
+        // Lazily spawn a background thread that reads stdin lines. The thread
+        // runs for the lifetime of the countdown; when the Receiver is dropped
+        // the next send will fail and the thread exits.
+        if self.yolo_stdin_rx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                use std::io::BufRead as _;
+                let stdin = std::io::stdin();
+                for line in stdin.lock().lines() {
+                    match line {
+                        Ok(l) => {
+                            if tx.send(l).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            self.yolo_stdin_rx = Some(std::sync::Mutex::new(rx));
+        }
+
+        // Non-blocking check for a line the user already typed.
+        if let Some(m) = &self.yolo_stdin_rx {
+            if let Ok(rx) = m.try_lock() {
+                match rx.try_recv() {
+                    Ok(line) => {
+                        return Ok(match line.trim() {
+                            "n" | "N" => YoloTickOutcome::AdvanceNow,
+                            "a" | "A" | "p" | "P" => YoloTickOutcome::Cancel,
+                            _ => YoloTickOutcome::Continue,
+                        });
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                }
+            }
+        }
+
         Ok(YoloTickOutcome::Continue)
     }
 
