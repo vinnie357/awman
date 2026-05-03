@@ -26,6 +26,8 @@ pub struct ReadyEngineOptions {
     pub build: bool,
     pub no_cache: bool,
     pub allow_docker: bool,
+    /// Env-passthrough list for audit container runs.
+    pub env_passthrough: Option<Vec<String>>,
 }
 
 pub struct ReadyEngine {
@@ -89,6 +91,28 @@ impl ReadyEngine {
 
         let next = match &self.phase {
             ReadyPhase::Preflight => {
+                // Issue 23: Check aspec folder and work-items config presence.
+                let aspec_dir = git_root.join("aspec");
+                if aspec_dir.exists() {
+                    self.summary.aspec_folder = StepStatus::Done;
+                } else {
+                    self.summary.aspec_folder = StepStatus::Failed("aspec/ folder not found".into());
+                    frontend.write_message(crate::engine::message::UserMessage {
+                        level: crate::engine::message::MessageLevel::Warning,
+                        text: "aspec/ folder not found in git root; run `amux init` to create it.".to_string(),
+                    });
+                }
+                let config_path = git_root.join("aspec").join(".amux.json");
+                if config_path.exists() {
+                    self.summary.work_items_config = StepStatus::Done;
+                } else {
+                    self.summary.work_items_config = StepStatus::Failed("aspec/.amux.json not found".into());
+                    frontend.write_message(crate::engine::message::UserMessage {
+                        level: crate::engine::message::MessageLevel::Warning,
+                        text: "aspec/.amux.json not found; run `amux init` to create it.".to_string(),
+                    });
+                }
+
                 let dockerfile_path = git_root.join("Dockerfile.dev");
                 if dockerfile_path.exists() {
                     self.summary.dockerfile = StepStatus::Skipped;
@@ -149,6 +173,15 @@ impl ReadyEngine {
                 ReadyPhase::BuildingBaseImage
             }
             ReadyPhase::BuildingBaseImage => {
+                // Issue 22: Docker daemon pre-check — soft failure allows
+                // run_to_completion to surface a summary rather than aborting.
+                if !self.container_runtime.is_available() {
+                    let msg = "Docker daemon is not running. Install Docker and retry.".to_string();
+                    self.summary.base_image = StepStatus::Failed(msg.clone());
+                    frontend.report_step_status("Build base image", StepStatus::Failed(msg));
+                    return Ok(ReadyPhase::BuildingAgentImage);
+                }
+
                 let tag = project_image_tag(&git_root);
                 // Legacy gate: rebuild when --build was passed, when the base
                 // image is missing, or when the legacy migration just rewrote
@@ -196,9 +229,11 @@ impl ReadyEngine {
                 let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
                 if !agent_dockerfile.exists() {
                     // Try downloading the per-agent Dockerfile (best-effort).
+                    let project_tag = project_image_tag(&git_root);
                     let dl = crate::engine::agent::download::download_agent_dockerfile(
                         self.options.agent.as_str(),
                         &agent_dockerfile,
+                        &project_tag,
                     )
                     .await;
                     if let Err(e) = dl {
@@ -255,6 +290,12 @@ impl ReadyEngine {
                 ReadyPhase::RunningAudit
             }
             ReadyPhase::RunningAudit => {
+                // Issue 7: When --refresh is not set, skip the audit entirely.
+                if !self.options.refresh {
+                    self.summary.audit = StepStatus::Skipped;
+                    self.phase = ReadyPhase::RebuildingAfterAudit;
+                    return Ok(self.phase.clone());
+                }
                 if frontend.ask_run_audit_on_template()? {
                     use crate::data::templates::ready_audit_prompt;
                     use crate::engine::agent::AgentRunOptions;
@@ -266,11 +307,11 @@ impl ReadyEngine {
                         allowed_tools: vec![],
                         disallowed_tools: vec![],
                         initial_prompt: Some(ready_audit_prompt().to_string()),
-                        allow_docker: false,
+                        allow_docker: self.options.allow_docker,
                         mount_ssh: false,
                         non_interactive: true,
                         model: None,
-                        env_passthrough: None,
+                        env_passthrough: self.options.env_passthrough.clone(),
                         directory_overlays: vec![],
                     };
                     match self.agent_engine.build_options(&self.session, &self.options.agent, &run_opts) {
@@ -331,7 +372,7 @@ impl ReadyEngine {
                             &tag,
                             &dockerfile_path_clone,
                             &git_root,
-                            false,
+                            self.options.no_cache,
                             &mut sink,
                         );
                         match result {
@@ -351,6 +392,33 @@ impl ReadyEngine {
                                     "Rebuilding after audit",
                                     StepStatus::Failed(msg),
                                 );
+                            }
+                        }
+
+                        // Issue 9: Also rebuild agent images that layer FROM the project base.
+                        let amux_dir = git_root.join(".amux");
+                        if amux_dir.exists() {
+                            if let Ok(entries) = std::fs::read_dir(&amux_dir) {
+                                for entry in entries.flatten() {
+                                    let name = entry.file_name();
+                                    let name_str = name.to_string_lossy().to_string();
+                                    if name_str.starts_with("Dockerfile.") {
+                                        let agent = name_str.strip_prefix("Dockerfile.").unwrap_or("");
+                                        if !agent.is_empty() {
+                                            let agent_tag = crate::data::image_tags::agent_image_tag(&git_root, agent);
+                                            let mut agent_sink = |line: &str| {
+                                                frontend.report_step_status(line, StepStatus::Running);
+                                            };
+                                            let _ = self.container_runtime.build_image(
+                                                &agent_tag,
+                                                &entry.path(),
+                                                &git_root,
+                                                self.options.no_cache,
+                                                &mut agent_sink,
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -530,6 +598,7 @@ mod tests {
             build: true,
             no_cache: false,
             allow_docker: false,
+            env_passthrough: None,
         };
         let engine = ReadyEngine::new(
             session,
@@ -616,6 +685,7 @@ mod tests {
             build: true,
             no_cache: false,
             allow_docker: false,
+            env_passthrough: None,
         };
         let mut engine = ReadyEngine::new(
             session,
@@ -681,6 +751,7 @@ mod tests {
             build: false,
             no_cache: false,
             allow_docker: false,
+            env_passthrough: None,
         };
         let mut engine2 = ReadyEngine::new(
             session,
@@ -737,6 +808,7 @@ mod tests {
             build: false,
             no_cache: false,
             allow_docker: false,
+            env_passthrough: None,
         };
         let mut engine = ReadyEngine::new(
             session,
@@ -797,6 +869,7 @@ mod tests {
             build: true,
             no_cache: false,
             allow_docker: false,
+            env_passthrough: None,
         };
         let mut engine = ReadyEngine::new(
             session,
@@ -862,6 +935,7 @@ mod tests {
             build: true,
             no_cache: false,
             allow_docker: false,
+            env_passthrough: None,
         };
         let mut engine = ReadyEngine::new(
             session,

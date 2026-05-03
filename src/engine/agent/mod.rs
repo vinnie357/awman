@@ -101,7 +101,7 @@ impl AgentEngine {
         // Ensure Dockerfile.<agent> is present.
         if !agent_dockerfile.exists() {
             frontend.report_step_status("Downloading Dockerfile", StepStatus::Running);
-            match download::download_agent_dockerfile(agent.as_str(), &agent_dockerfile).await {
+            match download::download_agent_dockerfile(agent.as_str(), &agent_dockerfile, &project_tag).await {
                 Ok(()) => frontend.report_step_status("Downloading Dockerfile", StepStatus::Done),
                 Err(e) => {
                     frontend.report_step_status(
@@ -213,9 +213,36 @@ impl AgentEngine {
         // Tool allow/deny lists.
         if !run.allowed_tools.is_empty() {
             options.push(ContainerOption::AllowedTools(run.allowed_tools.clone()));
+            if let Some(flag) = matrix.allowed_tools_flag {
+                options.push(ContainerOption::AllowedToolsFlag(flag.to_string()));
+            }
         }
         if !run.disallowed_tools.is_empty() {
             options.push(ContainerOption::DisallowedTools(run.disallowed_tools.clone()));
+            if let Some(flag) = matrix.disallowed_tools_flag {
+                options.push(ContainerOption::DisallowedToolsFlag(flag.to_string()));
+            }
+        }
+
+        // Resolve per-agent mode flags into literal argv strings.
+        let mut mode_flags = Vec::new();
+        if matches!(run.yolo, Some(YoloMode::Enabled)) {
+            if let Some(flag) = matrix.yolo_flag {
+                mode_flags.push(flag.to_string());
+            }
+        }
+        if matches!(run.auto, Some(crate::engine::container::options::AutoMode::Enabled)) {
+            if let Some(flags) = matrix.auto_flag {
+                mode_flags.extend(flags.iter().map(|s| s.to_string()));
+            }
+        }
+        if matches!(run.plan, Some(PlanMode::Enabled)) {
+            if let Some(flags) = matrix.plan_flag {
+                mode_flags.extend(flags.iter().map(|s| s.to_string()));
+            }
+        }
+        if !mode_flags.is_empty() {
+            options.push(ContainerOption::AgentModeFlags(mode_flags));
         }
 
         // Initial prompt (seeded into the container's stdin).
@@ -242,6 +269,24 @@ impl AgentEngine {
         for name in env_pass {
             options.push(ContainerOption::EnvPassthrough(EnvVar(name.clone())));
         }
+
+        // Per-agent static env vars.
+        match agent.as_str() {
+            "copilot" => {
+                options.push(ContainerOption::EnvLiteral(crate::engine::container::options::EnvLiteral {
+                    key: "COPILOT_OFFLINE".into(),
+                    value: "true".into(),
+                }));
+            }
+            _ => {}
+        }
+
+        // Mount the project source into the container's working directory.
+        options.push(ContainerOption::Overlay(crate::engine::container::options::OverlaySpec {
+            host_path: session.git_root().to_path_buf(),
+            container_path: std::path::PathBuf::from("/workspace"),
+            permission: crate::engine::container::options::OverlayPermission::ReadWrite,
+        }));
 
         // Overlays — agent settings + user-supplied dirs.
         let request = OverlayRequest {

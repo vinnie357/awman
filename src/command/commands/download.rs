@@ -106,7 +106,8 @@ impl Command for DownloadCommand {
                     .git_root()
                     .join(".amux")
                     .join(format!("Dockerfile.{agent}"));
-                crate::engine::agent::download::download_agent_dockerfile(&agent, &dest)
+                let project_tag = crate::data::image_tags::project_image_tag(session.git_root());
+                crate::engine::agent::download::download_agent_dockerfile(&agent, &dest, &project_tag)
                     .await
                     .map_err(|e| CommandError::Other(e.to_string()))?;
                 let bytes_written =

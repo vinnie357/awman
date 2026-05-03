@@ -8,6 +8,7 @@ use crate::data::session::Session;
 use crate::engine::container::ContainerRuntime;
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
+use crate::engine::message::{MessageLevel, UserMessage};
 use crate::engine::overlay::OverlayEngine;
 use crate::engine::step_status::StepStatus;
 
@@ -18,6 +19,19 @@ pub mod summary;
 pub use frontend::ClawsFrontend;
 pub use phase::{ClawsFailure, ClawsPhase};
 pub use summary::ClawsSummary;
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/// Issue 22: Audit prompt seeded into the nanoclaw audit container.
+const CLAWS_AUDIT_PROMPT: &str = r#"You are auditing a nanoclaw (container-based sub-agent) environment. Check:
+1. The Dockerfile is well-formed and installs the required tooling
+2. Network connectivity to required services is available
+3. The agent CLI is installed and accessible
+Report any issues found."#;
+
+/// Issue 21: URL for the nanoclaw-specific Dockerfile template.
+const NANOCLAW_DOCKERFILE_URL: &str =
+    "https://raw.githubusercontent.com/prettysmartdev/amux/main/templates/Dockerfile.nanoclaw";
 
 #[derive(Debug, Clone)]
 pub enum ClawsMode {
@@ -155,55 +169,110 @@ impl ClawsEngine {
                 }
             }
             (ClawsPhase::CloningRepo, _) => {
-                // Clone the nanoclaw repo into the resolved clone_dir. We capture
-                // stderr so a failure surfaces a real diagnostic rather than the
-                // legacy opaque "git clone failed" string. If the parent dir is
-                // root-owned we fail fast and route through CheckingPermissions
-                // for the user to approve a sudo escalation.
-                let url = self.options.nanoclaw_url.as_deref().unwrap_or(
-                    "https://github.com/prettysmartdev/nanoclaw.git",
-                );
+                // Clone the nanoclaw repo into the resolved clone_dir. We try
+                // SSH first, then fall back to HTTPS (matching old-amux
+                // behaviour). GIT_SSH_COMMAND auto-accepts new fingerprints so
+                // the clone can proceed non-interactively.
+                //
+                // TODO(issue-17): The full fork-and-clone flow (gh repo fork)
+                // is not yet implemented in the new engine. This is a known
+                // simplification — the SSH/HTTPS fallback covers the basic
+                // clone case.
                 let parent = self
                     .options
                     .clone_dir
                     .parent()
                     .unwrap_or(std::path::Path::new("/"));
                 let _ = std::fs::create_dir_all(parent);
-                let output = std::process::Command::new("git")
-                    .args(["clone", url])
-                    .arg(&self.options.clone_dir)
-                    .output();
-                match output {
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        let msg = "git binary not found on PATH".to_string();
-                        self.summary.clone = StepStatus::Failed(msg.clone());
-                        return Ok({
-                            self.phase = ClawsPhase::Failed(ClawsFailure::Cloning { message: msg });
-                            self.phase.clone()
-                        });
+
+                let clone_dir_str = self.options.clone_dir.to_str().unwrap_or("");
+
+                // If the user supplied an explicit URL, use it directly
+                // (no SSH/HTTPS fallback).
+                let clone_ok = if let Some(explicit_url) = self.options.nanoclaw_url.as_deref() {
+                    let output = std::process::Command::new("git")
+                        .args(["clone", explicit_url, clone_dir_str])
+                        .env("GIT_SSH_COMMAND", "ssh -o StrictHostKeyChecking=accept-new")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::piped())
+                        .output();
+                    match output {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            let msg = "git binary not found on PATH".to_string();
+                            self.summary.clone = StepStatus::Failed(msg.clone());
+                            return Ok({
+                                self.phase =
+                                    ClawsPhase::Failed(ClawsFailure::Cloning { message: msg });
+                                self.phase.clone()
+                            });
+                        }
+                        Err(e) => {
+                            let msg = format!("git clone: {e}");
+                            self.summary.clone = StepStatus::Failed(msg.clone());
+                            return Ok({
+                                self.phase =
+                                    ClawsPhase::Failed(ClawsFailure::Cloning { message: msg });
+                                self.phase.clone()
+                            });
+                        }
+                        Ok(out) => out.status.success(),
                     }
-                    Err(e) => {
-                        let msg = format!("git clone: {e}");
-                        self.summary.clone = StepStatus::Failed(msg.clone());
-                        return Ok({
-                            self.phase = ClawsPhase::Failed(ClawsFailure::Cloning { message: msg });
-                            self.phase.clone()
-                        });
+                } else {
+                    // Try SSH clone first.
+                    let ssh_url = "git@github.com:prettysmartdev/nanoclaw.git";
+                    let ssh_result = std::process::Command::new("git")
+                        .args(["clone", ssh_url, clone_dir_str])
+                        .env("GIT_SSH_COMMAND", "ssh -o StrictHostKeyChecking=accept-new")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::piped())
+                        .status();
+
+                    match ssh_result {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            let msg = "git binary not found on PATH".to_string();
+                            self.summary.clone = StepStatus::Failed(msg.clone());
+                            return Ok({
+                                self.phase =
+                                    ClawsPhase::Failed(ClawsFailure::Cloning { message: msg });
+                                self.phase.clone()
+                            });
+                        }
+                        Err(e) => {
+                            let msg = format!("git clone: {e}");
+                            self.summary.clone = StepStatus::Failed(msg.clone());
+                            return Ok({
+                                self.phase =
+                                    ClawsPhase::Failed(ClawsFailure::Cloning { message: msg });
+                                self.phase.clone()
+                            });
+                        }
+                        Ok(status) if status.success() => true,
+                        _ => {
+                            // SSH failed — fall back to HTTPS.
+                            let https_url = "https://github.com/prettysmartdev/nanoclaw.git";
+                            std::process::Command::new("git")
+                                .args(["clone", https_url, clone_dir_str])
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::piped())
+                                .status()
+                                .map(|s| s.success())
+                                .unwrap_or(false)
+                        }
                     }
-                    Ok(out) if out.status.success() => {
-                        self.summary.clone = StepStatus::Done;
-                    }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        let msg = if stderr.trim().is_empty() {
-                            format!("git clone exited with code {}", out.status.code().unwrap_or(-1))
-                        } else {
-                            stderr.trim().to_string()
-                        };
-                        self.summary.clone = StepStatus::Failed(msg.clone());
-                        // Fall through — user can still try `claws ready` later
-                        // — but record the structured failure on the phase.
-                    }
+                };
+
+                if clone_ok {
+                    self.summary.clone = StepStatus::Done;
+                    // Issue 20: set permissive permissions after successful clone.
+                    let _ = std::process::Command::new("chmod")
+                        .args(["-R", "u+rwX", clone_dir_str])
+                        .status();
+                    // Issue 21: download nanoclaw-specific Dockerfile and write
+                    // as Dockerfile.dev in the clone directory.
+                    download_nanoclaw_dockerfile(&self.options.clone_dir);
+                } else {
+                    let msg = "git clone failed via both SSH and HTTPS".to_string();
+                    self.summary.clone = StepStatus::Failed(msg);
                 }
                 ClawsPhase::CheckingPermissions
             }
@@ -231,13 +300,55 @@ impl ClawsEngine {
                     ];
                     match frontend.confirm_sudo_actions(&needed)? {
                         true => {
-                            // The engine intentionally does not exec sudo
-                            // itself — that is a Layer-3 capability (the
-                            // frontend can present a separate prompt or hand
-                            // off to a privileged helper). For now we record
-                            // Done so the build can attempt the next step;
-                            // the build will surface a real error if perms
-                            // remain wrong.
+                            // Issue 19: actually execute sudo chown + chmod
+                            // to fix permissions on the clone directory.
+                            let clone_path_str =
+                                self.options.clone_dir.to_str().unwrap_or("");
+                            // Resolve uid:gid via `id` commands (avoids
+                            // `unsafe` libc calls forbidden by the crate).
+                            let uid_str = std::process::Command::new("id")
+                                .arg("-u")
+                                .output()
+                                .map(|o| {
+                                    String::from_utf8_lossy(&o.stdout)
+                                        .trim()
+                                        .to_string()
+                                })
+                                .unwrap_or_else(|_| user.clone());
+                            let gid_str = std::process::Command::new("id")
+                                .arg("-g")
+                                .output()
+                                .map(|o| {
+                                    String::from_utf8_lossy(&o.stdout)
+                                        .trim()
+                                        .to_string()
+                                })
+                                .unwrap_or_else(|_| uid_str.clone());
+                            let chown_status = std::process::Command::new("sudo")
+                                .args([
+                                    "chown",
+                                    "-R",
+                                    &format!("{}:{}", uid_str, gid_str),
+                                    clone_path_str,
+                                ])
+                                .status();
+                            if let Ok(s) = chown_status {
+                                if !s.success() {
+                                    return Err(EngineError::Other(
+                                        "sudo chown failed".into(),
+                                    ));
+                                }
+                            }
+                            let chmod_status = std::process::Command::new("sudo")
+                                .args(["chmod", "-R", "u+rwX", clone_path_str])
+                                .status();
+                            if let Ok(s) = chmod_status {
+                                if !s.success() {
+                                    return Err(EngineError::Other(
+                                        "sudo chmod failed".into(),
+                                    ));
+                                }
+                            }
                             self.summary.permissions_check = StepStatus::Done;
                         }
                         false => {
@@ -284,14 +395,28 @@ impl ClawsEngine {
             (ClawsPhase::RunningAudit, _) => {
                 use crate::data::claws_paths::claws_image_tag;
                 let tag = claws_image_tag(self.session.git_root());
-                // Run the audit container interactively against the freshly
-                // built nanoclaw image. Output streams through the
-                // frontend's container sink. Failure is non-fatal — a failed
-                // audit doesn't block the rest of the init flow but is
-                // surfaced in the summary.
+                // Issue 22: Run the audit container with a seeded prompt
+                // (matching old-amux behaviour). The prompt instructs the
+                // agent to audit the nanoclaw environment. Failure is
+                // non-fatal — a failed audit doesn't block the rest of
+                // the init flow but is surfaced in the summary.
                 let cf = frontend.container_frontend();
+                let agent_name = self
+                    .session
+                    .effective_config()
+                    .agent()
+                    .unwrap_or_else(|| "claude".to_string());
+                let entrypoint = chat_entrypoint_for(&agent_name);
+                let mut args = vec![
+                    "run".to_string(),
+                    "--rm".to_string(),
+                    "-i".to_string(),
+                    tag.clone(),
+                ];
+                args.extend(entrypoint);
+                args.push(CLAWS_AUDIT_PROMPT.to_string());
                 let status = std::process::Command::new("docker")
-                    .args(["run", "--rm", "-i", &tag, "audit"])
+                    .args(&args)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::inherit())
                     .stderr(std::process::Stdio::inherit())
@@ -321,16 +446,21 @@ impl ClawsEngine {
                 ClawsPhase::Configuring
             }
             (ClawsPhase::Configuring, _) => {
-                use crate::data::claws_paths::{claws_clone_path, claws_config_path};
+                use crate::data::claws_paths::{
+                    claws_clone_path, claws_config_path, claws_controller_name,
+                };
                 if let Some(home) = dirs::home_dir() {
                     let _ = std::fs::create_dir_all(claws_clone_path(
                         &home,
                         self.session.git_root(),
                     ));
                     let cfg_path = claws_config_path(&home, self.session.git_root());
+                    // Issue 23: persist container_name alongside git_root.
+                    let controller_name = claws_controller_name(self.session.git_root());
                     let body = serde_json::json!({
                         "git_root": self.session.git_root(),
                         "version": 1,
+                        "container_name": controller_name,
                     });
                     let _ = std::fs::write(
                         &cfg_path,
@@ -344,6 +474,15 @@ impl ClawsEngine {
                 use crate::data::claws_paths::{claws_controller_name, claws_image_tag};
                 let tag = claws_image_tag(self.session.git_root());
                 let controller_name = claws_controller_name(self.session.git_root());
+
+                // Issue 26: warn the user about Docker socket access.
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text: "The nanoclaw controller will have access to the host Docker \
+                           socket. This grants the container ability to manage other \
+                           containers on this host."
+                        .to_string(),
+                });
 
                 // If a stopped container of this name already exists, prefer
                 // `docker start` over `run`. `--rm` would otherwise auto-remove
@@ -393,18 +532,54 @@ impl ClawsEngine {
                         "-v",
                         "/var/run/docker.sock:/var/run/docker.sock",
                     ]);
-                    // Forward common credential-bearing env vars when set on
-                    // the host. Missing vars are silently skipped.
+
+                    // Issue 25: Forward credential env vars from multiple
+                    // sources — hardcoded well-known keys, envPassthrough
+                    // from the effective config, and keychain credentials.
+
+                    // 1. Well-known credential env vars (superset of old list).
                     for name in [
                         "OPENAI_API_KEY",
                         "ANTHROPIC_API_KEY",
                         "GEMINI_API_KEY",
                         "GH_TOKEN",
+                        "GITHUB_TOKEN",
+                        "CLAUDE_CODE_OAUTH_TOKEN",
+                        "CODEX_API_KEY",
                     ] {
                         if let Ok(v) = std::env::var(name) {
                             cmd.arg("-e").arg(format!("{name}={v}"));
                         }
                     }
+
+                    // 2. envPassthrough from EffectiveConfig — forward any
+                    //    user-configured env vars that are set on the host.
+                    let passthrough_vars =
+                        self.session.effective_config().env_passthrough();
+                    for name in &passthrough_vars {
+                        if let Ok(v) = std::env::var(name) {
+                            cmd.arg("-e").arg(format!("{name}={v}"));
+                        }
+                    }
+
+                    // 3. Keychain credentials (macOS: Claude OAuth token, etc.)
+                    let eff_agent_name = self
+                        .session
+                        .effective_config()
+                        .agent()
+                        .unwrap_or_else(|| "claude".to_string());
+                    if let Ok(agent) =
+                        crate::data::session::AgentName::new(&eff_agent_name)
+                    {
+                        let keychain_creds =
+                            crate::engine::auth::keychain::agent_keychain_credentials(
+                                &agent,
+                            );
+                        for (key, val) in &keychain_creds {
+                            cmd.arg("-e").arg(format!("{key}={val}"));
+                        }
+                    }
+
                     cmd.arg(&tag);
                     cmd.stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
@@ -432,6 +607,23 @@ impl ClawsEngine {
                         });
                     }
                     Ok(_child) => {
+                        // Issue 23: also persist the container name in the
+                        // config now that it has been launched.
+                        if let Some(home) = dirs::home_dir() {
+                            use crate::data::claws_paths::claws_config_path;
+                            let cfg_path =
+                                claws_config_path(&home, self.session.git_root());
+                            let body = serde_json::json!({
+                                "git_root": self.session.git_root(),
+                                "version": 1,
+                                "container_name": controller_name,
+                            });
+                            let _ = std::fs::write(
+                                &cfg_path,
+                                serde_json::to_string_pretty(&body)
+                                    .unwrap_or_default(),
+                            );
+                        }
                         self.summary.controller = StepStatus::Done;
                     }
                 }
@@ -440,16 +632,21 @@ impl ClawsEngine {
             (ClawsPhase::AttachingChat, ClawsMode::Chat) => {
                 use crate::data::claws_paths::claws_controller_name;
                 let controller_name = claws_controller_name(self.session.git_root());
-                // Attach to the running controller via `docker exec`. The
-                // entrypoint inside the container is `/amux/claws-chat` per
-                // the legacy nanoclaw contract.
+                // Issue 24: dynamic chat entrypoint based on configured agent.
+                let agent_name = self
+                    .session
+                    .effective_config()
+                    .agent()
+                    .unwrap_or_else(|| "claude".to_string());
+                let entrypoint = chat_entrypoint_for(&agent_name);
+                let mut exec_args = vec![
+                    "exec".to_string(),
+                    "-it".to_string(),
+                    controller_name.clone(),
+                ];
+                exec_args.extend(entrypoint);
                 let status = std::process::Command::new("docker")
-                    .args([
-                        "exec",
-                        "-it",
-                        &controller_name,
-                        "/amux/claws-chat",
-                    ])
+                    .args(&exec_args)
                     .stdin(std::process::Stdio::inherit())
                     .stdout(std::process::Stdio::inherit())
                     .stderr(std::process::Stdio::inherit())
@@ -522,6 +719,47 @@ impl ClawsEngine {
             }
         }
         Ok(self.summary.clone())
+    }
+}
+
+// ── Helper functions ─────────────────────────────────────────────────────────
+
+/// Issue 24: Build the entrypoint command for a given agent name.
+fn chat_entrypoint_for(agent: &str) -> Vec<String> {
+    match agent {
+        "claude" => vec!["claude".to_string()],
+        "codex" => vec!["codex".to_string()],
+        _ => vec![agent.to_string()],
+    }
+}
+
+/// Issue 21: Download the nanoclaw Dockerfile template and write it as
+/// `Dockerfile.dev` in the clone directory. If the download fails, check
+/// if a `Dockerfile` or `Dockerfile.dev` already exists and use that.
+fn download_nanoclaw_dockerfile(clone_dir: &std::path::Path) {
+    let dockerfile_dev = clone_dir.join("Dockerfile.dev");
+
+    // Attempt download via curl (available on most systems).
+    let result = std::process::Command::new("curl")
+        .args(["-fsSL", NANOCLAW_DOCKERFILE_URL, "-o"])
+        .arg(&dockerfile_dev)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    let download_ok = result.map(|s| s.success()).unwrap_or(false);
+
+    if !download_ok {
+        // Download failed — check if a usable Dockerfile already exists.
+        if dockerfile_dev.exists() {
+            // Already have Dockerfile.dev, nothing to do.
+            return;
+        }
+        let dockerfile = clone_dir.join("Dockerfile");
+        if dockerfile.exists() {
+            // Copy Dockerfile to Dockerfile.dev as fallback.
+            let _ = std::fs::copy(&dockerfile, &dockerfile_dev);
+        }
     }
 }
 
@@ -620,7 +858,9 @@ mod tests {
 
     use super::*;
     use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
-    use crate::engine::container::frontend::{ContainerFrontend, ContainerProgress, ContainerStatus};
+    use crate::engine::container::frontend::{
+        ContainerFrontend, ContainerProgress, ContainerStatus,
+    };
     use crate::engine::message::{UserMessage, UserMessageSink};
     use crate::engine::overlay::OverlayEngine;
     use crate::engine::step_status::StepStatus;
@@ -650,9 +890,15 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl ContainerFrontend for FakeContainerFrontend {
-        fn write_stdout(&mut self, _: &[u8]) -> Result<(), EngineError> { Ok(()) }
-        fn write_stderr(&mut self, _: &[u8]) -> Result<(), EngineError> { Ok(()) }
-        async fn read_stdin(&mut self, _: &mut [u8]) -> Result<usize, EngineError> { Ok(0) }
+        fn write_stdout(&mut self, _: &[u8]) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn write_stderr(&mut self, _: &[u8]) -> Result<(), EngineError> {
+            Ok(())
+        }
+        async fn read_stdin(&mut self, _: &mut [u8]) -> Result<usize, EngineError> {
+            Ok(0)
+        }
         fn report_status(&mut self, _: ContainerStatus) {}
         fn report_progress(&mut self, _: ContainerProgress) {}
         fn resize_pty(&mut self, _: u16, _: u16) {}
@@ -726,7 +972,7 @@ mod tests {
 
     #[tokio::test]
     async fn init_mode_fresh_clone_runs_all_phases() {
-        // clone_dir does not exist → no AwaitingCloneDecision, goes straight to CloningRepo.
+        // clone_dir does not exist -> no AwaitingCloneDecision, goes straight to CloningRepo.
         let clone_dir = tempfile::tempdir().unwrap();
         let clone_path = clone_dir.path().join("nanoclaw"); // nonexistent subdir
         let mut engine = make_engine(ClawsMode::Init, clone_path);
@@ -759,7 +1005,7 @@ mod tests {
 
     #[tokio::test]
     async fn awaiting_clone_decision_false_skips_clone() {
-        // clone_dir exists → triggers AwaitingCloneDecision.
+        // clone_dir exists -> triggers AwaitingCloneDecision.
         let clone_dir = tempfile::tempdir().unwrap();
         let mut engine = make_engine(ClawsMode::Init, clone_dir.path().to_path_buf());
         // Decline the clone replacement.
@@ -791,7 +1037,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_mode_with_no_controller_and_decline_offer_init_skips_controller() {
-        // No docker / no controller → `query_claws_controller_state` returns
+        // No docker / no controller -> `query_claws_controller_state` returns
         // `Absent`. With the default `confirm_offer_init = false`, Ready
         // marks `controller = Skipped` and completes without launching.
         let clone_dir = tempfile::tempdir().unwrap();
@@ -811,7 +1057,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_mode_without_running_controller_fails_with_structured_error() {
-        // No docker / no controller → preflight transitions to
+        // No docker / no controller -> preflight transitions to
         // `Failed(ControllerNotRunning)`, never reaching AttachingChat.
         let clone_dir = tempfile::tempdir().unwrap();
         let mut engine = make_engine(ClawsMode::Chat, clone_dir.path().to_path_buf());
@@ -836,7 +1082,7 @@ mod tests {
     #[tokio::test]
     async fn each_phase_reachable_via_step_in_init_mode() {
         let clone_dir = tempfile::tempdir().unwrap();
-        let clone_path = clone_dir.path().join("nanoclaw"); // doesn't exist → no AwaitingCloneDecision
+        let clone_path = clone_dir.path().join("nanoclaw"); // doesn't exist -> no AwaitingCloneDecision
         let mut engine = make_engine(ClawsMode::Init, clone_path);
         let mut frontend = FakeClawsFrontend::new(true, true);
         assert_eq!(engine.phase(), &ClawsPhase::Preflight);

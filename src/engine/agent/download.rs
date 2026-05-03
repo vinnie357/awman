@@ -35,7 +35,10 @@ fn atomic_write(dest: &Path, body: &[u8]) -> Result<(), EngineError> {
 /// the bundled template baked into the binary (when one exists for this
 /// agent). Returns `EngineError::AgentDockerfileDownloadFailed` only when no
 /// bundled fallback is available.
-pub async fn download_agent_dockerfile(agent: &str, dest: &Path) -> Result<(), EngineError> {
+///
+/// `project_base_tag` is substituted for `{{AMUX_BASE_IMAGE}}` in the
+/// downloaded (or bundled) Dockerfile content.
+pub async fn download_agent_dockerfile(agent: &str, dest: &Path, project_base_tag: &str) -> Result<(), EngineError> {
     let url = dockerfile_url_for(agent);
     let client_result = reqwest::Client::builder().user_agent("amux").build();
 
@@ -57,11 +60,16 @@ pub async fn download_agent_dockerfile(agent: &str, dest: &Path) -> Result<(), E
     };
 
     match download_attempt {
-        Ok(body) => atomic_write(dest, &body),
+        Ok(body) => {
+            let body_str = String::from_utf8_lossy(&body);
+            let substituted = body_str.replace("{{AMUX_BASE_IMAGE}}", project_base_tag);
+            atomic_write(dest, substituted.as_bytes())
+        }
         Err(network_error) => {
             // Fall back to bundled template when one exists.
             if let Some(bundled) = crate::data::templates::agent_dockerfile_for(agent) {
-                atomic_write(dest, bundled.as_bytes())
+                let substituted = bundled.replace("{{AMUX_BASE_IMAGE}}", project_base_tag);
+                atomic_write(dest, substituted.as_bytes())
             } else {
                 Err(EngineError::AgentDockerfileDownloadFailed {
                     agent: agent.to_string(),

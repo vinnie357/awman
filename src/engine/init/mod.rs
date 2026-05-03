@@ -135,6 +135,28 @@ impl InitEngine {
                         .map_err(|e| EngineError::io(dockerfile_path.clone(), e))?;
                 }
                 self.summary.dockerfile = StepStatus::Done;
+                // Issue 10: Next phase creates the agent Dockerfile.
+                InitPhase::SettingUpAgentDockerfile
+            }
+            // Issue 10: Ensure .amux/Dockerfile.<agent> exists.
+            InitPhase::SettingUpAgentDockerfile => {
+                let paths = RepoDockerfilePaths::new(&git_root);
+                let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
+                let project_tag = crate::data::image_tags::project_image_tag(&git_root);
+                if !agent_dockerfile.exists() {
+                    let dl = crate::engine::agent::download::download_agent_dockerfile(
+                        self.options.agent.as_str(),
+                        &agent_dockerfile,
+                        &project_tag,
+                    )
+                    .await;
+                    if let Err(e) = dl {
+                        frontend.write_message(crate::engine::message::UserMessage {
+                            level: crate::engine::message::MessageLevel::Warning,
+                            text: format!("agent Dockerfile download failed: {e}; continuing without it"),
+                        });
+                    }
+                }
                 InitPhase::WritingConfig
             }
             InitPhase::WritingConfig => {
@@ -161,10 +183,24 @@ impl InitEngine {
                 } else {
                     self.summary.audit = StepStatus::Skipped;
                     self.summary.image_build = StepStatus::Skipped;
+                    self.summary.agent_image_build = StepStatus::Skipped;
+                    self.summary.image_rebuild = StepStatus::Skipped;
                     InitPhase::AwaitingWorkItemsDecision
                 }
             }
             InitPhase::BuildingImage => {
+                // Issue 16: Docker daemon pre-check — soft failure allows
+                // run_to_completion to surface a summary rather than aborting.
+                if !self.container_runtime.is_available() {
+                    let msg = "Docker daemon is not running. Install Docker and retry.".to_string();
+                    self.summary.image_build = StepStatus::Failed(msg.clone());
+                    self.summary.audit = StepStatus::Skipped;
+                    self.summary.agent_image_build = StepStatus::Skipped;
+                    self.summary.image_rebuild = StepStatus::Skipped;
+                    frontend.report_step_status("Build image", StepStatus::Failed(msg));
+                    return Ok(InitPhase::AwaitingWorkItemsDecision);
+                }
+
                 let paths = RepoDockerfilePaths::new(&git_root);
                 let dockerfile_path = paths.project_dockerfile();
                 let tag = project_image_tag(&git_root);
@@ -183,7 +219,8 @@ impl InitEngine {
                     Ok(()) => {
                         self.summary.image_build = StepStatus::Done;
                         frontend.report_step_status("Build base image", StepStatus::Done);
-                        InitPhase::RunningAudit
+                        // Issue 11: Next phase builds the agent image.
+                        InitPhase::BuildingAgentImage
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -192,9 +229,51 @@ impl InitEngine {
                             .report_step_status("Build base image", StepStatus::Failed(msg.clone()));
                         // Skip audit; nothing to audit without a base image.
                         self.summary.audit = StepStatus::Skipped;
+                        self.summary.agent_image_build = StepStatus::Skipped;
+                        self.summary.image_rebuild = StepStatus::Skipped;
                         InitPhase::AwaitingWorkItemsDecision
                     }
                 }
+            }
+            // Issue 11: Build the agent image after the base image.
+            InitPhase::BuildingAgentImage => {
+                use crate::data::image_tags::agent_image_tag;
+
+                let paths = RepoDockerfilePaths::new(&git_root);
+                let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
+                let agent_tag = agent_image_tag(&git_root, self.options.agent.as_str());
+
+                if agent_dockerfile.exists() {
+                    frontend.report_step_status("Build agent image", StepStatus::Running);
+                    let mut sink = |line: &str| {
+                        frontend.report_step_status(line, StepStatus::Running);
+                    };
+                    let result = self.container_runtime.build_image(
+                        &agent_tag,
+                        &agent_dockerfile,
+                        &git_root,
+                        false,
+                        &mut sink,
+                    );
+                    match result {
+                        Ok(()) => {
+                            self.summary.agent_image_build = StepStatus::Done;
+                            frontend.report_step_status("Build agent image", StepStatus::Done);
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            self.summary.agent_image_build = StepStatus::Failed(msg.clone());
+                            frontend.report_step_status("Build agent image", StepStatus::Failed(msg));
+                        }
+                    }
+                } else {
+                    self.summary.agent_image_build = StepStatus::Skipped;
+                    frontend.write_message(crate::engine::message::UserMessage {
+                        level: crate::engine::message::MessageLevel::Warning,
+                        text: "Agent Dockerfile not found; skipping agent image build.".to_string(),
+                    });
+                }
+                InitPhase::RunningAudit
             }
             InitPhase::RunningAudit => {
                 use crate::data::templates::init_audit_prompt;
@@ -268,6 +347,62 @@ impl InitEngine {
                         }
                     }
                 }
+                // Issue 12: After the audit, rebuild images if audit succeeded.
+                InitPhase::RebuildingAfterAudit
+            }
+            // Issue 12: Post-audit image rebuild in init.
+            InitPhase::RebuildingAfterAudit => {
+                if matches!(self.summary.audit, StepStatus::Done) {
+                    // Rebuild base image.
+                    let paths = RepoDockerfilePaths::new(&git_root);
+                    let dockerfile_path = paths.project_dockerfile();
+                    let tag = project_image_tag(&git_root);
+                    frontend.report_step_status("Rebuilding after audit", StepStatus::Running);
+                    let mut sink = |line: &str| {
+                        frontend.report_step_status(line, StepStatus::Running);
+                    };
+                    let result = self.container_runtime.build_image(
+                        &tag,
+                        &dockerfile_path,
+                        &git_root,
+                        false,
+                        &mut sink,
+                    );
+                    match result {
+                        Ok(()) => {
+                            self.summary.image_rebuild = StepStatus::Done;
+                            frontend.report_step_status("Rebuilding after audit", StepStatus::Done);
+                        }
+                        Err(e) => {
+                            let msg = e.to_string();
+                            self.summary.image_rebuild = StepStatus::Failed(msg.clone());
+                            frontend.report_step_status(
+                                "Rebuilding after audit",
+                                StepStatus::Failed(msg),
+                            );
+                        }
+                    }
+                    // Also rebuild agent image.
+                    if matches!(self.summary.image_rebuild, StepStatus::Done) {
+                        use crate::data::image_tags::agent_image_tag;
+                        let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
+                        if agent_dockerfile.exists() {
+                            let agent_tag = agent_image_tag(&git_root, self.options.agent.as_str());
+                            let mut agent_sink = |line: &str| {
+                                frontend.report_step_status(line, StepStatus::Running);
+                            };
+                            let _ = self.container_runtime.build_image(
+                                &agent_tag,
+                                &agent_dockerfile,
+                                &git_root,
+                                false,
+                                &mut agent_sink,
+                            );
+                        }
+                    }
+                } else {
+                    self.summary.image_rebuild = StepStatus::Skipped;
+                }
                 InitPhase::AwaitingWorkItemsDecision
             }
             InitPhase::AwaitingWorkItemsDecision => {
@@ -322,7 +457,7 @@ mod tests {
     use crate::engine::overlay::OverlayEngine;
     use crate::engine::step_status::StepStatus;
 
-    // ── Fake frontend ────────────────────────────────────────────────────────
+    // -- Fake frontend --------------------------------------------------------
 
     struct FakeInitFrontend {
         replace_aspec: bool,
@@ -388,7 +523,7 @@ mod tests {
         fn report_summary(&mut self, _: &InitSummary) {}
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
+    // -- Helpers --------------------------------------------------------------
 
     fn make_engine(git_root: &std::path::Path) -> InitEngine {
         let resolver = StaticGitRootResolver::new(git_root);
@@ -423,7 +558,7 @@ mod tests {
         )
     }
 
-    // ── Tests ────────────────────────────────────────────────────────────────
+    // -- Tests ----------------------------------------------------------------
 
     #[tokio::test]
     async fn run_to_completion_all_done() {

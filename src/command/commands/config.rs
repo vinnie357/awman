@@ -8,26 +8,101 @@ use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::engine::message::UserMessageSink;
 
-/// All valid top-level config field names (both global and repo).
-const VALID_CONFIG_FIELDS: &[&str] = &[
-    "agent",
-    "auto_agent_auth_accepted",
-    "terminal_scrollback_lines",
-    "yoloDisallowedTools",
-    "envPassthrough",
-    "workItems",
-    "overlays",
-    "agentStuckTimeout",
-    "runtime",
-    "default_agent",
-    "headless",
-    "remote",
+/// Scope metadata for each config field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldScope {
+    /// May only be written to global config.
+    GlobalOnly,
+    /// May only be written to repo config.
+    RepoOnly,
+    /// May be written to either global or repo config.
+    Both,
+}
+
+/// Entry in the config field table: `(dotted_name, scope)`.
+const VALID_CONFIG_FIELDS: &[(&str, FieldScope)] = &[
+    ("agent", FieldScope::Both),
+    ("auto_agent_auth_accepted", FieldScope::GlobalOnly),
+    ("terminal_scrollback_lines", FieldScope::Both),
+    ("yoloDisallowedTools", FieldScope::Both),
+    ("envPassthrough", FieldScope::Both),
+    ("workItems", FieldScope::RepoOnly),
+    ("overlays", FieldScope::RepoOnly),
+    ("agentStuckTimeout", FieldScope::Both),
+    ("runtime", FieldScope::GlobalOnly),
+    ("default_agent", FieldScope::GlobalOnly),
+    ("headless", FieldScope::GlobalOnly),
+    ("remote", FieldScope::Both),
+    // Dot-notation nested fields
+    ("work_items.dir", FieldScope::RepoOnly),
+    ("work_items.template", FieldScope::RepoOnly),
+    ("headless.workDirs", FieldScope::GlobalOnly),
+    ("headless.port", FieldScope::GlobalOnly),
+    ("headless.background", FieldScope::GlobalOnly),
+    ("remote.defaultAddr", FieldScope::Both),
+    ("remote.defaultAPIKey", FieldScope::Both),
 ];
+
+/// Flat list of all valid field names (for suggestions / validation).
+fn valid_field_names() -> Vec<&'static str> {
+    VALID_CONFIG_FIELDS.iter().map(|(name, _)| *name).collect()
+}
+
+/// Look up the scope for a field name.
+fn field_scope(name: &str) -> Option<FieldScope> {
+    VALID_CONFIG_FIELDS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, s)| *s)
+}
 
 /// Valid agent names for config set agent=<value>.
 const VALID_AGENT_VALUES: &[&str] = &[
     "claude", "codex", "gemini", "opencode", "crush", "cline", "copilot", "maki",
 ];
+
+/// Validate and coerce a string value into the appropriate JSON type for the
+/// given field. Returns the coerced `serde_json::Value` or a user-facing error.
+fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, String> {
+    match field {
+        "agent" | "default_agent" => {
+            if !VALID_AGENT_VALUES.contains(&value) {
+                return Err(format!(
+                    "'{}' is not a known agent; valid agents: {}",
+                    value,
+                    VALID_AGENT_VALUES.join(", ")
+                ));
+            }
+            Ok(serde_json::Value::String(value.to_string()))
+        }
+        "yoloDisallowedTools" | "envPassthrough" | "headless.workDirs" => {
+            // Parse comma-separated into array
+            let items: Vec<&str> = value.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+            Ok(serde_json::Value::Array(
+                items.iter().map(|s| serde_json::Value::String(s.to_string())).collect(),
+            ))
+        }
+        "terminal_scrollback_lines" | "agentStuckTimeout" | "headless.port" => {
+            // Must be a positive integer
+            value
+                .parse::<u64>()
+                .map(|n| serde_json::Value::Number(n.into()))
+                .map_err(|_| format!("'{}' is not a valid number", value))
+        }
+        _ => {
+            // Default: try bool, then number, then string
+            if value == "true" {
+                Ok(serde_json::Value::Bool(true))
+            } else if value == "false" {
+                Ok(serde_json::Value::Bool(false))
+            } else if let Ok(n) = value.parse::<u64>() {
+                Ok(serde_json::Value::Number(n.into()))
+            } else {
+                Ok(serde_json::Value::String(value.to_string()))
+            }
+        }
+    }
+}
 
 /// Levenshtein edit distance between two strings.
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -134,9 +209,11 @@ pub enum ConfigFieldKind {
 /// `String` (callers should reject them before reaching this function).
 fn config_field_kind(name: &str) -> ConfigFieldKind {
     match name {
-        "agent" => ConfigFieldKind::Enum,
-        "auto_agent_auth_accepted" => ConfigFieldKind::Bool,
-        "terminal_scrollback_lines" | "agentStuckTimeout" => ConfigFieldKind::Number,
+        "agent" | "default_agent" => ConfigFieldKind::Enum,
+        "auto_agent_auth_accepted" | "headless.background" => ConfigFieldKind::Bool,
+        "terminal_scrollback_lines" | "agentStuckTimeout" | "headless.port" => {
+            ConfigFieldKind::Number
+        }
         _ => ConfigFieldKind::String,
     }
 }
@@ -151,7 +228,7 @@ fn collect_config_rows(
 ) -> Vec<ConfigFieldRow> {
     VALID_CONFIG_FIELDS
         .iter()
-        .map(|name| {
+        .map(|(name, _scope)| {
             let g = config_field_value(global, name);
             let r = config_field_value(repo, name);
             ConfigFieldRow {
@@ -218,6 +295,7 @@ impl Command for ConfigCommand {
     ) -> Result<Self::Outcome, CommandError> {
         let _ = self.engines;
         let session = open_session()?;
+        let names = valid_field_names();
         let outcome = match self.sub {
             ConfigSubcommand::Show(_) => {
                 let global =
@@ -229,8 +307,8 @@ impl Command for ConfigCommand {
             }
             ConfigSubcommand::Get(f) => {
                 // Validate field name.
-                if !VALID_CONFIG_FIELDS.contains(&f.field.as_str()) {
-                    let suggestions = levenshtein_suggestions(&f.field, VALID_CONFIG_FIELDS);
+                if !names.contains(&f.field.as_str()) {
+                    let suggestions = levenshtein_suggestions(&f.field, &names);
                     return Err(CommandError::UnknownConfigField {
                         name: f.field.clone(),
                         suggestions: if suggestions.is_empty() {
@@ -258,8 +336,8 @@ impl Command for ConfigCommand {
             }
             ConfigSubcommand::Set(f) => {
                 // Validate field name.
-                if !VALID_CONFIG_FIELDS.contains(&f.field.as_str()) {
-                    let suggestions = levenshtein_suggestions(&f.field, VALID_CONFIG_FIELDS);
+                if !names.contains(&f.field.as_str()) {
+                    let suggestions = levenshtein_suggestions(&f.field, &names);
                     return Err(CommandError::UnknownConfigField {
                         name: f.field.clone(),
                         suggestions: if suggestions.is_empty() {
@@ -269,28 +347,41 @@ impl Command for ConfigCommand {
                         },
                     });
                 }
-                // Validate agent value when setting the "agent" field.
-                if f.field == "agent" && !VALID_AGENT_VALUES.contains(&f.value.as_str()) {
-                    return Err(CommandError::InvalidFlagValue {
-                        command: vec!["config".into(), "set".into()],
-                        flag: "agent".into(),
-                        reason: format!(
-                            "'{}' is not a known agent; valid agents: {}",
-                            f.value,
-                            VALID_AGENT_VALUES.join(", ")
-                        ),
-                    });
+                // Validate scope: enforce GlobalOnly / RepoOnly constraints.
+                if let Some(scope) = field_scope(&f.field) {
+                    if scope == FieldScope::GlobalOnly && !f.global {
+                        return Err(CommandError::InvalidFlagValue {
+                            command: vec!["config".into(), "set".into()],
+                            flag: "global".into(),
+                            reason: format!(
+                                "field '{}' can only be set in global config; add --global",
+                                f.field
+                            ),
+                        });
+                    }
+                    if scope == FieldScope::RepoOnly && f.global {
+                        return Err(CommandError::InvalidFlagValue {
+                            command: vec!["config".into(), "set".into()],
+                            flag: "global".into(),
+                            reason: format!(
+                                "field '{}' can only be set in repo config; omit --global",
+                                f.field
+                            ),
+                        });
+                    }
                 }
+                // Validate and coerce the value per field type.
+                let coerced = validate_and_coerce(&f.field, &f.value).map_err(|reason| {
+                    CommandError::InvalidFlagValue {
+                        command: vec!["config".into(), "set".into()],
+                        flag: f.field.clone(),
+                        reason,
+                    }
+                })?;
                 if f.global {
                     let mut cfg = session.global_config().clone();
-                    set_config_field(
-                        &mut serde_json::to_value(&cfg).unwrap_or_default(),
-                        &f.field,
-                        &f.value,
-                    );
-                    // Re-serialize via JSON round-trip to apply the change.
                     let mut json = serde_json::to_value(&cfg).unwrap_or_default();
-                    set_config_field(&mut json, &f.field, &f.value);
+                    set_config_field(&mut json, &f.field, coerced.clone());
                     if let Ok(updated) = serde_json::from_value(json) {
                         cfg = updated;
                         let _ = cfg.save();
@@ -298,7 +389,7 @@ impl Command for ConfigCommand {
                 } else {
                     let mut cfg = session.repo_config().clone();
                     let mut json = serde_json::to_value(&cfg).unwrap_or_default();
-                    set_config_field(&mut json, &f.field, &f.value);
+                    set_config_field(&mut json, &f.field, coerced.clone());
                     if let Ok(updated) = serde_json::from_value(json) {
                         cfg = updated;
                         let _ = cfg.save(session.git_root());
@@ -316,10 +407,14 @@ impl Command for ConfigCommand {
     }
 }
 
-/// Look up a JSON field value (top-level only) and stringify it.
+/// Look up a JSON field value, supporting dot-notation (e.g. "work_items.dir").
 fn config_field_value(json: &serde_json::Value, field: &str) -> Option<String> {
-    let v = json.get(field)?;
-    Some(match v {
+    let parts: Vec<&str> = field.split('.').collect();
+    let mut current = json;
+    for part in &parts {
+        current = current.get(*part)?;
+    }
+    Some(match current {
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Number(n) => n.to_string(),
@@ -328,19 +423,39 @@ fn config_field_value(json: &serde_json::Value, field: &str) -> Option<String> {
     })
 }
 
-/// Set a top-level JSON field, parsing the string into the right type.
-fn set_config_field(json: &mut serde_json::Value, field: &str, value: &str) {
-    if let serde_json::Value::Object(obj) = json {
-        let new_val = if value == "true" {
-            serde_json::Value::Bool(true)
-        } else if value == "false" {
-            serde_json::Value::Bool(false)
-        } else if let Ok(n) = value.parse::<u64>() {
-            serde_json::Value::Number(n.into())
-        } else {
-            serde_json::Value::String(value.to_string())
-        };
-        obj.insert(field.to_string(), new_val);
+/// Set a JSON field, supporting dot-notation for nested objects.
+/// E.g. "work_items.dir" sets `json["work_items"]["dir"]`.
+fn set_config_field(json: &mut serde_json::Value, field: &str, value: serde_json::Value) {
+    let parts: Vec<&str> = field.split('.').collect();
+    if parts.len() == 1 {
+        // Top-level field
+        if let serde_json::Value::Object(obj) = json {
+            obj.insert(field.to_string(), value);
+        }
+    } else {
+        // Navigate into nested objects, creating intermediate objects as needed.
+        let mut current = json;
+        for (i, part) in parts.iter().enumerate() {
+            if i == parts.len() - 1 {
+                // Last segment: insert the value.
+                if let serde_json::Value::Object(obj) = current {
+                    obj.insert(part.to_string(), value);
+                }
+                return;
+            }
+            // Intermediate segment: ensure a nested object exists.
+            if !current.get(*part).map(|v| v.is_object()).unwrap_or(false) {
+                if let serde_json::Value::Object(obj) = current {
+                    obj.insert(
+                        part.to_string(),
+                        serde_json::Value::Object(serde_json::Map::new()),
+                    );
+                }
+            }
+            current = current
+                .get_mut(*part)
+                .expect("just inserted nested object");
+        }
     }
 }
 
@@ -395,40 +510,50 @@ mod tests {
         assert_eq!(config_field_value(&json, "model"), None);
     }
 
+    #[test]
+    fn config_field_value_supports_dot_notation() {
+        let json = serde_json::json!({"work_items": {"dir": "aspec/work-items"}});
+        assert_eq!(
+            config_field_value(&json, "work_items.dir"),
+            Some("aspec/work-items".to_string())
+        );
+    }
+
     // ── set_config_field ─────────────────────────────────────────────────────
 
     #[test]
     fn set_config_field_inserts_string_value() {
         let mut json = serde_json::json!({});
-        set_config_field(&mut json, "agent", "codex");
+        set_config_field(
+            &mut json,
+            "agent",
+            serde_json::Value::String("codex".into()),
+        );
         assert_eq!(json["agent"], serde_json::Value::String("codex".into()));
     }
 
     #[test]
-    fn set_config_field_parses_true_as_bool() {
+    fn set_config_field_inserts_bool_value() {
         let mut json = serde_json::json!({});
-        set_config_field(&mut json, "yolo", "true");
+        set_config_field(&mut json, "yolo", serde_json::Value::Bool(true));
         assert_eq!(json["yolo"], serde_json::Value::Bool(true));
     }
 
     #[test]
-    fn set_config_field_parses_false_as_bool() {
+    fn set_config_field_inserts_number_value() {
         let mut json = serde_json::json!({});
-        set_config_field(&mut json, "yolo", "false");
-        assert_eq!(json["yolo"], serde_json::Value::Bool(false));
-    }
-
-    #[test]
-    fn set_config_field_parses_numeric_string_as_number() {
-        let mut json = serde_json::json!({});
-        set_config_field(&mut json, "port", "9876");
+        set_config_field(&mut json, "port", serde_json::json!(9876u64));
         assert_eq!(json["port"], serde_json::json!(9876u64));
     }
 
     #[test]
     fn set_config_field_overwrites_existing_value() {
         let mut json = serde_json::json!({"agent": "claude"});
-        set_config_field(&mut json, "agent", "gemini");
+        set_config_field(
+            &mut json,
+            "agent",
+            serde_json::Value::String("gemini".into()),
+        );
         assert_eq!(json["agent"], serde_json::Value::String("gemini".into()));
     }
 
@@ -436,9 +561,104 @@ mod tests {
     fn set_config_field_does_not_modify_non_object() {
         // If the json is not an Object, set_config_field is a no-op.
         let mut json = serde_json::Value::Null;
-        set_config_field(&mut json, "agent", "claude");
+        set_config_field(
+            &mut json,
+            "agent",
+            serde_json::Value::String("claude".into()),
+        );
         // Should still be Null — no panic.
         assert!(json.is_null());
+    }
+
+    #[test]
+    fn set_config_field_dot_notation_creates_nested() {
+        let mut json = serde_json::json!({});
+        set_config_field(
+            &mut json,
+            "work_items.dir",
+            serde_json::Value::String("custom/dir".into()),
+        );
+        assert_eq!(json["work_items"]["dir"], "custom/dir");
+    }
+
+    #[test]
+    fn set_config_field_dot_notation_preserves_siblings() {
+        let mut json = serde_json::json!({"work_items": {"template": "tmpl.md"}});
+        set_config_field(
+            &mut json,
+            "work_items.dir",
+            serde_json::Value::String("custom/dir".into()),
+        );
+        assert_eq!(json["work_items"]["dir"], "custom/dir");
+        assert_eq!(json["work_items"]["template"], "tmpl.md");
+    }
+
+    // ── validate_and_coerce ──────────────────────────────────────────────────
+
+    #[test]
+    fn validate_and_coerce_agent_valid() {
+        let v = validate_and_coerce("agent", "claude").unwrap();
+        assert_eq!(v, serde_json::Value::String("claude".into()));
+    }
+
+    #[test]
+    fn validate_and_coerce_agent_invalid() {
+        let err = validate_and_coerce("agent", "notareal").unwrap_err();
+        assert!(err.contains("not a known agent"));
+    }
+
+    #[test]
+    fn validate_and_coerce_list_field() {
+        let v = validate_and_coerce("yoloDisallowedTools", "tool1, tool2, tool3").unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!(["tool1", "tool2", "tool3"])
+        );
+    }
+
+    #[test]
+    fn validate_and_coerce_number_field() {
+        let v = validate_and_coerce("terminal_scrollback_lines", "5000").unwrap();
+        assert_eq!(v, serde_json::json!(5000u64));
+    }
+
+    #[test]
+    fn validate_and_coerce_number_field_invalid() {
+        let err = validate_and_coerce("terminal_scrollback_lines", "abc").unwrap_err();
+        assert!(err.contains("not a valid number"));
+    }
+
+    #[test]
+    fn validate_and_coerce_default_bool() {
+        assert_eq!(
+            validate_and_coerce("some_field", "true").unwrap(),
+            serde_json::Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn validate_and_coerce_default_string() {
+        assert_eq!(
+            validate_and_coerce("some_field", "hello").unwrap(),
+            serde_json::Value::String("hello".into())
+        );
+    }
+
+    // ── field_scope ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn field_scope_global_only() {
+        assert_eq!(field_scope("runtime"), Some(FieldScope::GlobalOnly));
+    }
+
+    #[test]
+    fn field_scope_repo_only() {
+        assert_eq!(field_scope("work_items.dir"), Some(FieldScope::RepoOnly));
+    }
+
+    #[test]
+    fn field_scope_both() {
+        assert_eq!(field_scope("agent"), Some(FieldScope::Both));
     }
 
     // ── levenshtein ───────────────────────────────────────────────────────────
@@ -473,7 +693,8 @@ mod tests {
 
     #[test]
     fn levenshtein_suggestions_finds_close_match() {
-        let result = levenshtein_suggestions("agnet", VALID_CONFIG_FIELDS);
+        let names = valid_field_names();
+        let result = levenshtein_suggestions("agnet", &names);
         // "agnet" is distance 2 from "agent" (two transpositions); should appear.
         assert!(
             result.contains(&"agent"),
@@ -483,7 +704,8 @@ mod tests {
 
     #[test]
     fn levenshtein_suggestions_empty_when_no_close_match() {
-        let result = levenshtein_suggestions("zzzzzzzzzzz", VALID_CONFIG_FIELDS);
+        let names = valid_field_names();
+        let result = levenshtein_suggestions("zzzzzzzzzzz", &names);
         assert!(
             result.is_empty(),
             "suggestions must be empty for very distant input"
@@ -492,8 +714,9 @@ mod tests {
 
     #[test]
     fn levenshtein_suggestions_sorted_by_distance() {
+        let names = valid_field_names();
         // "runtim" is distance 1 from "runtime" and distance 2+ from all others.
-        let result = levenshtein_suggestions("runtim", VALID_CONFIG_FIELDS);
+        let result = levenshtein_suggestions("runtim", &names);
         if result.len() >= 2 {
             // First result must be "runtime" (closest match).
             assert_eq!(result[0], "runtime", "closest match must be first: {result:?}");

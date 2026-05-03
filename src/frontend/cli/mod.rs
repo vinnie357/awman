@@ -319,7 +319,7 @@ pub(crate) fn error_exit_code(err: &CommandError) -> u8 {
         CommandError::Engine(crate::engine::error::EngineError::Container(_))
         | CommandError::Engine(crate::engine::error::EngineError::ContainerRuntimeUnavailable { .. }) => 3,
 
-        // Exit 1 — every other failure (each variant explicit; no catch-all)
+        // Exit 1 — remaining engine errors (catch-all for unlisted EngineError variants)
         CommandError::Engine(_) => 1,
         CommandError::Data(_) => 1,
         CommandError::MergeConflict { .. } => 1,

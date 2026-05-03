@@ -1,8 +1,8 @@
 //! `ReadyFrontend` impl for the CLI.
 //!
-//! Per WI 0069 §1, prompts on stdin for Dockerfile and legacy-migration
+//! Per WI 0069 section 1, prompts on stdin for Dockerfile and legacy-migration
 //! decisions when stdin is a TTY; otherwise returns the safe defaults
-//! from §7u.
+//! from section 7u.
 
 use crate::data::session::AgentName;
 use crate::engine::container::frontend::ContainerFrontend;
@@ -46,6 +46,10 @@ impl ReadyFrontend for CliFrontend {
     }
 
     fn report_step_status(&mut self, step: &str, status: StepStatus) {
+        // When --json is active, suppress human-readable output on stderr.
+        if self.is_json_mode() {
+            return;
+        }
         let level = match status {
             StepStatus::Failed(_) => MessageLevel::Error,
             _ => MessageLevel::Info,
@@ -61,6 +65,11 @@ impl ReadyFrontend for CliFrontend {
     }
 
     fn report_summary(&mut self, summary: &ReadySummary) {
+        // When --json is active, suppress the human-readable summary box on
+        // stderr — only the JSON output on stdout matters.
+        if self.is_json_mode() {
+            return;
+        }
         let rows: Vec<(&str, &StepStatus)> = vec![
             ("Base image", &summary.base_image),
             ("Agent image", &summary.agent_image),

@@ -21,7 +21,7 @@ use crate::engine::container::instance::{
     ContainerStats, ExecutionBackend,
 };
 use crate::engine::container::options::{
-    ContainerName, ImageRef, ResolvedContainerOptions, YoloMode,
+    ContainerName, ImageRef, ResolvedContainerOptions,
 };
 use crate::engine::error::EngineError;
 
@@ -313,7 +313,10 @@ pub(super) fn build_run_argv(
     image: &ImageRef,
     options: &ResolvedContainerOptions,
 ) -> Vec<String> {
-    let mut args: Vec<String> = vec!["run".into(), "--rm".into()];
+    let mut args: Vec<String> = vec!["run".into()];
+    if options.remove_on_exit {
+        args.push("--rm".into());
+    }
     if options.interactive {
         args.push("-it".into());
     } else if options.seeded_prompt.is_some() {
@@ -433,9 +436,24 @@ pub(super) fn build_run_argv(
         // Some agents take a sub-command (e.g. "run") rather than a flag.
         args.push(flag.clone());
     }
-    if matches!(options.yolo, YoloMode::Enabled) {
-        // `yolo` for claude is encoded in the entrypoint or denylist; agents
-        // that need a literal flag can append below.
+    // Per-agent mode flags (yolo, auto, plan) — appended as literal args.
+    for flag in &options.agent_mode_flags {
+        args.push(flag.clone());
+    }
+
+    // Disallowed tools.
+    if !options.disallowed_tools.is_empty() {
+        if let Some(flag_name) = options.disallowed_tools_flag.as_deref() {
+            args.push(flag_name.to_string());
+            args.push(options.disallowed_tools.join(","));
+        }
+    }
+    // Allowed tools.
+    if !options.allowed_tools.is_empty() {
+        if let Some(flag_name) = options.allowed_tools_flag.as_deref() {
+            args.push(flag_name.to_string());
+            args.push(options.allowed_tools.join(","));
+        }
     }
 
     // Model flag.

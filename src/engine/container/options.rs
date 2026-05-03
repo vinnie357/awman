@@ -157,6 +157,15 @@ pub enum ContainerOption {
     /// Session identifier — emitted as `--label amux.session=<id>` so
     /// `list_running` can attribute containers to a specific amux session.
     SessionLabel(String),
+    /// Per-agent mode flags (yolo, auto, plan) — emitted as literal argv
+    /// strings after the entrypoint in `build_run_argv`.
+    AgentModeFlags(Vec<String>),
+    /// The flag name to use when emitting disallowed tools (e.g. `--disallowedTools`).
+    DisallowedToolsFlag(String),
+    /// The flag name to use when emitting allowed tools (e.g. `--allowedTools`).
+    AllowedToolsFlag(String),
+    /// Keep the container after exit (do not pass `--rm`).
+    KeepContainer,
 }
 
 /// Resolved option bag — all options merged into a single struct that the
@@ -187,6 +196,10 @@ pub struct ResolvedContainerOptions {
     pub non_interactive_flag: Option<String>,
     pub dockerfile_user: Option<String>,
     pub session_label: Option<String>,
+    pub agent_mode_flags: Vec<String>,
+    pub disallowed_tools_flag: Option<String>,
+    pub allowed_tools_flag: Option<String>,
+    pub remove_on_exit: bool,
 }
 
 impl ResolvedContainerOptions {
@@ -197,6 +210,7 @@ impl ResolvedContainerOptions {
             yolo: YoloMode::Disabled,
             auto: AutoMode::Disabled,
             plan: PlanMode::Disabled,
+            remove_on_exit: true,
             ..Self::default()
         };
         for opt in options {
@@ -234,6 +248,10 @@ impl ResolvedContainerOptions {
             ContainerOption::NonInteractivePrintFlag(v) => self.non_interactive_flag = Some(v),
             ContainerOption::DockerfileUser(v) => self.dockerfile_user = Some(v),
             ContainerOption::SessionLabel(v) => self.session_label = Some(v),
+            ContainerOption::AgentModeFlags(v) => self.agent_mode_flags.extend(v),
+            ContainerOption::DisallowedToolsFlag(v) => self.disallowed_tools_flag = Some(v),
+            ContainerOption::AllowedToolsFlag(v) => self.allowed_tools_flag = Some(v),
+            ContainerOption::KeepContainer => self.remove_on_exit = false,
         }
         Ok(())
     }

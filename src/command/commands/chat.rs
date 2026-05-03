@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
-use crate::command::commands::mount_scope::MountScopeFrontend;
+use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
 use crate::command::commands::parse_overlay_spec;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
@@ -73,6 +73,11 @@ impl Command for ChatCommand {
         // 1. Resolve the agent: --agent flag wins over the repo / global default.
         let session = open_session_for_cwd(&self.engines)?;
         let agent = resolve_agent(&self.flags.agent, &session)?;
+
+        // 1b. Confirm mount scope when cwd differs from git root.
+        let cwd = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let _mount_path = MountScope::resolve(&cwd, session.git_root(), frontend.as_mut())?;
 
         // 2. Parse overlay specs before PTY is activated so errors surface early.
         let directory_overlays = self

@@ -38,9 +38,8 @@ impl ContainerRuntime {
                 }
             }
             Some(other) => {
-                return Err(EngineError::Config(format!(
-                    "unknown runtime '{other}'; supported values are 'docker' and 'apple-containers'"
-                )));
+                eprintln!("amux: warning: unknown runtime '{}', falling back to Docker", other);
+                Backend::Docker
             }
         };
         let backend: Box<dyn ContainerBackend> = match chosen {
@@ -179,6 +178,22 @@ impl ContainerRuntime {
     pub fn stop(&self, handle: &ContainerHandle) -> Result<(), EngineError> {
         self.backend.stop(handle)
     }
+
+    /// Best-effort check whether the container runtime daemon is reachable.
+    /// Returns `false` when `docker info` (or equivalent) fails.
+    pub fn is_available(&self) -> bool {
+        let cli_bin = match self.backend.name() {
+            "apple-containers" => "container",
+            _ => "docker",
+        };
+        std::process::Command::new(cli_bin)
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
 }
 
 enum Backend {
@@ -216,18 +231,14 @@ mod tests {
     }
 
     #[test]
-    fn detect_unknown_runtime_is_hard_error() {
+    fn detect_unknown_runtime_falls_back_to_docker() {
         let cfg = GlobalConfig {
             runtime: Some("blarg".into()),
             ..Default::default()
         };
-        match ContainerRuntime::detect(&cfg) {
-            Err(EngineError::Config(msg)) => {
-                assert!(msg.contains("blarg"), "error message should name the bad value");
-            }
-            Ok(_) => panic!("expected Config error for unknown runtime, got Ok"),
-            Err(e) => panic!("expected Config error for unknown runtime, got Err({e:?})"),
-        }
+        // Unknown runtime should fall back to Docker with a warning, not error.
+        let rt = ContainerRuntime::detect(&cfg).unwrap();
+        assert_eq!(rt.runtime_name(), "docker");
     }
 
     #[test]

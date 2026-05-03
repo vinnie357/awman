@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
-use crate::command::commands::mount_scope::MountScopeFrontend;
+use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
 use crate::command::commands::parse_overlay_spec;
 use crate::command::commands::worktree_lifecycle::{WorktreeLifecycle, WorktreeLifecycleFrontend};
 use crate::command::commands::Command;
@@ -311,10 +311,15 @@ impl Command for ExecWorkflowCommand {
         let workflow = Workflow::load(&self.flags.workflow)
             .map_err(|e| CommandError::Other(format!("loading workflow: {e}")))?;
 
-        // 2. Resolve mount scope.
-        // Session is read from the engines context; cwd comes from the process.
+        // 2. Resolve mount scope — confirm with the user when cwd differs from git root.
         let cwd = std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let git_root_for_scope = self
+            .engines
+            .git_engine
+            .resolve_root(&cwd)
+            .unwrap_or_else(|_| cwd.clone());
+        let _mount_path = MountScope::resolve(&cwd, &git_root_for_scope, frontend.as_mut())?;
 
         // 3. Worktree prepare (if --worktree is set).
         let worktree_lifecycle = if self.flags.worktree {

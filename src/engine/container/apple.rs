@@ -1,6 +1,6 @@
 //! Apple Containers backend — `pub(super)`. Same shape as Docker; the Apple
 //! `container` CLI is a near-drop-in replacement (it shares the docker `run`
-//! / `ps` / `stats` / `stop` surface).
+//! / `list` / `stats` / `stop` surface).
 
 use std::process::{Command, Stdio};
 
@@ -46,16 +46,11 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<ContainerHandle>, EngineError> {
-        // The Apple `container` CLI only accepts `--format json` or `table` —
-        // Go templates (as used by the Docker backend) are silently rejected.
+        // Apple Containers uses `container list`, not `container ps`.
+        // It does not support `--filter` for label filtering, so we list all
+        // containers and filter client-side by name pattern.
         let output = Command::new("container")
-            .args([
-                "ps",
-                "--filter",
-                &format!("label={AMUX_LABEL}"),
-                "--format",
-                "json",
-            ])
+            .args(["list", "--format", "json"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output();
@@ -79,6 +74,23 @@ impl ContainerBackend for AppleBackend {
                 .collect(),
         };
         for row in rows {
+            // Client-side filtering: only include containers that have the
+            // amux label or whose name starts with "amux-".
+            let labels = row
+                .get("Labels")
+                .or_else(|| row.get("labels"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let row_name = row
+                .get("Names")
+                .or_else(|| row.get("Name"))
+                .or_else(|| row.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if !labels.contains("amux") && !row_name.starts_with("amux-") {
+                continue;
+            }
+
             let id = row
                 .get("ID")
                 .or_else(|| row.get("Id"))
@@ -86,13 +98,7 @@ impl ContainerBackend for AppleBackend {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let name = row
-                .get("Names")
-                .or_else(|| row.get("Name"))
-                .or_else(|| row.get("name"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
+            let name = row_name.to_string();
             let image_tag = row
                 .get("Image")
                 .or_else(|| row.get("image"))
@@ -360,7 +366,7 @@ mod apple_tests {
         assert!((parse_memory_mb("1.5GB") - 1536.0).abs() < 0.001);
         assert!((parse_memory_mb("512KB") - 0.5).abs() < 0.001);
         assert!((parse_memory_mb("1024B") - (1024.0 / (1024.0 * 1024.0))).abs() < 0.001);
-        // No unit → default MB
+        // No unit -> default MB
         assert!((parse_memory_mb("64") - 64.0).abs() < 0.001);
     }
 

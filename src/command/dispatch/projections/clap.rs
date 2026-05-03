@@ -18,6 +18,9 @@ impl CommandCatalogue {
 
 fn build_clap_for_spec(spec: &'static CommandSpec, is_root: bool) -> Command {
     let mut cmd = Command::new(spec.name).about(spec.help);
+    if is_root {
+        cmd = cmd.version(env!("CARGO_PKG_VERSION"));
+    }
     if let Some(long) = spec.long_help {
         cmd = cmd.long_about(long);
     }

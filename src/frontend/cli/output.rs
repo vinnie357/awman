@@ -43,11 +43,11 @@ pub fn terminal_width() -> Option<u16> {
 }
 
 /// Wrap `text` in an OSC 8 hyperlink escape sequence pointing at `url` when
-/// stdout is a TTY. Returns the plain `text` otherwise.
+/// stdout is a TTY and color/escape output is enabled. Returns the plain
+/// `text` otherwise.
 pub fn hyperlink(text: &str, url: &str) -> String {
-    if stdout_is_tty() {
-        format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
-    } else {
-        text.to_string()
+    if !stdout_is_tty() || !color_enabled() {
+        return text.to_string();
     }
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
 }

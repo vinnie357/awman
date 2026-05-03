@@ -156,6 +156,7 @@ impl Command for ReadyCommand {
             build: self.flags.build,
             no_cache: self.flags.no_cache,
             allow_docker: self.flags.allow_docker,
+            env_passthrough: None,
         };
         let mut engine = ReadyEngine::new(
             std::sync::Arc::new(session),

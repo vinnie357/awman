@@ -49,6 +49,16 @@ impl CliFrontend {
         }
     }
 
+    /// Returns `true` when the `--json` flag is active for the current
+    /// command. Used by per-command frontends to suppress human-readable
+    /// output (e.g. the ready summary box) when structured JSON is requested.
+    pub(crate) fn is_json_mode(&self) -> bool {
+        let path_strs: Vec<&str> = self.command_path.iter().map(|s| s.as_str()).collect();
+        self.matches_for(&path_strs)
+            .and_then(|m| m.try_get_one::<bool>("json").ok().flatten().copied())
+            .unwrap_or(false)
+    }
+
     /// Resolve the [`ArgMatches`] sub-tree corresponding to `command_path`.
     fn matches_for(&self, command_path: &[&str]) -> Option<&ArgMatches> {
         let mut current = &self.matches;
