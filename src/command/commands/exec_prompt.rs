@@ -139,8 +139,7 @@ impl Command for ExecPromptCommand {
             plan: self.flags.plan.then_some(PlanMode::Enabled),
             allow_docker: self.flags.allow_docker,
             mount_ssh: self.flags.mount_ssh,
-            // Force non-interactive: this is a one-shot prompt injection.
-            non_interactive: true,
+            non_interactive: self.flags.non_interactive,
             model: self.flags.model.clone(),
             initial_prompt: Some(self.flags.prompt.clone()),
             env_passthrough: Some(session.effective_config().env_passthrough()),

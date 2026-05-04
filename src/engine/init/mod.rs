@@ -291,7 +291,7 @@ impl InitEngine {
                     initial_prompt: Some(init_audit_prompt().to_string()),
                     allow_docker: false,
                     mount_ssh: false,
-                    non_interactive: true,
+                    non_interactive: false,
                     model: None,
                     env_passthrough: None,
                     directory_overlays: vec![],

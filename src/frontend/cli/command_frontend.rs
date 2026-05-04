@@ -19,13 +19,15 @@ use crate::command::commands::status::StatusCommandFrontend;
 use crate::command::commands::{
     auth::AuthCommandFrontend, config::ConfigCommandFrontend,
     download::DownloadCommandFrontend, headless::HeadlessCommandFrontend,
-    new::NewCommandFrontend, remote::RemoteCommandFrontend, specs::SpecsCommandFrontend,
+    new::NewCommandFrontend, remote::RemoteCommandFrontend,
+    specs::{SpecsCommandFrontend, WorkItemKind},
 };
 use crate::command::dispatch::CommandFrontend;
 use crate::command::dispatch::catalogue::{
     ArgumentKind, CommandCatalogue, FlagKind,
 };
 use crate::command::error::CommandError;
+use crate::engine::container::frontend::ContainerFrontend;
 use crate::engine::message::{UserMessage, UserMessageSink};
 
 use super::user_message::CliUserMessageQueue;
@@ -293,8 +295,14 @@ impl NewCommandFrontend for CliFrontend {
     fn ask_workflow_name(&mut self) -> Result<String, CommandError> {
         require_named_input("workflow name?")
     }
+    fn ask_workflow_summary(&mut self) -> Result<String, CommandError> {
+        require_multiline_input("workflow description?")
+    }
     fn ask_skill_name(&mut self) -> Result<String, CommandError> {
         require_named_input("skill name?")
+    }
+    fn ask_skill_summary(&mut self) -> Result<String, CommandError> {
+        require_multiline_input("skill description?")
     }
     fn ask_skill_body(&mut self) -> Result<String, CommandError> {
         // Body may be empty, but the read itself must succeed; non-TTY must
@@ -305,11 +313,42 @@ impl NewCommandFrontend for CliFrontend {
 }
 impl RemoteCommandFrontend for CliFrontend {}
 impl SpecsCommandFrontend for CliFrontend {
+    fn ask_spec_kind(&mut self) -> Result<WorkItemKind, CommandError> {
+        use super::output::stdin_is_tty;
+        if !stdin_is_tty() {
+            return Ok(WorkItemKind::Task);
+        }
+        eprintln!("amux: work item kind?");
+        eprintln!("  [1] Feature");
+        eprintln!("  [2] Bug");
+        eprintln!("  [3] Task");
+        eprintln!("  [4] Enhancement");
+        Ok(
+            match super::per_command::helpers::read_line("choice [1-4]:").as_deref() {
+                Some("1") | Some("f") | Some("F") | Some("feature") => WorkItemKind::Feature,
+                Some("2") | Some("b") | Some("B") | Some("bug") => WorkItemKind::Bug,
+                Some("4") | Some("e") | Some("E") | Some("enhancement") => {
+                    WorkItemKind::Enhancement
+                }
+                _ => WorkItemKind::Task,
+            },
+        )
+    }
+
     fn ask_spec_title(&mut self) -> Result<String, CommandError> {
         require_named_input("spec title?")
     }
+
     fn ask_spec_summary(&mut self) -> Result<String, CommandError> {
-        require_optional_input("spec summary (one line)?")
+        require_multiline_input("spec description?")
+    }
+
+    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
+        Box::new(super::per_command::CliContainerProxy)
+    }
+
+    fn set_pty_active(&mut self, active: bool) {
+        self.messages.set_pty_active(active);
     }
 }
 
@@ -330,6 +369,17 @@ fn require_named_input(prompt: &str) -> Result<String, CommandError> {
 /// expect a real answer don't silently get `""` from a piped invocation.
 fn require_optional_input(prompt: &str) -> Result<String, CommandError> {
     match super::per_command::helpers::read_line(prompt) {
+        Some(s) => Ok(s),
+        None => Err(CommandError::InteractiveInputUnavailable {
+            prompt: prompt.to_string(),
+        }),
+    }
+}
+
+/// Read multi-line input from stdin (until a blank line or EOF), but require a
+/// TTY so callers don't silently get `""` from a piped invocation.
+fn require_multiline_input(prompt: &str) -> Result<String, CommandError> {
+    match super::per_command::helpers::read_multiline(prompt) {
         Some(s) => Ok(s),
         None => Err(CommandError::InteractiveInputUnavailable {
             prompt: prompt.to_string(),

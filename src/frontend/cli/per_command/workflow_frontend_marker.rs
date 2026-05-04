@@ -13,8 +13,8 @@ use crate::data::workflow_state::WorkflowState;
 use crate::engine::container::instance::ContainerExitInfo;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput,
-    WorkflowOutcome, WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
+    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
+    WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
 
@@ -70,9 +70,7 @@ impl WorkflowFrontend for CliFrontend {
                 }
             }
             "r" | "R" if available.can_restart_current_step => NextAction::RestartCurrentStep,
-            "b" | "B" if available.can_cancel_to_previous_step => {
-                NextAction::CancelToPreviousStep
-            }
+            "b" | "B" if available.can_cancel_to_previous_step => NextAction::CancelToPreviousStep,
             "p" | "P" if available.can_pause => NextAction::Pause,
             "a" | "A" if available.can_abort => NextAction::Abort,
             "f" | "F" if available.can_finish_workflow => NextAction::FinishWorkflow,
@@ -127,22 +125,18 @@ impl WorkflowFrontend for CliFrontend {
 
     fn report_step_unstuck(&mut self, _step: &WorkflowStep) {}
 
-    fn yolo_countdown_tick(
-        &mut self,
-        remaining: Duration,
-    ) -> Result<YoloTickOutcome, EngineError> {
+    fn yolo_countdown_tick(&mut self, remaining: Duration) -> Result<YoloTickOutcome, EngineError> {
         use std::io::Write as _;
 
         if remaining.is_zero() {
-            // Countdown expired: print a final message and a newline to move
-            // off the countdown line before the engine prints the next step.
-            eprintln!("\r  yolo: auto-advancing to next step...                            ");
+            // Erase the countdown line then print the final message on a clean line.
+            eprintln!("\r\x1b[2K  yolo: auto-advancing to next step...");
             return Ok(YoloTickOutcome::Continue);
         }
 
         let secs = remaining.as_secs();
         eprint!(
-            "\r  yolo: auto-advancing in {:2}s  [n] now  [a] abort  [p] pause    ",
+            "\r\x1b[2K  yolo: auto-advancing in {:2}s  [n] now  [a] abort  [p] pause",
             secs
         );
         let _ = std::io::stderr().flush();
@@ -196,10 +190,16 @@ impl WorkflowFrontend for CliFrontend {
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
         let msg = match outcome {
             WorkflowOutcome::Completed => "workflow completed successfully.",
-            WorkflowOutcome::Paused   => "workflow paused.",
-            WorkflowOutcome::Aborted  => "workflow aborted.",
-            WorkflowOutcome::Failed { last_step, exit_code } => {
-                eprintln!("amux: workflow failed at step '{}' (exit {}).", last_step, exit_code);
+            WorkflowOutcome::Paused => "workflow paused.",
+            WorkflowOutcome::Aborted => "workflow aborted.",
+            WorkflowOutcome::Failed {
+                last_step,
+                exit_code,
+            } => {
+                eprintln!(
+                    "amux: workflow failed at step '{}' (exit {}).",
+                    last_step, exit_code
+                );
                 return;
             }
         };
@@ -212,7 +212,12 @@ impl WorkflowFrontend for CliFrontend {
         }
         // Column widths.
         let name_w = steps.iter().map(|s| s.name.len()).max().unwrap_or(4).max(4);
-        let agent_w = steps.iter().map(|s| s.agent.len()).max().unwrap_or(5).max(5);
+        let agent_w = steps
+            .iter()
+            .map(|s| s.agent.len())
+            .max()
+            .unwrap_or(5)
+            .max(5);
         let model_w = steps
             .iter()
             .map(|s| s.model.as_deref().unwrap_or("default").len())
@@ -222,7 +227,7 @@ impl WorkflowFrontend for CliFrontend {
 
         let div = format!(
             "  {bar}  {bar2}  {bar3}  {bar4}",
-            bar  = "─".repeat(2),
+            bar = "─".repeat(2),
             bar2 = "─".repeat(name_w),
             bar3 = "─".repeat(agent_w),
             bar4 = "─".repeat(model_w),
@@ -230,24 +235,35 @@ impl WorkflowFrontend for CliFrontend {
         eprintln!();
         eprintln!(
             "  {:>2}  {:<name_w$}  {:<agent_w$}  {:<model_w$}  Status",
-            "#", "Step", "Agent", "Model",
-            name_w = name_w, agent_w = agent_w, model_w = model_w,
+            "#",
+            "Step",
+            "Agent",
+            "Model",
+            name_w = name_w,
+            agent_w = agent_w,
+            model_w = model_w,
         );
         eprintln!("{}", div);
         for (i, step) in steps.iter().enumerate() {
             let model_str = step.model.as_deref().unwrap_or("default");
             let status_str = match &step.status {
-                WorkflowStepStatus::Pending   => "· Pending".to_string(),
-                WorkflowStepStatus::Running   => "▶ Running".to_string(),
+                WorkflowStepStatus::Pending => "· Pending".to_string(),
+                WorkflowStepStatus::Running => "▶ Running".to_string(),
                 WorkflowStepStatus::Succeeded => "✓ Done".to_string(),
                 WorkflowStepStatus::Failed { exit_code } => format!("✗ Failed ({})", exit_code),
                 WorkflowStepStatus::Cancelled => "○ Cancelled".to_string(),
-                WorkflowStepStatus::Skipped   => "⊘ Skipped".to_string(),
+                WorkflowStepStatus::Skipped => "⊘ Skipped".to_string(),
             };
             eprintln!(
                 "  {:>2}  {:<name_w$}  {:<agent_w$}  {:<model_w$}  {}",
-                i + 1, step.name, step.agent, model_str, status_str,
-                name_w = name_w, agent_w = agent_w, model_w = model_w,
+                i + 1,
+                step.name,
+                step.agent,
+                model_str,
+                status_str,
+                name_w = name_w,
+                agent_w = agent_w,
+                model_w = model_w,
             );
         }
         eprintln!("{}", div);
@@ -266,9 +282,9 @@ impl WorkflowFrontend for CliFrontend {
         eprintln!();
         eprintln!("╔══════════════════════════════════════════════════════════════╗");
         eprintln!("║                                                              ║");
-        eprintln!("║     ╦╔╗╔╔╦╗╔═╗╦═╗╔═╗╔═╗╔╦╗╦╦  ╦╔═╗  ╔╦╗╔═╗╔╦╗╔═╗        ║");
-        eprintln!("║     ║║║║ ║ ║╣ ╠╦╝╠═╣║   ║ ║╚╗╔╝║╣   ║║║║ ║ ║║║╣         ║");
-        eprintln!("║     ╩╝╚╝ ╩ ╚═╝╩╚═╩ ╩╚═╝ ╩ ╩ ╚╝ ╚═╝  ╩ ╩╚═╝═╩╝╚═╝       ║");
+        eprintln!("║     ╦╔╗╔╔╦╗╔═╗╦═╗╔═╗╔═╗╔╦╗╦╦  ╦╔═╗  ╔╦╗╔═╗╔╦╗╔═╗             ║");
+        eprintln!("║     ║║║║ ║ ║╣ ╠╦╝╠═╣║   ║ ║╚╗╔╝║╣   ║║║║ ║ ║║║╣              ║");
+        eprintln!("║     ╩╝╚╝ ╩ ╚═╝╩╚═╩ ╩╚═╝ ╩ ╩ ╚╝ ╚═╝  ╩ ╩╚═╝═╩╝╚═╝             ║");
         eprintln!("║                                                              ║");
         let label = format!("║  Agent '{}' is launching in INTERACTIVE mode.", agent);
         let pad = 64usize.saturating_sub(label.chars().count() + 1);

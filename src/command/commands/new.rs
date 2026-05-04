@@ -3,20 +3,27 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::chat::open_session_for_cwd;
+use crate::command::commands::chat::{open_session_for_cwd, resolve_agent};
+use crate::command::commands::implement_prompts::{
+    render_skill_interview_prompt, render_workflow_interview_prompt,
+};
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
+use crate::engine::agent::AgentRunOptions;
+use crate::engine::container::options::ContainerOption;
 use crate::engine::message::UserMessageSink;
 
 #[derive(Debug, Clone)]
 pub struct NewSpecFlags {
     pub interview: bool,
+    pub non_interactive: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct NewWorkflowFlags {
     pub interview: bool,
+    pub non_interactive: bool,
     pub global: bool,
     pub format: String,
 }
@@ -24,6 +31,7 @@ pub struct NewWorkflowFlags {
 #[derive(Debug, Clone)]
 pub struct NewSkillFlags {
     pub interview: bool,
+    pub non_interactive: bool,
     pub global: bool,
 }
 
@@ -77,9 +85,17 @@ pub trait NewCommandFrontend:
     fn ask_workflow_name(&mut self) -> Result<String, CommandError> {
         Ok("workflow".to_string())
     }
+    /// Prompt for a one-line summary for the new workflow (used in interview mode).
+    fn ask_workflow_summary(&mut self) -> Result<String, CommandError> {
+        Ok(String::new())
+    }
     /// Prompt for a skill name.
     fn ask_skill_name(&mut self) -> Result<String, CommandError> {
         Ok("skill".to_string())
+    }
+    /// Prompt for a one-line summary for the new skill (used in interview mode).
+    fn ask_skill_summary(&mut self) -> Result<String, CommandError> {
+        Ok(String::new())
     }
     /// Prompt for the body content of the new skill.
     fn ask_skill_body(&mut self) -> Result<String, CommandError> {
@@ -121,6 +137,7 @@ impl Command for NewCommand {
                 let new_outcome = crate::command::commands::specs::create_new_spec(
                     &self.engines,
                     f.interview,
+                    f.non_interactive,
                     frontend.as_mut(),
                 )
                 .await?;
@@ -139,14 +156,18 @@ impl Command for NewCommand {
                     "md" | "markdown" => "md",
                     _ => "toml",
                 };
+                let session = if !f.global || f.interview {
+                    Some(open_session_for_cwd(&self.engines)?)
+                } else {
+                    None
+                };
                 let dir = if f.global {
                     dirs::home_dir()
                         .unwrap_or_else(|| std::path::PathBuf::from("."))
                         .join(".amux")
                         .join("workflows")
                 } else {
-                    let session = open_session_for_cwd(&self.engines)?;
-                    session.git_root().join("aspec").join("workflows")
+                    session.as_ref().unwrap().git_root().join("aspec").join("workflows")
                 };
                 let _ = std::fs::create_dir_all(&dir);
                 let path = dir.join(format!("{name}.{extension}"));
@@ -156,6 +177,54 @@ impl Command for NewCommand {
                     _ => "[[steps]]\nname = \"step-1\"\nagent = \"claude\"\nprompt = \"do something\"\n".to_string(),
                 };
                 let _ = std::fs::write(&path, body);
+
+                if f.interview {
+                    let session = session.as_ref().unwrap();
+                    let agent = resolve_agent(&None, session)?;
+                    let credentials = self
+                        .engines
+                        .auth_engine
+                        .resolve_agent_auth(session, &agent)
+                        .map_err(CommandError::from)?;
+                    let summary = frontend.ask_workflow_summary().unwrap_or_default();
+                    let filename = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&name)
+                        .to_string();
+                    let path_str = path.display().to_string();
+                    let prompt = render_workflow_interview_prompt(&filename, &path_str, &summary);
+                    let run_opts = AgentRunOptions {
+                        initial_prompt: Some(prompt),
+                        non_interactive: f.non_interactive,
+                        env_passthrough: Some(session.effective_config().env_passthrough()),
+                        ..Default::default()
+                    };
+                    let mut options = self
+                        .engines
+                        .agent_engine
+                        .build_options(session, &agent, &run_opts)?;
+                    if !credentials.env_vars.is_empty() {
+                        options.push(ContainerOption::AgentCredentials {
+                            env_vars: credentials.env_vars,
+                        });
+                    }
+                    let instance = self.engines.runtime.build(options)?;
+                    frontend.set_pty_active(true);
+                    let cf = frontend.container_frontend();
+                    let mut execution = match instance.run_with_frontend(cf) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            frontend.set_pty_active(false);
+                            frontend.replay_queued();
+                            return Err(CommandError::from(e));
+                        }
+                    };
+                    let _ = execution.wait().await;
+                    frontend.set_pty_active(false);
+                    frontend.replay_queued();
+                }
+
                 NewOutcome::Workflow(NewWorkflowOutcome {
                     interview: f.interview,
                     global: f.global,
@@ -165,7 +234,11 @@ impl Command for NewCommand {
             }
             NewSubcommand::Skill(f) => {
                 let name = frontend.ask_skill_name().unwrap_or_else(|_| "skill".into());
-                let body = frontend.ask_skill_body().unwrap_or_default();
+                let session = if !f.global || f.interview {
+                    Some(open_session_for_cwd(&self.engines)?)
+                } else {
+                    None
+                };
                 let dir = if f.global {
                     dirs::home_dir()
                         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -173,17 +246,66 @@ impl Command for NewCommand {
                         .join("skills")
                         .join(&name)
                 } else {
-                    let session = open_session_for_cwd(&self.engines)?;
-                    session.git_root().join("aspec").join("skills").join(&name)
+                    session.as_ref().unwrap().git_root().join("aspec").join("skills").join(&name)
                 };
                 let _ = std::fs::create_dir_all(&dir);
                 let path = dir.join("SKILL.md");
-                let content = if body.is_empty() {
-                    format!("# Skill: {name}\n\n## Description\n\n## Body\n")
+
+                if f.interview {
+                    // Interview mode: write skeleton and let agent fill it in.
+                    let skeleton = format!(
+                        "# Skill: {name}\n\n## Description\n\n## Body\n"
+                    );
+                    let _ = std::fs::write(&path, skeleton);
+                    let session = session.as_ref().unwrap();
+                    let agent = resolve_agent(&None, session)?;
+                    let credentials = self
+                        .engines
+                        .auth_engine
+                        .resolve_agent_auth(session, &agent)
+                        .map_err(CommandError::from)?;
+                    let summary = frontend.ask_skill_summary().unwrap_or_default();
+                    let path_str = path.display().to_string();
+                    let prompt = render_skill_interview_prompt(&path_str, &summary);
+                    let run_opts = AgentRunOptions {
+                        initial_prompt: Some(prompt),
+                        non_interactive: f.non_interactive,
+                        env_passthrough: Some(session.effective_config().env_passthrough()),
+                        ..Default::default()
+                    };
+                    let mut options = self
+                        .engines
+                        .agent_engine
+                        .build_options(session, &agent, &run_opts)?;
+                    if !credentials.env_vars.is_empty() {
+                        options.push(ContainerOption::AgentCredentials {
+                            env_vars: credentials.env_vars,
+                        });
+                    }
+                    let instance = self.engines.runtime.build(options)?;
+                    frontend.set_pty_active(true);
+                    let cf = frontend.container_frontend();
+                    let mut execution = match instance.run_with_frontend(cf) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            frontend.set_pty_active(false);
+                            frontend.replay_queued();
+                            return Err(CommandError::from(e));
+                        }
+                    };
+                    let _ = execution.wait().await;
+                    frontend.set_pty_active(false);
+                    frontend.replay_queued();
                 } else {
-                    format!("# Skill: {name}\n\n{body}\n")
-                };
-                let _ = std::fs::write(&path, content);
+                    let body = frontend.ask_skill_body().unwrap_or_default();
+                    let content = if body.is_empty() {
+                        format!("# Skill: {name}\n\n## Description\n\n## Body\n")
+                    } else {
+                        format!("# Skill: {name}\n\n{body}\n")
+                    };
+                    let _ = std::fs::write(&path, content);
+                }
+
                 NewOutcome::Skill(NewSkillOutcome {
                     interview: f.interview,
                     global: f.global,
@@ -353,6 +475,7 @@ mod tests {
         let cmd = NewCommand::new(
             NewSubcommand::Workflow(NewWorkflowFlags {
                 interview: false,
+                non_interactive: false,
                 global: false,
                 format: "toml".into(),
             }),
@@ -381,6 +504,7 @@ mod tests {
         let cmd = NewCommand::new(
             NewSubcommand::Workflow(NewWorkflowFlags {
                 interview: false,
+                non_interactive: false,
                 global: false,
                 format: "yaml".into(),
             }),
@@ -408,6 +532,7 @@ mod tests {
         let cmd = NewCommand::new(
             NewSubcommand::Workflow(NewWorkflowFlags {
                 interview: false,
+                non_interactive: false,
                 global: false,
                 format: "md".into(),
             }),
@@ -435,6 +560,7 @@ mod tests {
         let cmd = NewCommand::new(
             NewSubcommand::Skill(NewSkillFlags {
                 interview: false,
+                non_interactive: false,
                 global: false,
             }),
             engines,
@@ -467,6 +593,7 @@ mod tests {
         let cmd = NewCommand::new(
             NewSubcommand::Skill(NewSkillFlags {
                 interview: false,
+                non_interactive: false,
                 global: false,
             }),
             engines,

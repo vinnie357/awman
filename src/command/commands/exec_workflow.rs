@@ -279,15 +279,7 @@ impl ContainerExecutionFactory for CommandLayerFactory {
             plan: self.flags.plan.then_some(PlanMode::Enabled),
             allowed_tools: vec![],
             disallowed_tools: vec![],
-            // In interactive mode the agent runs with a PTY; the user
-            // supervises and interacts directly. The step prompt is shown in
-            // the progress table and interactive banner so the user knows
-            // the task. Only pipe the prompt in non-interactive mode.
-            initial_prompt: if self.flags.non_interactive {
-                Some(substitution.rendered)
-            } else {
-                None
-            },
+            initial_prompt: Some(substitution.rendered),
             allow_docker: self.flags.allow_docker,
             mount_ssh: self.flags.mount_ssh,
             non_interactive: self.flags.non_interactive,
@@ -404,6 +396,9 @@ impl Command for ExecWorkflowCommand {
         };
 
         // 4. Worktree prepare (if --worktree is set).
+        // When a worktree is used, capture its path so the session below is
+        // rooted at the worktree checkout rather than the main repo.
+        let mut worktree_path: Option<PathBuf> = None;
         let worktree_lifecycle = if self.flags.worktree {
             let git_root = self
                 .engines
@@ -432,7 +427,8 @@ impl Command for ExecWorkflowCommand {
                     &name,
                 )?
             };
-            let _worktree_path = lifecycle.prepare(&mut *frontend).await?;
+            let wt_path = lifecycle.prepare(&mut *frontend).await?;
+            worktree_path = Some(wt_path);
             Some(lifecycle)
         } else {
             None
@@ -461,12 +457,15 @@ impl Command for ExecWorkflowCommand {
 
         let flags_arc = Arc::new(self.flags.clone());
 
-        // 8. Build a temporary session from cwd for the engine.
+        // 8. Build a temporary session from cwd (or worktree path) for the engine.
+        // When a worktree is active, root the session at the worktree so that
+        // `build_options` mounts the worktree checkout, not the main repo.
+        let session_root = worktree_path.as_deref().unwrap_or(&cwd);
         let git_root_for_session = Arc::clone(&self.engines.git_engine)
-            .resolve_root(&cwd)
+            .resolve_root(session_root)
             .map_err(CommandError::from)?;
         let session = Session::open_at_git_root(
-            cwd.clone(),
+            session_root.to_path_buf(),
             git_root_for_session,
             crate::data::session::SessionOpenOptions::default(),
         )

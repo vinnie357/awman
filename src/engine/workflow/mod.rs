@@ -374,10 +374,6 @@ impl WorkflowEngine {
             session_id: self.session.id(),
         };
 
-        // Emit the workflow progress table (step still Pending) so the user
-        // sees the full picture before the container launches.
-        let progress = self.workflow_progress_info();
-        self.frontend.report_workflow_progress(&progress);
         // Emit the interactive-launch notice so the CLI can print the banner.
         self.frontend.report_step_interactive_launch(
             &step,
@@ -471,7 +467,7 @@ impl WorkflowEngine {
             if remaining.is_zero() {
                 return Ok(true);
             }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 

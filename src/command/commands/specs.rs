@@ -13,11 +13,13 @@ use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::container::frontend::ContainerFrontend;
+use crate::engine::container::options::ContainerOption;
 use crate::engine::message::UserMessageSink;
 
 #[derive(Debug, Clone)]
 pub struct SpecsNewFlags {
     pub interview: bool,
+    pub non_interactive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +172,7 @@ impl Command for SpecsCommand {
                 let new_outcome = create_new_spec(
                     &self.engines,
                     f.interview,
+                    f.non_interactive,
                     frontend.as_mut(),
                 )
                 .await?;
@@ -249,6 +252,7 @@ impl Command for SpecsCommand {
 pub(crate) async fn create_new_spec(
     engines: &crate::command::dispatch::Engines,
     interview: bool,
+    non_interactive: bool,
     frontend: &mut dyn SpecsCommandFrontend,
 ) -> Result<SpecsNewOutcome, CommandError> {
     let session = open_session_for_cwd(engines)?;
@@ -290,28 +294,31 @@ pub(crate) async fn create_new_spec(
     })?;
 
     let number_str = format!("{next_n:04}");
-    let body = template
-        .replace("{{kind}}", kind.as_str())
-        .replace("{{number}}", &number_str)
-        .replace("{{title}}", &title)
-        .replace("{{summary}}", &summary)
-        .replacen("title: title", &format!("title: {title}"), 1)
-        .replacen("Title: title", &format!("Title: {title}"), 1)
-        .replacen("- summary", &format!("- {summary}"), 1);
+    let body = apply_work_item_template(&template, kind, &title, &summary, &number_str);
     std::fs::write(&dest, body)
         .map_err(|e| CommandError::Other(format!("writing work item {}: {e}", dest.display())))?;
 
     if interview {
         let agent = resolve_agent(&None, &session)?;
+        let credentials = engines
+            .auth_engine
+            .resolve_agent_auth(&session, &agent)
+            .map_err(CommandError::from)?;
         let prompt = render_interview_prompt(next_n, kind.as_str(), &title, &summary);
         let run_opts = AgentRunOptions {
             initial_prompt: Some(prompt),
-            non_interactive: false,
+            non_interactive,
+            env_passthrough: Some(session.effective_config().env_passthrough()),
             ..Default::default()
         };
-        let options = engines
+        let mut options = engines
             .agent_engine
             .build_options(&session, &agent, &run_opts)?;
+        if !credentials.env_vars.is_empty() {
+            options.push(ContainerOption::AgentCredentials {
+                env_vars: credentials.env_vars,
+            });
+        }
         let instance = engines.runtime.build(options)?;
         frontend.set_pty_active(true);
         let cf = frontend.container_frontend();
@@ -351,6 +358,47 @@ fn next_work_item_number(dir: &std::path::Path) -> u32 {
         }
     }
     max + 1
+}
+
+/// Apply all work-item substitutions to a template string. Ported from
+/// `oldsrc/commands/new.rs::apply_template` and extended with number/summary.
+///
+/// Rules (applied in order):
+/// - Lines beginning with `# Work Item:` → `# Work Item: {kind}`
+/// - Lines beginning with `Title:` → `Title: {title}`
+/// - `{{kind}}` token anywhere → kind string
+/// - `{{number}}` token anywhere → zero-padded work item number
+/// - `{{title}}` token anywhere → title
+/// - `{{summary}}` token anywhere → summary text
+/// - First occurrence of literal `- summary` → `- {summary}`
+fn apply_work_item_template(
+    template: &str,
+    kind: WorkItemKind,
+    title: &str,
+    summary: &str,
+    number: &str,
+) -> String {
+    let mut first_summary_replaced = false;
+    let mut result = String::with_capacity(template.len() + 64);
+    for line in template.lines() {
+        let mut line = if line.starts_with("# Work Item:") {
+            format!("# Work Item: {}", kind.as_str())
+        } else if line.starts_with("Title:") {
+            format!("Title: {title}")
+        } else {
+            line.replace("{{kind}}", kind.as_str())
+                .replace("{{number}}", number)
+                .replace("{{title}}", title)
+                .replace("{{summary}}", summary)
+        };
+        if !first_summary_replaced && line.trim() == "- summary" {
+            line = format!("- {summary}");
+            first_summary_replaced = true;
+        }
+        result.push_str(&line);
+        result.push('\n');
+    }
+    result
 }
 
 /// Slugify a title: lowercase, ASCII alphanumerics + hyphens.
@@ -512,7 +560,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let engines = make_engines_with_root(tmp.path());
         let cmd = super::SpecsCommand::new(
-            super::SpecsSubcommand::New(super::SpecsNewFlags { interview: false }),
+            super::SpecsSubcommand::New(super::SpecsNewFlags { interview: false, non_interactive: false }),
             engines,
         );
         let result = with_cwd(tmp.path(), || async {
@@ -527,11 +575,15 @@ mod tests {
         let work_items = tmp.path().join("aspec").join("work-items");
         std::fs::create_dir_all(&work_items).unwrap();
         let template = work_items.join("0000-template.md");
-        std::fs::write(&template, "# Title: title\n- summary\n").unwrap();
+        // Template matches the real 0000-template.md format.
+        std::fs::write(
+            &template,
+            "# Work Item: [Feature | Bug | Task]\n\nTitle: title\n\n- summary\n",
+        ).unwrap();
 
         let engines = make_engines_with_root(tmp.path());
         let cmd = super::SpecsCommand::new(
-            super::SpecsSubcommand::New(super::SpecsNewFlags { interview: false }),
+            super::SpecsSubcommand::New(super::SpecsNewFlags { interview: false, non_interactive: false }),
             engines,
         );
         let outcome = with_cwd(tmp.path(), || async {
@@ -545,6 +597,8 @@ mod tests {
             );
             let content = std::fs::read_to_string(&path).unwrap();
             assert!(content.contains("My Test Spec"), "title must be substituted: {content}");
+            assert!(content.contains("# Work Item: Task"), "kind must be substituted: {content}");
+            assert!(content.contains("A one-line summary."), "summary must be substituted: {content}");
         } else {
             panic!("unexpected outcome variant");
         }
@@ -561,11 +615,11 @@ mod tests {
         let work_items = tmp.path().join("aspec").join("work-items");
         std::fs::create_dir_all(&work_items).unwrap();
         let template = work_items.join("0000-template.md");
-        std::fs::write(&template, "# Title: title\n").unwrap();
+        std::fs::write(&template, "# Work Item: [Feature | Bug | Task]\n\nTitle: title\n").unwrap();
 
         let engines = make_engines_with_root(tmp.path());
         let cmd = super::SpecsCommand::new(
-            super::SpecsSubcommand::New(super::SpecsNewFlags { interview: true }),
+            super::SpecsSubcommand::New(super::SpecsNewFlags { interview: true, non_interactive: false }),
             engines,
         );
         let _ = with_cwd(tmp.path(), || async {

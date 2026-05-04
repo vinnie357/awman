@@ -38,6 +38,28 @@ pub fn read_line(prompt: &str) -> Option<String> {
     Some(buf.trim().to_string())
 }
 
+/// Read multiple lines from stdin until a blank line or EOF (Ctrl+D).
+/// Returns the collected text with embedded newlines. Returns `None` when
+/// stdin is not a TTY.
+pub fn read_multiline(prompt: &str) -> Option<String> {
+    use std::io::BufRead as _;
+    if !stdin_is_tty() {
+        return None;
+    }
+    eprintln!("amux: {prompt}");
+    eprintln!("amux: (enter a blank line or press Ctrl+D when done)");
+    let stdin = std::io::stdin();
+    let mut lines: Vec<String> = Vec::new();
+    for line in stdin.lock().lines() {
+        match line {
+            Ok(l) if l.is_empty() => break,
+            Ok(l) => lines.push(l),
+            Err(_) => break,
+        }
+    }
+    Some(lines.join("\n"))
+}
+
 /// Render a [`StepStatus`] as a short human label suitable for inline progress
 /// lines (e.g. `Build base image: running`).
 pub fn step_status_label(status: &StepStatus) -> String {

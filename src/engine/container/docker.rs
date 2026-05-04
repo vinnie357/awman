@@ -2,9 +2,15 @@
 //! `src/engine/container/`.
 //!
 //! Builds a `docker run` argv from `ResolvedContainerOptions`, spawns the
-//! subprocess, and captures the exit code. Interactive runs (where the CLI
-//! is the host frontend) use `Stdio::inherit()` so Docker's `-it` allocates
-//! the PTY directly against the user's terminal — matches old-amux.
+//! subprocess, and captures the exit code.
+//!
+//! Interactive runs open `/dev/tty` directly as the stdin passed to the
+//! container runtime rather than inheriting fd 0. After CLI prompts have
+//! consumed stdin (e.g. kind/title/summary questions before an interview
+//! agent launches), fd 0 may be in a state that causes Docker Desktop and
+//! Apple Containers to fail with ENOTTY when they call ioctl(TIOCGWINSZ)
+//! on it during PTY setup. `/dev/tty` always refers to the process's
+//! controlling terminal and is unaffected by prior buffered reads on fd 0.
 //!
 //! For non-interactive captured output (or when a seeded prompt must be
 //! piped before user stdin), this module pipes stdin/stdout/stderr through
@@ -243,7 +249,29 @@ impl ContainerInstance for DockerContainerInstance {
         // and inherit stdout/stderr.
         let mut cmd = Command::new("docker");
         cmd.args(&argv);
-        if interactive && seeded.is_none() {
+        if interactive {
+            // Interactive: open /dev/tty directly so the container runtime
+            // gets a fresh, unmodified terminal fd for PTY setup. Inheriting
+            // fd 0 (stdin) can fail with ENOTTY after buffered CLI reads
+            // (e.g. prompts collected before an interview container launches)
+            // because Docker Desktop and Apple Containers call ioctl(TIOCGWINSZ)
+            // on the fd — and a previously-buffered fd 0 may fail that ioctl
+            // even though it is still technically a TTY. /dev/tty is the
+            // process's controlling terminal; it is always unmodified and
+            // satisfies all PTY-related ioctls. Falls back to Stdio::inherit()
+            // when /dev/tty is unavailable (non-Unix platforms, or headless
+            // environments with no controlling terminal).
+            #[cfg(unix)]
+            {
+                let tty_stdin = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open("/dev/tty")
+                    .map(std::process::Stdio::from)
+                    .unwrap_or_else(|_| Stdio::inherit());
+                cmd.stdin(tty_stdin);
+            }
+            #[cfg(not(unix))]
             cmd.stdin(Stdio::inherit());
             cmd.stdout(Stdio::inherit());
             cmd.stderr(Stdio::inherit());
@@ -352,12 +380,16 @@ pub(super) fn build_run_argv(
     if options.remove_on_exit {
         args.push("--rm".into());
     }
-    if options.seeded_prompt.is_some() {
-        // Seeded prompts pipe stdin; allocating a PTY (-t) fails when no host
-        // TTY is available (ENOTTY / "Inappropriate ioctl for device").
-        args.push("-i".into());
-    } else if options.interactive {
+    if options.interactive {
+        // Interactive runs always allocate a PTY. When a seeded prompt is also
+        // present, the prompt is appended as a positional argv arg below so the
+        // agent receives it without piping; stdin stays inherited for the user.
         args.push("-it".into());
+    } else if options.seeded_prompt.is_some() {
+        // Non-interactive with a seeded prompt: pipe stdin so we can write the
+        // prompt, then close it. No PTY — allocating one fails when there is no
+        // host TTY (ENOTTY / "Inappropriate ioctl for device").
+        args.push("-i".into());
     }
 
     args.push("--name".into());
@@ -502,6 +534,15 @@ pub(super) fn build_run_argv(
             crate::engine::container::options::ModelFlagForm::Shorthand(s) => {
                 args.push(s.clone());
             }
+        }
+    }
+
+    // Interactive + seeded prompt: pass the prompt as the final positional arg
+    // so the agent receives it as its initial task. Stdin stays inherited.
+    // Non-interactive + seeded prompt is handled via stdin piping at spawn time.
+    if options.interactive {
+        if let Some(prompt) = &options.seeded_prompt {
+            args.push(prompt.clone());
         }
     }
 
@@ -768,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn build_run_argv_seeded_prompt_with_interactive_still_uses_i_not_it() {
+    fn build_run_argv_seeded_prompt_with_interactive_uses_it_and_positional_arg() {
         let resolved = resolve(vec![
             ContainerOption::Image(ImageRef::new("img:latest")),
             ContainerOption::Interactive(true),
@@ -779,8 +820,9 @@ mod tests {
             &ImageRef::new("img:latest"),
             &resolved,
         );
-        assert!(argv.contains(&"-i".to_string()), "seeded prompt with interactive needs -i flag");
-        assert!(!argv.contains(&"-it".to_string()), "seeded prompt must NOT add -it even when interactive is true");
+        assert!(argv.contains(&"-it".to_string()), "interactive+seeded must use -it for PTY");
+        assert!(!argv.contains(&"-i".to_string()), "interactive+seeded must NOT use bare -i");
+        assert_eq!(argv.last().map(|s| s.as_str()), Some("hello"), "seeded prompt must be last positional arg");
     }
 
     #[test]

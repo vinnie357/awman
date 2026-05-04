@@ -87,6 +87,7 @@ pub struct ReadyEngineOptions {
     pub build: bool,
     pub no_cache: bool,
     pub allow_docker: bool,
+    pub non_interactive: bool,
     /// Env-passthrough list for audit container runs.
     pub env_passthrough: Option<Vec<String>>,
 }
@@ -449,7 +450,7 @@ impl ReadyEngine {
                         initial_prompt: Some(ready_audit_prompt().to_string()),
                         allow_docker: self.options.allow_docker,
                         mount_ssh: false,
-                        non_interactive: true,
+                        non_interactive: self.options.non_interactive,
                         model: None,
                         env_passthrough: self.options.env_passthrough.clone(),
                         directory_overlays: vec![],
@@ -747,6 +748,7 @@ mod tests {
             build: true,
             no_cache: false,
             allow_docker: false,
+            non_interactive: false,
             env_passthrough: None,
         };
         let engine = ReadyEngine::new(
@@ -822,6 +824,7 @@ mod tests {
             build: false,
             no_cache: false,
             allow_docker: false,
+            non_interactive: false,
             env_passthrough: None,
         };
         let mut engine2 = ReadyEngine::new(
@@ -879,6 +882,7 @@ mod tests {
             build: false,
             no_cache: false,
             allow_docker: false,
+            non_interactive: false,
             env_passthrough: None,
         };
         let mut engine = ReadyEngine::new(

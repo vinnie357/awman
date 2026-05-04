@@ -332,8 +332,12 @@ impl<F: CommandFrontend> Dispatch<F> {
                     .frontend
                     .flag_bool(&canonical_refs, "interview")?
                     .unwrap_or(false);
+                let non_interactive = self
+                    .frontend
+                    .flag_bool(&canonical_refs, "non-interactive")?
+                    .unwrap_or(false);
                 Ok(BuiltCommand::Specs(SpecsCommand::new(
-                    SpecsSubcommand::New(SpecsNewFlags { interview }),
+                    SpecsSubcommand::New(SpecsNewFlags { interview, non_interactive }),
                     self.engines.clone(),
                 )))
             }
@@ -533,8 +537,12 @@ impl<F: CommandFrontend> Dispatch<F> {
                     .frontend
                     .flag_bool(&canonical_refs, "interview")?
                     .unwrap_or(false);
+                let non_interactive = self
+                    .frontend
+                    .flag_bool(&canonical_refs, "non-interactive")?
+                    .unwrap_or(false);
                 Ok(BuiltCommand::New(NewCommand::new(
-                    NewSubcommand::Spec(NewSpecFlags { interview }),
+                    NewSubcommand::Spec(NewSpecFlags { interview, non_interactive }),
                     self.engines.clone(),
                 )))
             }
@@ -542,6 +550,10 @@ impl<F: CommandFrontend> Dispatch<F> {
                 let interview = self
                     .frontend
                     .flag_bool(&canonical_refs, "interview")?
+                    .unwrap_or(false);
+                let non_interactive = self
+                    .frontend
+                    .flag_bool(&canonical_refs, "non-interactive")?
                     .unwrap_or(false);
                 let global = self
                     .frontend
@@ -554,6 +566,7 @@ impl<F: CommandFrontend> Dispatch<F> {
                 Ok(BuiltCommand::New(NewCommand::new(
                     NewSubcommand::Workflow(NewWorkflowFlags {
                         interview,
+                        non_interactive,
                         global,
                         format,
                     }),
@@ -565,12 +578,16 @@ impl<F: CommandFrontend> Dispatch<F> {
                     .frontend
                     .flag_bool(&canonical_refs, "interview")?
                     .unwrap_or(false);
+                let non_interactive = self
+                    .frontend
+                    .flag_bool(&canonical_refs, "non-interactive")?
+                    .unwrap_or(false);
                 let global = self
                     .frontend
                     .flag_bool(&canonical_refs, "global")?
                     .unwrap_or(false);
                 Ok(BuiltCommand::New(NewCommand::new(
-                    NewSubcommand::Skill(NewSkillFlags { interview, global }),
+                    NewSubcommand::Skill(NewSkillFlags { interview, non_interactive, global }),
                     self.engines.clone(),
                 )))
             }
