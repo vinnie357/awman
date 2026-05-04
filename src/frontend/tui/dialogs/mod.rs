@@ -1,0 +1,329 @@
+//! Pure-presentation dialog widgets for the TUI.
+//!
+//! Each dialog captures keyboard input while open, renders centered in the
+//! terminal, and returns a typed Layer 2 enum value when the user responds.
+//! Cancellable with Esc.
+
+use ratatui::prelude::*;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+
+use crate::frontend::tui::text_edit::TextEdit;
+
+/// A dialog request sent from the command thread to the event loop.
+#[derive(Debug)]
+pub enum DialogRequest {
+    YesNo { title: String, body: String },
+    YesNoCancel { title: String, body: String },
+    TextInput { title: String, prompt: String },
+    MultilineInput { title: String, prompt: String },
+    ListPicker { title: String, items: Vec<String> },
+    KindSelect { title: String, options: Vec<(String, String)> },
+    WorkflowControlBoard(WorkflowControlBoardState),
+    WorkflowStepError(WorkflowStepErrorState),
+    WorkflowYoloCountdown(WorkflowYoloCountdownState),
+    AgentSetup(AgentSetupState),
+    MountScope(MountScopeState),
+    AgentAuth(AgentAuthState),
+    QuitConfirm,
+    CloseTabConfirm,
+    /// Confirmation prompt opened when the user presses Ctrl+C while a
+    /// workflow is running. `y` aborts the workflow (kills the container,
+    /// returns the current step to Pending), `n`/`Esc` keeps it running.
+    WorkflowCancelConfirm,
+    ConfigShow,
+    Loading { title: String },
+    Custom { title: String, body: String, keys: Vec<(char, String)> },
+}
+
+/// A dialog response returned from the event loop to the command thread.
+#[derive(Debug, Clone)]
+pub enum DialogResponse {
+    Yes,
+    No,
+    Cancel,
+    Text(String),
+    Index(usize),
+    Char(char),
+    Dismissed,
+}
+
+/// The active dialog state stored in `App`.
+pub enum Dialog {
+    YesNo { title: String, body: String },
+    YesNoCancel { title: String, body: String },
+    TextInput { title: String, prompt: String, editor: TextEdit },
+    MultilineInput { title: String, prompt: String, editor: TextEdit },
+    ListPicker { title: String, items: Vec<String>, selected: usize },
+    KindSelect { title: String, options: Vec<(String, String)> },
+    WorkflowControlBoard(WorkflowControlBoardState),
+    WorkflowStepError(WorkflowStepErrorState),
+    WorkflowYoloCountdown(WorkflowYoloCountdownState),
+    AgentSetup(AgentSetupState),
+    MountScope(MountScopeState),
+    AgentAuth(AgentAuthState),
+    QuitConfirm,
+    CloseTabConfirm,
+    WorkflowCancelConfirm,
+    ConfigShow(ConfigShowState),
+    Loading { title: String },
+    Custom { title: String, body: String, keys: Vec<(char, String)> },
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowControlBoardState {
+    pub step_name: String,
+    pub can_launch_next: bool,
+    pub can_continue_current: bool,
+    pub can_restart: bool,
+    pub can_go_back: bool,
+    pub can_finish: bool,
+    /// Human-readable reason explaining why "continue in current container"
+    /// is not available (e.g. "next step uses a different agent"). Rendered
+    /// in DarkGray underneath the disabled `[↓]` line so users understand
+    /// why it's greyed out.
+    pub continue_unavailable_reason: Option<String>,
+    pub cancel_to_previous_unavailable_reason: Option<String>,
+    pub finish_workflow_unavailable_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowStepErrorState {
+    pub step_name: String,
+    pub error_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowYoloCountdownState {
+    pub step_name: String,
+    pub remaining_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentSetupState {
+    pub agent_name: String,
+    pub image_only: bool,
+    pub has_fallback: bool,
+    pub fallback_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MountScopeState {
+    pub git_root: String,
+    pub cwd: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentAuthState {
+    pub agent_name: String,
+    pub env_vars: Vec<String>,
+}
+
+pub struct ConfigShowState {
+    pub rows: Vec<ConfigShowRow>,
+    pub selected: usize,
+    pub editing: bool,
+    pub edit_column: usize,
+    pub editor: TextEdit,
+}
+
+pub struct ConfigShowRow {
+    pub field: String,
+    pub global: String,
+    pub repo: String,
+    pub effective: String,
+    pub read_only: bool,
+}
+
+/// Compute a centered rect for a dialog.
+pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let popup_layout = Layout::vertical([
+        Constraint::Percentage((100 - percent_y) / 2),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage((100 - percent_y) / 2),
+    ])
+    .split(area);
+    Layout::horizontal([
+        Constraint::Percentage((100 - percent_x) / 2),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage((100 - percent_x) / 2),
+    ])
+    .split(popup_layout[1])[1]
+}
+
+/// Compute a fixed-size centered rect.
+pub fn centered_fixed(cols: u16, rows: u16, area: Rect) -> Rect {
+    let x = area.x + area.width.saturating_sub(cols) / 2;
+    let y = area.y + area.height.saturating_sub(rows) / 2;
+    Rect::new(x, y, cols.min(area.width), rows.min(area.height))
+}
+
+/// Render a dialog frame with the given title and border color.
+pub fn render_dialog_frame(
+    title: &str,
+    color: Color,
+    area: Rect,
+    frame: &mut Frame,
+) -> Rect {
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(format!(" {title} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .border_type(ratatui::widgets::BorderType::Rounded);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
+}
+
+/// Render the YesNo dialog.
+pub fn render_yes_no(
+    title: &str,
+    body: &str,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    let dialog_area = centered_fixed(50, 8, area);
+    let inner = render_dialog_frame(title, Color::Yellow, dialog_area, frame);
+    let text = format!("{body}\n\n  [y] Yes   [n] No");
+    frame.render_widget(
+        Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
+}
+
+/// Render the quit confirmation dialog.
+pub fn render_quit_confirm(area: Rect, frame: &mut Frame) {
+    render_yes_no("Quit?", "Are you sure you want to quit amux?", area, frame);
+}
+
+/// Render the close-tab confirmation dialog.
+pub fn render_close_tab_confirm(area: Rect, frame: &mut Frame) {
+    let dialog_area = centered_fixed(55, 9, area);
+    let inner = render_dialog_frame("Close tab?", Color::Yellow, dialog_area, frame);
+    let text = "  [q] Quit entire app\n  [c] Close this tab\n  [n] Cancel";
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
+/// Render the workflow-cancel confirmation dialog (Ctrl+C while a workflow
+/// is running).
+pub fn render_workflow_cancel_confirm(area: Rect, frame: &mut Frame) {
+    let dialog_area = centered_fixed(58, 10, area);
+    let inner = render_dialog_frame(
+        "Cancel Workflow Execution",
+        Color::Yellow,
+        dialog_area,
+        frame,
+    );
+    let text =
+        "  Cancel workflow execution?\n\n  The running container will be killed and the\n  current step returned to Pending for resumption.\n\n  [y] cancel execution   [n / Esc] keep running";
+    frame.render_widget(Paragraph::new(text), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    // ─── Helper ───────────────────────────────────────────────────────────────
+
+    fn render_to_string(
+        width: u16,
+        height: u16,
+        f: impl FnOnce(ratatui::layout::Rect, &mut ratatui::Frame),
+    ) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| f(frame.area(), frame)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| {
+                        buffer
+                            .cell((x, y))
+                            .map(|c| c.symbol().to_string())
+                            .unwrap_or(" ".to_string())
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    // ─── Geometry: centered_fixed ─────────────────────────────────────────────
+
+    #[test]
+    fn centered_fixed_center_within_large_area() {
+        let area = Rect::new(0, 0, 100, 50);
+        let result = centered_fixed(40, 10, area);
+        assert_eq!(result.x, (100 - 40) / 2);
+        assert_eq!(result.y, (50 - 10) / 2);
+        assert_eq!(result.width, 40);
+        assert_eq!(result.height, 10);
+    }
+
+    #[test]
+    fn centered_fixed_clips_width_when_smaller_than_area() {
+        let area = Rect::new(0, 0, 20, 50);
+        let result = centered_fixed(40, 10, area);
+        assert_eq!(result.width, 20);
+    }
+
+    #[test]
+    fn centered_fixed_clips_height_when_smaller_than_area() {
+        let area = Rect::new(0, 0, 100, 5);
+        let result = centered_fixed(40, 10, area);
+        assert_eq!(result.height, 5);
+    }
+
+    #[test]
+    fn centered_fixed_zero_dialog_is_at_center() {
+        let area = Rect::new(0, 0, 100, 50);
+        let result = centered_fixed(0, 0, area);
+        assert_eq!(result.width, 0);
+        assert_eq!(result.height, 0);
+    }
+
+    // ─── Geometry: centered_rect ──────────────────────────────────────────────
+
+    #[test]
+    fn centered_rect_centers_percentage_area() {
+        let area = Rect::new(0, 0, 100, 100);
+        let result = centered_rect(50, 50, area);
+        // With 50% of 100 = 50 cols/rows centered: margins are 25 each side
+        assert!(result.x >= 24 && result.x <= 26, "x={}", result.x);
+        assert!(result.y >= 24 && result.y <= 26, "y={}", result.y);
+    }
+
+    // ─── Rendering tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn render_quit_confirm_contains_quit_text() {
+        let output = render_to_string(80, 24, |area, frame| {
+            render_quit_confirm(area, frame);
+        });
+        let lower = output.to_lowercase();
+        assert!(lower.contains("quit"), "expected 'quit' in output:\n{output}");
+    }
+
+    #[test]
+    fn render_yes_no_shows_y_and_n_keys() {
+        let output = render_to_string(80, 24, |area, frame| {
+            render_yes_no("Test?", "Test body", area, frame);
+        });
+        assert!(output.contains("[y]"), "expected '[y]' in output:\n{output}");
+        assert!(output.contains("[n]"), "expected '[n]' in output:\n{output}");
+    }
+
+    #[test]
+    fn render_close_tab_confirm_shows_options() {
+        let output = render_to_string(80, 24, |area, frame| {
+            render_close_tab_confirm(area, frame);
+        });
+        assert!(output.contains("[q]"), "expected '[q]' in output:\n{output}");
+        assert!(output.contains("[c]"), "expected '[c]' in output:\n{output}");
+        assert!(output.contains("[n]"), "expected '[n]' in output:\n{output}");
+    }
+}

@@ -1,0 +1,352 @@
+//! Workflow status strip — horizontal display of workflow step progression.
+//!
+//! Layout matches old amux:
+//! - Steps are grouped into **topological columns** by sorted `depends_on`
+//!   signature (steps that share the same dependencies sit in the same
+//!   column).
+//! - Each step renders as a **3-row rounded box** with a status glyph and
+//!   the step name.
+//! - Parallel siblings (multiple steps in the same column) **stack
+//!   vertically with a 1-cell indent per row** to imply they will run
+//!   sequentially.
+//! - **Inter-column `→` arrows** sit on the middle row of the first row of
+//!   boxes, joining adjacent columns.
+//! - When more parallel steps exist than rows fit, the last visible row
+//!   becomes a `+ N more…` overflow box.
+
+use std::collections::BTreeMap;
+
+use ratatui::prelude::*;
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+
+use crate::frontend::tui::tabs::{WorkflowStepView, WorkflowViewState};
+
+/// Compute the rows needed for the workflow strip given a view state.
+/// `max_parallel` is capped at 3 (each box is 3 rows tall, so the strip
+/// caps at 9 rows). Returns 0 when `state` is empty / has no steps.
+pub fn workflow_strip_height(state: &WorkflowViewState) -> u16 {
+    if state.steps.is_empty() {
+        return 0;
+    }
+    let columns = build_workflow_columns(state);
+    let max_parallel = columns
+        .iter()
+        .map(|c| c.len())
+        .max()
+        .unwrap_or(1);
+    let rows = max_parallel.min(3) as u16;
+    rows * 3
+}
+
+/// Render the workflow status strip into the given area.
+pub fn render_workflow_strip(
+    state: &WorkflowViewState,
+    area: Rect,
+    frame: &mut Frame,
+) {
+    if area.width == 0 || area.height == 0 || state.steps.is_empty() {
+        return;
+    }
+
+    let columns = build_workflow_columns(state);
+    let num_cols = columns.len();
+    if num_cols == 0 {
+        return;
+    }
+
+    // Subtract one cell per inter-column arrow gap.
+    let arrow_chars = num_cols.saturating_sub(1) as u16;
+    let box_space = area.width.saturating_sub(arrow_chars);
+    let base_col_w = (box_space / num_cols as u16).max(4);
+
+    // The number of vertical slots for parallel steps in this strip.
+    let visible_rows = (area.height / 3).max(1) as usize;
+
+    let mut col_x = area.x;
+    for (col_idx, col_steps) in columns.iter().enumerate() {
+        // Last column absorbs the remainder so the strip fills the area.
+        let this_col_w = if col_idx + 1 == num_cols {
+            area.x + area.width - col_x
+        } else {
+            base_col_w
+        };
+
+        let steps_to_show: Vec<&WorkflowStepView> =
+            col_steps.iter().take(visible_rows).copied().collect();
+        let hidden = col_steps.len().saturating_sub(visible_rows);
+
+        for (row_idx, step) in steps_to_show.iter().enumerate() {
+            // Indent parallel siblings by row index (1 cell per extra row).
+            let indent = row_idx as u16;
+            let box_x = (col_x + indent).min(area.x + area.width.saturating_sub(4));
+            let box_w = this_col_w.saturating_sub(indent).max(4);
+            let row_y = area.y + row_idx as u16 * 3;
+            if row_y + 3 > area.y + area.height {
+                break;
+            }
+            let box_area = Rect::new(box_x, row_y, box_w, 3);
+
+            let is_current = state
+                .current_step
+                .as_ref()
+                .map(|c| c == &step.name)
+                .unwrap_or(false);
+            let auto_disabled = state.auto_disabled.contains(&step.name);
+            let (label, style) =
+                step_box_label_and_style(&step.name, &step.status, is_current, auto_disabled, box_w);
+
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(style);
+            let para = Paragraph::new(label).block(block).style(style);
+            frame.render_widget(para, box_area);
+
+            // Arrow between this column and the next, on the middle row of
+            // the FIRST row of boxes only (so it visually connects column
+            // headers without overlapping parallel siblings).
+            if col_idx + 1 < num_cols && row_idx == 0 {
+                let arrow_x = col_x + this_col_w;
+                if arrow_x < area.x + area.width {
+                    let arrow_area = Rect::new(arrow_x, row_y + 1, 1, 1);
+                    frame.render_widget(
+                        Paragraph::new("\u{2192}")
+                            .style(Style::default().fg(Color::DarkGray)),
+                        arrow_area,
+                    );
+                }
+            }
+        }
+
+        // Overflow indicator in the last visible row when there are hidden
+        // steps. Replaces the last shown step's box position.
+        if hidden > 0 && !steps_to_show.is_empty() {
+            let last_row = steps_to_show.len().saturating_sub(1);
+            let row_y = area.y + last_row as u16 * 3;
+            if row_y + 3 <= area.y + area.height {
+                let indent = last_row as u16;
+                let box_x = (col_x + indent).min(area.x + area.width.saturating_sub(4));
+                let box_w = this_col_w.saturating_sub(indent).max(4);
+                let box_area = Rect::new(box_x, row_y, box_w, 3);
+                let more_label = format!("+ {} more\u{2026}", hidden);
+                let para = Paragraph::new(more_label)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(Color::DarkGray)),
+                    )
+                    .style(Style::default().fg(Color::DarkGray));
+                frame.render_widget(para, box_area);
+            }
+        }
+
+        col_x += this_col_w + 1;
+    }
+}
+
+/// Group steps into columns by sorted `depends_on` signature. Steps with the
+/// same dependency set sit in the same column (parallel group). Columns are
+/// emitted in insertion order so the resulting layout reflects topological
+/// order.
+fn build_workflow_columns(state: &WorkflowViewState) -> Vec<Vec<&WorkflowStepView>> {
+    let mut by_signature: BTreeMap<String, Vec<&WorkflowStepView>> = BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for step in &state.steps {
+        let mut deps = step.depends_on.clone();
+        deps.sort();
+        let signature = deps.join("|");
+        if !by_signature.contains_key(&signature) {
+            order.push(signature.clone());
+        }
+        by_signature.entry(signature).or_default().push(step);
+    }
+    order
+        .into_iter()
+        .filter_map(|sig| by_signature.remove(&sig))
+        .collect()
+}
+
+/// Compute the label text + style for a step box.
+///
+/// Status → glyph + color:
+/// - Pending → `○` DarkGray
+/// - Running → `●` Blue + Bold
+/// - Done → `✓` Green
+/// - Error → `✗` Red + Bold
+/// - Cancelled / Skipped → `⊘` DarkGray
+///
+/// Current step is rendered with extra Bold on top of its status style.
+/// Auto-advance-disabled steps get a small `🔒` prefix.
+fn step_box_label_and_style(
+    name: &str,
+    status: &str,
+    is_current: bool,
+    auto_disabled: bool,
+    box_width: u16,
+) -> (String, Style) {
+    let prefix_chars = if auto_disabled { 2 } else { 0 };
+    // Available chars inside the box: width − 2 (borders) − 4 (' X ' around
+    // glyph + name + trailing space) − optional auto-disabled prefix.
+    let max_name_chars = (box_width as usize)
+        .saturating_sub(6 + prefix_chars)
+        .max(1);
+    let truncated_name = if name.chars().count() > max_name_chars {
+        let trunc: String = name.chars().take(max_name_chars.saturating_sub(1)).collect();
+        format!("{trunc}\u{2026}")
+    } else {
+        name.to_string()
+    };
+
+    let (glyph, mut style) = match status {
+        "pending" => ("\u{25cb}", Style::default().fg(Color::DarkGray)),
+        "running" => (
+            "\u{25cf}",
+            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+        ),
+        "done" => ("\u{2713}", Style::default().fg(Color::Green)),
+        "error" => (
+            "\u{2717}",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        "cancelled" | "skipped" => ("\u{2298}", Style::default().fg(Color::DarkGray)),
+        _ => ("\u{25cb}", Style::default().fg(Color::DarkGray)),
+    };
+    if is_current {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    let lock = if auto_disabled { "\u{1f512}" } else { "" };
+    let label = format!(" {lock}{glyph} {truncated_name} ");
+    (label, style)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step(name: &str, status: &str, deps: Vec<&str>) -> WorkflowStepView {
+        WorkflowStepView {
+            name: name.into(),
+            status: status.into(),
+            agent: None,
+            model: None,
+            depends_on: deps.into_iter().map(|s| s.into()).collect(),
+        }
+    }
+
+    fn view(steps: Vec<WorkflowStepView>) -> WorkflowViewState {
+        WorkflowViewState {
+            steps,
+            current_step: None,
+            auto_disabled: Default::default(),
+        }
+    }
+
+    #[test]
+    fn build_workflow_columns_groups_by_dependency_signature() {
+        let v = view(vec![
+            step("a", "done", vec![]),
+            step("b", "done", vec![]),
+            step("c", "running", vec!["a", "b"]),
+        ]);
+        let cols = build_workflow_columns(&v);
+        // a + b both depend on nothing → same column. c depends on a,b → next column.
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].len(), 2);
+        assert_eq!(cols[1].len(), 1);
+        assert_eq!(cols[1][0].name, "c");
+    }
+
+    #[test]
+    fn workflow_strip_height_is_zero_when_no_steps() {
+        let v = view(vec![]);
+        assert_eq!(workflow_strip_height(&v), 0);
+    }
+
+    #[test]
+    fn workflow_strip_height_3_when_sequential() {
+        let v = view(vec![
+            step("a", "done", vec![]),
+            step("b", "running", vec!["a"]),
+        ]);
+        assert_eq!(workflow_strip_height(&v), 3);
+    }
+
+    #[test]
+    fn workflow_strip_height_grows_with_parallel_group() {
+        let v = view(vec![
+            step("a", "done", vec![]),
+            step("b", "done", vec![]),
+            step("c", "running", vec![]),
+        ]);
+        // 3 parallel steps → 3 * 3 = 9 rows.
+        assert_eq!(workflow_strip_height(&v), 9);
+    }
+
+    #[test]
+    fn workflow_strip_height_caps_at_three_rows_of_boxes() {
+        let v = view(vec![
+            step("a", "done", vec![]),
+            step("b", "done", vec![]),
+            step("c", "done", vec![]),
+            step("d", "done", vec![]),
+            step("e", "done", vec![]),
+        ]);
+        // 5 parallel siblings → still capped at 3 box-rows = 9 rows.
+        assert_eq!(workflow_strip_height(&v), 9);
+    }
+
+    // ── step_box_label_and_style ──────────────────────────────────────────────
+
+    #[test]
+    fn step_box_label_pending_uses_circle_glyph_and_dark_gray() {
+        let (label, style) = step_box_label_and_style("foo", "pending", false, false, 20);
+        assert!(label.contains('\u{25cb}'));
+        assert!(label.contains("foo"));
+        assert_eq!(style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn step_box_label_running_uses_filled_circle_blue_bold() {
+        let (label, style) = step_box_label_and_style("foo", "running", false, false, 20);
+        assert!(label.contains('\u{25cf}'));
+        assert_eq!(style.fg, Some(Color::Blue));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn step_box_label_done_uses_check_glyph_green() {
+        let (label, style) = step_box_label_and_style("foo", "done", false, false, 20);
+        assert!(label.contains('\u{2713}'));
+        assert_eq!(style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn step_box_label_error_uses_cross_glyph_red_bold() {
+        let (label, style) = step_box_label_and_style("foo", "error", false, false, 20);
+        assert!(label.contains('\u{2717}'));
+        assert_eq!(style.fg, Some(Color::Red));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn step_box_label_current_step_adds_bold_on_top_of_status() {
+        let (_, style) = step_box_label_and_style("foo", "done", true, false, 20);
+        // Done is not bold by default, but is_current adds BOLD.
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn step_box_label_auto_disabled_adds_lock_prefix() {
+        let (label, _) = step_box_label_and_style("foo", "pending", false, true, 20);
+        assert!(label.contains('\u{1f512}'));
+    }
+
+    #[test]
+    fn step_box_label_truncates_long_name() {
+        let (label, _) =
+            step_box_label_and_style("very-long-step-name", "pending", false, false, 12);
+        // box_w=12 → max chars = 12 - 6 = 6; truncated to 5 chars + …
+        assert!(label.contains('\u{2026}'));
+    }
+}

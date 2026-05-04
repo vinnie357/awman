@@ -204,4 +204,41 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn completions_empty_prefix_returns_all_top_level_commands() {
+        let cat = CommandCatalogue::get();
+        let comps = cat.tui_completions("");
+        let names: Vec<&str> = comps.iter().map(|c| c.completion.as_str()).collect();
+        for expected in &["chat", "exec", "status", "ready", "config"] {
+            assert!(
+                names.contains(expected),
+                "empty prefix must return all top-level commands; missing '{expected}'"
+            );
+        }
+    }
+
+    #[test]
+    fn completions_no_match_returns_empty() {
+        let cat = CommandCatalogue::get();
+        let comps = cat.tui_completions("zzzzz");
+        assert!(
+            comps.is_empty(),
+            "non-matching prefix must return empty; got: {comps:?}"
+        );
+    }
+
+    #[test]
+    fn hint_for_unknown_path_returns_none() {
+        let cat = CommandCatalogue::get();
+        let hint = cat.tui_hint_for(&["notacommand"]);
+        assert!(hint.is_none(), "unknown path must return None");
+    }
+
+    #[test]
+    fn hint_for_unknown_nested_path_returns_none() {
+        let cat = CommandCatalogue::get();
+        let hint = cat.tui_hint_for(&["exec", "notasubcommand"]);
+        assert!(hint.is_none(), "unknown nested path must return None");
+    }
 }

@@ -27,6 +27,37 @@ pub struct ContainerProgress {
     pub total: Option<u64>,
 }
 
+/// Byte-stream I/O channels detached from a frontend so the engine can bridge
+/// them to a real PTY in the container backend.
+///
+/// When a frontend opts into PTY bridging (TUI, headless), the engine takes
+/// ownership of these channels in `run_with_frontend` and spawns reader/writer
+/// tasks against the PTY master. When a frontend does not opt in (the bare
+/// CLI), `take_container_io` returns `None` and the backend falls back to its
+/// inherit-stdio path.
+///
+/// The stdin direction has both ends because the TUI also needs a sender (for
+/// keystrokes) and the engine retains its own sender clone — used by
+/// `ContainerExecution::try_inject_stdin` to send a fresh prompt into a still-
+/// running container during workflow `ContinueInCurrentContainer` advances.
+pub struct ContainerIo {
+    /// Engine sends container stdout/stderr bytes here. The frontend drains it
+    /// (e.g. into a vt100 parser).
+    pub stdout: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// Sender side of the stdin channel — engine retains a clone for
+    /// `try_inject_stdin`; frontend also keeps its own clone for keystrokes.
+    pub stdin_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// Receiver side of the stdin channel — consumed by the engine's PTY
+    /// writer task. Both the frontend (keystrokes) and the engine
+    /// (`try_inject_stdin`) push into the matching sender.
+    pub stdin_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    /// Engine reads PTY resize requests from here whenever the host terminal
+    /// resizes. The frontend pushes (cols, rows).
+    pub resize: tokio::sync::mpsc::UnboundedReceiver<(u16, u16)>,
+    /// Initial PTY size at spawn time.
+    pub initial_size: (u16, u16),
+}
+
 /// Abstract container-side I/O. Implementations live in Layer 3 (CLI binds
 /// stdio, TUI binds a PTY, headless binds an SSE/WebSocket stream).
 ///
@@ -43,4 +74,17 @@ pub trait ContainerFrontend: UserMessageSink + Send {
     fn report_status(&mut self, status: ContainerStatus);
     fn report_progress(&mut self, progress: ContainerProgress);
     fn resize_pty(&mut self, cols: u16, rows: u16);
+
+    /// Detach the byte-stream I/O channels for engine PTY bridging.
+    ///
+    /// If `Some`, the backend should bridge the container's PTY directly via
+    /// these channels (instead of inheriting host stdio). The default
+    /// implementation returns `None` — appropriate for CLI/headless frontends
+    /// that have no PTY to bridge.
+    ///
+    /// Once channels have been taken, `write_stdout`/`read_stdin`/`resize_pty`
+    /// are unused — the engine drives the PTY directly via the channels.
+    fn take_container_io(&mut self) -> Option<ContainerIo> {
+        None
+    }
 }

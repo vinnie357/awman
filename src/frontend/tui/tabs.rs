@@ -1,0 +1,883 @@
+//! Per-tab state.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use ratatui::layout::Rect;
+
+use crate::command::dispatch::CommandOutcome;
+use crate::command::error::CommandError;
+use crate::data::session::Session;
+use crate::engine::container::instance::ContainerStats;
+use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
+use crate::frontend::tui::user_message::SharedStatusLog;
+
+/// How long a tab can produce no PTY output before being marked "stuck".
+/// The tab color flips to yellow and a warning glyph is added to the tab
+/// label, so the user knows to check on it.
+pub const STUCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Per-tab execution lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutionPhase {
+    Idle,
+    Running { command: String },
+    Done { command: String, exit_code: i32 },
+    Error { command: String, message: String },
+}
+
+/// Container overlay window state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerWindowState {
+    Hidden,
+    Minimized,
+    Maximized,
+}
+
+impl ContainerWindowState {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Hidden => Self::Minimized,
+            Self::Minimized => Self::Maximized,
+            Self::Maximized => Self::Hidden,
+        }
+    }
+}
+
+/// Current workflow view state (visible when a workflow is running).
+#[derive(Debug, Clone, Default)]
+pub struct WorkflowViewState {
+    pub steps: Vec<WorkflowStepView>,
+    pub current_step: Option<String>,
+    /// Set of step names with auto-advance disabled (the user pressed `[d]`
+    /// in the WorkflowControlBoard while this step was current).
+    pub auto_disabled: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowStepView {
+    pub name: String,
+    pub status: String,
+    /// Resolved agent (e.g. `"claude"`) — fed by `report_workflow_progress`.
+    pub agent: Option<String>,
+    /// Optional resolved model.
+    pub model: Option<String>,
+    /// Steps this one waits on. Drives the column-grouping in the strip
+    /// renderer (steps with the same sorted `depends_on` set sit in the
+    /// same topological column).
+    pub depends_on: Vec<String>,
+}
+
+/// Cross-thread shared workflow view state.
+///
+/// `WorkflowFrontend` (engine-driven, in a tokio task) writes to it; the TUI
+/// renderer reads from it. Mirrors the pattern used by `SharedStatusLog`.
+pub type SharedWorkflowViewState = Arc<Mutex<Option<WorkflowViewState>>>;
+
+/// Cross-thread shared yolo-countdown state. The engine ticks it every 100ms
+/// while a yolo countdown is active; the renderer reads it to display the
+/// "Auto-advancing in Ns" non-modal overlay.
+pub type SharedYoloState = Arc<Mutex<Option<YoloState>>>;
+
+#[derive(Debug, Clone)]
+pub struct YoloState {
+    pub step_name: String,
+    pub remaining_secs: u64,
+}
+
+/// Mouse text selection.
+///
+/// Coordinates are stored in vt100 cell space (0-based against the parser
+/// grid), not raw terminal coords. The renderer publishes
+/// `Tab::container_inner_area` so `handle_mouse_event` can subtract the
+/// overlay's screen offset before recording these.
+#[derive(Debug, Clone)]
+pub struct TextSelection {
+    pub start_col: u16,
+    pub start_row: u16,
+    pub end_col: u16,
+    pub end_row: u16,
+    /// Snapshot of the vt100 grid at selection-start time. Each cell is the
+    /// printable contents of that position (or `" "` for empties), so the
+    /// copied text reflects what the user *saw* when they started the drag,
+    /// not the grid's current values (which mutate with live PTY output).
+    pub snapshot: Vec<Vec<String>>,
+}
+
+/// Live container metadata, populated while a containerized command runs.
+#[derive(Debug, Clone)]
+pub struct ContainerInfo {
+    pub agent_display_name: String,
+    pub container_name: String,
+    pub start_time: Instant,
+    pub latest_stats: Option<ContainerStats>,
+    /// History of `(cpu_percent, memory_mb)` samples for averaging in the
+    /// post-exit summary bar.
+    pub stats_history: Vec<(f64, f64)>,
+}
+
+/// Summary captured after a containerized command exits, displayed in a
+/// dashed-border bar below the execution window until the next command starts.
+#[derive(Debug, Clone)]
+pub struct LastContainerSummary {
+    pub agent_display_name: String,
+    pub container_name: String,
+    pub avg_cpu: String,
+    pub avg_memory: String,
+    pub total_time: String,
+    pub exit_code: i32,
+}
+
+/// Tab state — one per open tab.
+pub struct Tab {
+    pub session: Session,
+    pub execution_phase: ExecutionPhase,
+    pub vt100_parser: vt100::Parser,
+    pub container_window_state: ContainerWindowState,
+    /// How many lines from the bottom to skip in the vt100 scrollback when
+    /// the container is Maximized. 0 = follow live output.
+    pub container_scroll_offset: usize,
+    /// Live container metadata, populated while a containerized command runs.
+    pub container_info: Option<ContainerInfo>,
+    /// Summary of the last container session, shown in a dashed-border bar
+    /// below the exec window after the container exits.
+    pub last_container_summary: Option<LastContainerSummary>,
+    /// Inner content rect of the container overlay, refreshed each frame by
+    /// the renderer. Used by the mouse handler to translate raw terminal
+    /// coords into vt100 cell coords.
+    pub container_inner_area: Option<Rect>,
+    /// Shared workflow view state. The engine's `WorkflowFrontend` impl
+    /// writes here on `report_workflow_progress` / `report_step_status`;
+    /// the renderer reads from here when drawing the workflow strip.
+    pub workflow_state: SharedWorkflowViewState,
+    /// Shared yolo countdown state. Updated by `yolo_countdown_tick` on the
+    /// engine side; rendered as a non-modal overlay (avoids the dialog-spam
+    /// that a per-tick `ask_dialog` would cause).
+    pub yolo_state: SharedYoloState,
+    pub status_log: SharedStatusLog,
+    pub status_log_collapsed: bool,
+    pub scroll_offset: usize,
+    pub mouse_selection: Option<TextSelection>,
+    pub workflow_agent_fallbacks: HashMap<String, String>,
+    pub auto_workflow_disabled_steps: HashSet<String>,
+    pub is_remote: bool,
+    pub is_claws: bool,
+    pub output_lines: Vec<String>,
+    pub stuck: bool,
+    pub yolo_countdown: Option<u64>,
+    pub last_output_time: Option<Instant>,
+    /// Last time the user touched this tab (key press, mouse). Used together
+    /// with `last_output_time` to suppress stuck detection while the user is
+    /// actively engaged.
+    pub last_user_activity_time: Option<Instant>,
+
+    // ── Async command plumbing ───────────────────────────────────────────
+    /// Event loop drains container stdout/stderr into the vt100 parser.
+    pub container_stdout_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    /// Event loop forwards keystrokes to the container stdin.
+    pub container_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    /// Event loop forwards terminal resizes to the container's PTY master.
+    pub container_resize_tx: Option<tokio::sync::mpsc::UnboundedSender<(u16, u16)>>,
+    /// Receives the command outcome once the spawned task finishes.
+    pub command_result_rx:
+        Option<std::sync::mpsc::Receiver<Result<CommandOutcome, CommandError>>>,
+    /// Event loop polls for dialog requests from the command thread.
+    pub dialog_request_rx: Option<std::sync::mpsc::Receiver<DialogRequest>>,
+    /// Event loop sends dialog responses back to the command thread.
+    pub dialog_response_tx: Option<std::sync::mpsc::Sender<DialogResponse>>,
+}
+
+impl Tab {
+    pub fn new(session: Session) -> Self {
+        Self {
+            session,
+            execution_phase: ExecutionPhase::Idle,
+            vt100_parser: vt100::Parser::new(24, 80, 10000),
+            container_window_state: ContainerWindowState::Hidden,
+            container_scroll_offset: 0,
+            container_info: None,
+            last_container_summary: None,
+            container_inner_area: None,
+            workflow_state: Arc::new(Mutex::new(None)),
+            yolo_state: Arc::new(Mutex::new(None)),
+            status_log: Arc::new(Mutex::new(Vec::new())),
+            status_log_collapsed: false,
+            scroll_offset: 0,
+            mouse_selection: None,
+            workflow_agent_fallbacks: HashMap::new(),
+            auto_workflow_disabled_steps: HashSet::new(),
+            is_remote: false,
+            is_claws: false,
+            output_lines: Vec::new(),
+            stuck: false,
+            yolo_countdown: None,
+            last_output_time: None,
+            last_user_activity_time: None,
+            container_stdout_rx: None,
+            container_stdin_tx: None,
+            container_resize_tx: None,
+            command_result_rx: None,
+            dialog_request_rx: None,
+            dialog_response_tx: None,
+        }
+    }
+
+    /// Recompute the `stuck` flag based on `last_output_time` vs. now.
+    ///
+    /// A tab is considered stuck when:
+    /// - it is currently Running
+    /// - a container is open (Maximized or Minimized)
+    /// - no PTY bytes have arrived for `STUCK_TIMEOUT`
+    /// - if this is the active tab, the user hasn't touched it for at least
+    ///   `STUCK_TIMEOUT` either (so we don't flag a tab the user is plainly
+    ///   working in).
+    pub fn recompute_stuck(&mut self, is_active: bool) {
+        let was_stuck = self.stuck;
+        self.stuck = self.is_stuck(is_active, STUCK_TIMEOUT);
+        if !was_stuck && self.stuck {
+            // Cosmetic: nothing else; the tab color picks this up.
+        }
+    }
+
+    fn is_stuck(&self, is_active: bool, timeout: std::time::Duration) -> bool {
+        if !matches!(self.execution_phase, ExecutionPhase::Running { .. }) {
+            return false;
+        }
+        if self.container_window_state == ContainerWindowState::Hidden {
+            return false;
+        }
+        let output_stale = self
+            .last_output_time
+            .map(|t| t.elapsed() >= timeout)
+            .unwrap_or(false);
+        if !output_stale {
+            return false;
+        }
+        if is_active {
+            // Active tab: don't flag while the user is actively typing.
+            if let Some(activity) = self.last_user_activity_time {
+                if activity.elapsed() < timeout {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Stamp `last_user_activity_time` to suppress stuck detection while the
+    /// user is engaged. Called on key/mouse events.
+    pub fn record_user_activity(&mut self) {
+        self.last_user_activity_time = Some(Instant::now());
+    }
+
+    /// Activate the container overlay for a fresh PTY container session.
+    ///
+    /// Resizes the vt100 parser to the container's inner area, resets
+    /// scrollback, and records `ContainerInfo` so the title bar can show the
+    /// agent name and live stats.
+    pub fn start_container(
+        &mut self,
+        agent_display_name: String,
+        container_name: String,
+        cols: u16,
+        rows: u16,
+    ) {
+        self.container_window_state = ContainerWindowState::Maximized;
+        self.container_scroll_offset = 0;
+        self.vt100_parser = vt100::Parser::new(rows, cols, 10000);
+        self.last_container_summary = None;
+        self.mouse_selection = None;
+        self.last_output_time = Some(Instant::now());
+        self.container_info = Some(ContainerInfo {
+            agent_display_name,
+            container_name,
+            start_time: Instant::now(),
+            latest_stats: None,
+            stats_history: Vec::new(),
+        });
+    }
+
+    /// Project name for display in the tab bar. Truncated to 14 chars + `…`
+    /// when the cwd's basename is longer.
+    pub fn project_name(&self) -> String {
+        let name = self
+            .session
+            .working_dir()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+            .to_string();
+        truncate_with_ellipsis(&name, 14)
+    }
+
+    /// Subcommand label rendered inside the tab cell (NOT in the title).
+    /// Empty while Idle. Prepended with `⚠️ ` while stuck. Truncated to fit
+    /// `tab_width - 4` chars (2 borders + 2 padding spaces).
+    pub fn tab_subcommand_label(&self, tab_width: u16, is_active: bool) -> String {
+        let cmd = match &self.execution_phase {
+            ExecutionPhase::Idle => return String::new(),
+            ExecutionPhase::Running { command }
+            | ExecutionPhase::Done { command, .. }
+            | ExecutionPhase::Error { command, .. } => command.as_str(),
+        };
+        let prefix = if self.stuck && self.is_stuck(is_active, STUCK_TIMEOUT) {
+            "\u{26a0}\u{fe0f} "
+        } else {
+            ""
+        };
+        let prefix_chars = prefix.chars().count();
+        let max_chars = (tab_width as usize).saturating_sub(4);
+        let cmd_max = max_chars.saturating_sub(prefix_chars);
+        let cmd_str = if cmd.chars().count() > cmd_max && cmd_max > 1 {
+            let truncated: String = cmd.chars().take(cmd_max - 1).collect();
+            format!("{}\u{2026}", truncated)
+        } else {
+            cmd.to_string()
+        };
+        format!("{}{}", prefix, cmd_str)
+    }
+
+    /// Drain pending container output into the vt100 parser.
+    ///
+    /// Auto-opens the container overlay to Maximized the first time bytes
+    /// arrive so the user sees the PTY output immediately without having to
+    /// manually cycle with Ctrl+M.
+    pub fn drain_container_output(&mut self) {
+        if let Some(ref mut rx) = self.container_stdout_rx {
+            let mut received_any = false;
+            while let Ok(bytes) = rx.try_recv() {
+                self.vt100_parser.process(&bytes);
+                self.last_output_time = Some(Instant::now());
+                received_any = true;
+            }
+            if received_any && self.container_window_state == ContainerWindowState::Hidden {
+                self.container_window_state = ContainerWindowState::Maximized;
+            }
+        }
+    }
+
+    /// Tear down the container overlay state. Called when a containerized
+    /// command finishes (exit, error, or task drop). Captures
+    /// `LastContainerSummary` from `container_info` (if any) so the post-exit
+    /// summary bar can show averaged stats and the exit code.
+    fn close_container_overlay(&mut self, exit_code: i32) {
+        if self.container_window_state != ContainerWindowState::Hidden {
+            if let Some(info) = self.container_info.take() {
+                let elapsed = info.start_time.elapsed().as_secs();
+                let (avg_cpu, avg_memory) = if info.stats_history.is_empty() {
+                    ("n/a".to_string(), "n/a".to_string())
+                } else {
+                    let count = info.stats_history.len() as f64;
+                    let cpu_avg: f64 =
+                        info.stats_history.iter().map(|(c, _)| c).sum::<f64>() / count;
+                    let mem_avg: f64 =
+                        info.stats_history.iter().map(|(_, m)| m).sum::<f64>() / count;
+                    (
+                        format!("{:.1}%", cpu_avg),
+                        format!("{:.0}MiB", mem_avg),
+                    )
+                };
+                self.last_container_summary = Some(LastContainerSummary {
+                    agent_display_name: info.agent_display_name,
+                    container_name: info.container_name,
+                    avg_cpu,
+                    avg_memory,
+                    total_time: format_duration(elapsed),
+                    exit_code,
+                });
+            }
+        }
+        self.container_window_state = ContainerWindowState::Hidden;
+        self.container_inner_area = None;
+        self.mouse_selection = None;
+        self.container_scroll_offset = 0;
+        self.last_output_time = None;
+        self.stuck = false;
+    }
+
+    /// Check if the command task has completed; update execution phase.
+    ///
+    /// Closes the container overlay on completion so the user regains full
+    /// keyboard control without having to manually cycle Ctrl+M.
+    pub fn poll_command_completion(&mut self) {
+        if let Some(ref rx) = self.command_result_rx {
+            match rx.try_recv() {
+                Ok(Ok(_outcome)) => {
+                    let cmd_name = match &self.execution_phase {
+                        ExecutionPhase::Running { command } => command.clone(),
+                        _ => String::new(),
+                    };
+                    self.execution_phase =
+                        ExecutionPhase::Done { command: cmd_name, exit_code: 0 };
+                    self.close_container_overlay(0);
+                    self.command_result_rx = None;
+                    self.container_stdout_rx = None;
+                    self.container_stdin_tx = None;
+                    self.container_resize_tx = None;
+                }
+                Ok(Err(err)) => {
+                    let cmd_name = match &self.execution_phase {
+                        ExecutionPhase::Running { command } => command.clone(),
+                        _ => String::new(),
+                    };
+                    self.execution_phase = ExecutionPhase::Error {
+                        command: cmd_name,
+                        message: format!("{err}"),
+                    };
+                    self.close_container_overlay(-1);
+                    self.command_result_rx = None;
+                    self.container_stdout_rx = None;
+                    self.container_stdin_tx = None;
+                    self.container_resize_tx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still running — nothing to do.
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Command task dropped without sending a result.
+                    let cmd_name = match &self.execution_phase {
+                        ExecutionPhase::Running { command } => command.clone(),
+                        _ => String::new(),
+                    };
+                    self.execution_phase = ExecutionPhase::Error {
+                        command: cmd_name,
+                        message: "command task dropped unexpectedly".to_string(),
+                    };
+                    self.close_container_overlay(-1);
+                    self.command_result_rx = None;
+                    self.container_stdout_rx = None;
+                    self.container_stdin_tx = None;
+                    self.container_resize_tx = None;
+                }
+            }
+        }
+    }
+
+    pub fn subcommand_label(&self) -> &str {
+        match &self.execution_phase {
+            ExecutionPhase::Idle => "",
+            ExecutionPhase::Running { command } => command.as_str(),
+            ExecutionPhase::Done { command, .. } => command.as_str(),
+            ExecutionPhase::Error { command, .. } => command.as_str(),
+        }
+    }
+}
+
+/// Truncate a string to at most `max` characters; if longer, replace the
+/// trailing characters with `…`.
+fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let trunc: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{}\u{2026}", trunc)
+    } else {
+        s.to_string()
+    }
+}
+
+/// Format an elapsed-seconds count as a short human duration:
+/// `"42s"` < 60s, `"7m"` < 1h, `"2h 15m"` otherwise.
+pub fn format_duration(secs: u64) -> String {
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        format!("{}h {}m", h, m)
+    }
+}
+
+/// Tab color based on execution state.
+pub fn tab_color(tab: &Tab) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    if tab.stuck {
+        return Color::Yellow;
+    }
+    if tab.is_remote {
+        return Color::Magenta;
+    }
+    match &tab.execution_phase {
+        ExecutionPhase::Error { .. } => Color::Red,
+        ExecutionPhase::Running { .. } => {
+            if tab.is_claws {
+                Color::Magenta
+            } else if tab.container_window_state != ContainerWindowState::Hidden {
+                Color::Green
+            } else {
+                Color::Blue
+            }
+        }
+        ExecutionPhase::Idle | ExecutionPhase::Done { .. } => Color::DarkGray,
+    }
+}
+
+/// Execution window border color based on phase and focus.
+pub fn window_border_color(
+    phase: &ExecutionPhase,
+    focused: bool,
+) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    match phase {
+        ExecutionPhase::Error { .. } => Color::Red,
+        ExecutionPhase::Running { .. } => {
+            if focused { Color::Blue } else { Color::Gray }
+        }
+        ExecutionPhase::Done { .. } => {
+            if focused { Color::Green } else { Color::Gray }
+        }
+        ExecutionPhase::Idle => Color::DarkGray,
+    }
+}
+
+/// Phase label shown in the execution window border.
+///
+/// Glyphs and text mirror old amux exactly:
+/// - Idle → `" amux "`
+/// - Running → `" ● running: {cmd} "`  (U+25CF)
+/// - Done (exit 0) → `" ✓ done: {cmd} "`  (U+2713)
+/// - Done (non-zero exit) → `" ✗ error: {cmd} (exit N) "`  (U+2717)
+/// - Error → `" ✗ error: {cmd} "`
+pub fn phase_label(phase: &ExecutionPhase) -> String {
+    match phase {
+        ExecutionPhase::Idle => " amux ".to_string(),
+        ExecutionPhase::Running { command } => format!(" \u{25cf} running: {command} "),
+        ExecutionPhase::Done { command, exit_code } if *exit_code == 0 => {
+            format!(" \u{2713} done: {command} ")
+        }
+        ExecutionPhase::Done { command, exit_code } => {
+            format!(" \u{2717} error: {command} (exit {exit_code}) ")
+        }
+        ExecutionPhase::Error { command, .. } => format!(" \u{2717} error: {command} "),
+    }
+}
+
+/// Compute the width of each tab in the tab bar.
+///
+/// Two-stage formula matching old amux:
+/// - **Budget** (cap): 1 tab → ¼ of area, 2 → ½, 3 → ¾, n≥4 → 1/n. Caps how
+///   wide a single tab can grow.
+/// - **Natural**: the widest "untruncated content" across all tabs (project
+///   name title vs. subcommand body) plus 2 cells for the borders. Tabs only
+///   grow as wide as needed to fit their content.
+///
+/// The actual tab width is `min(natural, budget)`.
+pub fn compute_tab_bar_width(
+    num_tabs: usize,
+    area_width: u16,
+    max_natural_content: u16,
+) -> u16 {
+    if num_tabs == 0 || area_width == 0 {
+        return 0;
+    }
+    let n = num_tabs as u16;
+    let natural = max_natural_content + 2;
+    let budget = match num_tabs {
+        1 => area_width / 4,
+        2 => area_width / 2,
+        3 => (area_width * 3) / 4,
+        _ => area_width / n,
+    };
+    natural.min(budget)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+
+    fn make_test_session() -> Session {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        Session::open(
+            tmp.path().to_path_buf(),
+            &resolver,
+            SessionOpenOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn make_tab() -> Tab {
+        Tab::new(make_test_session())
+    }
+
+    #[test]
+    fn container_window_cycles() {
+        assert_eq!(ContainerWindowState::Hidden.cycle(), ContainerWindowState::Minimized);
+        assert_eq!(ContainerWindowState::Minimized.cycle(), ContainerWindowState::Maximized);
+        assert_eq!(ContainerWindowState::Maximized.cycle(), ContainerWindowState::Hidden);
+    }
+
+    // ── truncate_with_ellipsis ─────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_with_ellipsis_no_change_when_short() {
+        assert_eq!(truncate_with_ellipsis("hello", 14), "hello");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_at_limit() {
+        // Exactly 14 chars: no ellipsis.
+        assert_eq!(truncate_with_ellipsis("aaaaaaaaaaaaaa", 14), "aaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_when_too_long() {
+        let s = "aaaaaaaaaaaaaaaaaa"; // 18 chars
+        let result = truncate_with_ellipsis(s, 14);
+        assert!(result.ends_with('\u{2026}'));
+        assert_eq!(result.chars().count(), 14);
+    }
+
+    // ── tab_subcommand_label ───────────────────────────────────────────────────
+
+    #[test]
+    fn tab_subcommand_label_idle_is_empty() {
+        let tab = make_tab();
+        assert_eq!(tab.tab_subcommand_label(20, true), "");
+    }
+
+    #[test]
+    fn tab_subcommand_label_running_returns_command() {
+        let mut tab = make_tab();
+        tab.execution_phase = ExecutionPhase::Running { command: "chat".into() };
+        assert_eq!(tab.tab_subcommand_label(20, true), "chat");
+    }
+
+    #[test]
+    fn tab_subcommand_label_truncates_to_fit_cell() {
+        let mut tab = make_tab();
+        tab.execution_phase = ExecutionPhase::Running {
+            command: "very-long-subcommand-name".into(),
+        };
+        // tab_width=10 → max_chars=6; truncated to 5 chars + …
+        let label = tab.tab_subcommand_label(10, true);
+        assert!(label.ends_with('\u{2026}'));
+        assert!(label.chars().count() <= 6);
+    }
+
+    // ── compute_tab_bar_width ──────────────────────────────────────────────────
+
+    #[test]
+    fn tab_bar_width_single_tab_uses_natural_when_tiny() {
+        // 1 tab, content 5 → natural = 7, budget = 50; min = 7.
+        assert_eq!(compute_tab_bar_width(1, 200, 5), 7);
+    }
+
+    #[test]
+    fn tab_bar_width_single_tab_caps_at_quarter() {
+        // 1 tab, large content → capped at area/4.
+        assert_eq!(compute_tab_bar_width(1, 100, 80), 25);
+    }
+
+    #[test]
+    fn tab_bar_width_two_tabs_caps_at_half() {
+        assert_eq!(compute_tab_bar_width(2, 100, 90), 50);
+    }
+
+    #[test]
+    fn tab_bar_width_three_tabs_caps_at_three_quarters() {
+        assert_eq!(compute_tab_bar_width(3, 100, 90), 75);
+    }
+
+    #[test]
+    fn tab_bar_width_four_tabs_uses_natural_when_small() {
+        // 4 tabs, content 10 → natural = 12, budget = 25; min = 12.
+        assert_eq!(compute_tab_bar_width(4, 100, 10), 12);
+    }
+
+    #[test]
+    fn tab_bar_width_zero_tabs() {
+        assert_eq!(compute_tab_bar_width(0, 100, 5), 0);
+    }
+
+    // ── phase_label ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn phase_label_idle() {
+        assert_eq!(phase_label(&ExecutionPhase::Idle), " amux ");
+    }
+
+    #[test]
+    fn phase_label_running() {
+        let label = phase_label(&ExecutionPhase::Running {
+            command: "chat".into(),
+        });
+        assert!(label.contains("running"));
+        assert!(label.contains("chat"));
+    }
+
+    #[test]
+    fn phase_label_done_exit_zero_shows_checkmark() {
+        let label = phase_label(&ExecutionPhase::Done {
+            command: "chat".into(),
+            exit_code: 0,
+        });
+        assert!(label.contains('✓'), "exit-0 done must use checkmark");
+        assert!(label.contains("done"));
+        assert!(label.contains("chat"));
+    }
+
+    #[test]
+    fn phase_label_done_nonzero_exit_shows_cross_and_code() {
+        let label = phase_label(&ExecutionPhase::Done {
+            command: "chat".into(),
+            exit_code: 1,
+        });
+        assert!(label.contains('✗'), "non-zero exit must use cross");
+        assert!(label.contains("exit 1"));
+        assert!(label.contains("chat"));
+    }
+
+    #[test]
+    fn phase_label_error_shows_cross_and_command() {
+        let label = phase_label(&ExecutionPhase::Error {
+            command: "ready".into(),
+            message: "something broke".into(),
+        });
+        assert!(label.contains('✗'));
+        assert!(label.contains("error"));
+        assert!(label.contains("ready"));
+    }
+
+    // ── window_border_color matrix ────────────────────────────────────────────
+
+    #[test]
+    fn window_border_color_error_always_red() {
+        use ratatui::style::Color;
+        let phase = ExecutionPhase::Error {
+            command: "x".into(),
+            message: "y".into(),
+        };
+        assert_eq!(window_border_color(&phase, true), Color::Red);
+        assert_eq!(window_border_color(&phase, false), Color::Red);
+    }
+
+    #[test]
+    fn window_border_color_running_focused_is_blue() {
+        use ratatui::style::Color;
+        let phase = ExecutionPhase::Running { command: "x".into() };
+        assert_eq!(window_border_color(&phase, true), Color::Blue);
+    }
+
+    #[test]
+    fn window_border_color_running_unfocused_is_gray() {
+        use ratatui::style::Color;
+        let phase = ExecutionPhase::Running { command: "x".into() };
+        assert_eq!(window_border_color(&phase, false), Color::Gray);
+    }
+
+    #[test]
+    fn window_border_color_done_focused_is_green() {
+        use ratatui::style::Color;
+        let phase = ExecutionPhase::Done { command: "x".into(), exit_code: 0 };
+        assert_eq!(window_border_color(&phase, true), Color::Green);
+    }
+
+    #[test]
+    fn window_border_color_done_unfocused_is_gray() {
+        use ratatui::style::Color;
+        let phase = ExecutionPhase::Done { command: "x".into(), exit_code: 0 };
+        assert_eq!(window_border_color(&phase, false), Color::Gray);
+    }
+
+    #[test]
+    fn window_border_color_idle_is_dark_gray_regardless_of_focus() {
+        use ratatui::style::Color;
+        assert_eq!(window_border_color(&ExecutionPhase::Idle, true), Color::DarkGray);
+        assert_eq!(window_border_color(&ExecutionPhase::Idle, false), Color::DarkGray);
+    }
+
+    // ── tab_color ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tab_color_stuck_is_yellow() {
+        use ratatui::style::Color;
+        let mut tab = make_tab();
+        tab.stuck = true;
+        assert_eq!(tab_color(&tab), Color::Yellow);
+    }
+
+    #[test]
+    fn tab_color_remote_is_magenta() {
+        use ratatui::style::Color;
+        let mut tab = make_tab();
+        tab.is_remote = true;
+        assert_eq!(tab_color(&tab), Color::Magenta);
+    }
+
+    #[test]
+    fn tab_color_stuck_takes_priority_over_remote() {
+        use ratatui::style::Color;
+        let mut tab = make_tab();
+        tab.stuck = true;
+        tab.is_remote = true;
+        assert_eq!(tab_color(&tab), Color::Yellow);
+    }
+
+    #[test]
+    fn tab_color_error_is_red() {
+        use ratatui::style::Color;
+        let mut tab = make_tab();
+        tab.execution_phase = ExecutionPhase::Error {
+            command: "chat".into(),
+            message: "oops".into(),
+        };
+        assert_eq!(tab_color(&tab), Color::Red);
+    }
+
+    #[test]
+    fn tab_color_running_with_pty_container_visible_is_green() {
+        use ratatui::style::Color;
+        let mut tab = make_tab();
+        tab.execution_phase = ExecutionPhase::Running { command: "chat".into() };
+        tab.container_window_state = ContainerWindowState::Minimized;
+        assert_eq!(tab_color(&tab), Color::Green);
+    }
+
+    #[test]
+    fn tab_color_running_maximized_container_is_green() {
+        use ratatui::style::Color;
+        let mut tab = make_tab();
+        tab.execution_phase = ExecutionPhase::Running { command: "chat".into() };
+        tab.container_window_state = ContainerWindowState::Maximized;
+        assert_eq!(tab_color(&tab), Color::Green);
+    }
+
+    #[test]
+    fn tab_color_running_no_container_is_blue() {
+        use ratatui::style::Color;
+        let mut tab = make_tab();
+        tab.execution_phase = ExecutionPhase::Running { command: "chat".into() };
+        tab.container_window_state = ContainerWindowState::Hidden;
+        assert_eq!(tab_color(&tab), Color::Blue);
+    }
+
+    #[test]
+    fn tab_color_running_claws_is_magenta() {
+        use ratatui::style::Color;
+        let mut tab = make_tab();
+        tab.execution_phase = ExecutionPhase::Running { command: "claws".into() };
+        tab.is_claws = true;
+        assert_eq!(tab_color(&tab), Color::Magenta);
+    }
+
+    #[test]
+    fn tab_color_idle_is_dark_gray() {
+        use ratatui::style::Color;
+        let tab = make_tab();
+        assert_eq!(tab_color(&tab), Color::DarkGray);
+    }
+
+    #[test]
+    fn tab_color_done_is_dark_gray() {
+        use ratatui::style::Color;
+        let mut tab = make_tab();
+        tab.execution_phase = ExecutionPhase::Done {
+            command: "chat".into(),
+            exit_code: 0,
+        };
+        assert_eq!(tab_color(&tab), Color::DarkGray);
+    }
+}

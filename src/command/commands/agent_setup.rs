@@ -32,6 +32,22 @@ pub trait AgentSetupFrontend: UserMessageSink + Send + Sync {
 /// trait having to be its own bound.
 pub trait HasContainerFrontend: UserMessageSink + Send {
     fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
+
+    /// Like `container_frontend`, but the returned frontend is allowed to
+    /// surrender its byte-stream I/O channels to the engine for direct PTY
+    /// bridging via `ContainerFrontend::take_container_io`.
+    ///
+    /// Commands that intend to launch an *interactive* PTY container (chat,
+    /// claws, exec prompt) call this variant so the container's PTY is wired
+    /// to the frontend's renderer instead of inheriting host stdio.
+    /// Build/pull/probe paths keep using `container_frontend` so the io stays
+    /// reserved for the actual interactive launch.
+    ///
+    /// Default impl falls back to `container_frontend` — appropriate for CLI
+    /// frontends that already inherit a real host terminal.
+    fn container_frontend_for_pty(&mut self) -> Box<dyn ContainerFrontend> {
+        self.container_frontend()
+    }
 }
 
 /// Adapter that wraps any per-command frontend implementing

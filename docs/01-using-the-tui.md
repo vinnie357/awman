@@ -9,6 +9,22 @@ This guide covers TUI mode.
 
 ---
 
+## Startup
+
+When you run `amux` with no arguments, the TUI opens immediately in an alternate terminal screen. What happens next depends on your environment:
+
+**Inside a Git repository:**
+
+The TUI runs `amux ready` automatically on the first tab. This checks that your container runtime is available, that `Dockerfile.dev` and `.amux/Dockerfile.{agent}` exist, and that your agent image is built. If anything needs attention, `ready` will guide you through it. Once `ready` passes, the TUI shows the welcome message and waits for your first command.
+
+**Outside a Git repository:**
+
+If the working directory is not inside a Git repository, the TUI runs `amux status --watch` instead, streaming a live status view. This is useful for monitoring a headless server or checking the state of remote sessions. Most agent commands require a Git repo — navigate to one and open a new tab with **Ctrl+T**.
+
+In both cases, terminal raw mode, alternate screen, and mouse capture are enabled on entry and restored unconditionally on exit, even if amux crashes.
+
+---
+
 ## Layout
 
 ```
@@ -48,36 +64,43 @@ The command box is where you interact with amux. Type any subcommand and press *
 |-----|--------|
 | Type | Update input; suggestions appear below |
 | **Enter** | Execute command |
-| **Shift+Enter** | Insert a newline (multi-line input) |
+| **Ctrl+Enter** or **Shift+Enter** | Insert a newline (multi-line input) |
 | **← / →** | Move cursor within input |
+| **Ctrl+← / Ctrl+→** | Move cursor by word |
+| **Home / End** | Move cursor to start / end of input |
 | **↑** | Focus the execution window (for scrolling) |
 | **Backspace / Delete** | Edit input |
-| **q** (empty input) | Open quit confirmation |
-| **Ctrl+C** | Open quit confirmation |
+| **Ctrl+Backspace** | Delete previous word |
+| **Tab** | Cycle to next autocomplete suggestion |
+| **Shift+Tab** | Cycle to previous autocomplete suggestion |
+| **Ctrl+C** | Close tab (multiple tabs) or open quit confirmation (single tab) |
 
 ### Autocomplete
 
-As you type, amux shows matching suggestions below the command box:
+As you type, matching command completions appear in the suggestion row below the command box:
 
 ```
-implement --
-  implement <NNNN>  e.g. implement 0001
-  implement <NNNN> --agent <NAME>  — override configured agent
-  implement <NNNN> --non-interactive  — run without interactive prompt
-  implement <NNNN> --plan  — plan mode
-  implement <NNNN> --worktree  — use git worktree
-  implement <NNNN> --yolo  — skip confirmation prompts
-  implement <NNNN> --yolo --workflow <FILE>  — workflow file path
+> implement · init · status
 ```
 
-Every flag available in `amux implement` and `amux chat` is also available in
-the TUI command box and appears in autocomplete. Both `--flag value` and
-`--flag=value` forms are accepted. For example:
+When you type a partial command, the list narrows. Use **Tab** / **Shift+Tab** to cycle through suggestions and fill them into the input. Every command available in `amux` is also available in the TUI command box. Both `--flag value` and `--flag=value` forms are accepted. For example:
 
 ```
 chat --agent codex
 chat --agent=codex
 implement 0042 --agent opencode --plan
+```
+
+When the input is empty or there are no matching completions, the suggestion row shows the current working directory of the active session instead:
+
+```
+CWD: /home/user/myproject
+```
+
+If a worktree is active for the session, it shows the worktree path:
+
+```
+Using Worktree: /home/user/myproject-worktree
 ```
 
 If you type an unrecognised command, amux suggests the closest known one:
@@ -88,7 +111,7 @@ If you type an unrecognised command, amux suggests the closest known one:
 
 ### Quitting
 
-Press **q** or **Ctrl+C** from the command box to open the quit confirmation:
+Press **Ctrl+C** from the command box to open the quit confirmation dialog:
 
 ```
 ╭─── Quit amux? ───────────────────╮
@@ -97,7 +120,13 @@ Press **q** or **Ctrl+C** from the command box to open the quit confirmation:
 ╰───────────────────────────────────╯
 ```
 
-Press **y** to quit, **n** or **Esc** to cancel.
+Press **y** to quit, **n** or **Esc** to cancel. With multiple tabs open, **Ctrl+C** instead shows a close-tab dialog:
+
+```
+╭─── Close tab? ──────────────────────────────╮
+│  [q] Quit amux   [c] Close this tab   [n] Cancel │
+╰──────────────────────────────────────────────╯
+```
 
 ---
 
@@ -112,9 +141,27 @@ When the window is selected (press **↑** from the command box to select it):
 | Key / Action | Effect |
 |---|---|
 | **↑ / ↓** | Scroll line by line |
+| **PageUp / PageDown** | Scroll one full page |
 | **b / e** | Jump to beginning / end |
 | Mouse scroll | Scroll at any time |
 | **Esc** | Return focus to command box |
+
+### Status log
+
+amux itself writes informational messages — not agent output, but messages from amux about what it is doing — into a per-tab **status log**. Examples include "container started", "worktree created", "auth token accepted", and error messages from failed commands.
+
+The status log appears in the execution window. By default it is **collapsed**: only the most recent message is shown as a single line at the bottom of the output area.
+
+Press **l** (lowercase L) while the execution window is focused to toggle between collapsed and expanded view. In expanded view the full message history is visible and scrollable, with color-coded level prefixes:
+
+| Level | Colour |
+|-------|--------|
+| Info | Dark gray |
+| Warning | Yellow |
+| Error | Red |
+| Success | Green |
+
+The status log is per-tab and accumulates for the lifetime of the session. It does not include agent output (that lives in the container window's scrollback).
 
 ### Border colours
 
@@ -250,6 +297,15 @@ Ctrl+C, Ctrl+T  (multiple tabs open) close current tab
 
 The tab bar shows each tab's project name, current or last command, and an arrow (`➡`) on the active tab. The active tab's bottom border is suppressed so it visually opens into the content area.
 
+Tab names are truncated at 14 characters with `…`. The tab bar distributes width according to the number of open tabs:
+
+| Open tabs | Each tab gets |
+|-----------|--------------|
+| 1 | ¼ of terminal width |
+| 2 | ½ of terminal width |
+| 3 | ¾ ÷ 3 of terminal width |
+| 4+ | full width ÷ n |
+
 ### Tab colours
 
 | Colour | Meaning |
@@ -260,7 +316,7 @@ The tab bar shows each tab's project name, current or last command, and an arrow
 | Purple / Magenta | Running a claws (nanoclaw) session, **or** permanently bound to a remote headless session |
 | Red | Exited with error |
 | Yellow | Container silent for >10 seconds (stuck warning) |
-| Alternating Yellow / Purple | Background yolo countdown in progress (see [Yolo Mode](05-yolo-mode.md#background-yolo-countdown)) |
+| Alternating Yellow / Purple | Background yolo countdown in progress: tab label alternates between `⚠️ yolo in Ns` and `🤘 yolo in Ns` every 2 seconds (see [Yolo Mode](05-yolo-mode.md#background-yolo-countdown)) |
 
 ### Remote-bound tabs
 
@@ -293,22 +349,37 @@ For workflow tabs, amux goes further: the [workflow control board](04-workflows.
 | **Ctrl+T** | Anywhere | Open new tab |
 | **Ctrl+A** | Anywhere | Switch to previous tab |
 | **Ctrl+D** | Anywhere | Switch to next tab |
-| **Ctrl+A / Ctrl+D** | Yolo countdown dialog | Close dialog and continue countdown in background |
-| **Ctrl+M** | Anywhere (container running) | Toggle container window (minimize / restore) |
-| **Ctrl+C** | Command box, multiple tabs | Close current tab |
+| **Ctrl+M** | Anywhere | Toggle container window (minimize / restore / hide) |
+| **Ctrl+C** | Single tab open | Open quit confirmation |
+| **Ctrl+C** | Multiple tabs open | Open close-tab dialog |
 | **Ctrl+W** | Workflow running | Open workflow control board |
 | **Ctrl+,** | Anywhere | Open / close config dialog |
 | **Enter** | Command box | Execute command |
-| **Shift+Enter** | Command box | Insert newline |
+| **Ctrl+Enter** or **Shift+Enter** | Command box | Insert newline |
+| **Tab** | Command box | Cycle to next autocomplete suggestion |
+| **Shift+Tab** | Command box | Cycle to previous autocomplete suggestion |
 | **↑** | Command box | Focus execution window |
-| **q** | Command box (empty) | Quit confirmation |
+| **← / →** | Command box | Move cursor |
+| **Ctrl+← / Ctrl+→** | Command box | Move cursor by word |
+| **Home / End** | Command box | Move cursor to start / end |
+| **Ctrl+Backspace** | Command box | Delete previous word |
+| **Esc** | Execution window | Return focus to command box |
+| **↑ / ↓** | Execution window | Scroll output line by line |
+| **PageUp / PageDown** | Execution window | Scroll output by page |
+| **b** | Execution window | Jump to beginning |
+| **e** | Execution window | Jump to end (live view) |
+| **l** | Execution window | Toggle status log collapsed / expanded |
+| **Ctrl+Y** | Execution window (text selected) | Copy selection to clipboard |
 | **Esc** | Container window maximized | Forwarded to agent (`\x1b`) |
-| **↑ / ↓** | Execution window selected | Scroll output |
-| **b / e** | Execution window selected | Jump to beginning / end |
-| **Ctrl+Y** | Container window, text selected | Copy selection to clipboard |
+| **Ctrl+Y** | Container window maximized (text selected) | Copy selection to clipboard |
+| **Ctrl+M** | Container window maximized | Minimize container window |
 | Mouse scroll | Container window | Scroll scrollback history |
 | Mouse drag | Container window | Select text |
-| **y / n / Esc** | Quit dialog | Confirm / cancel quit |
+| **y** | Quit dialog | Quit amux |
+| **n / Esc** | Quit dialog | Cancel |
+| **q** | Close-tab dialog | Quit amux |
+| **c** | Close-tab dialog | Close current tab only |
+| **n / Esc** | Close-tab dialog | Cancel |
 | **↑ / ↓** | Config dialog | Navigate between fields |
 | **← / →** | Config dialog | Navigate between columns |
 | **e** | Config dialog | Enter edit mode for selected field |

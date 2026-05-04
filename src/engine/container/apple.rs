@@ -269,7 +269,7 @@ impl ContainerInstance for AppleContainerInstance {
 
     fn run_with_frontend(
         self: Box<Self>,
-        _frontend: Box<dyn crate::engine::container::frontend::ContainerFrontend>,
+        mut frontend: Box<dyn crate::engine::container::frontend::ContainerFrontend>,
     ) -> Result<ContainerExecution, EngineError> {
         // The Apple `container` CLI honours the same `run` argv shape; reuse
         // the Docker assembler.
@@ -279,16 +279,22 @@ impl ContainerInstance for AppleContainerInstance {
         let seeded = self.options.seeded_prompt.clone();
         let handle = handle_now(&self.id, &self.name, &self.image);
 
+        // PTY-bridged path: the TUI frontend exposes a `ContainerIo`. We
+        // spawn the Apple `container run -it` binary via portable-pty so the
+        // PTY master is bridged into the frontend's vt100 parser.
+        let pty_io = if interactive { frontend.take_container_io() } else { None };
+        if let Some(io) = pty_io {
+            return spawn_pty_bridged_apple(self, frontend, io, argv, started_at, handle);
+        }
+
         let mut cmd = Command::new("container");
         cmd.args(&argv);
         if interactive {
-            // Interactive: open /dev/tty directly so Apple Containers gets a
-            // fresh terminal fd for PTY setup. After CLI prompts have consumed
-            // buffered reads on fd 0, inheriting stdin can fail with ENOTTY
-            // (NSPOSIXErrorDomain Code=25 "Inappropriate ioctl for device")
-            // because Apple Containers calls ioctl(TIOCGWINSZ) on the fd.
-            // /dev/tty always refers to the controlling terminal and satisfies
-            // all PTY-related ioctls.
+            // Interactive (no PTY bridge): open /dev/tty directly so Apple
+            // Containers gets a fresh terminal fd for PTY setup. After CLI
+            // prompts have consumed buffered reads on fd 0, inheriting stdin
+            // can fail with ENOTTY because Apple Containers calls
+            // ioctl(TIOCGWINSZ) on the fd.
             #[cfg(unix)]
             {
                 let tty_stdin = std::fs::OpenOptions::new()
@@ -334,6 +340,9 @@ impl ContainerInstance for AppleContainerInstance {
 
         let backend = AppleExecution {
             child: Some(child),
+            pty_child: None,
+            pty_master: None,
+            stdin_injector: None,
             container_name: self.name.0.clone(),
             started_at,
         };
@@ -341,14 +350,138 @@ impl ContainerInstance for AppleContainerInstance {
     }
 }
 
+/// Spawn the Apple `container run -it` binary via `portable-pty` and bridge
+/// the PTY master to the frontend's `ContainerIo` channels. Mirrors
+/// `docker.rs::spawn_pty_bridged_docker` exactly — same reader thread,
+/// writer task, and resize task — but talks to the Apple `container` CLI
+/// instead of `docker`.
+fn spawn_pty_bridged_apple(
+    instance: Box<AppleContainerInstance>,
+    _frontend: Box<dyn crate::engine::container::frontend::ContainerFrontend>,
+    io: crate::engine::container::frontend::ContainerIo,
+    argv: Vec<String>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    handle: crate::data::session::ContainerHandle,
+) -> Result<ContainerExecution, EngineError> {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+    let (cols, rows) = io.initial_size;
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| EngineError::Container(format!("openpty: {e}")))?;
+
+    let mut cmd = CommandBuilder::new("container");
+    for arg in &argv {
+        cmd.arg(arg);
+    }
+
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| EngineError::Container(format!("spawn container via pty: {e}")))?;
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| EngineError::Container(format!("clone pty reader: {e}")))?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| EngineError::Container(format!("take pty writer: {e}")))?;
+
+    // Reader thread: PTY → frontend stdout channel.
+    let stdout_tx = io.stdout;
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stdout_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Writer task: stdin channel → PTY. Same channel feeds keystrokes from
+    // the frontend AND `inject_prompt`.
+    let mut stdin_rx = io.stdin_rx;
+    tokio::spawn(async move {
+        use std::io::Write;
+        while let Some(bytes) = stdin_rx.recv().await {
+            if writer.write_all(&bytes).is_err() {
+                break;
+            }
+            if writer.flush().is_err() {
+                break;
+            }
+        }
+    });
+
+    // Resize task: forward terminal resizes to the PTY master.
+    let master_arc =
+        std::sync::Arc::new(std::sync::Mutex::new(pair.master));
+    let master_for_resize = std::sync::Arc::clone(&master_arc);
+    let mut resize_rx = io.resize;
+    tokio::spawn(async move {
+        while let Some((cols, rows)) = resize_rx.recv().await {
+            if let Ok(master) = master_for_resize.lock() {
+                let _ = master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+            }
+        }
+    });
+
+    let backend = AppleExecution {
+        child: None,
+        pty_child: Some(child),
+        pty_master: Some(master_arc),
+        stdin_injector: Some(io.stdin_tx),
+        container_name: instance.name.0.clone(),
+        started_at,
+    };
+    Ok(ContainerExecution::new(handle, Box::new(backend)))
+}
+
 struct AppleExecution {
+    /// Set when running with inherit-stdio.
     child: Option<std::process::Child>,
+    /// Set when running PTY-bridged via portable-pty.
+    pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    /// Held alive so the resize task and PTY writer keep working until exit.
+    pty_master: Option<std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
+    /// Sender side of the stdin channel — used by `try_inject_stdin` to push
+    /// a workflow continue-in-current prompt into the running PTY.
+    stdin_injector: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     container_name: String,
     started_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl ExecutionBackend for AppleExecution {
     fn wait_blocking(mut self: Box<Self>) -> Result<ContainerExitInfo, EngineError> {
+        // PTY-bridged path: wait on the portable-pty child.
+        if let Some(mut child) = self.pty_child.take() {
+            let status = child
+                .wait()
+                .map_err(|e| EngineError::Container(format!("wait container (pty): {e}")))?;
+            self.pty_master = None;
+            let exit_code = status.exit_code().try_into().unwrap_or(-1);
+            return Ok(ContainerExitInfo {
+                exit_code,
+                signal: None,
+                started_at: self.started_at,
+                ended_at: chrono::Utc::now(),
+            });
+        }
+
         let mut child = self
             .child
             .take()
@@ -370,6 +503,15 @@ impl ExecutionBackend for AppleExecution {
             started_at: self.started_at,
             ended_at: chrono::Utc::now(),
         })
+    }
+
+    fn try_inject_stdin(&self, bytes: &[u8]) -> Result<bool, EngineError> {
+        if let Some(tx) = &self.stdin_injector {
+            tx.send(bytes.to_vec())
+                .map_err(|e| EngineError::Container(format!("inject stdin: {e}")))?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn cancel(&self) -> Result<(), EngineError> {

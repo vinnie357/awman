@@ -72,6 +72,17 @@ enum ExecutionState {
 pub(crate) trait ExecutionBackend: Send {
     fn wait_blocking(self: Box<Self>) -> Result<ContainerExitInfo, EngineError>;
     fn cancel(&self) -> Result<(), EngineError>;
+
+    /// Best-effort: push raw bytes into the running container's stdin.
+    ///
+    /// Used by `WorkflowEngine` for the `ContinueInCurrentContainer` advance
+    /// — the next step's prompt is written into the still-running PTY rather
+    /// than spawning a fresh container. Returns `Ok(false)` when the backend
+    /// cannot inject (e.g. inherit-stdio with no PTY bridge), in which case
+    /// the engine falls back to a fresh container launch.
+    fn try_inject_stdin(&self, _bytes: &[u8]) -> Result<bool, EngineError> {
+        Ok(false)
+    }
 }
 
 impl ContainerExecution {
@@ -126,6 +137,20 @@ impl ContainerExecution {
         match &self.inner {
             ExecutionState::Running(b) => b.cancel(),
             _ => Ok(()),
+        }
+    }
+
+    /// Attempt to push raw bytes into the running container's stdin.
+    ///
+    /// `WorkflowEngine` calls this for `ContinueInCurrentContainer` to inject
+    /// the next step's prompt without spawning a new container. Returns
+    /// `Ok(false)` when the backend can't inject (no PTY bridge, already
+    /// finished/detached) — the engine will then fall back to launching a
+    /// fresh container.
+    pub fn try_inject_stdin(&self, bytes: &[u8]) -> Result<bool, EngineError> {
+        match &self.inner {
+            ExecutionState::Running(b) => b.try_inject_stdin(bytes),
+            _ => Ok(false),
         }
     }
 

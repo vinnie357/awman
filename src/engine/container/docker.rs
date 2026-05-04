@@ -229,38 +229,38 @@ impl ContainerInstance for DockerContainerInstance {
 
     fn run_with_frontend(
         self: Box<Self>,
-        frontend: Box<dyn crate::engine::container::frontend::ContainerFrontend>,
+        mut frontend: Box<dyn crate::engine::container::frontend::ContainerFrontend>,
     ) -> Result<ContainerExecution, EngineError> {
-        // frontend is intentionally unused for non-PTY interactive runs where
-        // Docker inherits stdio directly. It's accepted to satisfy the trait
-        // contract and for future PTY-wiring.
-        let _ = frontend;
-
         let argv = build_run_argv(&self.name, &self.image, &self.options);
         let started_at = chrono::Utc::now();
         let interactive = self.options.interactive;
         let seeded = self.options.seeded_prompt.clone();
-
         let handle = handle_now(&self.id, &self.name, &self.image);
 
-        // Spawn the subprocess. Interactive runs use stdio inherit so
-        // Docker's `-it` allocates the PTY against the user terminal.
-        // Non-interactive runs pipe stdin (so we can write the seeded prompt)
-        // and inherit stdout/stderr.
+        // Decide between PTY-bridged and inherit-stdio paths.
+        //
+        // - If the frontend exposes a `ContainerIo` AND the container is
+        //   interactive, we spawn `docker run -it` via `portable-pty` and
+        //   bridge the PTY master to the frontend's channels. This is the
+        //   correct path for the TUI: it puts the container's terminal
+        //   output into the frontend's vt100 parser instead of fighting
+        //   ratatui for the host's alternate screen.
+        // - Otherwise we keep the existing inherit-stdio path (correct for
+        //   the bare CLI, for non-interactive runs, and for build/pull
+        //   probes that should stream into the user's terminal).
+        let pty_io = if interactive { frontend.take_container_io() } else { None };
+
+        if let Some(io) = pty_io {
+            return spawn_pty_bridged_docker(self, frontend, io, argv, started_at, handle);
+        }
+
         let mut cmd = Command::new("docker");
         cmd.args(&argv);
         if interactive {
-            // Interactive: open /dev/tty directly so the container runtime
-            // gets a fresh, unmodified terminal fd for PTY setup. Inheriting
-            // fd 0 (stdin) can fail with ENOTTY after buffered CLI reads
-            // (e.g. prompts collected before an interview container launches)
-            // because Docker Desktop and Apple Containers call ioctl(TIOCGWINSZ)
-            // on the fd — and a previously-buffered fd 0 may fail that ioctl
-            // even though it is still technically a TTY. /dev/tty is the
-            // process's controlling terminal; it is always unmodified and
-            // satisfies all PTY-related ioctls. Falls back to Stdio::inherit()
-            // when /dev/tty is unavailable (non-Unix platforms, or headless
-            // environments with no controlling terminal).
+            // Interactive (no PTY bridge): open /dev/tty directly so the
+            // container runtime gets a fresh, unmodified terminal fd for PTY
+            // setup. Inheriting fd 0 can fail with ENOTTY after buffered CLI
+            // reads.
             #[cfg(unix)]
             {
                 let tty_stdin = std::fs::OpenOptions::new()
@@ -295,7 +295,6 @@ impl ContainerInstance for DockerContainerInstance {
             }
         })?;
 
-        // Write seeded prompt to stdin when present.
         if let Some(prompt) = seeded {
             if let Some(mut stdin) = child.stdin.take() {
                 use std::io::Write;
@@ -307,6 +306,9 @@ impl ContainerInstance for DockerContainerInstance {
 
         let backend = DockerExecution {
             child: Some(child),
+            pty_child: None,
+            pty_master: None,
+            stdin_injector: None,
             container_name: self.name.0.clone(),
             started_at,
         };
@@ -314,14 +316,155 @@ impl ContainerInstance for DockerContainerInstance {
     }
 }
 
+/// Spawn `docker run -it` via `portable-pty` and bridge the PTY master to
+/// the frontend's `ContainerIo` channels.
+///
+/// - Reader thread: PTY master → `io.stdout` (frontend's vt100 parser).
+/// - Writer task:   `io.stdin` → PTY master (user keystrokes).
+/// - Resize task:   `io.resize` → `master.resize()` (terminal resize forwarding).
+///
+/// The returned `DockerExecution` owns the master and child so cancel/wait
+/// keep working and the bridge tasks tear themselves down on EOF.
+fn spawn_pty_bridged_docker(
+    instance: Box<DockerContainerInstance>,
+    _frontend: Box<dyn crate::engine::container::frontend::ContainerFrontend>,
+    io: crate::engine::container::frontend::ContainerIo,
+    argv: Vec<String>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    handle: crate::data::session::ContainerHandle,
+) -> Result<ContainerExecution, EngineError> {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+    let (cols, rows) = io.initial_size;
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| EngineError::Container(format!("openpty: {e}")))?;
+
+    let mut cmd = CommandBuilder::new("docker");
+    for arg in &argv {
+        cmd.arg(arg);
+    }
+
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| EngineError::Container(format!("spawn docker via pty: {e}")))?;
+
+    // Master-side I/O handles. Reader and writer are taken before we hand
+    // the master to the execution backend (which keeps it alive for resize).
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| EngineError::Container(format!("clone pty reader: {e}")))?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| EngineError::Container(format!("take pty writer: {e}")))?;
+
+    // Reader thread: PTY → frontend stdout channel.
+    let stdout_tx = io.stdout;
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stdout_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Writer task: stdin channel → PTY. The same channel is fed by the
+    // frontend's keystrokes AND by `inject_prompt` (workflow continue-in-current).
+    let mut stdin_rx = io.stdin_rx;
+    tokio::spawn(async move {
+        use std::io::Write;
+        while let Some(bytes) = stdin_rx.recv().await {
+            if writer.write_all(&bytes).is_err() {
+                break;
+            }
+            if writer.flush().is_err() {
+                break;
+            }
+        }
+    });
+
+    // Resize task: forward terminal resizes to the PTY master.
+    //
+    // `MasterPty` is not `Clone`, so we wrap it in `Arc<Mutex>` and share
+    // between the resize task and the execution backend (which needs it for
+    // cleanup). Resize calls are rare and brief, so lock contention is fine.
+    let master_arc =
+        std::sync::Arc::new(std::sync::Mutex::new(pair.master));
+
+    let master_for_resize = std::sync::Arc::clone(&master_arc);
+    let mut resize_rx = io.resize;
+    tokio::spawn(async move {
+        while let Some((cols, rows)) = resize_rx.recv().await {
+            if let Ok(master) = master_for_resize.lock() {
+                let _ = master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+            }
+        }
+    });
+
+    let backend = DockerExecution {
+        child: None,
+        pty_child: Some(child),
+        pty_master: Some(master_arc),
+        stdin_injector: Some(io.stdin_tx),
+        container_name: instance.name.0.clone(),
+        started_at,
+    };
+    Ok(ContainerExecution::new(handle, Box::new(backend)))
+}
+
 struct DockerExecution {
+    /// Set when running with inherit-stdio (CLI / non-interactive).
     child: Option<std::process::Child>,
+    /// Set when running PTY-bridged. `portable_pty::Child` has its own wait
+    /// API and cannot be unified with `std::process::Child`.
+    pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+    /// Master PTY end. Held alive so the resize task can call into it and so
+    /// the PTY isn't torn down before the child has finished writing.
+    pty_master: Option<std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
+    /// Stdin sender — same channel the writer task drains. Used by
+    /// `try_inject_stdin` so workflow `ContinueInCurrentContainer` can push a
+    /// fresh prompt into the running container.
+    stdin_injector: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     container_name: String,
     started_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl ExecutionBackend for DockerExecution {
     fn wait_blocking(mut self: Box<Self>) -> Result<ContainerExitInfo, EngineError> {
+        // PTY-bridged path: wait on the portable-pty child.
+        if let Some(mut child) = self.pty_child.take() {
+            let status = child
+                .wait()
+                .map_err(|e| EngineError::Container(format!("wait docker (pty): {e}")))?;
+            // Drop the master AFTER the child exits so the reader thread sees
+            // EOF cleanly.
+            self.pty_master = None;
+            let exit_code = status.exit_code().try_into().unwrap_or(-1);
+            return Ok(ContainerExitInfo {
+                exit_code,
+                signal: None,
+                started_at: self.started_at,
+                ended_at: chrono::Utc::now(),
+            });
+        }
+
+        // Inherit-stdio path: wait on std::process::Child.
         let mut child = self
             .child
             .take()
@@ -350,6 +493,18 @@ impl ExecutionBackend for DockerExecution {
             started_at: self.started_at,
             ended_at: chrono::Utc::now(),
         })
+    }
+
+    fn try_inject_stdin(&self, bytes: &[u8]) -> Result<bool, EngineError> {
+        // PTY-bridged path: push into the writer task's input channel.
+        if let Some(tx) = &self.stdin_injector {
+            tx.send(bytes.to_vec())
+                .map_err(|e| EngineError::Container(format!("inject stdin: {e}")))?;
+            return Ok(true);
+        }
+        // Inherit-stdio path: no channel back to the host TTY — engine will
+        // fall back to a fresh container.
+        Ok(false)
     }
 
     fn cancel(&self) -> Result<(), EngineError> {

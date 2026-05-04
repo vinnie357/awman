@@ -39,7 +39,7 @@ Layer 0: data      Session, config, filesystem, database, typed data
 
 **Layer 2 (command)** owns higher-level business logic: the `Dispatch` type that routes input to typed command objects, and command-specific types (`ChatCommand`, `InitCommand`, etc.). Implemented in work item 0068.
 
-**Layer 3 (frontend)** contains the CLI, TUI, and headless server. Each is a presentation layer only: it translates user input into `Dispatch` calls and renders command output. The CLI frontend is fully functional; the TUI and headless are placeholders (work items 0071 and 0072 respectively). See [Layer 3 reference](#layer-3-frontend-srcfrontend) below.
+**Layer 3 (frontend)** contains the CLI, TUI, and headless server. Each is a presentation layer only: it translates user input into `Dispatch` calls and renders command output. The CLI and TUI frontends are fully functional; the headless frontend is a placeholder (→ work item 0072). See [Layer 3 reference](#layer-3-frontend-srcfrontend) below.
 
 **Layer 4 (binary)** is `src/main.rs` — the real entrypoint that builds clap from `CommandCatalogue`, constructs engines, opens a `Session`, and routes to the CLI or TUI frontend. See [Layer 4 reference](#layer-4-binary-srcmainrs) below.
 
@@ -50,7 +50,7 @@ Layer 0: data      Session, config, filesystem, database, typed data
 | 0 — data | `src/data/` | Complete (work item 0066) |
 | 1 — engine | `src/engine/` | Complete (work item 0067) |
 | 2 — command | `src/command/` | Complete (work item 0068) |
-| 3 — frontend | `src/frontend/` | CLI fully functional (0070); TUI placeholder (→ 0071); Headless placeholder (→ 0072) |
+| 3 — frontend | `src/frontend/` | CLI fully functional (0070); TUI complete (0071); Headless placeholder (→ 0072) |
 | 4 — binary | `src/main.rs` | Complete (work item 0069) |
 | Legacy binary | `oldsrc/` | Frozen, no longer compiled (binary swap complete in 0069) |
 
@@ -199,7 +199,45 @@ src/
         workflow_frontend_marker.rs   WorkflowFrontend marker impl
         worktree_lifecycle_marker.rs  WorktreeLifecycleFrontend marker impl
     tui/
-      mod.rs              Placeholder run() — prints notice; real TUI ships in 0071
+      mod.rs              run() — TUI entry point; run_event_loop(); main_loop()
+      app.rs              App — central TUI state; Focus, StatusBar
+      tabs.rs             Tab — per-tab state; ExecutionPhase, ContainerWindowState; tab_color, compute_tab_bar_width, window_border_color, phase_label
+      command_box.rs      parse_input(), format_parse_error() — command-box tokenization and error formatting
+      command_frontend.rs TuiCommandFrontend — implements CommandFrontend + all *CommandFrontend traits
+      container_view.rs   render_container_maximized/minimized() — vt100 overlay rendering
+      dialogs/
+        mod.rs            Dialog enum, DialogRequest/Response, all dialog state types and rendering helpers
+      hints.rs            hint_for_input(), format_suggestion_row() — catalogue-driven hint text
+      keymap.rs           Action enum, FocusContext, map_key() — complete keyboard shortcut map
+      per_command/        TUI per-command *CommandFrontend trait implementations (one file per command)
+        mod.rs
+        agent_auth.rs     AgentAuthFrontend impl
+        agent_setup.rs    AgentSetupFrontend impl
+        auth.rs           AuthCommandFrontend impl
+        chat.rs           ChatCommandFrontend impl
+        claws.rs          ClawsCommandFrontend impl
+        config.rs         ConfigCommandFrontend impl
+        container_frontend.rs  ContainerFrontend impl
+        download.rs       DownloadCommandFrontend impl
+        exec_prompt.rs    ExecPromptCommandFrontend impl
+        exec_workflow.rs  ExecWorkflowCommandFrontend impl
+        headless.rs       HeadlessCommandFrontend impl
+        implement.rs      ImplementCommandFrontend impl
+        init.rs           InitCommandFrontend impl
+        mount_scope.rs    MountScopeFrontend impl
+        new.rs            NewCommandFrontend impl
+        ready.rs          ReadyCommandFrontend impl
+        remote.rs         RemoteCommandFrontend impl
+        specs.rs          SpecsCommandFrontend impl
+        status.rs         StatusCommandFrontend impl
+        workflow_frontend.rs   WorkflowFrontend impl
+        worktree_lifecycle.rs  WorktreeLifecycleFrontend impl
+      pty.rs              PtySession — portable-pty wrapper; PtyEvent; spawn_text_command()
+      render.rs           render_frame() — full frame layout; tab bar, execution window, status bar, command box, dialogs
+      tabs.rs             (also see above)
+      text_edit.rs        TextEdit — single-line/multiline text editing with cursor and word movement
+      user_message.rs     TuiUserMessageSink, SharedStatusLog, StatusLogEntry
+      workflow_view.rs    render_workflow_strip() — per-step status strip
     headless/
       mod.rs              HeadlessServeConfig; placeholder serve() — ships in 0072
   main.rs                 Layer 4 binary entrypoint
@@ -2239,15 +2277,244 @@ The **safe default policy** (applied when `stdin_is_tty()` returns `false`) matc
 
 ### TUI Frontend (`src/frontend/tui/`)
 
-Placeholder. `tui::run(matches, ctx)` prints a one-line notice and returns `ExitCode(0)`. The full Ratatui event loop (porting and adapting the `oldsrc/tui/` implementation to the layered architecture) is the deliverable of work item 0071.
+The TUI frontend is the Ratatui-based interactive terminal UI invoked by bare `amux` (no subcommand). It is a pure presentation layer: it translates keystrokes into `Dispatch` calls and renders typed outcomes via Ratatui widgets. No business logic lives here — any behavioral decision belongs in Layer 2.
 
-The public signature of `tui::run` is the contract that WI 0071 must preserve:
+#### Entry point (`mod.rs`)
 
 ```rust
-pub async fn run(_matches: clap::ArgMatches, _ctx: RuntimeContext) -> ExitCode
+pub async fn run(_matches: clap::ArgMatches, ctx: RuntimeContext) -> ExitCode
 ```
 
-`main.rs` routes to this function whenever `argv` contains no subcommand.
+`run` constructs an in-memory `SessionManager`, opens an initial `Tab` bound to the working directory session, creates an `App`, and enters the terminal event loop. Terminal cleanup (raw mode off, alternate screen off, mouse capture off) runs unconditionally on exit, even on error.
+
+**Startup branching:** After the initial tab is open, `run` dispatches a startup command through the standard `Dispatch` → `Command` → `Frontend` chain before entering the event loop:
+
+- **Inside a Git repository:** dispatches `["ready"]` through `TuiReadyFrontend`. This checks that the container runtime, Dockerfiles, and agent images are present. Phase transitions render as an in-place progress dialog.
+- **Not inside a Git repository:** dispatches `["status", "--watch"]` so the TUI immediately shows a live status stream.
+
+No startup logic is special-cased in `App::new`; both branches go through the normal `Dispatch::run_command` path.
+
+`run_event_loop` sets up the Crossterm backend and drives `main_loop`. The main loop renders on every iteration, polls for input events with a 50 ms timeout, and dispatches key events through the keymap.
+
+#### Application state (`app.rs`)
+
+```rust
+pub struct App {
+    pub tabs: Vec<Tab>,
+    pub active_tab: usize,
+    pub active_dialog: Option<Dialog>,
+    pub focus: Focus,
+    pub catalogue: &'static CommandCatalogue,
+    pub engines: Engines,
+    pub session_manager: Arc<RwLock<SessionManager>>,
+    pub command_input: TextEdit,
+    pub suggestion_row: Vec<String>,
+    pub input_error: Option<String>,
+    pub status_bar: StatusBar,
+    pub should_quit: bool,
+    pub needs_redraw: bool,
+}
+```
+
+`App` is the single shared mutable state object. It stores only UI state; commands are dispatched through `Dispatch` and results flow back through the per-command frontend trait chain.
+
+Key methods:
+
+| Method | Description |
+|--------|-------------|
+| `active_tab()` / `active_tab_mut()` | Borrow the current tab |
+| `switch_to_prev_tab()` / `switch_to_next_tab()` | Wrap-around tab switching |
+| `close_active_tab()` | Remove tab; set `should_quit` if only one tab remains |
+| `update_suggestions()` | Refresh `suggestion_row` from `CommandCatalogue::tui_completions(partial)` |
+
+`Focus` enum has two variants: `CommandBox` and `ExecutionWindow`.
+
+#### Per-tab state (`tabs.rs`)
+
+```rust
+pub struct Tab {
+    pub session: Session,           // Layer 0 session for this tab
+    pub execution_phase: ExecutionPhase,
+    pub vt100_parser: vt100::Parser,          // 10000-line scrollback
+    pub container_window_state: ContainerWindowState,
+    pub workflow_state: Option<WorkflowViewState>,
+    pub status_log: SharedStatusLog,          // Arc<Mutex<Vec<StatusLogEntry>>>
+    pub status_log_collapsed: bool,
+    pub scroll_offset: usize,
+    pub mouse_selection: Option<TextSelection>,
+    pub workflow_agent_fallbacks: HashMap<String, String>,
+    pub auto_workflow_disabled_steps: HashSet<String>,
+    pub is_remote: bool,
+    pub is_claws: bool,
+    pub output_lines: Vec<String>,
+    pub stuck: bool,
+    pub yolo_countdown: Option<u64>,
+    pub last_output_time: Option<std::time::Instant>,
+}
+```
+
+**`ExecutionPhase`** drives border colour and title:
+
+| Variant | Phase label | Border (focused) |
+|---------|-------------|-----------------|
+| `Idle` | ` amux ` | DarkGray |
+| `Running { command }` | ` ● running: {command} ` | Blue |
+| `Done { command, exit_code: 0 }` | ` ✓ done: {command} ` | Green (focused) / Gray |
+| `Done { command, exit_code: n }` | ` ✗ error: {command} (exit N) ` | Green (focused) / Gray |
+| `Error { command, .. }` | ` ✗ error: {command} ` | Red |
+
+**`ContainerWindowState`** cycles Hidden → Minimized → Maximized → Hidden via `Ctrl+M`.
+
+**Pure functions** in `tabs.rs` — safe to unit-test without a terminal:
+
+| Function | Purpose |
+|----------|---------|
+| `tab_color(tab)` | Stuck→Yellow, Remote→Magenta, Error→Red, Running+PTY→Green, Running→Blue, Claws→Magenta, Idle/Done→DarkGray |
+| `window_border_color(phase, focused)` | Maps phase + focus to a Ratatui `Color` |
+| `phase_label(phase)` | Phase label string for the execution window border title |
+| `compute_tab_bar_width(n, width)` | 1 tab → ¼ width; 2 → ½; 3 → ¾/3; N → 1/N |
+
+#### Keyboard shortcuts (`keymap.rs`)
+
+Every key binding is defined in one place. `map_key(key, ctx) -> Action` is pure: no state mutation, no side effects.
+
+**`FocusContext`** determines which bindings are active:
+
+| Context | When active |
+|---------|-------------|
+| `CommandBox` | No dialog, no maximized container, focus on command box |
+| `ExecutionWindow` | No dialog, no maximized container, focus on execution window |
+| `Dialog` | A dialog is open |
+| `ContainerMaximized` | Container window is in Maximized state |
+
+Global shortcuts (available in all contexts except `ContainerMaximized`):
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+T` | `OpenNewTabDialog` |
+| `Ctrl+A` | `PreviousTab` |
+| `Ctrl+D` | `NextTab` |
+| `Ctrl+C` | `CloseTabOrQuit` |
+| `Ctrl+M` | `CycleContainerWindow` |
+| `Ctrl+,` | `OpenConfigShow` |
+
+`ContainerMaximized` context: all keys except `Ctrl+Y` (copy) and `Ctrl+M` (toggle) are forwarded to the PTY as `Action::ForwardToPty(key)`. Global shortcuts are suppressed.
+
+#### Command box (`command_box.rs`)
+
+`parse_input(text)` tokenizes the raw command-box string by calling `Dispatch::parse_command_box_input`. Returns `Ok(ParsedCommandBoxInput)` or a `CommandError`.
+
+`format_parse_error(err)` converts a `CommandError` into a user-visible string:
+- `UnknownCommand` with a close match (Levenshtein ≤ 4): `"did you mean: <suggestion>?"`
+- `UnknownCommand` with no close match: `"unknown command: <name>"`
+- `UnknownFlag`: `"unknown flag: --<name>"`
+- `CommandBoxParse`: the error message verbatim
+
+#### Hints and suggestions (`hints.rs`)
+
+`hint_for_input(input)` returns a one-line inline hint for the command currently being typed, by delegating to `CommandCatalogue::tui_hint_for`. No command names or flag names are hard-coded here.
+
+`format_suggestion_row(suggestions)` formats the suggestion list as:
+```
+> chat · exec · implement · ready · …
+```
+Suggestions are separated by middots (` · `). An empty list produces an empty string.
+
+#### Dialog system (`dialogs/mod.rs`)
+
+The `Dialog` enum holds the state for every modal overlay. One dialog is active at a time (`App::active_dialog: Option<Dialog>`). Dialogs are pure presentation: they render centered on the terminal frame and map key presses to typed Layer 2 enum values.
+
+Available dialog variants:
+
+| Variant | Purpose |
+|---------|---------|
+| `QuitConfirm` | Quit confirmation: `[y]` quits, `[n]`/Esc cancels |
+| `CloseTabConfirm` | Multi-tab close: `[q]` quits app, `[c]` closes tab, `[n]`/Esc cancels |
+| `YesNo { title, body }` | Generic yes/no prompt |
+| `YesNoCancel { title, body }` | Generic yes/no/cancel prompt |
+| `TextInput { title, prompt, editor }` | Single-line text input |
+| `MultilineInput { title, prompt, editor }` | Multiline text input; Ctrl+Enter submits |
+| `ListPicker { title, items, selected }` | Arrow-key selection list; Enter selects |
+| `KindSelect { title, options }` | Numbered option select |
+| `WorkflowControlBoard(..)` | Workflow step navigation (→ ← ↑ ↓ d Ctrl+Enter Ctrl+C Esc) |
+| `WorkflowStepError(..)` | Step failure prompt: `[r]`/`[1]` retry, `[q]`/`[2]`/Esc pause, `[a]` abort |
+| `WorkflowYoloCountdown(..)` | Yolo countdown display; Esc dismisses |
+| `AgentSetup(..)` | Agent build/setup confirmation |
+| `MountScope(..)` | Git root vs CWD mount selection |
+| `AgentAuth(..)` | Agent credential injection consent |
+| `ConfigShow(..)` | Full-screen config editor table |
+| `Loading { title }` | "loading…" placeholder during async data fetch |
+| `Custom { title, body, keys }` | Ad-hoc dialog with arbitrary key/label pairs |
+
+`DialogRequest` and `DialogResponse` are the channel types for async communication between the command thread and the event loop.
+
+#### Per-command frontend traits (`per_command/`)
+
+Each file implements the `*CommandFrontend` trait for one command, opening the appropriate `Dialog` variant for each interactive Q&A method. The pattern:
+
+1. The command (Layer 2) calls a trait method (e.g. `ask_agent_setup(decision_info)`)
+2. The TUI implementation sends a `DialogRequest` to the event loop
+3. The event loop renders the dialog and waits for a `DialogResponse`
+4. The TUI implementation maps the response to the typed Layer 2 enum and returns it
+
+Commands with no interactive methods use marker impls that delegate to `UserMessageSink` only.
+
+#### PTY management (`pty.rs`)
+
+`PtySession` wraps `portable-pty` to provide interactive shell access inside container windows. Background threads handle read (PTY → channel), exit-wait, and write (keystrokes → PTY).
+
+`PtyEvent` enum: `Data(Vec<u8>)`, `Exit(i32)`.
+
+`spawn_text_command()` runs non-PTY commands (init, ready) as async tasks piping stdout/stderr to the vt100 parser as plain text.
+
+#### UI rendering (`render.rs`)
+
+`render_frame(app, frame)` lays out the full terminal area top-to-bottom:
+
+| Slot | Height | Content |
+|------|--------|---------|
+| Tab bar | 3 rows | Colored tabs with project name and command label |
+| Execution window | fills remaining (min 5) | Status log or PTY output; border color by phase |
+| Minimized container bar | 3 rows (conditional) | One-line PTY summary |
+| Workflow strip | 3 rows (conditional) | Step status boxes |
+| Status bar | 1 row | Git root path; optional status text |
+| Command box | 3 rows | Text input with inline hint |
+| Suggestion row | 1 row | `> sugg1 · sugg2 · …` |
+
+Container overlay (Maximized) and active dialogs are rendered as floating layers on top of the base layout.
+
+**Welcome message** (Idle phase, no output): two dark-gray lines:
+```
+Welcome to amux.
+Running 'amux ready' to check your environment...
+```
+
+#### Text editing widget (`text_edit.rs`)
+
+`TextEdit` is the shared single-line/multiline text editing primitive used by the command box and dialog text inputs.
+
+| Key | Action |
+|-----|--------|
+| `←` / `→` | Move cursor |
+| `Ctrl+←` / `Ctrl+→` | Move by word |
+| `Home` / `End` | Move to line start/end |
+| `Backspace` | Delete previous character |
+| `Ctrl+Backspace` | Delete previous word |
+| `Delete` | Delete next character |
+| `Ctrl+Enter` or `Shift+Enter` | Insert newline (multiline mode) |
+
+#### Message sink (`user_message.rs`)
+
+`TuiUserMessageSink` implements `UserMessageSink` by appending to the active tab's `SharedStatusLog` with level-colored prefixes:
+
+| Level | Color |
+|-------|-------|
+| Info | DarkGray |
+| Warning | Yellow |
+| Error | Red |
+| Success | Green |
+
+`SharedStatusLog` is `Arc<Mutex<Vec<StatusLogEntry>>>`. The status log is collapsed by default (shows only the most recent entry); press `l` in the execution window to toggle expanded view.
 
 ---
 
@@ -2291,7 +2558,7 @@ pub async fn serve(config: HeadlessServeConfig) -> Result<(), CommandError>
    - `AgentEngine::new(overlay_engine, runtime)` — wraps the overlay and runtime for agent execution
    - `EngineWorkflowStateStore::at_git_root(session.git_root())` — filesystem workflow state store
 5. **Construct `RuntimeContext`**: `RuntimeContext::new(session, engines)` — wraps the session in `Arc<RwLock<Session>>`.
-6. **Route**: `matches.subcommand_name().is_some()` → `cli::run(matches, ctx)` (CLI); otherwise → `tui::run(matches, ctx)` (TUI or, currently, the TUI placeholder).
+6. **Route**: `matches.subcommand_name().is_some()` → `cli::run(matches, ctx)` (CLI); otherwise → `tui::run(matches, ctx)` (TUI).
 
 ### Routing rule
 
@@ -2789,7 +3056,12 @@ Background daemonization: systemd-run on Linux, launchd plist on macOS, double-f
 | Layer 3 — CLI routing | `src/frontend/cli/mod.rs` | `error_exit_code` data-table (all `CommandError` variants); `subcommand_present_routes_to_cli`; `bare_invocation_routes_to_tui`; `render_outcome_empty_is_success` |
 | Layer 3 — CliFrontend | `src/frontend/cli/command_frontend.rs` | `command_path_from_matches` (top-level, nested, bare, 3-level); `flag_bool` data-table; `flag_string`/`flag_enum`; `flag_strings` (single, repeated, absent); `flag_path`; `flag_u16`; `argument` (positional, TrailingVarArgs single + multi); `arguments`; cross-flag independence; parent-path isolation |
 | Layer 3 — CliUserMessageQueue | `src/frontend/cli/user_message.rs` | Queue-when-active; write-through-when-inactive; `replay_queued` drains; PTY toggle changes behavior |
-| Layer 3 — TUI placeholder | `src/frontend/tui/mod.rs` | Bare invocation has no subcommand; any subcommand routes away from TUI |
+| Layer 3 — TUI routing | `src/frontend/tui/mod.rs` | Bare invocation has no subcommand; any subcommand routes away from TUI |
+| Layer 3 — TUI keymap | `src/frontend/tui/keymap.rs` | Every key in every FocusContext produces the expected Action variant; global shortcuts available in CommandBox/ExecutionWindow/Dialog but not ContainerMaximized |
+| Layer 3 — TUI tabs | `src/frontend/tui/tabs.rs` | `tab_color` for every ExecutionPhase and flag combination; `compute_tab_bar_width` for 0–5+ tabs; `window_border_color` matrix; `phase_label` formatting |
+| Layer 3 — TUI command box | `src/frontend/tui/command_box.rs` | `parse_input` valid/invalid/edge cases; `format_parse_error` did-you-mean and no-match paths |
+| Layer 3 — TUI App | `src/frontend/tui/app.rs` | `update_suggestions` empty/match/no-match; tab switch wrap-around; `close_active_tab` single/multi |
+| Layer 3 — TUI hints | `src/frontend/tui/hints.rs` | `format_suggestion_row` empty/single/multi; `hint_for_input` known/unknown/flag inclusion |
 | Layer 3 — Headless placeholder | `src/frontend/headless/mod.rs` | `serve()` returns `NotImplemented`; `HeadlessServeConfig` struct fields are valid |
 | Layer 4 — binary routing | `src/main.rs` | Subcommand presence signals CLI branch (data-table over representative argv); bare invocation signals TUI branch; `exec workflow` alias resolves correctly |
 | Unit — per module | `oldsrc/**/#[cfg(test)]` | Individual functions, data structures (legacy reference only — not compiled) |

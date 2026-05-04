@@ -271,14 +271,11 @@ impl AgentEngine {
         }
 
         // Per-agent static env vars.
-        match agent.as_str() {
-            "copilot" => {
-                options.push(ContainerOption::EnvLiteral(crate::engine::container::options::EnvLiteral {
-                    key: "COPILOT_OFFLINE".into(),
-                    value: "true".into(),
-                }));
-            }
-            _ => {}
+        if agent.as_str() == "copilot" {
+            options.push(ContainerOption::EnvLiteral(crate::engine::container::options::EnvLiteral {
+                key: "COPILOT_OFFLINE".into(),
+                value: "true".into(),
+            }));
         }
 
         // Mount the project source into the container's working directory.

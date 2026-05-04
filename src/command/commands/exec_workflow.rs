@@ -315,15 +315,22 @@ impl ContainerExecutionFactory for CommandLayerFactory {
 
     fn inject_prompt(
         &self,
-        _execution: &crate::engine::container::instance::ContainerExecution,
-        _prompt: &str,
+        execution: &crate::engine::container::instance::ContainerExecution,
+        prompt: &str,
     ) -> Result<Option<()>, EngineError> {
-        // See `ContainerExecutionFactory::inject_prompt` for the contract:
-        // `Ok(None)` requests a fresh container per step. No agent in
-        // `AgentMatrix` currently advertises mid-session stdin re-injection
-        // support (`supports_stdin_injection: false`), so this is the
-        // documented and safe behavior for every shipped agent.
-        Ok(None)
+        // Mirror old amux's `launch_next_workflow_step_in_current_container`:
+        // write the prompt followed by `\r` (Enter) directly into the running
+        // container's PTY stdin. The Container Execution back-end returns
+        // `Ok(true)` if it accepted the bytes (PTY-bridged backends do),
+        // `Ok(false)` if it can't inject (inherit-stdio with no PTY) — in
+        // which case we report `Ok(None)` and the engine launches a fresh
+        // container.
+        let mut payload = prompt.as_bytes().to_vec();
+        payload.push(b'\r');
+        match execution.try_inject_stdin(&payload)? {
+            true => Ok(Some(())),
+            false => Ok(None),
+        }
     }
 }
 

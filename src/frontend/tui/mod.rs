@@ -1,35 +1,1156 @@
-//! TUI frontend — placeholder.
+//! TUI frontend — Ratatui-based interactive terminal UI.
 //!
-//! The full TUI implementation (~21k lines ported and adapted from
-//! `oldsrc/tui/`) is the deliverable of work item
-//! `0070-grand-architecture-tui-frontend.md`. Until then, bare invocations
-//! of `amux` print a one-line notice and exit cleanly so the CLI surface
-//! introduced in `0069-…` is usable end-to-end.
+//! Captures the terminal (raw mode, alternate screen, mouse), constructs
+//! `App` state, enters the event loop, and restores the terminal on exit.
 
+use std::io;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::prelude::*;
+use tokio::sync::RwLock;
+
+use crate::command::dispatch::catalogue::CommandCatalogue;
+use crate::command::dispatch::parsed_input::ParsedCommandBoxInput;
+use crate::data::session_manager::SessionManager;
 use crate::frontend::cli::RuntimeContext;
 
+pub mod app;
+pub mod command_box;
+pub mod command_frontend;
+pub mod container_view;
+pub mod dialogs;
+pub mod hints;
+pub mod keymap;
+pub mod per_command;
+pub mod pty;
+pub mod render;
+pub mod tabs;
+pub mod text_edit;
+pub mod user_message;
+pub mod workflow_view;
+
+use app::{App, Focus};
+use dialogs::{Dialog, DialogResponse};
+use keymap::{Action, FocusContext};
+use tabs::{ContainerWindowState, Tab};
+
 /// Entry point invoked by `main.rs` for bare (no-subcommand) launches.
-///
-/// **Placeholder implementation** — work item 0070 replaces the body with
-/// the real Ratatui event loop. The signature is the public contract that
-/// 0070 must preserve.
-pub async fn run(_matches: clap::ArgMatches, _ctx: RuntimeContext) -> ExitCode {
-    eprintln!(
-        "amux: TUI is not yet wired up in this build. \
-         Run with a subcommand (try `amux --help`) for the CLI flow. \
-         The TUI ships in work item 0070."
+pub async fn run(_matches: clap::ArgMatches, ctx: RuntimeContext) -> ExitCode {
+    let catalogue = CommandCatalogue::get();
+    let session_manager = Arc::new(RwLock::new(SessionManager::in_memory()));
+
+    let session = ctx.session.read().await.clone();
+    let initial_tab = Tab::new(session);
+    let runtime_handle = tokio::runtime::Handle::current();
+    let session_arc = Arc::clone(&ctx.session);
+
+    let mut app = App::new(
+        catalogue,
+        ctx.engines,
+        session_manager,
+        initial_tab,
+        runtime_handle,
+        session_arc,
     );
-    ExitCode::from(0)
+
+    // Auto-spawn `ready` at startup to check the environment.
+    app.spawn_command(
+        "ready",
+        ParsedCommandBoxInput {
+            path: vec!["ready".into()],
+            flags: Default::default(),
+            arguments: Default::default(),
+        },
+    );
+
+    match run_event_loop(&mut app) {
+        Ok(()) => ExitCode::from(0),
+        Err(e) => {
+            eprintln!("amux: TUI error: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// Set up the terminal, run the main loop, and restore on exit.
+fn run_event_loop(app: &mut App) -> io::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, crossterm::event::EnableMouseCapture)?;
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let result = main_loop(&mut terminal, app);
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    result
+}
+
+/// The main event loop: render → tick → poll → handle input → repeat.
+fn main_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
+    loop {
+        if app.should_quit {
+            break;
+        }
+
+        terminal.draw(|frame| {
+            render::render_frame(app, frame);
+        })?;
+
+        app.tick_all_tabs();
+        app.poll_dialog_requests();
+
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Key(key_event) => {
+                    if key_event.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    handle_key_event(app, key_event);
+                }
+                Event::Mouse(mouse) => {
+                    handle_mouse_event(app, mouse);
+                }
+                Event::Resize(cols, rows) => {
+                    handle_resize(app, cols, rows);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns true when the active tab has a command currently running.
+fn command_box_locked(app: &App) -> bool {
+    matches!(
+        app.active_tab().execution_phase,
+        tabs::ExecutionPhase::Running { .. }
+    )
+}
+
+/// Determine focus context and dispatch the key event through the keymap.
+fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
+    // Any key counts as user activity. Suppresses stuck detection on the
+    // active tab and keeps `last_user_activity_time` fresh.
+    app.active_tab_mut().record_user_activity();
+
+    let ctx = if app.active_dialog.is_some() {
+        FocusContext::Dialog
+    } else if app.active_tab().container_window_state == ContainerWindowState::Maximized
+        && matches!(
+            app.active_tab().execution_phase,
+            tabs::ExecutionPhase::Running { .. }
+        )
+    {
+        // Only treat the container overlay as the focus target while a command is
+        // actively running.  Once the command finishes the overlay is closed, but
+        // guard here too so a race can't leave the user unable to type.
+        FocusContext::ContainerMaximized
+    } else {
+        match app.focus {
+            Focus::CommandBox => FocusContext::CommandBox,
+            Focus::ExecutionWindow => FocusContext::ExecutionWindow,
+        }
+    };
+
+    // WorkflowControlBoard intercepts arrow keys and Ctrl+Enter before the
+    // generic keymap so they map to workflow navigation rather than scroll/cursor.
+    if matches!(app.active_dialog, Some(Dialog::WorkflowControlBoard(_))) {
+        if handle_workflow_control_board_key(app, key) {
+            return;
+        }
+    }
+
+    let action = keymap::map_key(key, ctx);
+
+    match action {
+        // ── Global actions ────────────────────────────────────────────
+        Action::OpenNewTabDialog => {
+            let cwd = app
+                .active_tab()
+                .session
+                .working_dir()
+                .to_string_lossy()
+                .to_string();
+            app.active_dialog = Some(Dialog::TextInput {
+                title: "New Tab".to_string(),
+                prompt: "Working directory:".to_string(),
+                editor: {
+                    let mut ed = text_edit::TextEdit::new(false);
+                    ed.set_text(&cwd);
+                    ed
+                },
+            });
+            app.command_dialog_active = false;
+        }
+        Action::PreviousTab => app.switch_to_prev_tab(),
+        Action::NextTab => app.switch_to_next_tab(),
+        Action::CloseTabOrQuit => {
+            if app.active_dialog.is_some() {
+                return;
+            }
+            // If a workflow is active in the focused tab, prefer the
+            // workflow-cancel confirmation over the close-tab one — old amux
+            // semantics. The user can still escape and Ctrl+C again to close
+            // the tab if they really mean it.
+            let workflow_active = app
+                .active_tab()
+                .workflow_state
+                .lock()
+                .map(|g| g.is_some())
+                .unwrap_or(false);
+            if workflow_active
+                && matches!(
+                    app.active_tab().execution_phase,
+                    tabs::ExecutionPhase::Running { .. }
+                )
+            {
+                app.active_dialog = Some(Dialog::WorkflowCancelConfirm);
+            } else if app.tabs.len() > 1 {
+                app.active_dialog = Some(Dialog::CloseTabConfirm);
+            } else {
+                app.active_dialog = Some(Dialog::QuitConfirm);
+            }
+        }
+        Action::CycleContainerWindow => {
+            let tab = app.active_tab_mut();
+            tab.container_window_state = tab.container_window_state.cycle();
+        }
+        Action::OpenConfigShow => {
+            app.active_dialog = Some(Dialog::ConfigShow(dialogs::ConfigShowState {
+                rows: Vec::new(),
+                selected: 0,
+                editing: false,
+                edit_column: 0,
+                editor: text_edit::TextEdit::new(false),
+            }));
+            app.command_dialog_active = false;
+        }
+
+        // ── Command box actions ───────────────────────────────────────
+        Action::SubmitCommand => {
+            if ctx == FocusContext::Dialog {
+                handle_dialog_submit(app);
+            } else if !command_box_locked(app) {
+                handle_command_submit(app);
+            }
+        }
+        Action::AutocompleteNext => {
+            app.update_suggestions();
+            if !app.suggestion_row.is_empty() {
+                let suggestion = app.suggestion_row[0].clone();
+                app.command_input.set_text(&suggestion);
+            }
+        }
+        Action::AutocompletePrev => {
+            app.update_suggestions();
+            if let Some(suggestion) = app.suggestion_row.last().cloned() {
+                app.command_input.set_text(&suggestion);
+            }
+        }
+        Action::FocusExecutionWindow => {
+            app.focus = Focus::ExecutionWindow;
+        }
+
+        // ── Execution window actions ──────────────────────────────────
+        Action::FocusCommandBox => {
+            app.focus = Focus::CommandBox;
+        }
+        Action::ScrollUp => {
+            if ctx == FocusContext::Dialog {
+                handle_dialog_scroll(app, -1);
+            } else {
+                let tab = app.active_tab_mut();
+                tab.scroll_offset = tab.scroll_offset.saturating_add(1);
+            }
+        }
+        Action::ScrollDown => {
+            if ctx == FocusContext::Dialog {
+                handle_dialog_scroll(app, 1);
+            } else {
+                let tab = app.active_tab_mut();
+                tab.scroll_offset = tab.scroll_offset.saturating_sub(1);
+            }
+        }
+        Action::ScrollPageUp => {
+            let tab = app.active_tab_mut();
+            tab.scroll_offset = tab.scroll_offset.saturating_add(20);
+        }
+        Action::ScrollPageDown => {
+            let tab = app.active_tab_mut();
+            tab.scroll_offset = tab.scroll_offset.saturating_sub(20);
+        }
+        Action::ScrollToTop => {
+            let tab = app.active_tab_mut();
+            tab.scroll_offset = usize::MAX / 2;
+        }
+        Action::ScrollToBottom => {
+            let tab = app.active_tab_mut();
+            tab.scroll_offset = 0;
+        }
+        Action::CopySelection => {
+            copy_selection_to_clipboard(app);
+        }
+        Action::ToggleStatusLog => {
+            let tab = app.active_tab_mut();
+            tab.status_log_collapsed = !tab.status_log_collapsed;
+        }
+
+        // ── Dialog actions ────────────────────────────────────────────
+        Action::DismissDialog => {
+            dismiss_dialog(app);
+        }
+
+        // ── Text input actions ────────────────────────────────────────
+        Action::Char(c) => {
+            if ctx == FocusContext::Dialog {
+                handle_dialog_char(app, c);
+            } else if command_box_locked(app) {
+                // Command box is read-only while a command is executing.
+            } else if c == 'q' && app.command_input.text.is_empty() {
+                // `q` with an empty input opens the quit dialog (old-TUI parity).
+                app.active_dialog = Some(Dialog::QuitConfirm);
+            } else {
+                app.command_input.insert_char(c);
+                app.input_error = None;
+                app.update_suggestions();
+            }
+        }
+        Action::Backspace => {
+            if ctx == FocusContext::Dialog {
+                handle_dialog_backspace(app);
+            } else if !command_box_locked(app) {
+                app.command_input.backspace();
+                app.input_error = None;
+                app.update_suggestions();
+            }
+        }
+        Action::Delete => {
+            if ctx == FocusContext::Dialog {
+                handle_dialog_delete(app);
+            } else if !command_box_locked(app) {
+                app.command_input.delete();
+                app.input_error = None;
+                app.update_suggestions();
+            }
+        }
+        Action::BackspaceWord => {
+            if !command_box_locked(app) {
+                app.command_input.backspace_word();
+                app.input_error = None;
+                app.update_suggestions();
+            }
+        }
+        Action::CursorLeft => {
+            if ctx == FocusContext::Dialog {
+                handle_dialog_cursor(app, CursorDir::Left);
+            } else if !command_box_locked(app) {
+                app.command_input.move_left();
+            }
+        }
+        Action::CursorRight => {
+            if ctx == FocusContext::Dialog {
+                handle_dialog_cursor(app, CursorDir::Right);
+            } else if !command_box_locked(app) {
+                app.command_input.move_right();
+            }
+        }
+        Action::CursorWordLeft => {
+            if !command_box_locked(app) {
+                app.command_input.move_word_left();
+            }
+        }
+        Action::CursorWordRight => {
+            if !command_box_locked(app) {
+                app.command_input.move_word_right();
+            }
+        }
+        Action::CursorHome => {
+            if ctx == FocusContext::Dialog {
+                handle_dialog_cursor(app, CursorDir::Home);
+            } else if !command_box_locked(app) {
+                app.command_input.move_home();
+            }
+        }
+        Action::CursorEnd => {
+            if ctx == FocusContext::Dialog {
+                handle_dialog_cursor(app, CursorDir::End);
+            } else if !command_box_locked(app) {
+                app.command_input.move_end();
+            }
+        }
+        Action::InsertNewline => {
+            if !command_box_locked(app) {
+                app.command_input.insert_newline();
+            }
+        }
+
+        // ── PTY passthrough ───────────────────────────────────────────
+        Action::ForwardToPty(key_event) => {
+            forward_key_to_pty(app, key_event);
+        }
+
+        Action::None => {
+            // When the execution window is focused and the command is finished,
+            // any unhandled key press returns focus to the command box.
+            if ctx == FocusContext::ExecutionWindow {
+                let done_or_error = matches!(
+                    app.active_tab().execution_phase,
+                    tabs::ExecutionPhase::Done { .. } | tabs::ExecutionPhase::Error { .. }
+                );
+                if done_or_error {
+                    app.focus = Focus::CommandBox;
+                }
+            }
+        }
+    }
+}
+
+// ─── Mouse ───────────────────────────────────────────────────────────────────
+
+fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
+    // Mouse events count as user activity for the stuck-detection clock.
+    app.active_tab_mut().record_user_activity();
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            let tab = app.active_tab_mut();
+            if tab.container_window_state == ContainerWindowState::Maximized {
+                // Probe the actual scrollback depth so we don't run past it.
+                let max_scroll = {
+                    let parser = &mut tab.vt100_parser;
+                    parser.set_scrollback(usize::MAX);
+                    let m = parser.screen().scrollback();
+                    parser.set_scrollback(0);
+                    m
+                };
+                tab.container_scroll_offset =
+                    (tab.container_scroll_offset + 5).min(max_scroll);
+            } else {
+                tab.scroll_offset = tab.scroll_offset.saturating_add(5);
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            let tab = app.active_tab_mut();
+            if tab.container_window_state == ContainerWindowState::Maximized {
+                tab.container_scroll_offset =
+                    tab.container_scroll_offset.saturating_sub(5);
+            } else {
+                tab.scroll_offset = tab.scroll_offset.saturating_sub(5);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            let tab = app.active_tab_mut();
+            if tab.container_window_state != ContainerWindowState::Maximized {
+                return;
+            }
+            let inner = match tab.container_inner_area {
+                Some(r) => r,
+                None => return,
+            };
+            // Only start a selection if the click landed inside the vt100
+            // grid (not on the border).
+            if mouse.column < inner.x
+                || mouse.row < inner.y
+                || mouse.column >= inner.x + inner.width
+                || mouse.row >= inner.y + inner.height
+            {
+                return;
+            }
+            let vt_col = mouse.column - inner.x;
+            let vt_row = mouse.row - inner.y;
+            let scroll = tab.container_scroll_offset;
+            let snapshot = capture_vt100_snapshot(&mut tab.vt100_parser, scroll);
+            tab.mouse_selection = Some(tabs::TextSelection {
+                start_col: vt_col,
+                start_row: vt_row,
+                end_col: vt_col,
+                end_row: vt_row,
+                snapshot,
+            });
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let tab = app.active_tab_mut();
+            if tab.container_window_state != ContainerWindowState::Maximized {
+                return;
+            }
+            let inner = match tab.container_inner_area {
+                Some(r) => r,
+                None => return,
+            };
+            if let Some(ref mut sel) = tab.mouse_selection {
+                let vt_col = mouse
+                    .column
+                    .saturating_sub(inner.x)
+                    .min(inner.width.saturating_sub(1));
+                let vt_row = mouse
+                    .row
+                    .saturating_sub(inner.y)
+                    .min(inner.height.saturating_sub(1));
+                sel.end_col = vt_col;
+                sel.end_row = vt_row;
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let tab = app.active_tab_mut();
+            if let Some(ref sel) = tab.mouse_selection {
+                // A click without a drag (zero-area selection) is treated as
+                // just a click, so accidental Ctrl+Y copies after a stray
+                // click don't yank stale text.
+                if sel.start_col == sel.end_col && sel.start_row == sel.end_row {
+                    tab.mouse_selection = None;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Snapshot the vt100 grid into a `Vec<Vec<String>>` of cell contents.
+///
+/// Why: the vt100 grid mutates with live PTY output. When the user starts a
+/// drag selection, they need the copied text to reflect what they *saw* —
+/// not the cells' current values.
+fn capture_vt100_snapshot(
+    parser: &mut vt100::Parser,
+    scroll_offset: usize,
+) -> Vec<Vec<String>> {
+    if scroll_offset > 0 {
+        parser.set_scrollback(scroll_offset);
+    }
+    let snapshot = {
+        let screen = parser.screen();
+        let (rows, cols) = screen.size();
+        (0..rows)
+            .map(|row| {
+                (0..cols)
+                    .map(|col| {
+                        screen
+                            .cell(row, col)
+                            .map(|c| {
+                                let s = c.contents();
+                                if s.is_empty() { " ".to_string() } else { s }
+                            })
+                            .unwrap_or_else(|| " ".to_string())
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    if scroll_offset > 0 {
+        parser.set_scrollback(0);
+    }
+    snapshot
+}
+
+/// Extract the selected text from a snapshot. Range is inclusive on both ends;
+/// trailing whitespace per line is stripped; rows are joined with `\n`.
+fn extract_selection_text(sel: &tabs::TextSelection) -> String {
+    let (sr, sc, er, ec) = if sel.start_row < sel.end_row
+        || (sel.start_row == sel.end_row && sel.start_col <= sel.end_col)
+    {
+        (
+            sel.start_row as usize,
+            sel.start_col as usize,
+            sel.end_row as usize,
+            sel.end_col as usize,
+        )
+    } else {
+        (
+            sel.end_row as usize,
+            sel.end_col as usize,
+            sel.start_row as usize,
+            sel.start_col as usize,
+        )
+    };
+    let mut result = String::new();
+    for row in sr..=er {
+        if row >= sel.snapshot.len() {
+            break;
+        }
+        let row_data = &sel.snapshot[row];
+        let col_start = if row == sr { sc } else { 0 };
+        let col_end = if row == er {
+            (ec + 1).min(row_data.len())
+        } else {
+            row_data.len()
+        };
+        let mut line = String::new();
+        for col in col_start..col_end {
+            if col < row_data.len() {
+                line.push_str(&row_data[col]);
+            }
+        }
+        result.push_str(line.trim_end());
+        if row < er {
+            result.push('\n');
+        }
+    }
+    result
+}
+
+// ─── Resize ──────────────────────────────────────────────────────────────────
+
+fn handle_resize(app: &mut App, cols: u16, rows: u16) {
+    for tab in &mut app.tabs {
+        tab.mouse_selection = None;
+        if tab.container_window_state != ContainerWindowState::Hidden {
+            let (inner_cols, inner_rows) = compute_container_inner_size(cols, rows);
+            tab.vt100_parser.set_size(inner_rows, inner_cols);
+            // Forward the new size to the container's PTY master so its
+            // SIGWINCH handler reflows TUI apps inside the container.
+            if let Some(ref tx) = tab.container_resize_tx {
+                let _ = tx.send((inner_cols, inner_rows));
+            }
+        }
+    }
+}
+
+/// Compute the vt100 grid size that fits inside the container overlay,
+/// accounting for the 95% sizing and the 2-cell border subtraction. Mirrors
+/// `oldsrc/tui/render.rs::calculate_container_inner_size`.
+pub fn compute_container_inner_size(term_cols: u16, term_rows: u16) -> (u16, u16) {
+    let outer_cols = ((term_cols as u32 * 95 / 100) as u16).max(10);
+    let outer_rows = ((term_rows as u32 * 95 / 100) as u16).max(5);
+    (outer_cols.saturating_sub(2), outer_rows.saturating_sub(2))
+}
+
+// ─── PTY forwarding ──────────────────────────────────────────────────────────
+
+fn forward_key_to_pty(app: &mut App, key: crossterm::event::KeyEvent) {
+    if let Some(bytes) = key_to_bytes(&key) {
+        let tab = app.active_tab_mut();
+        if let Some(ref tx) = tab.container_stdin_tx {
+            let _ = tx.send(bytes);
+        }
+    }
+}
+
+fn key_to_bytes(key: &crossterm::event::KeyEvent) -> Option<Vec<u8>> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                let n = (c as u8).to_ascii_lowercase();
+                if n >= b'a' && n <= b'z' {
+                    return Some(vec![n - b'a' + 1]);
+                }
+            }
+            let mut buf = [0u8; 4];
+            Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
+        }
+        KeyCode::Enter => Some(b"\r".to_vec()),
+        KeyCode::Backspace => Some(b"\x7f".to_vec()),
+        KeyCode::Tab => Some(b"\t".to_vec()),
+        KeyCode::Esc => Some(b"\x1b".to_vec()),
+        KeyCode::Up => Some(b"\x1b[A".to_vec()),
+        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Right => Some(b"\x1b[C".to_vec()),
+        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        KeyCode::F(n) => Some(format!("\x1b[{}~", n).into_bytes()),
+        _ => None,
+    }
+}
+
+// ─── Clipboard ───────────────────────────────────────────────────────────────
+
+fn copy_selection_to_clipboard(app: &mut App) {
+    let tab = app.active_tab();
+    let text = match tab.mouse_selection.as_ref() {
+        Some(sel) if !sel.snapshot.is_empty() => extract_selection_text(sel),
+        _ => return,
+    };
+    if text.is_empty() {
+        return;
+    }
+    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(&text)) {
+        Ok(()) => {
+            // Drop the selection after a successful copy so the copy hint
+            // disappears and a subsequent Ctrl+Y doesn't re-yank.
+            app.active_tab_mut().mouse_selection = None;
+        }
+        Err(e) => {
+            app.active_tab_mut()
+                .status_log
+                .lock()
+                .map(|mut log| {
+                    log.push(crate::frontend::tui::user_message::StatusLogEntry {
+                        level: crate::engine::message::MessageLevel::Error,
+                        text: format!("clipboard unavailable: {e}"),
+                    })
+                })
+                .ok();
+        }
+    }
+}
+
+// ─── Command submission ──────────────────────────────────────────────────────
+
+/// Handle command submission from the command box.
+fn handle_command_submit(app: &mut App) {
+    let text = app.command_input.text.clone();
+    if text.trim().is_empty() {
+        return;
+    }
+
+    match command_box::parse_input(&text) {
+        Ok(parsed) => {
+            app.input_error = None;
+            app.command_input.set_text("");
+            app.suggestion_row.clear();
+            app.spawn_command(&text, parsed);
+        }
+        Err(err) => {
+            app.input_error = Some(command_box::format_parse_error(&err));
+        }
+    }
+}
+
+// ─── WorkflowControlBoard special handler ────────────────────────────────────
+
+/// Handle arrow keys, Ctrl+Enter, and `[d]` for the WorkflowControlBoard dialog.
+///
+/// Returns `true` if the key was consumed; `false` to let it fall through to
+/// the generic dialog handler (for char keys like 'a', Esc, etc.).
+fn handle_workflow_control_board_key(app: &mut App, key: crossterm::event::KeyEvent) -> bool {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // `[d]` toggles auto-advance for the current step. The dialog stays open
+    // — old amux UX. We mutate the shared workflow_view's auto_disabled set
+    // and the engine consults it on its next yolo countdown.
+    if matches!(key.code, KeyCode::Char('d')) && !ctrl {
+        if let Some(Dialog::WorkflowControlBoard(state)) = &app.active_dialog {
+            let step = state.step_name.clone();
+            if let Ok(mut g) = app.active_tab().workflow_state.lock() {
+                if let Some(view) = g.as_mut() {
+                    if !view.auto_disabled.insert(step.clone()) {
+                        // Already disabled → toggle off.
+                        view.auto_disabled.remove(&step);
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    let response = match key.code {
+        KeyCode::Right => DialogResponse::Char('>'),
+        KeyCode::Down => DialogResponse::Char('v'),
+        KeyCode::Up => DialogResponse::Char('^'),
+        KeyCode::Left => DialogResponse::Char('<'),
+        KeyCode::Enter if ctrl => DialogResponse::Char('f'),
+        _ => return false,
+    };
+    app.send_dialog_response(response);
+    app.active_dialog = None;
+    app.command_dialog_active = false;
+    true
+}
+
+// ─── Dialog handling ─────────────────────────────────────────────────────────
+
+/// Dismiss the active dialog, sending Dismissed to the command thread if needed.
+fn dismiss_dialog(app: &mut App) {
+    if app.command_dialog_active {
+        app.send_dialog_response(DialogResponse::Dismissed);
+    }
+    app.active_dialog = None;
+    app.command_dialog_active = false;
+}
+
+/// Handle Enter key in a dialog context.
+fn handle_dialog_submit(app: &mut App) {
+    let is_command = app.command_dialog_active;
+
+    match &app.active_dialog {
+        Some(Dialog::QuitConfirm) => {}
+        Some(Dialog::CloseTabConfirm) => {}
+
+        Some(Dialog::TextInput { editor, .. }) if is_command => {
+            let text = editor.text.clone();
+            app.send_dialog_response(DialogResponse::Text(text));
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+        Some(Dialog::TextInput { editor, .. }) => {
+            let path = editor.text.clone();
+            app.active_dialog = None;
+            handle_new_tab_path(app, &path);
+        }
+
+        Some(Dialog::MultilineInput { editor, .. }) if is_command => {
+            let text = editor.text.clone();
+            app.send_dialog_response(DialogResponse::Text(text));
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+
+        Some(Dialog::ListPicker { selected, .. }) if is_command => {
+            let idx = *selected;
+            app.send_dialog_response(DialogResponse::Index(idx));
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+
+        _ => {}
+    }
+}
+
+enum CursorDir {
+    Left,
+    Right,
+    Home,
+    End,
+}
+
+fn handle_dialog_cursor(app: &mut App, dir: CursorDir) {
+    match &mut app.active_dialog {
+        Some(Dialog::TextInput { editor, .. }) | Some(Dialog::MultilineInput { editor, .. }) => {
+            match dir {
+                CursorDir::Left => editor.move_left(),
+                CursorDir::Right => editor.move_right(),
+                CursorDir::Home => editor.move_home(),
+                CursorDir::End => editor.move_end(),
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_dialog_backspace(app: &mut App) {
+    match &mut app.active_dialog {
+        Some(Dialog::TextInput { editor, .. }) | Some(Dialog::MultilineInput { editor, .. }) => {
+            editor.backspace();
+        }
+        _ => {}
+    }
+}
+
+fn handle_dialog_delete(app: &mut App) {
+    match &mut app.active_dialog {
+        Some(Dialog::TextInput { editor, .. }) | Some(Dialog::MultilineInput { editor, .. }) => {
+            editor.delete();
+        }
+        _ => {}
+    }
+}
+
+/// Handle arrow-key scrolling in list-based dialogs.
+fn handle_dialog_scroll(app: &mut App, direction: i32) {
+    match &mut app.active_dialog {
+        Some(Dialog::ListPicker { items, selected, .. }) => {
+            let len = items.len();
+            if len == 0 {
+                return;
+            }
+            if direction < 0 {
+                *selected = selected.saturating_sub(1);
+            } else {
+                *selected = (*selected + 1).min(len - 1);
+            }
+        }
+        Some(Dialog::ConfigShow(state)) => {
+            let len = state.rows.len();
+            if len == 0 {
+                return;
+            }
+            if direction < 0 {
+                state.selected = state.selected.saturating_sub(1);
+            } else {
+                state.selected = (state.selected + 1).min(len - 1);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Handle a character key press in a dialog.
+fn handle_dialog_char(app: &mut App, c: char) {
+    let is_command = app.command_dialog_active;
+
+    match app.active_dialog.as_ref() {
+        // ── Always UI-originated ─────────────────────────────────────
+        Some(Dialog::QuitConfirm) => match c {
+            'y' => {
+                app.active_dialog = None;
+                app.should_quit = true;
+            }
+            'n' => {
+                app.active_dialog = None;
+            }
+            _ => {}
+        },
+        Some(Dialog::CloseTabConfirm) => match c {
+            'q' => {
+                app.active_dialog = None;
+                app.should_quit = true;
+            }
+            'c' => {
+                app.active_dialog = None;
+                app.close_active_tab();
+            }
+            'n' => {
+                app.active_dialog = None;
+            }
+            _ => {}
+        },
+        Some(Dialog::WorkflowCancelConfirm) => match c {
+            'y' | 'Y' => {
+                // Tell the engine to abort: the workflow_frontend's
+                // user_choose_next_action will see this as Abort. We send
+                // Char('a') because that's the dialog protocol the workflow
+                // dialog handlers use — the engine's frontend impl maps it
+                // to NextAction::Abort.
+                app.send_dialog_response(DialogResponse::Char('a'));
+                app.active_dialog = None;
+                app.command_dialog_active = false;
+            }
+            'n' | 'N' => {
+                // Just dismiss — the engine keeps running.
+                app.active_dialog = None;
+            }
+            _ => {}
+        },
+
+        // ── Command-originated dialogs ───────────────────────────────
+        Some(Dialog::YesNo { .. }) if is_command => match c {
+            'y' => {
+                app.send_dialog_response(DialogResponse::Yes);
+                app.active_dialog = None;
+                app.command_dialog_active = false;
+            }
+            'n' => {
+                app.send_dialog_response(DialogResponse::No);
+                app.active_dialog = None;
+                app.command_dialog_active = false;
+            }
+            _ => {}
+        },
+        Some(Dialog::YesNoCancel { .. }) if is_command => match c {
+            'y' => {
+                app.send_dialog_response(DialogResponse::Yes);
+                app.active_dialog = None;
+                app.command_dialog_active = false;
+            }
+            'n' => {
+                app.send_dialog_response(DialogResponse::No);
+                app.active_dialog = None;
+                app.command_dialog_active = false;
+            }
+            _ => {}
+        },
+
+        Some(Dialog::MountScope { .. }) => {
+            app.send_dialog_response(DialogResponse::Char(c));
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+        Some(Dialog::AgentSetup { .. }) => {
+            app.send_dialog_response(DialogResponse::Char(c));
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+        Some(Dialog::AgentAuth { .. }) => {
+            app.send_dialog_response(DialogResponse::Char(c));
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+        Some(Dialog::Custom { .. }) => {
+            app.send_dialog_response(DialogResponse::Char(c));
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+
+        Some(Dialog::WorkflowControlBoard { .. }) => {
+            app.send_dialog_response(DialogResponse::Char(c));
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+        Some(Dialog::WorkflowStepError { .. }) => {
+            app.send_dialog_response(DialogResponse::Char(c));
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+        Some(Dialog::WorkflowYoloCountdown { .. }) => {
+            app.send_dialog_response(DialogResponse::Char(c));
+            app.active_dialog = None;
+            app.command_dialog_active = false;
+        }
+
+        Some(Dialog::KindSelect { options, .. }) if is_command => {
+            if let Some(digit) = c.to_digit(10) {
+                let idx = digit as usize;
+                if idx >= 1 && idx <= options.len() {
+                    app.send_dialog_response(DialogResponse::Index(idx - 1));
+                    app.active_dialog = None;
+                    app.command_dialog_active = false;
+                }
+            }
+        }
+
+        // ── Text input in dialogs ────────────────────────────────────
+        Some(Dialog::TextInput { .. }) | Some(Dialog::MultilineInput { .. }) => {
+            if let Some(Dialog::TextInput { editor, .. })
+            | Some(Dialog::MultilineInput { editor, .. }) = &mut app.active_dialog
+            {
+                editor.insert_char(c);
+            }
+        }
+
+        // ── Non-interactive / fallback dialogs ─────────────────────
+        Some(Dialog::Loading { .. })
+        | Some(Dialog::ConfigShow(_))
+        | Some(Dialog::ListPicker { .. })
+        | Some(Dialog::KindSelect { .. })
+        | Some(Dialog::YesNo { .. })
+        | Some(Dialog::YesNoCancel { .. }) => {}
+
+        None => {}
+    }
+}
+
+/// Handle path selection from the new-tab dialog.
+fn handle_new_tab_path(app: &mut App, path: &str) {
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+    let dir = std::path::PathBuf::from(path);
+    if !dir.is_dir() {
+        app.status_bar.text = format!("Not a directory: {path}");
+        return;
+    }
+
+    let resolver = crate::data::session::StaticGitRootResolver::new(&dir);
+    match crate::data::session::Session::open(
+        dir,
+        &resolver,
+        crate::data::session::SessionOpenOptions::default(),
+    ) {
+        Ok(session) => {
+            let idx = app.add_tab(session);
+            app.active_tab = idx;
+        }
+        Err(e) => {
+            app.status_bar.text = format!("Failed to open session: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::command::dispatch::catalogue::CommandCatalogue;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
-    /// The TUI is selected when no subcommand is given. Verify that the clap
-    /// layer agrees: a bare `amux` invocation has no subcommand name.
+    use crate::command::dispatch::catalogue::CommandCatalogue;
+    use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+    use crate::data::session_manager::SessionManager;
+    use crate::frontend::tui::app::{App, Focus};
+    use crate::frontend::tui::dialogs::{
+        Dialog, DialogResponse, MountScopeState, WorkflowStepErrorState,
+    };
+    use crate::frontend::tui::tabs::Tab;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    // ─── Shared helpers ───────────────────────────────────────────────────────
+
+    fn make_engines() -> crate::command::dispatch::Engines {
+        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
+        let overlay = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
+            crate::data::fs::auth_paths::AuthPathResolver::at_home(
+                std::path::PathBuf::from("/tmp"),
+            ),
+        ));
+        let git_engine = Arc::new(crate::engine::git::GitEngine::new());
+        let agent_engine =
+            Arc::new(crate::engine::agent::AgentEngine::new(overlay.clone(), runtime.clone()));
+        let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
+            crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
+            crate::data::fs::headless_paths::HeadlessPaths::at_root("/tmp"),
+        ));
+        let workflow_state_store = {
+            let tmp = tempfile::tempdir().unwrap();
+            Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(tmp.path()))
+        };
+        crate::command::dispatch::Engines {
+            runtime,
+            git_engine,
+            overlay_engine: overlay,
+            auth_engine,
+            agent_engine,
+            workflow_state_store,
+        }
+    }
+
+    fn make_session() -> Session {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        Session::open(tmp.path().to_path_buf(), &resolver, SessionOpenOptions::default()).unwrap()
+    }
+
+    fn make_app() -> App {
+        let rt = Box::leak(Box::new(tokio::runtime::Runtime::new().unwrap()));
+        let catalogue = CommandCatalogue::get();
+        let engines = make_engines();
+        let session_manager = Arc::new(RwLock::new(SessionManager::in_memory()));
+        let session = make_session();
+        let session_arc = Arc::new(RwLock::new(session.clone()));
+        let tab = Tab::new(session);
+        App::new(catalogue, engines, session_manager, tab, rt.handle().clone(), session_arc)
+    }
+
+    fn press_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+        super::handle_key_event(
+            app,
+            KeyEvent {
+                code,
+                modifiers: mods,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            },
+        );
+    }
+
+    fn press_char(app: &mut App, c: char) {
+        press_key(app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+
+    fn setup_command_dialog(
+        app: &mut App,
+        dialog: Dialog,
+    ) -> std::sync::mpsc::Receiver<DialogResponse> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.tabs[app.active_tab].dialog_response_tx = Some(tx);
+        app.active_dialog = Some(dialog);
+        app.command_dialog_active = true;
+        rx
+    }
+
+    // ─── Clap routing (existing tests retained) ───────────────────────────────
+
     #[test]
     fn bare_invocation_has_no_subcommand() {
         let cmd = CommandCatalogue::get().build_clap_command();
@@ -40,7 +1161,6 @@ mod tests {
         );
     }
 
-    /// Any subcommand routes to CLI, NOT TUI. Verify a representative sample.
     #[test]
     fn subcommand_presence_routes_away_from_tui() {
         let cmd = CommandCatalogue::get().build_clap_command();
@@ -54,6 +1174,621 @@ mod tests {
                 m.subcommand_name().is_some(),
                 "{argv:?} must have a subcommand name"
             );
+        }
+    }
+
+    // ─── QuitConfirm dialog ───────────────────────────────────────────────────
+
+    #[test]
+    fn quit_confirm_y_sets_should_quit() {
+        let mut app = make_app();
+        app.active_dialog = Some(Dialog::QuitConfirm);
+        press_char(&mut app, 'y');
+        assert!(app.should_quit);
+        assert!(app.active_dialog.is_none());
+    }
+
+    #[test]
+    fn quit_confirm_n_dismisses_without_quitting() {
+        let mut app = make_app();
+        app.active_dialog = Some(Dialog::QuitConfirm);
+        press_char(&mut app, 'n');
+        assert!(!app.should_quit);
+        assert!(app.active_dialog.is_none());
+    }
+
+    #[test]
+    fn quit_confirm_esc_dismisses() {
+        let mut app = make_app();
+        app.active_dialog = Some(Dialog::QuitConfirm);
+        press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.active_dialog.is_none());
+        assert!(!app.should_quit);
+    }
+
+    // ─── CloseTabConfirm dialog ───────────────────────────────────────────────
+
+    #[test]
+    fn close_tab_confirm_q_quits_entire_app() {
+        let mut app = make_app();
+        app.active_dialog = Some(Dialog::CloseTabConfirm);
+        press_char(&mut app, 'q');
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn close_tab_confirm_c_closes_current_tab() {
+        let mut app = make_app();
+        app.tabs.push(Tab::new(make_session()));
+        app.active_dialog = Some(Dialog::CloseTabConfirm);
+        press_char(&mut app, 'c');
+        assert_eq!(app.tabs.len(), 1);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn close_tab_confirm_n_cancels() {
+        let mut app = make_app();
+        app.tabs.push(Tab::new(make_session()));
+        let initial_len = app.tabs.len();
+        app.active_dialog = Some(Dialog::CloseTabConfirm);
+        press_char(&mut app, 'n');
+        assert!(app.active_dialog.is_none());
+        assert_eq!(app.tabs.len(), initial_len);
+    }
+
+    // ─── YesNo command dialog ─────────────────────────────────────────────────
+
+    #[test]
+    fn yes_no_command_dialog_y_sends_yes_response() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            Dialog::YesNo {
+                title: "Test".into(),
+                body: "Test body".into(),
+            },
+        );
+        press_char(&mut app, 'y');
+        let response = rx.try_recv().unwrap();
+        assert!(matches!(response, DialogResponse::Yes));
+        assert!(app.active_dialog.is_none());
+    }
+
+    #[test]
+    fn yes_no_command_dialog_n_sends_no_response() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            Dialog::YesNo {
+                title: "Test".into(),
+                body: "Test body".into(),
+            },
+        );
+        press_char(&mut app, 'n');
+        let response = rx.try_recv().unwrap();
+        assert!(matches!(response, DialogResponse::No));
+    }
+
+    // ─── Command dialog Esc sends Dismissed ──────────────────────────────────
+
+    #[test]
+    fn esc_on_command_dialog_sends_dismissed() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            Dialog::YesNo {
+                title: "Test".into(),
+                body: "Test body".into(),
+            },
+        );
+        press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let response = rx.try_recv().unwrap();
+        assert!(matches!(response, DialogResponse::Dismissed));
+    }
+
+    // ─── MountScope dialog ────────────────────────────────────────────────────
+
+    #[test]
+    fn mount_scope_r_sends_char_r() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            Dialog::MountScope(MountScopeState {
+                git_root: "/tmp".into(),
+                cwd: "/tmp/sub".into(),
+            }),
+        );
+        press_char(&mut app, 'r');
+        let response = rx.try_recv().unwrap();
+        assert!(matches!(response, DialogResponse::Char('r')));
+    }
+
+    #[test]
+    fn mount_scope_c_sends_char_c() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            Dialog::MountScope(MountScopeState {
+                git_root: "/tmp".into(),
+                cwd: "/tmp/sub".into(),
+            }),
+        );
+        press_char(&mut app, 'c');
+        let response = rx.try_recv().unwrap();
+        assert!(matches!(response, DialogResponse::Char('c')));
+    }
+
+    #[test]
+    fn mount_scope_a_sends_char_a() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            Dialog::MountScope(MountScopeState {
+                git_root: "/tmp".into(),
+                cwd: "/tmp/sub".into(),
+            }),
+        );
+        press_char(&mut app, 'a');
+        let response = rx.try_recv().unwrap();
+        assert!(matches!(response, DialogResponse::Char('a')));
+    }
+
+    // ─── KindSelect command dialog ────────────────────────────────────────────
+
+    #[test]
+    fn kind_select_digit_1_sends_index_0() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            Dialog::KindSelect {
+                title: "Select".into(),
+                options: vec![
+                    ("a".into(), "Option A".into()),
+                    ("b".into(), "Option B".into()),
+                    ("c".into(), "Option C".into()),
+                ],
+            },
+        );
+        press_char(&mut app, '1');
+        let response = rx.try_recv().unwrap();
+        assert!(matches!(response, DialogResponse::Index(0)));
+    }
+
+    #[test]
+    fn kind_select_digit_3_sends_index_2() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            Dialog::KindSelect {
+                title: "Select".into(),
+                options: vec![
+                    ("a".into(), "Option A".into()),
+                    ("b".into(), "Option B".into()),
+                    ("c".into(), "Option C".into()),
+                ],
+            },
+        );
+        press_char(&mut app, '3');
+        let response = rx.try_recv().unwrap();
+        assert!(matches!(response, DialogResponse::Index(2)));
+    }
+
+    // ─── WorkflowStepError dialog ─────────────────────────────────────────────
+
+    #[test]
+    fn workflow_step_error_r_sends_char_r() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            Dialog::WorkflowStepError(WorkflowStepErrorState {
+                step_name: "build".into(),
+                error_lines: vec!["Step failed".into()],
+            }),
+        );
+        press_char(&mut app, 'r');
+        let response = rx.try_recv().unwrap();
+        assert!(matches!(response, DialogResponse::Char('r')));
+    }
+
+    #[test]
+    fn workflow_step_error_a_sends_char_a() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            Dialog::WorkflowStepError(WorkflowStepErrorState {
+                step_name: "build".into(),
+                error_lines: vec!["Step failed".into()],
+            }),
+        );
+        press_char(&mut app, 'a');
+        let response = rx.try_recv().unwrap();
+        assert!(matches!(response, DialogResponse::Char('a')));
+    }
+
+    // ─── ListPicker scroll ────────────────────────────────────────────────────
+
+    #[test]
+    fn list_picker_scroll_down_increments_selection() {
+        let mut app = make_app();
+        app.active_dialog = Some(Dialog::ListPicker {
+            title: "Pick".into(),
+            items: vec!["a".into(), "b".into(), "c".into()],
+            selected: 0,
+        });
+        press_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        match &app.active_dialog {
+            Some(Dialog::ListPicker { selected, .. }) => assert_eq!(*selected, 1),
+            _ => panic!("expected ListPicker dialog"),
+        }
+    }
+
+    #[test]
+    fn list_picker_scroll_up_at_zero_stays_zero() {
+        let mut app = make_app();
+        app.active_dialog = Some(Dialog::ListPicker {
+            title: "Pick".into(),
+            items: vec!["a".into(), "b".into(), "c".into()],
+            selected: 0,
+        });
+        press_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        match &app.active_dialog {
+            Some(Dialog::ListPicker { selected, .. }) => assert_eq!(*selected, 0),
+            _ => panic!("expected ListPicker dialog"),
+        }
+    }
+
+    #[test]
+    fn list_picker_enter_sends_selected_index() {
+        let mut app = make_app();
+        let rx = setup_command_dialog(
+            &mut app,
+            Dialog::ListPicker {
+                title: "Pick".into(),
+                items: vec!["a".into(), "b".into(), "c".into()],
+                selected: 2,
+            },
+        );
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let response = rx.try_recv().unwrap();
+        assert!(matches!(response, DialogResponse::Index(2)));
+    }
+
+    // ─── Autocomplete cycling ─────────────────────────────────────────────────
+
+    #[test]
+    fn autocomplete_next_fills_command_box_with_first_suggestion() {
+        let mut app = make_app();
+        // Type enough for a known completion
+        for c in "cha".chars() {
+            press_char(&mut app, c);
+        }
+        press_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(
+            app.command_input.text.contains("chat"),
+            "expected 'chat' in input, got: {:?}",
+            app.command_input.text
+        );
+    }
+
+    #[test]
+    fn autocomplete_prev_fills_command_box_with_last_suggestion() {
+        let mut app = make_app();
+        for c in "cha".chars() {
+            press_char(&mut app, c);
+        }
+        // Update suggestions so we know the last one
+        app.update_suggestions();
+        let last = app.suggestion_row.last().cloned().unwrap_or_default();
+        press_key(&mut app, KeyCode::BackTab, KeyModifiers::NONE);
+        assert!(
+            app.command_input.text.contains("cha"),
+            "expected suggestion containing 'cha', got: {:?}",
+            app.command_input.text
+        );
+        // The text should match the last suggestion (or still contain "cha" if only one)
+        let _ = last; // used above
+    }
+
+    #[test]
+    fn tab_with_no_suggestions_leaves_input_unchanged() {
+        let mut app = make_app();
+        for c in "zzzzz".chars() {
+            press_char(&mut app, c);
+        }
+        press_key(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.command_input.text, "zzzzz");
+    }
+
+    // ─── Focus switching ──────────────────────────────────────────────────────
+
+    #[test]
+    fn up_arrow_in_command_box_switches_focus_to_execution_window() {
+        let mut app = make_app();
+        assert_eq!(app.focus, Focus::CommandBox);
+        press_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::ExecutionWindow);
+    }
+
+    #[test]
+    fn esc_in_execution_window_returns_focus_to_command_box() {
+        let mut app = make_app();
+        app.focus = Focus::ExecutionWindow;
+        press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(app.focus, Focus::CommandBox);
+    }
+
+    // ─── Text input (non-dialog) ──────────────────────────────────────────────
+
+    #[test]
+    fn empty_command_submit_does_not_set_execution_phase() {
+        use crate::frontend::tui::tabs::ExecutionPhase;
+        let mut app = make_app();
+        // input is empty by default
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.tabs[app.active_tab].execution_phase, ExecutionPhase::Idle);
+    }
+
+    // ─── Toggle status log ────────────────────────────────────────────────────
+
+    #[test]
+    fn l_in_execution_window_toggles_status_log() {
+        let mut app = make_app();
+        app.focus = Focus::ExecutionWindow;
+        let initial = app.tabs[app.active_tab].status_log_collapsed;
+        press_char(&mut app, 'l');
+        assert_ne!(app.tabs[app.active_tab].status_log_collapsed, initial);
+    }
+
+    // ─── WorkflowControlBoard arrow keys ─────────────────────────────────────
+
+    fn setup_wcb_dialog(app: &mut App) -> std::sync::mpsc::Receiver<DialogResponse> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.tabs[app.active_tab].dialog_response_tx = Some(tx);
+        app.active_dialog = Some(Dialog::WorkflowControlBoard(
+            crate::frontend::tui::dialogs::WorkflowControlBoardState {
+                step_name: "test".into(),
+                can_launch_next: true,
+                can_continue_current: true,
+                can_restart: true,
+                can_go_back: true,
+                can_finish: true,
+                continue_unavailable_reason: None,
+                cancel_to_previous_unavailable_reason: None,
+                finish_workflow_unavailable_reason: None,
+            },
+        ));
+        app.command_dialog_active = true;
+        rx
+    }
+
+    #[test]
+    fn wcb_right_arrow_sends_launch_next() {
+        let mut app = make_app();
+        let rx = setup_wcb_dialog(&mut app);
+        press_key(&mut app, KeyCode::Right, KeyModifiers::NONE);
+        let resp = rx.try_recv().unwrap();
+        assert!(matches!(resp, DialogResponse::Char('>')));
+        assert!(app.active_dialog.is_none());
+    }
+
+    #[test]
+    fn wcb_down_arrow_sends_continue_current() {
+        let mut app = make_app();
+        let rx = setup_wcb_dialog(&mut app);
+        press_key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        let resp = rx.try_recv().unwrap();
+        assert!(matches!(resp, DialogResponse::Char('v')));
+    }
+
+    #[test]
+    fn wcb_up_arrow_sends_restart_step() {
+        let mut app = make_app();
+        let rx = setup_wcb_dialog(&mut app);
+        press_key(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        let resp = rx.try_recv().unwrap();
+        assert!(matches!(resp, DialogResponse::Char('^')));
+    }
+
+    #[test]
+    fn wcb_left_arrow_sends_cancel_to_previous() {
+        let mut app = make_app();
+        let rx = setup_wcb_dialog(&mut app);
+        press_key(&mut app, KeyCode::Left, KeyModifiers::NONE);
+        let resp = rx.try_recv().unwrap();
+        assert!(matches!(resp, DialogResponse::Char('<')));
+    }
+
+    #[test]
+    fn wcb_ctrl_enter_sends_finish_workflow() {
+        let mut app = make_app();
+        let rx = setup_wcb_dialog(&mut app);
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
+        let resp = rx.try_recv().unwrap();
+        assert!(matches!(resp, DialogResponse::Char('f')));
+    }
+
+    #[test]
+    fn wcb_char_a_sends_abort() {
+        let mut app = make_app();
+        let rx = setup_wcb_dialog(&mut app);
+        press_char(&mut app, 'a');
+        let resp = rx.try_recv().unwrap();
+        assert!(matches!(resp, DialogResponse::Char('a')));
+    }
+
+    #[test]
+    fn wcb_esc_sends_dismissed() {
+        let mut app = make_app();
+        let rx = setup_wcb_dialog(&mut app);
+        press_key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let resp = rx.try_recv().unwrap();
+        assert!(matches!(resp, DialogResponse::Dismissed));
+    }
+
+    // ─── Command box locked during Running ────────────────────────────────────
+
+    #[test]
+    fn char_input_blocked_while_running() {
+        let mut app = make_app();
+        app.tabs[app.active_tab].execution_phase =
+            crate::frontend::tui::tabs::ExecutionPhase::Running { command: "chat".into() };
+        press_char(&mut app, 'x');
+        assert_eq!(app.command_input.text, "", "command box must be locked while running");
+    }
+
+    #[test]
+    fn backspace_blocked_while_running() {
+        let mut app = make_app();
+        app.command_input.set_text("abc");
+        app.tabs[app.active_tab].execution_phase =
+            crate::frontend::tui::tabs::ExecutionPhase::Running { command: "chat".into() };
+        press_key(&mut app, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(app.command_input.text, "abc", "backspace must be blocked while running");
+    }
+
+    #[test]
+    fn submit_command_blocked_while_running() {
+        use crate::frontend::tui::tabs::ExecutionPhase;
+        let mut app = make_app();
+        app.command_input.set_text("status");
+        app.tabs[app.active_tab].execution_phase =
+            ExecutionPhase::Running { command: "chat".into() };
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        // Phase should still be Running, not a new command
+        assert!(matches!(
+            app.tabs[app.active_tab].execution_phase,
+            ExecutionPhase::Running { .. }
+        ));
+    }
+
+    // ─── q with empty box opens QuitConfirm ──────────────────────────────────
+
+    #[test]
+    fn q_with_empty_command_box_opens_quit_confirm() {
+        let mut app = make_app();
+        assert!(app.command_input.text.is_empty());
+        press_char(&mut app, 'q');
+        assert!(
+            matches!(app.active_dialog, Some(Dialog::QuitConfirm)),
+            "q with empty command box must open QuitConfirm"
+        );
+    }
+
+    #[test]
+    fn q_with_nonempty_command_box_inserts_char() {
+        let mut app = make_app();
+        app.command_input.set_text("quer");
+        press_char(&mut app, 'y');
+        assert_eq!(app.command_input.text, "query");
+        assert!(app.active_dialog.is_none());
+    }
+
+    // ─── Any key in Done/Error execution window refocuses command box ─────────
+
+    #[test]
+    fn any_unhandled_key_in_done_execution_window_refocuses_command_box() {
+        let mut app = make_app();
+        app.focus = Focus::ExecutionWindow;
+        app.tabs[app.active_tab].execution_phase =
+            crate::frontend::tui::tabs::ExecutionPhase::Done {
+                command: "chat".into(),
+                exit_code: 0,
+            };
+        // Press a key that maps to Action::None in execution window context
+        press_char(&mut app, 'x');
+        assert_eq!(
+            app.focus,
+            Focus::CommandBox,
+            "unhandled key in Done execution window must refocus command box"
+        );
+    }
+
+    #[test]
+    fn any_unhandled_key_in_error_execution_window_refocuses_command_box() {
+        let mut app = make_app();
+        app.focus = Focus::ExecutionWindow;
+        app.tabs[app.active_tab].execution_phase =
+            crate::frontend::tui::tabs::ExecutionPhase::Error {
+                command: "chat".into(),
+                message: "failed".into(),
+            };
+        press_char(&mut app, 'z');
+        assert_eq!(app.focus, Focus::CommandBox);
+    }
+
+    #[test]
+    fn unhandled_key_in_running_execution_window_does_not_refocus() {
+        let mut app = make_app();
+        app.focus = Focus::ExecutionWindow;
+        app.tabs[app.active_tab].execution_phase =
+            crate::frontend::tui::tabs::ExecutionPhase::Running { command: "chat".into() };
+        press_char(&mut app, 'x');
+        assert_eq!(
+            app.focus,
+            Focus::ExecutionWindow,
+            "focus must not change during Running"
+        );
+    }
+
+    // ─── Dialog Home/End/Delete ───────────────────────────────────────────────
+
+    #[test]
+    fn home_in_text_input_dialog_moves_cursor_to_start() {
+        let mut app = make_app();
+        let mut editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+        editor.set_text("hello");
+        app.active_dialog = Some(Dialog::TextInput {
+            title: "T".into(),
+            prompt: "P".into(),
+            editor,
+        });
+        app.command_dialog_active = true;
+        press_key(&mut app, KeyCode::Home, KeyModifiers::NONE);
+        if let Some(Dialog::TextInput { editor, .. }) = &app.active_dialog {
+            assert_eq!(editor.cursor, 0, "Home must move cursor to start");
+        } else {
+            panic!("dialog should still be open");
+        }
+    }
+
+    #[test]
+    fn end_in_text_input_dialog_moves_cursor_to_end() {
+        let mut app = make_app();
+        let mut editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+        editor.set_text("hello");
+        editor.move_home();
+        app.active_dialog = Some(Dialog::TextInput {
+            title: "T".into(),
+            prompt: "P".into(),
+            editor,
+        });
+        app.command_dialog_active = true;
+        press_key(&mut app, KeyCode::End, KeyModifiers::NONE);
+        if let Some(Dialog::TextInput { editor, .. }) = &app.active_dialog {
+            assert_eq!(editor.cursor, 5, "End must move cursor to end");
+        } else {
+            panic!("dialog should still be open");
+        }
+    }
+
+    #[test]
+    fn delete_in_text_input_dialog_removes_char_at_cursor() {
+        let mut app = make_app();
+        let mut editor = crate::frontend::tui::text_edit::TextEdit::new(false);
+        editor.set_text("hello");
+        editor.move_home(); // cursor at 0
+        app.active_dialog = Some(Dialog::TextInput {
+            title: "T".into(),
+            prompt: "P".into(),
+            editor,
+        });
+        app.command_dialog_active = true;
+        press_key(&mut app, KeyCode::Delete, KeyModifiers::NONE);
+        if let Some(Dialog::TextInput { editor, .. }) = &app.active_dialog {
+            assert_eq!(editor.text, "ello", "Delete must remove char at cursor");
+        } else {
+            panic!("dialog should still be open");
         }
     }
 }

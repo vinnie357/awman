@@ -259,4 +259,38 @@ mod tests {
         let err = parse("status --bogus", cat).unwrap_err();
         assert!(matches!(err, CommandError::UnknownFlag { .. }));
     }
+
+    #[test]
+    fn parse_empty_string_returns_command_box_parse_error() {
+        let cat = CommandCatalogue::get();
+        let err = parse("", cat).unwrap_err();
+        assert!(
+            matches!(err, CommandError::CommandBoxParse(_)),
+            "empty input must return CommandBoxParse, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_quoted_string_argument_is_handled() {
+        let cat = CommandCatalogue::get();
+        let parsed = parse(r#"exec prompt "do something complex""#, cat).unwrap();
+        assert_eq!(parsed.path, vec!["exec", "prompt"]);
+        match parsed.arguments.get("prompt") {
+            Some(ArgValue::Single(s)) => {
+                assert_eq!(s, "do something complex");
+            }
+            other => panic!("expected Single prompt argument, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_short_flag_maps_to_long_name() {
+        let cat = CommandCatalogue::get();
+        let parsed = parse("ready -n", cat).unwrap();
+        assert_eq!(parsed.path, vec!["ready"]);
+        assert!(
+            matches!(parsed.flags.get("non-interactive"), Some(FlagValue::Bool(true))),
+            "-n must map to non-interactive flag"
+        );
+    }
 }

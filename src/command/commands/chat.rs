@@ -145,7 +145,7 @@ impl Command for ChatCommand {
 
         // 8. Run with PTY-active gating.
         frontend.set_pty_active(true);
-        let container_frontend = frontend.container_frontend();
+        let container_frontend = frontend.container_frontend_for_pty();
         let mut execution = match instance.run_with_frontend(container_frontend) {
             Ok(e) => e,
             Err(e) => {
