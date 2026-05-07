@@ -107,20 +107,6 @@ impl Command for StatusCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: "status: gathering session info…".into(),
-        });
-        let session = match open_session() {
-            Ok(s) => s,
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("status: failed to open session: {e}"),
-                });
-                return Err(e);
-            }
-        };
         let mut last_containers: Vec<StatusContainerRow>;
         let mut tick: u32 = 0;
 
@@ -128,7 +114,7 @@ impl Command for StatusCommand {
             let handles = match self
                 .engines
                 .runtime
-                .list_running(&session)
+                .list_running_sync()
             {
                 Ok(h) => h,
                 Err(e) => {
@@ -289,17 +275,6 @@ fn write_status_table(
     frontend.replay_queued();
 }
 
-fn open_session() -> Result<crate::data::session::Session, CommandError> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| CommandError::Other(format!("cwd unavailable: {e}")))?;
-    let resolver = crate::data::session::StaticGitRootResolver::new(cwd.clone());
-    crate::data::session::Session::open(
-        cwd,
-        &resolver,
-        crate::data::session::SessionOpenOptions::default(),
-    )
-    .map_err(CommandError::from)
-}
 
 #[cfg(test)]
 mod tests {

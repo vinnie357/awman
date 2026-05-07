@@ -145,6 +145,7 @@ impl ContainerBackend for DockerBackend {
         let queries: &[&[&str]] = &[
             &["ps", "--filter", "label=amux=true", "--format", format],
             &["ps", "--filter", "name=amux-",      "--format", format],
+            &["ps", "--filter", "name=nanoclaw",   "--format", format],
         ];
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -171,6 +172,9 @@ impl ContainerBackend for DockerBackend {
                     continue;
                 }
                 let name = parts[1].to_string();
+                if id.is_empty() && name.is_empty() {
+                    continue;
+                }
                 let image_tag = parts[2].to_string();
                 let created = parts[3];
                 let started_at =

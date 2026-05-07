@@ -74,13 +74,11 @@ pub fn render_container_maximized(
     // overflow inside vt100's `visible_rows()`.
     let (effective_scroll_offset, max_scrollback) = if tab.container_scroll_offset > 0 {
         let parser = &mut tab.vt100_parser;
-        let rows = parser.screen().size().0 as usize;
         parser.set_scrollback(usize::MAX);
         let depth = parser.screen().scrollback();
         parser.set_scrollback(0);
-        let max = depth.min(rows);
-        let eff = tab.container_scroll_offset.min(max);
-        (eff, max)
+        let eff = tab.container_scroll_offset.min(depth);
+        (eff, depth)
     } else {
         (0, 0)
     };
@@ -204,6 +202,12 @@ pub fn render_container_summary(summary: &LastContainerSummary, area: Rect, fram
 }
 
 // ─── Internals ──────────────────────────────────────────────────────────
+
+/// Test-accessible wrapper for `build_stats_title`.
+#[cfg(test)]
+pub fn build_stats_title_for_test(tab: &Tab) -> String {
+    build_stats_title(tab)
+}
 
 /// Build the right-side stats title: `" {container} | {cpu} | {mem} | {dur} "`.
 /// Falls back to placeholder values until the first stats sample arrives.

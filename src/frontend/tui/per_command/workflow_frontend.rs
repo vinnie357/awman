@@ -122,6 +122,12 @@ impl WorkflowFrontend for TuiCommandFrontend {
         self.pty_reset_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
+        // Clear yolo state so the countdown dialog disappears immediately
+        // when the next step launches (fixes TUI-8: dialog lingering at 0s).
+        if let Ok(mut guard) = self.yolo_state.lock() {
+            *guard = None;
+        }
+
         // Recreate container I/O channels so the new step's container gets
         // fresh stdin/resize channels (stdout reuses the same TUI receiver).
         // The new senders are published via shared slots so the TUI event loop

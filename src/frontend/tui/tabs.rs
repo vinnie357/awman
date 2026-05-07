@@ -192,6 +192,7 @@ pub struct Tab {
     pub is_claws: bool,
     pub output_lines: Vec<String>,
     pub stuck: bool,
+    pub yolo_mode: bool,
     pub yolo_countdown: Option<u64>,
     /// When the user dismissed the yolo countdown (Esc or Ctrl-W), records the
     /// instant so `tick_all_tabs` won't re-open the overlay until the stuck
@@ -231,10 +232,11 @@ pub struct Tab {
 
 impl Tab {
     pub fn new(session: Session) -> Self {
+        let scrollback = session.effective_config().scrollback_lines();
         Self {
             session,
             execution_phase: ExecutionPhase::Idle,
-            vt100_parser: vt100::Parser::new(24, 80, 10000),
+            vt100_parser: vt100::Parser::new(24, 80, scrollback),
             container_window_state: ContainerWindowState::Hidden,
             container_scroll_offset: 0,
             container_info: None,
@@ -253,6 +255,7 @@ impl Tab {
             is_claws: false,
             output_lines: Vec::new(),
             stuck: false,
+            yolo_mode: false,
             yolo_countdown: None,
             yolo_dismissed_at: None,
             last_output_time: None,
@@ -332,7 +335,7 @@ impl Tab {
     ) {
         self.container_window_state = ContainerWindowState::Maximized;
         self.container_scroll_offset = 0;
-        self.vt100_parser = vt100::Parser::new(rows, cols, 10000);
+        self.vt100_parser = vt100::Parser::new(rows, cols, self.session.effective_config().scrollback_lines());
         self.last_container_summary = None;
         self.mouse_selection = None;
         self.last_output_time = Some(Instant::now());
@@ -394,6 +397,15 @@ impl Tab {
             | ExecutionPhase::Done { command, .. }
             | ExecutionPhase::Error { command, .. } => command.as_str(),
         };
+
+        // When a workflow is active, append step info: "exec workflow: step (N/M)"
+        let workflow_suffix = self.workflow_step_suffix();
+        let display = if workflow_suffix.is_empty() {
+            cmd.to_string()
+        } else {
+            format!("{}: {}", cmd, workflow_suffix)
+        };
+
         let prefix = if self.stuck && self.is_stuck(is_active, STUCK_TIMEOUT) {
             "\u{26a0}\u{fe0f} "
         } else {
@@ -402,13 +414,47 @@ impl Tab {
         let prefix_chars = prefix.chars().count();
         let max_chars = (tab_width as usize).saturating_sub(4);
         let cmd_max = max_chars.saturating_sub(prefix_chars);
-        let cmd_str = if cmd.chars().count() > cmd_max && cmd_max > 1 {
-            let truncated: String = cmd.chars().take(cmd_max - 1).collect();
+        let cmd_str = if display.chars().count() > cmd_max && cmd_max > 1 {
+            let truncated: String = display.chars().take(cmd_max - 1).collect();
             format!("{}\u{2026}", truncated)
         } else {
-            cmd.to_string()
+            display
         };
         format!("{}{}", prefix, cmd_str)
+    }
+
+    /// Build a workflow step suffix like "implement (2/5)" for the tab label.
+    /// Returns empty string when no workflow is active or has no steps.
+    fn workflow_step_suffix(&self) -> String {
+        let guard = match self.workflow_state.lock() {
+            Ok(g) => g,
+            Err(_) => return String::new(),
+        };
+        let view = match guard.as_ref() {
+            Some(v) if !v.steps.is_empty() => v,
+            _ => return String::new(),
+        };
+        let total = view.steps.len();
+        let done_count = view.steps.iter().filter(|s| s.status == "done").count();
+        let current_name = view.current_step.as_deref().unwrap_or_else(|| {
+            view.steps.iter()
+                .find(|s| s.status == "running")
+                .map(|s| s.name.as_str())
+                .unwrap_or("")
+        });
+        if current_name.is_empty() {
+            // Workflow finished or not yet started
+            let completed = done_count == total;
+            if completed {
+                return format!("done ({}/{})", total, total);
+            }
+            return String::new();
+        }
+        let step_index = view.steps.iter()
+            .position(|s| s.name == current_name)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        format!("{} ({}/{})", current_name, step_index, total)
     }
 
     /// Drain pending container output into the vt100 parser.
@@ -427,7 +473,7 @@ impl Tab {
             // Check if the engine signalled a PTY reset (workflow step transition).
             if self.pty_reset_flag.swap(false, Ordering::Relaxed) {
                 let (rows, cols) = self.vt100_parser.screen().size();
-                self.vt100_parser = vt100::Parser::new(rows, cols, 10000);
+                self.vt100_parser = vt100::Parser::new(rows, cols, self.session.effective_config().scrollback_lines());
                 self.container_scroll_offset = 0;
                 self.mouse_selection = None;
             }

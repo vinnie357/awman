@@ -472,9 +472,12 @@ impl Command for ImplementCommand {
                 flags: Arc::clone(&flags_arc),
                 directory_overlays,
             };
+            let wi_num = parse_work_item_number(&self.flags.work_item);
+            let work_item = if wi_num > 0 { Some(wi_num) } else { None };
             let mut engine = match WorkflowEngine::new(
                 &session,
                 workflow,
+                work_item,
                 Box::new(proxy),
                 Box::new(factory),
                 Arc::clone(&self.engines.git_engine),

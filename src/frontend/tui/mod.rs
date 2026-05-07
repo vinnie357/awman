@@ -266,11 +266,15 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             tab.container_window_state = tab.container_window_state.cycle();
         }
         Action::WorkflowControl => {
-            // Guard: only act when a workflow is active with a current step.
+            // Guard: act when a workflow is active (has steps) OR a yolo
+            // countdown is running (current_step may be None between steps).
             let workflow_active = app.active_tab().workflow_state.lock().ok()
-                .and_then(|g| g.as_ref().and_then(|v| v.current_step.clone()))
-                .is_some();
-            if !workflow_active {
+                .and_then(|g| g.as_ref().map(|v| !v.steps.is_empty()))
+                .unwrap_or(false);
+            let yolo_active = app.active_tab().yolo_state.lock().ok()
+                .and_then(|g| g.is_some().then_some(true))
+                .unwrap_or(false);
+            if !workflow_active && !yolo_active {
                 // No workflow running — ignore.
             } else if matches!(app.active_dialog, Some(Dialog::WorkflowYoloCountdown(_))) {
                 // During yolo countdown: cancel it and signal the engine to
@@ -504,11 +508,10 @@ fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
                 // screen rows, so cap to min(scrollback_depth, rows).
                 let max_scroll = {
                     let parser = &mut tab.vt100_parser;
-                    let rows = parser.screen().size().0 as usize;
                     parser.set_scrollback(usize::MAX);
                     let depth = parser.screen().scrollback();
                     parser.set_scrollback(0);
-                    depth.min(rows)
+                    depth
                 };
                 tab.container_scroll_offset =
                     (tab.container_scroll_offset + 5).min(max_scroll);

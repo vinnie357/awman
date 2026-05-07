@@ -39,6 +39,8 @@ pub struct WorkflowState {
     pub schema_version: u32,
     pub workflow_name: String,
     pub workflow_hash: String,
+    #[serde(default)]
+    pub work_item: Option<u32>,
     pub step_states: HashMap<String, StepState>,
     pub completed_steps: HashSet<String>,
     pub current_step_index: Option<usize>,
@@ -52,7 +54,12 @@ fn default_schema_version() -> u32 {
 
 impl WorkflowState {
     /// Construct a fresh state for a workflow that is about to run for the first time.
-    pub fn new(workflow_name: String, steps: &[WorkflowStep], hash: String) -> Self {
+    pub fn new(
+        workflow_name: String,
+        steps: &[WorkflowStep],
+        hash: String,
+        work_item: Option<u32>,
+    ) -> Self {
         let now = Utc::now();
         let mut step_states = HashMap::with_capacity(steps.len());
         for s in steps {
@@ -62,6 +69,7 @@ impl WorkflowState {
             schema_version: WORKFLOW_STATE_SCHEMA_VERSION,
             workflow_name,
             workflow_hash: hash,
+            work_item,
             step_states,
             completed_steps: HashSet::new(),
             current_step_index: None,
@@ -142,7 +150,7 @@ mod tests {
     #[test]
     fn new_state_initializes_pending() {
         let steps = vec![step("a", &[]), step("b", &["a"])];
-        let s = WorkflowState::new("wf".into(), &steps, "h".into());
+        let s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
         assert!(matches!(s.status_of("a"), Some(StepState::Pending)));
         assert!(s.completed_steps.is_empty());
         assert_eq!(s.schema_version, WORKFLOW_STATE_SCHEMA_VERSION);
@@ -151,7 +159,7 @@ mod tests {
     #[test]
     fn set_status_updates_completed_set() {
         let steps = vec![step("a", &[])];
-        let mut s = WorkflowState::new("wf".into(), &steps, "h".into());
+        let mut s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
         s.set_status("a", StepState::Succeeded);
         assert!(s.completed_steps.contains("a"));
         s.set_status("a", StepState::Pending);
@@ -161,7 +169,7 @@ mod tests {
     #[test]
     fn round_trips_through_json() {
         let steps = vec![step("a", &[])];
-        let s = WorkflowState::new("wf".into(), &steps, "h".into());
+        let s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
         let j = serde_json::to_string(&s).unwrap();
         let back: WorkflowState = serde_json::from_str(&j).unwrap();
         assert_eq!(s, back);
@@ -175,7 +183,7 @@ mod tests {
     #[test]
     fn is_complete_when_all_succeeded() {
         let steps = vec![step("a", &[])];
-        let mut s = WorkflowState::new("wf".into(), &steps, "h".into());
+        let mut s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
         s.set_status("a", StepState::Succeeded);
         assert!(s.is_complete());
     }
@@ -183,7 +191,7 @@ mod tests {
     #[test]
     fn is_complete_false_when_pending() {
         let steps = vec![step("a", &[])];
-        let s = WorkflowState::new("wf".into(), &steps, "h".into());
+        let s = WorkflowState::new("wf".into(), &steps, "h".into(), None);
         assert!(!s.is_complete());
     }
 }

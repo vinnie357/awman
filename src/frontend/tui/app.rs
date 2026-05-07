@@ -150,10 +150,18 @@ impl App {
 
         // Reset the vt100 parser so the previous container's output is gone.
         let (rows, cols) = tab.vt100_parser.screen().size();
-        tab.vt100_parser = vt100::Parser::new(rows, cols, 10000);
+        tab.vt100_parser = vt100::Parser::new(rows, cols, tab.session.effective_config().scrollback_lines());
         tab.container_scroll_offset = 0;
         tab.mouse_selection = None;
         tab.last_container_summary = None;
+
+        // Clear previous workflow state so the strip resets for the new command.
+        if let Ok(mut guard) = tab.workflow_state.lock() {
+            *guard = None;
+        }
+        if let Ok(mut guard) = tab.yolo_state.lock() {
+            *guard = None;
+        }
 
         // Dialog channels (std::sync::mpsc — command thread blocks on recv).
         let (dialog_req_tx, dialog_req_rx) = std::sync::mpsc::channel::<DialogRequest>();
@@ -259,6 +267,12 @@ impl App {
             sink.info("╚══════════════════════════════════════════════════════════════╝".to_string());
         }
 
+        tab.yolo_mode = parsed.flags.get("yolo")
+            .map(|v| matches!(v, crate::command::dispatch::parsed_input::FlagValue::Bool(true)))
+            .unwrap_or(false)
+            || parsed.flags.get("auto")
+                .map(|v| matches!(v, crate::command::dispatch::parsed_input::FlagValue::Bool(true)))
+                .unwrap_or(false);
         tab.execution_phase = ExecutionPhase::Running {
             command: command_name,
         };
@@ -297,12 +311,15 @@ impl App {
 
             // Pick up the container name from the engine (set via
             // `report_status(Running { container_name })`).
+            // Also handles workflow step transitions: the engine clears the
+            // shared name (setting it to None) then sets a new name when the
+            // next container reports Running. We must clear the tab's
+            // container_name so the new name gets picked up.
             if let Some(ref mut info) = tab.container_info {
-                if info.container_name.is_empty() {
-                    if let Ok(mut name_guard) = tab.container_name_shared.lock() {
-                        if let Some(name) = name_guard.take() {
-                            info.container_name = name;
-                        }
+                if let Ok(mut name_guard) = tab.container_name_shared.lock() {
+                    if let Some(name) = name_guard.take() {
+                        info.container_name = name;
+                        info.latest_stats = None;
                     }
                 }
             }
@@ -340,13 +357,19 @@ impl App {
         }
 
         // Dispatch a new stats poll every ~3 seconds for tabs with active containers.
+        // Uses spawn_blocking because stats() runs blocking Docker/container
+        // CLI commands that must not occupy the async worker thread pool.
+        //
+        // When the container name is known, we call stats() directly (1 Docker
+        // command) instead of list_running_all() + find + stats (4 commands).
+        // Falls back to listing only when the name isn't set yet.
         if self.last_stats_poll.elapsed() >= std::time::Duration::from_secs(3) {
             self.last_stats_poll = std::time::Instant::now();
             for (i, tab) in self.tabs.iter().enumerate() {
                 if !matches!(tab.execution_phase, crate::frontend::tui::tabs::ExecutionPhase::Running { .. }) {
                     continue;
                 }
-                if tab.container_window_state == crate::frontend::tui::tabs::ContainerWindowState::Hidden {
+                if tab.container_info.is_none() {
                     continue;
                 }
                 let container_name = tab.container_info.as_ref()
@@ -355,28 +378,106 @@ impl App {
                 let runtime = self.engines.runtime.clone();
                 let tx = self.stats_tx.clone();
                 let tab_idx = i;
-                self.runtime_handle.spawn(async move {
-                    let handles = match runtime.list_running_sync() {
-                        Ok(h) => h,
-                        Err(_) => return,
-                    };
-                    // Find the right container: match by name if known,
-                    // otherwise use the first amux container.
-                    let target = if !container_name.is_empty() {
-                        handles.iter().find(|h| h.name == container_name)
-                    } else {
-                        handles.first()
-                    };
-                    if let Some(handle) = target {
-                        if let Ok(stats) = runtime.stats(handle) {
+                self.runtime_handle.spawn_blocking(move || {
+                    if !container_name.is_empty() {
+                        // Fast path: name is known, query stats directly.
+                        let handle = crate::data::session::ContainerHandle {
+                            id: container_name.clone(),
+                            name: container_name,
+                            image_tag: String::new(),
+                            started_at: chrono::Utc::now(),
+                        };
+                        if let Ok(stats) = runtime.stats(&handle) {
                             let _ = tx.send((tab_idx, stats));
+                        }
+                    } else {
+                        // Slow path: name unknown, list containers and pick the first.
+                        if let Ok(handles) = runtime.list_running_sync() {
+                            if let Some(handle) = handles.first() {
+                                if let Ok(stats) = runtime.stats(handle) {
+                                    let _ = tx.send((tab_idx, stats));
+                                }
+                            }
                         }
                     }
                 });
             }
         }
 
+        // Stuck-container → trigger yolo countdown or control board.
+        // This mirrors old-amux: when a tab is stuck during a workflow step,
+        // the TUI autonomously opens the appropriate dialog.
         let active = self.active_tab;
+        {
+            let tab = &self.tabs[active];
+            let has_workflow_step = tab.workflow_state.lock().ok()
+                .and_then(|g| g.as_ref().and_then(|ws| ws.current_step.clone()))
+                .is_some();
+            let engine_yolo_active = tab.yolo_state.lock().ok()
+                .map(|g| g.is_some())
+                .unwrap_or(false);
+            let backoff_active = tab.yolo_dismissed_at
+                .map(|t| t.elapsed() < crate::engine::workflow::timing::STUCK_DIALOG_BACKOFF)
+                .unwrap_or(false);
+            let auto_disabled = tab.workflow_state.lock().ok()
+                .and_then(|g| g.as_ref().map(|ws| {
+                    ws.current_step.as_ref()
+                        .map(|s| ws.auto_disabled.contains(s))
+                        .unwrap_or(false)
+                }))
+                .unwrap_or(false);
+
+            if tab.stuck
+                && has_workflow_step
+                && !engine_yolo_active
+                && !self.command_dialog_active
+                && !backoff_active
+                && !auto_disabled
+            {
+                let step_name = tab.workflow_state.lock().ok()
+                    .and_then(|g| g.as_ref().and_then(|ws| ws.current_step.clone()))
+                    .unwrap_or_default();
+                if tab.yolo_mode {
+                    if tab.yolo_countdown.is_none() {
+                        let tab_mut = &mut self.tabs[active];
+                        tab_mut.yolo_countdown = Some(60);
+                    }
+                    let remaining = self.tabs[active].yolo_countdown.unwrap_or(60);
+                    self.active_dialog =
+                        Some(Dialog::WorkflowYoloCountdown(
+                            crate::frontend::tui::dialogs::WorkflowYoloCountdownState {
+                                step_name,
+                                remaining_secs: remaining,
+                            },
+                        ));
+                } else if !matches!(self.active_dialog, Some(Dialog::WorkflowControlBoard(_))) {
+                    self.active_dialog =
+                        Some(Dialog::WorkflowControlBoard(
+                            crate::frontend::tui::dialogs::WorkflowControlBoardState {
+                                step_name,
+                                can_launch_next: true,
+                                can_continue_current: false,
+                                can_restart: true,
+                                can_go_back: false,
+                                can_finish: true,
+                                continue_unavailable_reason: Some(
+                                    "agent is still running".into(),
+                                ),
+                                cancel_to_previous_unavailable_reason: None,
+                                finish_workflow_unavailable_reason: None,
+                            },
+                        ));
+                }
+            } else if !tab.stuck && !has_workflow_step {
+                // Clear stuck-triggered countdown when unstuck.
+                if matches!(self.active_dialog, Some(Dialog::WorkflowYoloCountdown(_))) {
+                    if !engine_yolo_active {
+                        self.active_dialog = None;
+                    }
+                }
+            }
+        }
+
         let yolo_snapshot = self.tabs[active]
             .yolo_state
             .lock()
@@ -402,7 +503,9 @@ impl App {
             self.active_dialog,
             Some(Dialog::WorkflowYoloCountdown(_))
         ) {
-            self.active_dialog = None;
+            if self.tabs[active].yolo_countdown.is_none() {
+                self.active_dialog = None;
+            }
         }
     }
 
@@ -651,5 +754,128 @@ mod tests {
         app.close_active_tab();
         assert_eq!(app.tabs.len(), 1);
         assert!(!app.should_quit);
+    }
+
+    // ── stats drain pipeline ─────────────────────────────────────────────
+
+    #[test]
+    fn stats_drain_populates_latest_stats() {
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        tab.execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
+            command: "chat".into(),
+        };
+        tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
+            agent_display_name: "Claude".into(),
+            container_name: "amux-test-1234".into(),
+            start_time: std::time::Instant::now(),
+            latest_stats: None,
+            stats_history: Vec::new(),
+        });
+        assert!(app.active_tab().container_info.as_ref().unwrap().latest_stats.is_none());
+
+        // Simulate a stats result arriving on the channel.
+        let stats = crate::engine::container::instance::ContainerStats {
+            name: "amux-test-1234".into(),
+            cpu_percent: 42.5,
+            memory_mb: 256.0,
+        };
+        app.stats_tx.send((0, stats)).unwrap();
+
+        // tick_all_tabs drains the channel.
+        app.tick_all_tabs();
+
+        let info = app.active_tab().container_info.as_ref().unwrap();
+        assert!(info.latest_stats.is_some(), "latest_stats must be populated after drain");
+        let s = info.latest_stats.as_ref().unwrap();
+        assert_eq!(s.cpu_percent, 42.5);
+        assert_eq!(s.memory_mb, 256.0);
+        assert_eq!(s.name, "amux-test-1234");
+        assert_eq!(info.stats_history.len(), 1);
+    }
+
+    #[test]
+    fn container_name_picked_up_from_shared_state() {
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        tab.execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
+            command: "chat".into(),
+        };
+        tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
+            agent_display_name: "Claude".into(),
+            container_name: String::new(),
+            start_time: std::time::Instant::now(),
+            latest_stats: None,
+            stats_history: Vec::new(),
+        });
+
+        // Simulate the engine reporting the container name.
+        if let Ok(mut guard) = tab.container_name_shared.lock() {
+            *guard = Some("amux-new-container".into());
+        }
+
+        app.tick_all_tabs();
+
+        let info = app.active_tab().container_info.as_ref().unwrap();
+        assert_eq!(info.container_name, "amux-new-container");
+    }
+
+    #[test]
+    fn new_container_name_overwrites_old_and_clears_stats() {
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        tab.execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
+            command: "exec workflow".into(),
+        };
+        tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
+            agent_display_name: "Claude".into(),
+            container_name: "amux-old-container".into(),
+            start_time: std::time::Instant::now(),
+            latest_stats: Some(crate::engine::container::instance::ContainerStats {
+                name: "amux-old-container".into(),
+                cpu_percent: 10.0,
+                memory_mb: 100.0,
+            }),
+            stats_history: vec![(10.0, 100.0)],
+        });
+
+        // Simulate a workflow step transition reporting a new container name.
+        if let Ok(mut guard) = tab.container_name_shared.lock() {
+            *guard = Some("amux-step2-container".into());
+        }
+
+        app.tick_all_tabs();
+
+        let info = app.active_tab().container_info.as_ref().unwrap();
+        assert_eq!(info.container_name, "amux-step2-container");
+        assert!(
+            info.latest_stats.is_none(),
+            "latest_stats must be cleared when a new container name arrives"
+        );
+    }
+
+    #[test]
+    fn stats_title_shows_values_when_stats_present() {
+        use crate::frontend::tui::tabs::ContainerInfo;
+        use crate::engine::container::instance::ContainerStats;
+
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        tab.container_info = Some(ContainerInfo {
+            agent_display_name: "Claude".into(),
+            container_name: "amux-test".into(),
+            start_time: std::time::Instant::now(),
+            latest_stats: Some(ContainerStats {
+                name: "amux-test".into(),
+                cpu_percent: 42.5,
+                memory_mb: 256.0,
+            }),
+            stats_history: Vec::new(),
+        });
+
+        let title = crate::frontend::tui::container_view::build_stats_title_for_test(tab);
+        assert!(title.contains("42.5%"), "title must contain CPU: {title}");
+        assert!(title.contains("256MiB"), "title must contain memory: {title}");
+        assert!(title.contains("amux-test"), "title must contain name: {title}");
     }
 }

@@ -1,3 +1,4 @@
 {
-  "agent": "claude"
+  "agent": "claude",
+  "terminal_scrollback_lines": 7500
 }

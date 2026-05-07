@@ -28,7 +28,7 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
     ) -> Result<PreWorktreeDecision, CommandError> {
         let file_list = format_file_list(files);
         let body = format!(
-            "{} uncommitted file(s):\n{}\n\n[c] Commit first  [u] Use last commit  [a] Abort",
+            "{} uncommitted file(s):\n\n{}",
             files.len(),
             file_list
         );
@@ -98,17 +98,17 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
         let status = if had_error {
             "ended with errors"
         } else {
-            "completed"
+            "completed successfully"
         };
         let response = self.ask_dialog(DialogRequest::Custom {
-            title: "Worktree action".into(),
+            title: "Workflow Complete — Worktree Action".into(),
             body: format!(
-                "Workflow {status} on branch '{branch}'.\n\nWhat would you like to do?"
+                "Workflow {status}.\nBranch: {branch}\n\nChoose what to do with the worktree:"
             ),
             keys: vec![
                 ('m', "Merge into main branch".into()),
-                ('d', "Discard worktree".into()),
-                ('k', "Keep worktree".into()),
+                ('d', "Discard worktree (delete branch and directory)".into()),
+                ('k', "Keep worktree for later".into()),
             ],
         })?;
         Ok(match response {

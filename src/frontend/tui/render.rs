@@ -535,17 +535,25 @@ fn render_suggestion_row(app: &App, area: Rect, frame: &mut Frame) {
         return;
     }
 
-    // Context fallback: project's working directory.
-    let cwd_str = app
-        .active_tab()
-        .session
-        .working_dir()
-        .to_string_lossy()
-        .into_owned();
-    let para = Paragraph::new(Line::from(vec![
-        Span::styled("  CWD: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(cwd_str, Style::default().fg(Color::DarkGray)),
-    ]));
+    // Context fallback: show worktree path (if active) or working directory.
+    let tab = app.active_tab();
+    let working_dir = tab.session.working_dir();
+    let git_root = tab.session.git_root();
+    let is_worktree = working_dir != git_root;
+
+    let para = if is_worktree {
+        let wt_str = working_dir.to_string_lossy().into_owned();
+        Paragraph::new(Line::from(vec![
+            Span::styled("  Using worktree: ", Style::default().fg(Color::Blue)),
+            Span::styled(wt_str, Style::default().fg(Color::DarkGray)),
+        ]))
+    } else {
+        let cwd_str = working_dir.to_string_lossy().into_owned();
+        Paragraph::new(Line::from(vec![
+            Span::styled("  CWD: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(cwd_str, Style::default().fg(Color::DarkGray)),
+        ]))
+    };
     frame.render_widget(para, area);
 }
 
@@ -591,7 +599,7 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             editor,
         } => {
             let prompt_lines = prompt.lines().count() as u16;
-            let dialog_h = prompt_lines + 6;
+            let dialog_h = prompt_lines + 8;
             let dialog_area = dialogs::centered_fixed(60, dialog_h, area);
             let inner =
                 dialogs::render_dialog_frame(title, Color::Cyan, dialog_area, frame);
@@ -889,8 +897,10 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
         }
         dialogs::Dialog::Custom { title, body, keys } => {
             let body_lines = body.lines().count() as u16;
-            let height = (keys.len() as u16 + body_lines + 5).min(area.height.saturating_sub(4));
-            let dialog_area = dialogs::centered_fixed(55, height, area);
+            let height = (keys.len() as u16 + body_lines + 6).min(area.height.saturating_sub(4));
+            let max_body_width = body.lines().map(|l| l.len()).max().unwrap_or(40) as u16;
+            let width = max_body_width.clamp(55, area.width.saturating_sub(6));
+            let dialog_area = dialogs::centered_fixed(width, height, area);
             let inner =
                 dialogs::render_dialog_frame(title, Color::Yellow, dialog_area, frame);
             let mut lines = vec![Line::from(body.as_str()), Line::from("")];

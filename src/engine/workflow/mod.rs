@@ -63,6 +63,9 @@ pub struct WorkflowEngine {
     current_step_agent: Option<AgentName>,
     /// The model the in-flight execution targets.
     current_step_model: Option<String>,
+    /// Work item number (e.g. 42 for work item 0042). `None` when running a
+    /// standalone workflow via `exec workflow` without `--work-item`.
+    work_item: Option<u32>,
     /// When true, skip the inter-step user prompt and auto-advance after a
     /// 60-second countdown (giving the user a chance to intervene).
     yolo: bool,
@@ -75,6 +78,7 @@ impl WorkflowEngine {
     pub fn new(
         session: &Session,
         workflow: Workflow,
+        work_item: Option<u32>,
         frontend: Box<dyn WorkflowFrontend>,
         container_factory: Box<dyn ContainerExecutionFactory>,
         git_engine: Arc<GitEngine>,
@@ -86,6 +90,7 @@ impl WorkflowEngine {
             workflow_name_for(&workflow),
             &workflow.steps,
             workflow_hash,
+            work_item,
         );
         let state_store = WorkflowStateStore::new(session);
         let effective_config = session.effective_config();
@@ -104,6 +109,7 @@ impl WorkflowEngine {
             current_step_name: None,
             current_step_agent: None,
             current_step_model: None,
+            work_item,
             yolo: false,
             last_exit_info: None,
         })
@@ -121,6 +127,7 @@ impl WorkflowEngine {
     pub async fn resume(
         session: &Session,
         workflow: Workflow,
+        work_item: Option<u32>,
         mut frontend: Box<dyn WorkflowFrontend>,
         container_factory: Box<dyn ContainerExecutionFactory>,
         git_engine: Arc<GitEngine>,
@@ -129,7 +136,7 @@ impl WorkflowEngine {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
         let store = WorkflowStateStore::new(session);
         let workflow_name = workflow_name_for(&workflow);
-        let saved = store.load(&workflow_name)?;
+        let saved = store.load(work_item, &workflow_name)?;
 
         let workflow_hash = compute_workflow_hash(&workflow);
         let mut state = match saved {
@@ -155,7 +162,7 @@ impl WorkflowEngine {
                 }
                 saved
             }
-            None => WorkflowState::new(workflow_name, &workflow.steps, workflow_hash),
+            None => WorkflowState::new(workflow_name, &workflow.steps, workflow_hash, work_item),
         };
 
         let interrupted = state.interrupted_running_steps();
@@ -188,6 +195,7 @@ impl WorkflowEngine {
             current_step_name: None,
             current_step_agent: None,
             current_step_model: None,
+            work_item,
             yolo: false,
             last_exit_info: None,
         })
@@ -200,6 +208,11 @@ impl WorkflowEngine {
     /// Drive every step until the workflow finishes, the user pauses, or a
     /// step fails terminally.
     pub async fn run_to_completion(&mut self) -> Result<WorkflowOutcome, EngineError> {
+        // Report initial progress immediately so the TUI workflow strip
+        // renders before the first step starts running.
+        let initial_progress = self.workflow_progress_info();
+        self.frontend.report_workflow_progress(&initial_progress);
+
         loop {
             if self.state.is_complete() {
                 let progress = self.workflow_progress_info();
@@ -964,6 +977,7 @@ mod tests {
         WorkflowEngine::new(
             session,
             workflow,
+            None,
             Box::new(frontend),
             Box::new(factory),
             Arc::new(GitEngine::new()),
@@ -1003,7 +1017,7 @@ mod tests {
 
         // Verify state is on disk.
         let store = WorkflowStateStore::at_git_root(tmp.path());
-        let saved = store.load("my-wf").unwrap();
+        let saved = store.load(None, "my-wf").unwrap();
         assert!(saved.is_some());
     }
 
@@ -1024,6 +1038,7 @@ mod tests {
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
+            None,
             Box::new(frontend),
             Box::new(factory),
             Arc::new(GitEngine::new()),
@@ -1167,6 +1182,7 @@ mod tests {
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
+            None,
             Box::new(FakeWorkflowFrontend::new([
                 NextAction::RestartCurrentStep,
                 NextAction::LaunchNext,
@@ -1253,7 +1269,7 @@ mod tests {
 
         // State should be persisted on disk.
         let store = WorkflowStateStore::at_git_root(tmp.path());
-        let saved = store.load("wf-pause").unwrap();
+        let saved = store.load(None, "wf-pause").unwrap();
         assert!(saved.is_some(), "persisted state must exist after pause");
         let saved = saved.unwrap();
         // "a" is Succeeded, "b" is still Pending.
@@ -1287,6 +1303,7 @@ mod tests {
         let mut engine = WorkflowEngine::resume(
             &session,
             wf,
+            None,
             Box::new(frontend),
             Box::new(factory2),
             Arc::new(GitEngine::new()),
@@ -1331,6 +1348,7 @@ mod tests {
         let result = WorkflowEngine::resume(
             &session,
             wf2,
+            None,
             Box::new(frontend),
             Box::new(FakeContainerExecutionFactory::always_success()),
             Arc::new(GitEngine::new()),
@@ -1381,6 +1399,7 @@ mod tests {
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
+            None,
             Box::new(FakeWorkflowFrontend::new([])),
             Box::new(RecordingFactory(factory_arc.clone())),
             Arc::new(GitEngine::new()),
@@ -1431,6 +1450,7 @@ mod tests {
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
+            None,
             Box::new(FakeWorkflowFrontend::new([])),
             Box::new(RecordingFactory(factory_arc.clone())),
             Arc::new(GitEngine::new()),
@@ -1539,6 +1559,7 @@ mod tests {
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
+            None,
             Box::new(FakeWorkflowFrontend::new([
                 NextAction::ContinueInCurrentContainer { prompt: "next task".into() },
             ])),
@@ -1612,6 +1633,7 @@ mod tests {
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
+            None,
             Box::new(FakeWorkflowFrontend::new([
                 NextAction::LaunchNext,
                 NextAction::CancelToPreviousStep,
@@ -1686,6 +1708,7 @@ mod tests {
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
+            None,
             Box::new(FakeWorkflowFrontend::new([])),
             Box::new(RecordingFactory(factory_arc.clone())),
             Arc::new(GitEngine::new()),
