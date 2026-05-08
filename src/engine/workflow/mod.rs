@@ -973,7 +973,7 @@ fn compute_workflow_hash(workflow: &Workflow) -> String {
 
 /// `Workflow` doesn't carry a name field; derive one from the title or fall
 /// back to "workflow".
-fn workflow_name_for(workflow: &Workflow) -> String {
+pub fn workflow_name_for(workflow: &Workflow) -> String {
     workflow
         .title
         .as_deref()

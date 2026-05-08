@@ -7,8 +7,8 @@
 use std::path::Path;
 
 use crate::command::commands::worktree_lifecycle::{
-    ExistingWorktreeDecision, PostWorkflowWorktreeAction, PreWorktreeDecision,
-    WorktreeLifecycleFrontend,
+    ExistingWorktreeDecision, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
+    PreWorktreeDecision, WorktreeLifecycleFrontend,
 };
 use crate::command::error::CommandError;
 use crate::engine::message::UserMessageSink;
@@ -91,17 +91,17 @@ impl WorktreeLifecycleFrontend for CliFrontend {
 
     fn ask_post_workflow_action(
         &mut self,
-        branch: &str,
-        had_error: bool,
+        prompt: &PostWorkflowWorktreePrompt,
     ) -> Result<PostWorkflowWorktreeAction, CommandError> {
         if !stdin_is_tty() {
             return Ok(PostWorkflowWorktreeAction::Keep);
         }
+        eprintln!("amux: {}", prompt.body.replace('\n', " "));
         eprintln!(
-            "amux: workflow on {branch} {}. [m]erge / [d]iscard / [s]kip-and-keep?",
-            if had_error { "ended with errors" } else { "completed" }
+            "  [m] {} / [d] {} / [k] {}",
+            prompt.merge_label, prompt.discard_label, prompt.keep_label,
         );
-        match read_line_or_default('s') {
+        match read_line_or_default('k') {
             'm' | 'M' => Ok(PostWorkflowWorktreeAction::Merge),
             'd' | 'D' => Ok(PostWorkflowWorktreeAction::Discard),
             _ => Ok(PostWorkflowWorktreeAction::Keep),

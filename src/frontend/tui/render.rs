@@ -587,12 +587,32 @@ fn render_suggestion_row(app: &App, area: Rect, frame: &mut Frame) {
     }
 
     // Context fallback: show worktree path (if active) or working directory.
+    //
+    // Three sources, in priority order:
+    //   1. The shared active-worktree path published by the worktree-lifecycle
+    //      frontend while a workflow runs in a worktree.
+    //   2. The tab session's working_dir when it differs from git_root (the
+    //      session was opened directly on a worktree path — e.g. exec workflow
+    //      with --worktree opened a fresh session there).
+    //   3. The CWD itself.
     let tab = app.active_tab();
     let working_dir = tab.session.working_dir();
     let git_root = tab.session.git_root();
-    let is_worktree = working_dir != git_root;
+    let active_worktree: Option<std::path::PathBuf> = tab
+        .active_worktree_path
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
 
-    let para = if is_worktree {
+    let para = if let Some(wt) = active_worktree {
+        let label = "  Using worktree: ";
+        let max_path_w = (area.width as usize).saturating_sub(label.len() + 2);
+        let wt_str = truncate_middle(&wt.to_string_lossy(), max_path_w);
+        Paragraph::new(Line::from(vec![
+            Span::styled(label, Style::default().fg(Color::Blue)),
+            Span::styled(wt_str, Style::default().fg(Color::DarkGray)),
+        ]))
+    } else if working_dir != git_root {
         let label = "  Using worktree: ";
         let max_path_w = (area.width as usize).saturating_sub(label.len() + 2);
         let wt_str = truncate_middle(&working_dir.to_string_lossy(), max_path_w);
@@ -706,7 +726,30 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             dialogs::render_yes_no(title, body, area, frame);
         }
         dialogs::Dialog::YesNoCancel { title, body } => {
-            let dialog_area = dialogs::centered_fixed(50, 9, area);
+            // Same dynamic sizing as render_yes_no, plus an explicit Cancel.
+            let max_w = area.width.saturating_sub(6).max(40);
+            let max_body_w = body
+                .lines()
+                .map(unicode_width::UnicodeWidthStr::width)
+                .max()
+                .unwrap_or(0) as u16;
+            let title_w = unicode_width::UnicodeWidthStr::width(title.as_str()) as u16 + 4;
+            let width = max_body_w
+                .saturating_add(6)
+                .max(50)
+                .max(title_w)
+                .min(max_w);
+            let inner_w = width.saturating_sub(4) as usize;
+            let wrapped_lines: usize = body
+                .lines()
+                .map(|line| {
+                    let w = unicode_width::UnicodeWidthStr::width(line);
+                    if inner_w == 0 || w == 0 { 1 } else { w.div_ceil(inner_w) }
+                })
+                .sum();
+            let body_h = wrapped_lines as u16;
+            let height = (body_h + 5).min(area.height.saturating_sub(2)).max(7);
+            let dialog_area = dialogs::centered_fixed(width, height, area);
             let inner =
                 dialogs::render_dialog_frame(title, Color::Yellow, dialog_area, frame);
             let text = format!("{body}\n\n  [y] Yes   [n] No   [Esc] Cancel");
@@ -720,9 +763,12 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             prompt,
             editor,
         } => {
+            // Layout: prompt (multi-line) + spacer + bordered input + spacer +
+            // hint row. Width grows with terminal but caps at 80.
             let prompt_lines = prompt.lines().count() as u16;
-            let dialog_h = prompt_lines + 8;
-            let dialog_area = dialogs::centered_fixed(60, dialog_h, area);
+            let dialog_h = prompt_lines + 9;
+            let dialog_w = (area.width.saturating_sub(8)).clamp(50, 80);
+            let dialog_area = dialogs::centered_fixed(dialog_w, dialog_h, area);
             let inner =
                 dialogs::render_dialog_frame(title, Color::Cyan, dialog_area, frame);
             let prompt_area = Rect { height: prompt_lines, ..inner };
@@ -745,6 +791,20 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                 Paragraph::new(display_text).style(Style::default().fg(Color::White)),
                 input_inner,
             );
+            // Hint row below the input.
+            let hint_y = input_area.y + input_area.height + 1;
+            if hint_y < inner.y + inner.height {
+                let hint_area = Rect {
+                    y: hint_y,
+                    height: 1,
+                    ..inner
+                };
+                frame.render_widget(
+                    Paragraph::new("  [Enter] submit   [Esc] cancel")
+                        .style(Style::default().fg(Color::DarkGray)),
+                    hint_area,
+                );
+            }
             let text_before_cursor = &editor.text[..editor.cursor];
             let cursor_display_w = unicode_width::UnicodeWidthStr::width(text_before_cursor) as u16;
             let cursor_x = input_inner.x + cursor_display_w.min(input_inner.width.saturating_sub(1));
@@ -758,21 +818,37 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             prompt,
             editor,
         } => {
-            let dialog_area = dialogs::centered_rect(60, 50, area);
+            let dialog_area = dialogs::centered_rect(70, 60, area);
             let inner =
                 dialogs::render_dialog_frame(title, Color::Cyan, dialog_area, frame);
+            // Reserve the bottom row for a hint so it never gets clipped.
+            let content_h = inner.height.saturating_sub(1);
+            let content_area = Rect { height: content_h, ..inner };
             let text = format!("{prompt}\n{}", editor.text);
             frame.render_widget(
                 Paragraph::new(text).wrap(Wrap { trim: false }),
-                inner,
+                content_area,
+            );
+            let hint_area = Rect {
+                y: inner.y + content_h,
+                height: 1,
+                ..inner
+            };
+            frame.render_widget(
+                Paragraph::new(
+                    "  [Ctrl+Enter] submit   [Enter] newline   [Esc] cancel",
+                )
+                .style(Style::default().fg(Color::DarkGray)),
+                hint_area,
             );
             let lines_before: Vec<&str> = editor.text[..editor.cursor].split('\n').collect();
             let last_line = lines_before.last().unwrap_or(&"");
             let cursor_display_w = unicode_width::UnicodeWidthStr::width(*last_line) as u16;
             let prompt_lines = prompt.lines().count() as u16 + 1;
             let cursor_x = inner.x + cursor_display_w.min(inner.width.saturating_sub(1));
-            let cursor_y = inner.y + prompt_lines + (lines_before.len() as u16).saturating_sub(1);
-            if cursor_x < inner.x + inner.width && cursor_y < inner.y + inner.height {
+            let cursor_y =
+                inner.y + prompt_lines + (lines_before.len() as u16).saturating_sub(1);
+            if cursor_x < inner.x + inner.width && cursor_y < inner.y + content_h {
                 frame.set_cursor_position(Position::new(cursor_x, cursor_y));
             }
         }
@@ -781,13 +857,37 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             items,
             selected,
         } => {
-            let height = (items.len() as u16 + 4).min(area.height.saturating_sub(4));
-            let dialog_area = dialogs::centered_fixed(50, height, area);
+            // Width fits the longest item plus margin/prefix; height fits up
+            // to all items plus a hint, capped to the terminal area.
+            let max_item_w = items
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()))
+                .max()
+                .unwrap_or(0) as u16;
+            let title_w = unicode_width::UnicodeWidthStr::width(title.as_str()) as u16 + 4;
+            let width = (max_item_w + 8)
+                .max(title_w)
+                .max(50)
+                .min(area.width.saturating_sub(4));
+            let body_h = items.len() as u16 + 1; // +1 for the hint row
+            let height = (body_h + 4).min(area.height.saturating_sub(2)).max(7);
+            let dialog_area = dialogs::centered_fixed(width, height, area);
             let inner =
                 dialogs::render_dialog_frame(title, Color::Cyan, dialog_area, frame);
+            // Reserve last row for the hint.
+            let list_h = inner.height.saturating_sub(1);
+            let list_area = Rect { height: list_h, ..inner };
+            // Window items so the selection stays visible when the list is
+            // taller than the dialog.
+            let visible = list_h as usize;
+            let start = selected
+                .saturating_sub(visible.saturating_sub(1))
+                .min(items.len().saturating_sub(visible).max(0));
             let lines: Vec<Line> = items
                 .iter()
                 .enumerate()
+                .skip(start)
+                .take(visible)
                 .map(|(i, item)| {
                     let prefix = if i == *selected { "▸ " } else { "  " };
                     let style = if i == *selected {
@@ -798,20 +898,46 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                     Line::from(Span::styled(format!("{prefix}{item}"), style))
                 })
                 .collect();
-            frame.render_widget(Paragraph::new(lines), inner);
+            frame.render_widget(Paragraph::new(lines), list_area);
+            let hint_area = Rect {
+                y: inner.y + list_h,
+                height: 1,
+                ..inner
+            };
+            frame.render_widget(
+                Paragraph::new("  [↑/↓] navigate   [Enter] select   [Esc] cancel")
+                    .style(Style::default().fg(Color::DarkGray)),
+                hint_area,
+            );
         }
         dialogs::Dialog::KindSelect { title, options } => {
-            let height = (options.len() as u16 + 4).min(area.height.saturating_sub(4));
-            let dialog_area = dialogs::centered_fixed(50, height, area);
+            let max_label_w = options
+                .iter()
+                .map(|(_k, l)| unicode_width::UnicodeWidthStr::width(l.as_str()))
+                .max()
+                .unwrap_or(0) as u16;
+            let title_w = unicode_width::UnicodeWidthStr::width(title.as_str()) as u16 + 4;
+            let width = (max_label_w + 12)
+                .max(title_w)
+                .max(50)
+                .min(area.width.saturating_sub(4));
+            let body_h = options.len() as u16 + 1; // +1 for hint
+            let height = (body_h + 4).min(area.height.saturating_sub(2)).max(7);
+            let dialog_area = dialogs::centered_fixed(width, height, area);
             let inner =
                 dialogs::render_dialog_frame(title, Color::Yellow, dialog_area, frame);
-            let lines: Vec<Line> = options
+            let mut lines: Vec<Line> = options
                 .iter()
                 .enumerate()
                 .map(|(i, (_key, label))| {
                     Line::from(format!("  [{}] {label}", i + 1))
                 })
                 .collect();
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [1-9] select   [Esc] cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
             frame.render_widget(Paragraph::new(lines), inner);
         }
         dialogs::Dialog::WorkflowControlBoard(state) => {
@@ -825,8 +951,27 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             .count() as u16;
             let mid_step_extra: u16 = if state.is_mid_step { 2 } else { 0 };
             let base_height: u16 = if state.can_finish { 15 } else { 13 };
+            // Width fits the longest reason line (+ left margin) when present;
+            // otherwise the diamond layout's natural minimum is comfortable.
+            let max_reason_w = [
+                state.continue_unavailable_reason.as_deref(),
+                state.cancel_to_previous_unavailable_reason.as_deref(),
+                state.finish_workflow_unavailable_reason.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|s| unicode_width::UnicodeWidthStr::width(s) + 12)
+            .max()
+            .unwrap_or(0) as u16;
+            let step_w =
+                unicode_width::UnicodeWidthStr::width(state.step_name.as_str()) as u16
+                    + 10;
+            let width = max_reason_w
+                .max(step_w)
+                .max(56)
+                .min(area.width.saturating_sub(4));
             let dialog_area =
-                dialogs::centered_fixed(52, base_height + extra_reasons + mid_step_extra, area);
+                dialogs::centered_fixed(width, base_height + extra_reasons + mid_step_extra, area);
             let title = if state.is_mid_step {
                 "Workflow Control (step running)"
             } else {
@@ -932,8 +1077,24 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             frame.render_widget(Paragraph::new(lines), inner);
         }
         dialogs::Dialog::WorkflowStepError(state) => {
-            let height = (state.error_lines.len() as u16 + 8).min(area.height.saturating_sub(4));
-            let dialog_area = dialogs::centered_fixed(60, height, area);
+            let max_err_w = state
+                .error_lines
+                .iter()
+                .map(|l| unicode_width::UnicodeWidthStr::width(l.as_str()))
+                .max()
+                .unwrap_or(0) as u16;
+            let step_w = unicode_width::UnicodeWidthStr::width(state.step_name.as_str())
+                as u16
+                + 10; // "  Step: " prefix.
+            let width = max_err_w
+                .max(step_w)
+                .saturating_add(6)
+                .max(60)
+                .min(area.width.saturating_sub(4));
+            let height = (state.error_lines.len() as u16 + 8)
+                .min(area.height.saturating_sub(4))
+                .max(9);
+            let dialog_area = dialogs::centered_fixed(width, height, area);
             let inner = dialogs::render_dialog_frame(
                 "Step failed",
                 Color::Red,
@@ -951,8 +1112,11 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                 )));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from("  [r] Retry   [q] Pause   [a] Abort"));
-            frame.render_widget(Paragraph::new(lines), inner);
+            lines.push(Line::from(Span::styled(
+                "  [r] Retry   [q/Esc] Pause   [a] Abort",
+                Style::default().fg(Color::DarkGray),
+            )));
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
         dialogs::Dialog::WorkflowYoloCountdown(state) => {
             let emoji = if state.remaining_secs % 2 == 0 {
@@ -961,7 +1125,13 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                 "\u{1f918}"
             };
             let title = format!("{} Yolo in {}s", emoji, state.remaining_secs);
-            let dialog_area = dialogs::centered_fixed(50, 8, area);
+            let step_w =
+                unicode_width::UnicodeWidthStr::width(state.step_name.as_str()) as u16;
+            let width = step_w
+                .saturating_add(20)
+                .max(56)
+                .min(area.width.saturating_sub(4));
+            let dialog_area = dialogs::centered_fixed(width, 9, area);
             let inner = dialogs::render_dialog_frame(
                 &title,
                 Color::Magenta,
@@ -972,7 +1142,10 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                 "  Step: {}\n  Auto-advancing in {}s\n\n  [Esc] Cancel   [Ctrl-W] Control board",
                 state.step_name, state.remaining_secs
             );
-            frame.render_widget(Paragraph::new(text), inner);
+            frame.render_widget(
+                Paragraph::new(text).wrap(Wrap { trim: false }),
+                inner,
+            );
         }
         dialogs::Dialog::AgentSetup(state) => {
             let title = if state.image_only {
@@ -980,7 +1153,24 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             } else {
                 format!("Set up {}?", state.agent_name)
             };
-            let dialog_area = dialogs::centered_fixed(55, 10, area);
+            let title_w =
+                unicode_width::UnicodeWidthStr::width(title.as_str()) as u16 + 4;
+            let fallback_w = state
+                .fallback_name
+                .as_deref()
+                .map(unicode_width::UnicodeWidthStr::width)
+                .unwrap_or(0) as u16
+                + 22;
+            let width = title_w
+                .max(fallback_w)
+                .max(55)
+                .min(area.width.saturating_sub(4));
+            let height = if state.has_fallback && state.fallback_name.is_some() {
+                10
+            } else {
+                9
+            };
+            let dialog_area = dialogs::centered_fixed(width, height, area);
             let inner =
                 dialogs::render_dialog_frame(&title, Color::Yellow, dialog_area, frame);
             let mut lines = vec![Line::from(""), Line::from("  [y] Yes   [n] No")];
@@ -989,22 +1179,56 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                     lines.push(Line::from(format!("  [f] Fallback to {fb}")));
                 }
             }
-            lines.push(Line::from("  [Esc] Abort"));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Esc] Abort",
+                Style::default().fg(Color::DarkGray),
+            )));
             frame.render_widget(Paragraph::new(lines), inner);
         }
         dialogs::Dialog::MountScope(state) => {
-            let dialog_area = dialogs::centered_fixed(60, 10, area);
+            // Paths can be long — auto-grow to fit, but cap to area.
+            let path_w = unicode_width::UnicodeWidthStr::width(state.git_root.as_str())
+                .max(unicode_width::UnicodeWidthStr::width(state.cwd.as_str()))
+                as u16
+                + 14; // "  Git root: " / "  CWD:      " prefixes.
+            let width = path_w.max(60).min(area.width.saturating_sub(4));
+            let dialog_area = dialogs::centered_fixed(width, 11, area);
             let inner =
                 dialogs::render_dialog_frame("Mount Scope", Color::Yellow, dialog_area, frame);
-            let text = format!(
-                "  Git root: {}\n  CWD:      {}\n\n  [r] Mount git root\n  [c] Mount current dir only\n  [a] Abort",
-                state.git_root, state.cwd
-            );
-            frame.render_widget(Paragraph::new(text), inner);
+            let lines: Vec<Line> = vec![
+                Line::from(format!("  Git root: {}", state.git_root)),
+                Line::from(format!("  CWD:      {}", state.cwd)),
+                Line::from(""),
+                Line::from("  [r] Mount git root"),
+                Line::from("  [c] Mount current dir only"),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  [a / Esc] Abort",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
         dialogs::Dialog::AgentAuth(state) => {
-            let height = (state.env_vars.len() as u16 + 8).min(area.height.saturating_sub(4));
-            let dialog_area = dialogs::centered_fixed(55, height, area);
+            let max_var_w = state
+                .env_vars
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.as_str()))
+                .max()
+                .unwrap_or(0) as u16
+                + 8;
+            let agent_w =
+                unicode_width::UnicodeWidthStr::width(state.agent_name.as_str()) as u16
+                    + 12;
+            let width = max_var_w
+                .max(agent_w)
+                .max(55)
+                .min(area.width.saturating_sub(4));
+            let height = (state.env_vars.len() as u16 + 8)
+                .min(area.height.saturating_sub(4))
+                .max(9);
+            let dialog_area = dialogs::centered_fixed(width, height, area);
             let inner = dialogs::render_dialog_frame(
                 "Agent credentials?",
                 Color::Yellow,
@@ -1019,14 +1243,20 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                 lines.push(Line::from(format!("    - {var}")));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from("  [y] Accept   [n] Decline   [o] Decline once"));
-            frame.render_widget(Paragraph::new(lines), inner);
+            lines.push(Line::from(Span::styled(
+                "  [y] Accept   [n] Decline   [o] Decline once   [Esc] cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
         dialogs::Dialog::ConfigShow(state) => {
             render_config_show(state, area, frame);
         }
         dialogs::Dialog::Loading { title } => {
-            let dialog_area = dialogs::centered_fixed(40, 5, area);
+            let title_w =
+                unicode_width::UnicodeWidthStr::width(title.as_str()) as u16 + 4;
+            let width = title_w.max(40).min(area.width.saturating_sub(4));
+            let dialog_area = dialogs::centered_fixed(width, 6, area);
             let inner =
                 dialogs::render_dialog_frame(title, Color::Cyan, dialog_area, frame);
             frame.render_widget(
@@ -1035,24 +1265,59 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             );
         }
         dialogs::Dialog::WorkflowStepConfirm(state) => {
-            let dialog_area = dialogs::centered_fixed(60, 7, area);
+            let body_w = unicode_width::UnicodeWidthStr::width(
+                format!(
+                    "  Step '{}' done. Advance to '{}'?",
+                    state.completed_step, state.next_step
+                )
+                .as_str(),
+            ) as u16
+                + 4;
+            let width = body_w.max(64).min(area.width.saturating_sub(4));
+            let dialog_area = dialogs::centered_fixed(width, 8, area);
             let inner = dialogs::render_dialog_frame(
                 "Step Complete",
                 Color::Green,
                 dialog_area,
                 frame,
             );
-            let text = format!(
-                "  Step '{}' done. Advance to '{}'?\n\n  [Enter] yes   [Esc] pause   [Ctrl+W] full control board",
-                state.completed_step, state.next_step
-            );
-            frame.render_widget(Paragraph::new(text), inner);
+            let lines = vec![
+                Line::from(format!(
+                    "  Step '{}' done. Advance to '{}'?",
+                    state.completed_step, state.next_step
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  [Enter] yes   [Esc] pause   [Ctrl+W] full control board",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
         dialogs::Dialog::Custom { title, body, keys } => {
             let body_lines = body.lines().count() as u16;
-            let height = (keys.len() as u16 + body_lines + 6).min(area.height.saturating_sub(4));
-            let max_body_width = body.lines().map(|l| l.len()).max().unwrap_or(40) as u16;
-            let width = max_body_width.clamp(55, area.width.saturating_sub(6));
+            let title_w =
+                unicode_width::UnicodeWidthStr::width(title.as_str()) as u16 + 4;
+            // Use display width, not byte length, so wide chars/emoji size
+            // the dialog correctly. Account for padding + borders.
+            let max_body_width = body
+                .lines()
+                .map(unicode_width::UnicodeWidthStr::width)
+                .max()
+                .unwrap_or(40) as u16;
+            let max_key_label_width = keys
+                .iter()
+                .map(|(_, l)| unicode_width::UnicodeWidthStr::width(l.as_str()) + 6)
+                .max()
+                .unwrap_or(0) as u16;
+            let width = max_body_width
+                .max(max_key_label_width)
+                .max(title_w)
+                .saturating_add(6)
+                .clamp(55, area.width.saturating_sub(4));
+            let height = (keys.len() as u16 + body_lines + 7)
+                .min(area.height.saturating_sub(2))
+                .max(9);
             let dialog_area = dialogs::centered_fixed(width, height, area);
             let inner =
                 dialogs::render_dialog_frame(title, Color::Yellow, dialog_area, frame);
@@ -1061,7 +1326,14 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             for (ch, label) in keys {
                 lines.push(Line::from(format!("  [{ch}] {label}")));
             }
-            frame.render_widget(Paragraph::new(lines), inner);
+            // Always offer an Esc hint at the bottom — Custom is also used
+            // for prompts where the natural cancel key is Esc.
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  [Esc] cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
     }
 }

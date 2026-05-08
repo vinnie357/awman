@@ -218,6 +218,7 @@ impl App {
             tab.stdin_tx_shared.clone(),
             tab.resize_tx_shared.clone(),
             tab.control_board_tx_shared.clone(),
+            tab.active_worktree_path.clone(),
         );
 
         // Store the receiving/sending ends in the tab.
@@ -436,23 +437,16 @@ impl App {
                 && !backoff_active
                 && !auto_disabled
             {
+                // Stuck-detection during a running step opens the workflow
+                // control board so the user can choose Restart/Abort/etc.
+                // We don't open a yolo-style countdown here — the engine
+                // owns the inter-step countdown via `yolo_state`. Showing
+                // an undriven countdown that never advances was confusing
+                // (issue ENG-2: "stuck at 60").
                 let step_name = tab.workflow_state.lock().ok()
                     .and_then(|g| g.as_ref().and_then(|ws| ws.current_step.clone()))
                     .unwrap_or_default();
-                if tab.yolo_mode {
-                    if tab.yolo_countdown.is_none() {
-                        let tab_mut = &mut self.tabs[active];
-                        tab_mut.yolo_countdown = Some(60);
-                    }
-                    let remaining = self.tabs[active].yolo_countdown.unwrap_or(60);
-                    self.active_dialog =
-                        Some(Dialog::WorkflowYoloCountdown(
-                            crate::frontend::tui::dialogs::WorkflowYoloCountdownState {
-                                step_name,
-                                remaining_secs: remaining,
-                            },
-                        ));
-                } else if !matches!(self.active_dialog, Some(Dialog::WorkflowControlBoard(_))) {
+                if !matches!(self.active_dialog, Some(Dialog::WorkflowControlBoard(_))) {
                     self.active_dialog =
                         Some(Dialog::WorkflowControlBoard(
                             crate::frontend::tui::dialogs::WorkflowControlBoardState {

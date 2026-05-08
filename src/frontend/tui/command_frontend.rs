@@ -16,7 +16,7 @@ use crate::command::error::CommandError;
 use crate::engine::container::frontend::ContainerIo;
 use crate::engine::message::{UserMessage, UserMessageSink};
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
-use crate::frontend::tui::tabs::{SharedContainerName, SharedControlBoardTx, SharedPtyResetFlag, SharedResizeTx, SharedStdinTx, SharedWorkflowViewState, SharedYoloCtrlW, SharedYoloState};
+use crate::frontend::tui::tabs::{SharedActiveWorktreePath, SharedContainerName, SharedControlBoardTx, SharedPtyResetFlag, SharedResizeTx, SharedStdinTx, SharedWorkflowViewState, SharedYoloCtrlW, SharedYoloState};
 use crate::frontend::tui::user_message::{SharedStatusLog, TuiUserMessageSink};
 
 /// TUI frontend struct. Implements every per-command frontend trait.
@@ -61,6 +61,10 @@ pub struct TuiCommandFrontend {
     /// sender here via `set_control_board_sender`; the TUI event loop reads
     /// it to send mid-step WCB requests.
     pub(crate) control_board_tx_shared: SharedControlBoardTx,
+    /// Shared active-worktree path. The worktree-lifecycle frontend sets
+    /// this when a worktree is created/resumed and clears it on cleanup;
+    /// the renderer reads it for the bottom-bar context line.
+    pub(crate) active_worktree_path: SharedActiveWorktreePath,
 }
 
 impl TuiCommandFrontend {
@@ -79,6 +83,7 @@ impl TuiCommandFrontend {
         stdin_tx_shared: SharedStdinTx,
         resize_tx_shared: SharedResizeTx,
         control_board_tx_shared: SharedControlBoardTx,
+        active_worktree_path: SharedActiveWorktreePath,
     ) -> Self {
         let stdout_tx = container_io.stdout.clone();
         Self {
@@ -99,6 +104,7 @@ impl TuiCommandFrontend {
             stdin_tx_shared,
             resize_tx_shared,
             control_board_tx_shared,
+            active_worktree_path,
         }
     }
 

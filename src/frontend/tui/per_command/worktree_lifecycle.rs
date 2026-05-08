@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use crate::command::commands::worktree_lifecycle::{
-    ExistingWorktreeDecision, PostWorkflowWorktreeAction, PreWorktreeDecision,
-    WorktreeLifecycleFrontend,
+    ExistingWorktreeDecision, PostWorkflowWorktreeAction, PostWorkflowWorktreePrompt,
+    PreWorktreeDecision, WorktreeLifecycleFrontend,
 };
 use crate::command::error::CommandError;
 use crate::engine::message::UserMessageSink;
@@ -76,13 +76,25 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
             ),
             keys: vec![('r', "Resume".into()), ('n', "Recreate".into())],
         })?;
-        Ok(match response {
+        let decision = match response {
             DialogResponse::Char('n') => ExistingWorktreeDecision::Recreate,
             _ => ExistingWorktreeDecision::Resume,
-        })
+        };
+        if matches!(decision, ExistingWorktreeDecision::Resume) {
+            // The lifecycle returns early on Resume without calling
+            // report_worktree_created, so publish the path here so the
+            // bottom-bar context line shows "Using worktree" immediately.
+            if let Ok(mut guard) = self.active_worktree_path.lock() {
+                *guard = Some(path.to_path_buf());
+            }
+        }
+        Ok(decision)
     }
 
     fn report_worktree_created(&mut self, path: &Path, branch: &str) {
+        if let Ok(mut guard) = self.active_worktree_path.lock() {
+            *guard = Some(path.to_path_buf());
+        }
         self.messages.info(format!(
             "Created worktree at {} on branch {}",
             path.display(),
@@ -92,23 +104,15 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
 
     fn ask_post_workflow_action(
         &mut self,
-        branch: &str,
-        had_error: bool,
+        prompt: &PostWorkflowWorktreePrompt,
     ) -> Result<PostWorkflowWorktreeAction, CommandError> {
-        let status = if had_error {
-            "ended with errors"
-        } else {
-            "completed successfully"
-        };
         let response = self.ask_dialog(DialogRequest::Custom {
-            title: "Workflow Complete — Worktree Action".into(),
-            body: format!(
-                "Workflow {status}.\nBranch: {branch}\n\nChoose what to do with the worktree:"
-            ),
+            title: prompt.title.clone(),
+            body: prompt.body.clone(),
             keys: vec![
-                ('m', "Merge into main branch".into()),
-                ('d', "Discard worktree (delete branch and directory)".into()),
-                ('k', "Keep worktree for later".into()),
+                ('m', prompt.merge_label.clone()),
+                ('d', prompt.discard_label.clone()),
+                ('k', prompt.keep_label.clone()),
             ],
         })?;
         Ok(match response {
@@ -126,13 +130,17 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
     ) -> Result<Option<String>, CommandError> {
         let file_list = format_file_list(files);
         let body = format!(
-            "{} uncommitted file(s) on worktree:\n{}\n\nCommit before merge?",
+            "{} uncommitted file(s) on worktree:\n{}",
             files.len(),
             file_list
         );
-        let response = self.ask_dialog(DialogRequest::YesNo {
+        let response = self.ask_dialog(DialogRequest::Custom {
             title: "Commit before merge?".into(),
             body,
+            keys: vec![
+                ('y', "Commit, then merge".into()),
+                ('n', "Skip commit, merge as-is".into()),
+            ],
         })?;
         if matches!(
             response,
@@ -195,11 +203,17 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
     }
 
     fn report_worktree_discarded(&mut self, branch: &str) {
+        if let Ok(mut guard) = self.active_worktree_path.lock() {
+            *guard = None;
+        }
         self.messages
             .info(format!("Worktree for branch '{branch}' discarded"));
     }
 
     fn report_worktree_kept(&mut self, path: &Path, branch: &str) {
+        if let Ok(mut guard) = self.active_worktree_path.lock() {
+            *guard = None;
+        }
         self.messages.info(format!(
             "Worktree kept at {} (branch: {branch})",
             path.display()

@@ -586,10 +586,9 @@ impl WorktreeLifecycleFrontend for HeadlessDispatchFrontend {
 
     fn ask_post_workflow_action(
         &mut self,
-        _branch: &str,
-        had_error: bool,
+        prompt: &crate::command::commands::worktree_lifecycle::PostWorkflowWorktreePrompt,
     ) -> Result<PostWorkflowWorktreeAction, CommandError> {
-        if had_error {
+        if prompt.had_error {
             Ok(PostWorkflowWorktreeAction::Keep)
         } else {
             Ok(PostWorkflowWorktreeAction::Merge)
@@ -763,6 +762,15 @@ impl ExecWorkflowCommandFrontend for HeadlessDispatchFrontend {
             "[INFO] Workflow summary: {} completed, {} failed",
             summary.steps_completed, summary.steps_failed
         ));
+    }
+    fn ask_workflow_resume_or_fresh(
+        &mut self,
+        _workflow_name: &str,
+        _completed_steps: usize,
+        _total_steps: usize,
+    ) -> Result<bool, CommandError> {
+        // Headless mode has no interactive prompt; resume by default.
+        Ok(true)
     }
 }
 

@@ -12,7 +12,7 @@ Issue: n/a — fifth-of-eight work item implementing `aspec/architecture/2026-gr
 > - `0070-…` (this work item) — Real container execution + real engine phase bodies + real per-command Layer 2 bodies for **every** command (`init`, `ready`, `chat`, `specs new`, `specs amend`, `new spec/workflow/skill`, `status`, `config show/get/set`, `claws init/ready/chat`, `implement`, `exec prompt`, `exec workflow`, `download`, the interactive half of `auth`) + real `AgentEngine::ensure_available` (download + build) + real `OverlayEngine` Claude transformations + full CLI completion (every `*Outcome` and `*Error` variant rendered, every flag honored end-to-end including `--json`, every Q&A frontend method TTY-aware).
 > - `0071-grand-architecture-tui-frontend.md` — TUI frontend on top of the now-real engines and commands (no business logic; pure presentation per the four tenets).
 > - `0072-grand-architecture-headless-frontend.md` — Headless frontend + the still-stub Layer 2 command bodies that exist only to talk to the headless server (`headless start/kill/logs/status`, `remote run/session start/session kill`) + the headless-side persistence half of `auth` + `AuthEngine::ensure_self_signed_tls` real wiring.
-> - `0073-grand-architecture-finalize-and-remove-oldsrc.md` — Cross-frontend parity validation, `tests/` rebuild, oldsrc removal, docs/aspec refresh.
+> - `0073-grand-architecture-finalize.md` — Cross-frontend parity validation, `tests/` rebuild, docs/aspec refresh.
 
 ## Required reading before starting
 
@@ -33,7 +33,7 @@ The companion work items are:
 - `0069-grand-architecture-layer-3-frontends-and-binary.md` (merged — CLI shell exists; this work item completes the CLI rendering / flag-handling / TTY-detection paths so it is fully functional once the engines underneath go real)
 - `0071-grand-architecture-tui-frontend.md`
 - `0072-grand-architecture-headless-frontend.md`
-- `0073-grand-architecture-finalize-and-remove-oldsrc.md`
+- `0073-grand-architecture-finalize.md`
 
 ## Summary
 

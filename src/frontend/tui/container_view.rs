@@ -70,19 +70,26 @@ pub fn render_container_maximized(
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Green));
 
-    // Probe scrollback depth, capping to screen rows to avoid a subtraction
-    // overflow inside vt100's `visible_rows()`.
+    // Probe vt100 for the effective offset and total scrollback depth.
+    // vt100-ctt 0.17's `set_scrollback` clamps to the buffer length; its
+    // `visible_rows()` uses `saturating_sub` for the live-rows portion
+    // (the panic that vt100 0.15 had on offset > screen_rows is fixed),
+    // so we can scroll the full configured `terminal_scrollback_lines`
+    // depth without crashing. We probe by setting the requested offset
+    // and reading back the clamped value, then probe the depth via
+    // `set_scrollback(usize::MAX)`. Reset to live before rendering.
     let (effective_scroll_offset, max_scrollback) = if tab.container_scroll_offset > 0 {
-        let parser = &mut tab.vt100_parser;
-        let screen_rows = parser.screen().size().0 as usize;
-        parser.set_scrollback(usize::MAX);
-        let depth = parser.screen().scrollback();
-        parser.set_scrollback(0);
-        let eff = tab.container_scroll_offset.min(depth).min(screen_rows);
+        let screen = tab.vt100_parser.screen_mut();
+        screen.set_scrollback(tab.container_scroll_offset);
+        let eff = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        let depth = screen.scrollback();
+        screen.set_scrollback(0);
         (eff, depth)
     } else {
         (0, 0)
     };
+
     if effective_scroll_offset > 0 {
         let scroll_hint = format!(
             " \u{2191} scrollback ({} / {} lines) ",
@@ -114,14 +121,13 @@ pub fn render_container_maximized(
     // Publish the inner area for the mouse handler.
     tab.container_inner_area = Some(inner);
 
-    // Render the vt100 grid into the inner area.
-    let parser = &mut tab.vt100_parser;
+    let screen = tab.vt100_parser.screen_mut();
     if effective_scroll_offset > 0 {
-        parser.set_scrollback(effective_scroll_offset);
-        render_vt100_screen(frame, parser.screen(), inner, selection.as_ref(), false);
-        parser.set_scrollback(0);
+        screen.set_scrollback(effective_scroll_offset);
+        render_vt100_screen(frame, screen, inner, selection.as_ref(), false);
+        screen.set_scrollback(0);
     } else {
-        render_vt100_screen(frame, parser.screen(), inner, selection.as_ref(), true);
+        render_vt100_screen(frame, screen, inner, selection.as_ref(), true);
     }
 }
 
@@ -291,7 +297,7 @@ fn render_vt100_screen(
                 let symbol = if contents.is_empty() {
                     " ".to_string()
                 } else {
-                    contents
+                    contents.to_string()
                 };
                 if let Some(buf_cell) = buf.cell_mut((x, y)) {
                     buf_cell.set_symbol(&symbol).set_style(style);

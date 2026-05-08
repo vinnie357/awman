@@ -99,6 +99,13 @@ pub type SharedPtyResetFlag = Arc<AtomicBool>;
 /// polling.
 pub type SharedContainerName = Arc<Mutex<Option<String>>>;
 
+/// Shared active-worktree path. Set by the worktree-lifecycle frontend on
+/// `report_worktree_created` and cleared on the post-workflow report
+/// (kept/discarded). The renderer reads this so the bottom-bar context
+/// line can show "Using worktree: <path>" while a workflow runs in a
+/// worktree even though the tab's session is rooted at the main repo.
+pub type SharedActiveWorktreePath = Arc<Mutex<Option<std::path::PathBuf>>>;
+
 /// Shared stdin sender slot. When a workflow step transition creates fresh
 /// stdin channels, the new sender is published here so the TUI event loop
 /// can swap `tab.container_stdin_tx` to the new one.
@@ -240,6 +247,10 @@ pub struct Tab {
     pub resize_tx_shared: SharedResizeTx,
     /// Shared control board sender for mid-step WCB requests.
     pub control_board_tx_shared: SharedControlBoardTx,
+    /// Shared active worktree path: set by the worktree-lifecycle frontend
+    /// after a worktree is created/resumed, cleared after the workflow
+    /// finalize step. Drives the "Using worktree: <path>" bottom-bar line.
+    pub active_worktree_path: SharedActiveWorktreePath,
 }
 
 impl Tab {
@@ -285,6 +296,7 @@ impl Tab {
             stdin_tx_shared: Arc::new(Mutex::new(None)),
             resize_tx_shared: Arc::new(Mutex::new(None)),
             control_board_tx_shared: Arc::new(Mutex::new(None)),
+            active_worktree_path: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -503,7 +515,7 @@ impl Tab {
                 if let Ok((cols, rows)) = crossterm::terminal::size() {
                     let (inner_cols, inner_rows) =
                         crate::frontend::tui::compute_container_inner_size(cols, rows);
-                    self.vt100_parser.set_size(inner_rows, inner_cols);
+                    self.vt100_parser.screen_mut().set_size(inner_rows, inner_cols);
                     if let Some(ref tx) = self.container_resize_tx {
                         let _ = tx.send((inner_cols, inner_rows));
                     }
@@ -796,6 +808,47 @@ mod tests {
         assert_eq!(ContainerWindowState::Hidden.cycle(), ContainerWindowState::Maximized);
         assert_eq!(ContainerWindowState::Minimized.cycle(), ContainerWindowState::Maximized);
         assert_eq!(ContainerWindowState::Maximized.cycle(), ContainerWindowState::Minimized);
+    }
+
+    /// Reproduces TUI-3: vt100 0.15.2's `Grid::visible_rows()` panicked in
+    /// debug builds when `scrollback_offset > rows_len` (an unchecked
+    /// `rows_len - scrollback_offset` subtraction). vt100-ctt 0.17 fixes
+    /// the panic with `saturating_sub`, so we can scroll the full
+    /// configured scrollback depth (5000 lines by default) without
+    /// hitting an arithmetic overflow.
+    #[test]
+    fn deep_scroll_past_screen_rows_does_not_panic() {
+        let mut tab = make_tab();
+        tab.start_container("agent".into(), "container".into(), 80, 24);
+        // Feed enough lines that the vt100 scrollback grows well past the
+        // screen height. Each "line\n" becomes one row of scrollback.
+        for i in 0..500 {
+            let s = format!("line {i}\r\n");
+            tab.vt100_parser.process(s.as_bytes());
+        }
+        // Probe depth.
+        let depth = {
+            let screen = tab.vt100_parser.screen_mut();
+            screen.set_scrollback(usize::MAX);
+            let d = screen.scrollback();
+            screen.set_scrollback(0);
+            d
+        };
+        assert!(
+            depth > 24,
+            "test setup: scrollback depth must exceed screen height; got {depth}"
+        );
+        // Set offset to a value much larger than screen_rows. Pre-fix
+        // (vt100 0.15.2) this would panic in debug; vt100-ctt 0.17 must
+        // handle it safely.
+        let screen = tab.vt100_parser.screen_mut();
+        screen.set_scrollback(depth);
+        let eff = screen.scrollback();
+        assert_eq!(eff, depth, "set_scrollback must clamp to depth, not screen_rows");
+        // Reading cells at this offset must not panic.
+        let _ = screen.cell(0, 0);
+        let _ = screen.cell(23, 79);
+        screen.set_scrollback(0);
     }
 
     // ── truncate_with_ellipsis ─────────────────────────────────────────────────

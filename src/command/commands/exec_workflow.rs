@@ -80,6 +80,17 @@ pub trait ExecWorkflowCommandFrontend:
     fn set_pty_active(&mut self, active: bool);
 
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary);
+
+    /// Ask the user whether to resume the workflow from its persisted state
+    /// or to delete that state and start fresh. Called only when a saved
+    /// state file is found on disk before the engine is built. Returns
+    /// `true` to resume, `false` to start fresh.
+    fn ask_workflow_resume_or_fresh(
+        &mut self,
+        workflow_name: &str,
+        completed_steps: usize,
+        total_steps: usize,
+    ) -> Result<bool, CommandError>;
 }
 
 pub struct ExecWorkflowCommand {
@@ -554,6 +565,71 @@ impl Command for ExecWorkflowCommand {
             }
         };
 
+        // 5b. Detect a persisted workflow-state file and ask the user whether
+        //     to resume it or delete it and start fresh. The check uses the
+        //     session_root the engine will pick up below — the worktree path
+        //     when --worktree is active, otherwise cwd. Done before PTY
+        //     activation so the dialog renders immediately, like the
+        //     existing-worktree dialog does in the lifecycle step above.
+        let session_root_for_state = worktree_path.as_deref().unwrap_or(&cwd).to_path_buf();
+        let git_root_for_state = match Arc::clone(&self.engines.git_engine)
+            .resolve_root(&session_root_for_state)
+        {
+            Ok(r) => r,
+            Err(_) => session_root_for_state.clone(),
+        };
+        let workflow_name_for_state =
+            crate::engine::workflow::workflow_name_for(&workflow);
+        let work_item_number_for_state = work_item_context.as_ref().map(|c| c.number);
+        {
+            let store = crate::data::workflow_state_store::WorkflowStateStore::at_git_root(
+                git_root_for_state.clone(),
+            );
+            match store.load(work_item_number_for_state, &workflow_name_for_state) {
+                Ok(Some(saved)) => {
+                    let total = saved.step_states.len();
+                    let completed = saved
+                        .step_states
+                        .values()
+                        .filter(|s| {
+                            matches!(
+                                s,
+                                crate::data::workflow_state::StepState::Succeeded
+                                    | crate::data::workflow_state::StepState::Skipped
+                            )
+                        })
+                        .count();
+                    let resume = frontend.ask_workflow_resume_or_fresh(
+                        &workflow_name_for_state,
+                        completed,
+                        total,
+                    )?;
+                    if !resume {
+                        if let Err(e) =
+                            store.delete(work_item_number_for_state, &workflow_name_for_state)
+                        {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Warning,
+                                text: format!(
+                                    "exec workflow: failed to delete workflow state file: {e}",
+                                ),
+                            });
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Warning,
+                        text: format!(
+                            "exec workflow: failed to read workflow state file: {e}; \
+                             starting fresh",
+                        ),
+                    });
+                }
+            }
+        }
+
         // 6. Set PTY active — queues user messages during the engine run.
         frontend.set_pty_active(true);
 
@@ -614,7 +690,7 @@ impl Command for ExecWorkflowCommand {
                 work_item_context,
                 image_git_root: git_root_for_scope.clone(),
             };
-            let mut engine = match WorkflowEngine::new(
+            let mut engine = match WorkflowEngine::resume(
                 &session,
                 workflow,
                 work_item_number,
@@ -622,7 +698,9 @@ impl Command for ExecWorkflowCommand {
                 Box::new(factory),
                 Arc::clone(&self.engines.git_engine),
                 Arc::clone(&self.engines.overlay_engine),
-            ) {
+            )
+            .await
+            {
                 Ok(eng) => eng,
                 Err(e) => {
                     let err = CommandError::from(e);
@@ -892,8 +970,7 @@ mod tests {
         fn report_worktree_created(&mut self, _path: &Path, _branch: &str) {}
         fn ask_post_workflow_action(
             &mut self,
-            _branch: &str,
-            _had_error: bool,
+            _prompt: &crate::command::commands::worktree_lifecycle::PostWorkflowWorktreePrompt,
         ) -> Result<PostWorkflowWorktreeAction, CommandError> {
             Ok(PostWorkflowWorktreeAction::Keep)
         }
@@ -926,6 +1003,14 @@ mod tests {
         }
         fn report_workflow_summary(&mut self, summary: &WorkflowSummary) {
             self.summary_calls.push(summary.clone());
+        }
+        fn ask_workflow_resume_or_fresh(
+            &mut self,
+            _workflow_name: &str,
+            _completed_steps: usize,
+            _total_steps: usize,
+        ) -> Result<bool, CommandError> {
+            Ok(true)
         }
     }
 

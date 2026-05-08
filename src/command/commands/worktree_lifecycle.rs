@@ -34,6 +34,35 @@ pub enum PostWorkflowWorktreeAction {
     Keep,
 }
 
+/// Prebuilt dialog content for the post-workflow worktree-action prompt.
+///
+/// Built by the command layer (which queries the git engine for the target
+/// branch and decides on the human-readable labels) and consumed by every
+/// frontend. Frontends should NOT compose these strings themselves — that
+/// keeps the prompt copy testable in one place and avoids divergence
+/// between CLI/TUI/headless wording.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostWorkflowWorktreePrompt {
+    /// Worktree branch name (e.g. `amux/work-item-0072`).
+    pub branch: String,
+    /// Branch that a Merge action would target — the parent repo's HEAD
+    /// branch. Resolved via `GitEngine::current_branch`; falls back to
+    /// `"current branch"` for detached HEAD or query failure.
+    pub target_branch: String,
+    /// Whether the workflow ended with an error (drives the title copy).
+    pub had_error: bool,
+    /// Title shown at the top of the dialog.
+    pub title: String,
+    /// Body text rendered above the action list.
+    pub body: String,
+    /// Label for the Merge action (e.g. `Merge into 'main'`).
+    pub merge_label: String,
+    /// Label for the Discard action.
+    pub discard_label: String,
+    /// Label for the Keep action.
+    pub keep_label: String,
+}
+
 pub trait WorktreeLifecycleFrontend: UserMessageSink + Send + Sync {
     fn ask_pre_worktree_uncommitted_files(
         &mut self,
@@ -51,8 +80,7 @@ pub trait WorktreeLifecycleFrontend: UserMessageSink + Send + Sync {
 
     fn ask_post_workflow_action(
         &mut self,
-        branch: &str,
-        had_error: bool,
+        prompt: &PostWorkflowWorktreePrompt,
     ) -> Result<PostWorkflowWorktreeAction, CommandError>;
 
     fn ask_worktree_commit_before_merge(
@@ -132,6 +160,33 @@ impl WorktreeLifecycle {
         &self.branch
     }
 
+    /// Compose the [`PostWorkflowWorktreePrompt`] handed to the frontend.
+    /// All copy lives here — the frontend just renders the strings.
+    fn build_post_workflow_prompt(&self, had_error: bool) -> PostWorkflowWorktreePrompt {
+        let target_branch = self
+            .git_engine
+            .current_branch(&self.git_root)
+            .unwrap_or_else(|| "current branch".to_string());
+        let status = if had_error {
+            "ended with errors"
+        } else {
+            "completed successfully"
+        };
+        PostWorkflowWorktreePrompt {
+            branch: self.branch.clone(),
+            target_branch: target_branch.clone(),
+            had_error,
+            title: "Workflow Complete — Worktree Action".to_string(),
+            body: format!(
+                "Workflow {status}.\nBranch: {branch}\n\nChoose what to do with the worktree:",
+                branch = self.branch,
+            ),
+            merge_label: format!("Merge into '{target_branch}'"),
+            discard_label: "Discard worktree (delete branch and directory)".to_string(),
+            keep_label: "Keep worktree for later".to_string(),
+        }
+    }
+
     pub async fn prepare(
         &self,
         frontend: &mut dyn WorktreeLifecycleFrontend,
@@ -176,7 +231,8 @@ impl WorktreeLifecycle {
         frontend: &mut dyn WorktreeLifecycleFrontend,
         had_error: bool,
     ) -> Result<(), CommandError> {
-        let action = frontend.ask_post_workflow_action(&self.branch, had_error)?;
+        let prompt = self.build_post_workflow_prompt(had_error);
+        let action = frontend.ask_post_workflow_action(&prompt)?;
         match action {
             PostWorkflowWorktreeAction::Merge => {
                 let files = self.git_engine.uncommitted_files_logged(&self.worktree_path, frontend)?;
@@ -326,8 +382,7 @@ mod tests {
 
         fn ask_post_workflow_action(
             &mut self,
-            _branch: &str,
-            _had_error: bool,
+            _prompt: &PostWorkflowWorktreePrompt,
         ) -> Result<PostWorkflowWorktreeAction, CommandError> {
             Ok(self.post_workflow_action)
         }
@@ -784,10 +839,10 @@ mod tests {
                 self.inner.report_worktree_created(path, branch);
             }
             fn ask_post_workflow_action(
-                &mut self, branch: &str, had_error: bool,
+                &mut self, prompt: &PostWorkflowWorktreePrompt,
             ) -> Result<PostWorkflowWorktreeAction, CommandError> {
-                self.received_had_error = Some(had_error);
-                self.inner.ask_post_workflow_action(branch, had_error)
+                self.received_had_error = Some(prompt.had_error);
+                self.inner.ask_post_workflow_action(prompt)
             }
             fn ask_worktree_commit_before_merge(
                 &mut self, branch: &str, files: &[String], suggested_message: &str,

@@ -233,63 +233,75 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn stats(&self, handle: &ContainerHandle) -> Result<ContainerStats, EngineError> {
-        let output = Command::new("container")
-            .args([
-                "stats",
-                "--no-stream",
-                "--format",
-                "json",
-                &handle.name,
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    EngineError::ContainerRuntimeUnavailable {
-                        binary: "container".into(),
+        // Apple's `container stats --no-stream --format json` emits raw
+        // counters: `cpuUsageUsec` (cumulative CPU time) and
+        // `memoryUsageBytes`. Computing CPU% from a single sample isn't
+        // possible, so take two samples ~200ms apart and divide the delta
+        // by elapsed wall-clock time. Mirrors old-amux behavior.
+        let take_sample = |name: &str| -> Result<(u64, u64), EngineError> {
+            let out = Command::new("container")
+                .args(["stats", "--no-stream", "--format", "json", name])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+                .map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        EngineError::ContainerRuntimeUnavailable {
+                            binary: "container".into(),
+                        }
+                    } else {
+                        EngineError::Container(format!("container stats: {e}"))
                     }
-                } else {
-                    EngineError::Container(format!("container stats: {e}"))
-                }
-            })?;
-        if !output.status.success() {
-            return Err(EngineError::Container(format!(
-                "container stats failed for {}",
-                handle.name
-            )));
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Same defensive JSON parsing as `list_running`: array or per-line.
-        let row: serde_json::Value = serde_json::from_str(stdout.trim())
-            .or_else(|_| {
-                stdout
-                    .lines()
-                    .next()
-                    .ok_or_else(|| serde_json::Error::io(std::io::Error::other("empty")))
-                    .and_then(serde_json::from_str)
-            })
-            .map_err(|e| {
-                EngineError::Container(format!("unparseable container stats output: {e}"))
-            })?;
+                })?;
+            if !out.status.success() {
+                return Err(EngineError::Container(format!(
+                    "container stats failed for {}",
+                    name
+                )));
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // Apple emits a JSON array; some other versions emit per-line.
+            let value: serde_json::Value = serde_json::from_str(stdout.trim())
+                .or_else(|_| {
+                    stdout
+                        .lines()
+                        .next()
+                        .ok_or_else(|| serde_json::Error::io(std::io::Error::other("empty")))
+                        .and_then(serde_json::from_str)
+                })
+                .map_err(|e| {
+                    EngineError::Container(format!(
+                        "unparseable container stats output: {e}"
+                    ))
+                })?;
+            let entry = match &value {
+                serde_json::Value::Array(arr) => arr.first().cloned().unwrap_or(serde_json::Value::Null),
+                _ => value,
+            };
+            let cpu = entry
+                .get("cpuUsageUsec")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let mem = entry
+                .get("memoryUsageBytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            Ok((cpu, mem))
+        };
 
-        let cpu_str = row
-            .get("CPUPerc")
-            .or_else(|| row.get("CPU"))
-            .or_else(|| row.get("cpu"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("0");
-        let cpu_percent = cpu_str.trim().trim_end_matches('%').parse::<f64>().unwrap_or(0.0);
+        let (cpu1, _) = take_sample(&handle.name)?;
+        let t0 = std::time::Instant::now();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (cpu2, mem) = take_sample(&handle.name)?;
+        let elapsed_usec = t0.elapsed().as_micros() as u64;
 
-        let mem_str = row
-            .get("MemUsage")
-            .or_else(|| row.get("Memory"))
-            .or_else(|| row.get("memory"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("0");
-        // Take just the "used" half of "X / Y" and unit-aware parse.
-        let mem_used = mem_str.split('/').next().unwrap_or(mem_str).trim();
-        let memory_mb = parse_memory_mb(mem_used);
+        let cpu_delta = cpu2.saturating_sub(cpu1);
+        let cpu_percent = if elapsed_usec > 0 {
+            (cpu_delta as f64 / elapsed_usec as f64) * 100.0
+        } else {
+            0.0
+        };
+        let memory_mb = (mem as f64) / (1024.0 * 1024.0);
 
         Ok(ContainerStats {
             name: handle.name.clone(),

@@ -567,4 +567,4 @@ A REGRESSION blocks the PR.
 - Do not introduce business logic in `src/frontend/headless/`.
 - Do not introduce upward calls — use traits.
 - The PR description MUST link to this work item, MUST include the headless parity smoke-test checklist, and MUST list every developer-clarification question raised.
-- After this work item lands, the next agent picks up `0073-grand-architecture-finalize-and-remove-oldsrc.md`.
+- After this work item lands, the next agent picks up `0073-grand-architecture-finalize.md`.

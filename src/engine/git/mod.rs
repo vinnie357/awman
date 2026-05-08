@@ -311,6 +311,26 @@ impl GitEngine {
             .unwrap_or(false)
     }
 
+    /// Return the current branch name at `git_root` (the branch HEAD points
+    /// to). Returns `None` if HEAD is detached or git invocation fails.
+    pub fn current_branch(&self, git_root: &Path) -> Option<String> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(git_root)
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if name.is_empty() || name == "HEAD" {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
     // ─── Logged variants ──────────────────────────────────────────────
     //
     // These methods mirror the unlogged methods above but push every git

@@ -1,6 +1,6 @@
 # Work Item: Task
 
-Title: grand architecture refactor — final parity validation, oldsrc removal, docs and aspec refresh
+Title: grand architecture refactor — final parity validation, docs and aspec refresh
 Issue: n/a — eighth and final work item implementing `aspec/architecture/2026-grand-architecture.md`
 
 ## Prerequisites
@@ -13,32 +13,34 @@ All eight layers of the grand architecture refactor are complete:
 - **Layer 3 (frontend)**: `src/frontend/cli/` + `src/frontend/tui/` + `src/frontend/headless/` (WIs 0069, 0070, 0071, 0072)
 - **Layer 4 (binary)**: `src/main.rs` (WI 0069)
 
-Every command body is real, all three frontends are functionally complete. The remaining work is verification, deletion, and documentation.
+Every command body is real, all three frontends are functionally complete. The remaining work is verification and documentation. The developer will delete `oldsrc/` manually after manual testing is satisfactory — this work item does NOT include that deletion.
 
 The implementing agent MUST read:
 
 - `aspec/architecture/2026-grand-architecture.md` end-to-end — the source of truth for the layered architecture and its tenets.
 - The entire `src/` tree — this is the code being validated and the sole survivor of the refactor.
-- `oldsrc/` (briefly, for final comparison) — this is about to be deleted. Do not edit it. Do not extend its lifetime.
+- `oldsrc/` (briefly, for comparison during parity validation) — do not edit it.
 
 When uncertain about any gap discovered during validation, ASK THE DEVELOPER rather than papering over it.
 
 ## Summary
 
-- **Build a fresh integration and end-to-end test suite from scratch** under `tests/`, designed against the new four-layer architecture. The legacy `tests/` directory is deleted along with `oldsrc/`; nothing is ported by default.
+- **Build a fresh integration and end-to-end test suite from scratch** under `tests/`, designed against the new four-layer architecture. Nothing is ported from the legacy `tests/` directory by default.
 - Run the resulting suite as a comprehensive parity validation pass. Capture results in `aspec/review-notes/0073-parity-validation.md`.
 - Audit `src/` against every architecture tenet. Fix any violations. Produce `aspec/review-notes/0073-architecture-audit.md`.
-- Delete `oldsrc/`, legacy `tests/`, legacy `benches/`, and all stragglers.
+- Audit `src/` against the functionality of oldsrc, focusing on TUI, Headless, and Remote mode completeness, compatibility with on-disk files/directories, databases, and the handling of workflows, containers, security, and complex flows like `init` and `ready`. 
 - Clean up stale placeholder comments and TODO markers left from prior work items.
 - Refresh `docs/` and `aspec/` to describe the new architecture with no pre-refactor references.
 - Add `make architecture-lint` target enforcing layering rules.
+
+**NOTE:** Deletion of `oldsrc/`, legacy `tests/`, and legacy `benches/` is NOT part of this work item. The developer will perform those deletions manually after manual testing is satisfactory.
 
 ## User Stories
 
 ### User Story 1:
 As a: maintainer
-I want to: have `oldsrc/` deleted and the new architecture be the only source of truth
-So I can: trust that no one accidentally edits or copies from legacy code, and CI no longer compiles 50k+ lines of frozen reference code.
+I want to: have the new architecture validated for full parity with `oldsrc/` so I can confidently delete it
+So I can: trust that the new `src/` tree is a complete replacement before removing the legacy code.
 
 ### User Story 2:
 As a: future implementing agent or contributor
@@ -57,14 +59,14 @@ So I can: catch tenet violations at PR time rather than during review.
 ### 0. Ground rules
 
 - Read the entire `src/` tree before writing any code.
-- `oldsrc/` exists for one last comparison pass. Do not edit it. Do not extend its lifetime.
+- `oldsrc/` exists for comparison during parity validation. Do not edit it. The developer will delete it manually after testing.
 - When uncertain, ASK THE DEVELOPER.
 
 ### 1. Build the new `tests/` tree from scratch
 
 Work items 0066–0072 produced **only colocated unit tests** (plus the route-parity guard in WI 0072). This work item is where every cross-layer integration test, every real-Docker / real-git / real-network end-to-end test, every binary-level smoke test, and every parity test is written.
 
-**Do not port files from the pre-refactor `tests/` directory.** Those tests target legacy command entry points, untyped flags, and frontend-conflated business logic. The narrow exception: a single test file or fixture that satisfies ALL THREE of:
+**Do not port files from the pre-refactor `tests/` directory.** Those tests target legacy command entry points, untyped flags, and frontend-conflated business logic. The legacy `tests/` directory will remain until the developer deletes it manually alongside `oldsrc/`. The narrow exception for porting: a single test file or fixture that satisfies ALL THREE of:
 
 1. Asserts a precise wire-format or on-disk invariant the new architecture must preserve (e.g. headless SSE chunk format, workflow-state JSON schema, `.amux.json` schema, SQLite migration compatibility).
 2. Compiles unchanged or with mechanical edits against the new types.
@@ -199,7 +201,7 @@ Produce `aspec/review-notes/0073-parity-validation.md` capturing all results.
 
 #### 2d. Sign-off rule
 
-Cannot proceed to step 4 (deletion) until every parity entry is PASS or has explicit developer-approved MINOR-DRIFT. REGRESSIONs block the PR.
+Every parity entry must be PASS or have explicit developer-approved MINOR-DRIFT before this work item is considered complete. REGRESSIONs block the PR. The developer will use the parity report to decide when manual testing and `oldsrc/` deletion can proceed.
 
 #### 2e. Parity validation matrix — explicit coverage requirements
 
@@ -350,29 +352,16 @@ Walk every `pub fn` in `src/`. Flag any that is stateful, takes many inputs, or 
 - Verify `Dispatch::parse_command_box_input` (added in WI 0071) works for every catalogue command
 - Verify `CommandCatalogue::tui_completions` and `tui_hint_for` (added in WI 0071) cover all commands
 
-### 5. Delete `oldsrc/` and legacy `tests/` + `benches/`
+### 5. (Reserved — oldsrc deletion is manual)
 
-Once parity (§2) and audit (§4) are PASS, perform deletions in a single atomic commit:
+The developer will delete `oldsrc/`, legacy `tests/`, and legacy `benches/` manually after manual testing is satisfactory. This section is intentionally left as a placeholder to preserve numbering of subsequent sections.
 
-- `git rm -r oldsrc/`
-- `git rm -r` any pre-refactor test files superseded by §1's fresh tree
-- `git rm -r` pre-refactor `benches/` files; delete directory entirely if no longer needed
+When the developer performs the deletion, the following cleanup will also be needed:
 
-Sweep for remaining references:
-
-- `Cargo.toml`: no `path = "oldsrc/…"` remains; remove `amux-next` `[[bin]]` entry; confirm `[[bin]] name = "amux"` points at `src/main.rs`
-- `Makefile`: no `oldsrc` reference; `make all`, `make install`, `make test`, `make test-fast`, `make test-full` all work
+- `Cargo.toml`: remove `oldsrc`/`amux-next` references; confirm `[[bin]] name = "amux"` points at `src/main.rs`
+- `Makefile`: remove `oldsrc` references; confirm `make all`, `make install`, `make test`, `make test-fast`, `make test-full` all work
 - `.gitignore`, `.github/workflows/*.yml`, `scripts/*.sh`, `Dockerfile.dev`: search for `oldsrc` and `amux-next`
 - `aspec/`, `docs/`, `README.md`, `CLAUDE.md`: same search
-- `tests/`: every file compiles against `src/` only; no `oldsrc` imports
-
-Confirm:
-
-```
-$ rg -i 'oldsrc|amux-next' -l --hidden -g '!target' -g '!.git'
-```
-
-returns only documentation files: `aspec/architecture/2026-grand-architecture.md`, `aspec/work-items/006[6-9]-*.md`, `aspec/work-items/007[0-3]-*.md`, and `aspec/review-notes/0073-*.md`.
 
 ### 6. `make architecture-lint`
 
@@ -417,7 +406,8 @@ Add `make pre-push` umbrella: `cargo fmt --check` + `cargo clippy --all-targets 
 - `cargo clippy --all-targets -- -D warnings` passes
 - `make architecture-lint` passes
 - `make all`, `make install`, `make test` work
-- `git status` is clean. Repository is ready to release.
+- Parity validation report is complete with no unresolved REGRESSIONs
+- Repository is ready for developer's manual testing and subsequent `oldsrc/` deletion.
 
 ### 10. What must NOT happen in this work item
 
@@ -425,7 +415,8 @@ Add `make pre-push` umbrella: `cargo fmt --check` + `cargo clippy --all-targets 
 - No new flags
 - No new commands
 - No user-visible behavior change (if a parity check shows something "feels worse" but is technically equivalent, leave it alone unless developer says otherwise)
-- No leaving any `oldsrc` reference behind (outside the documented allowlist in §5)
+- No deleting `oldsrc/`, legacy `tests/`, or legacy `benches/` — the developer will do this manually
+- No editing `oldsrc/`
 
 ---
 
@@ -433,11 +424,11 @@ Add `make pre-push` umbrella: `cargo fmt --check` + `cargo clippy --all-targets 
 
 - **Architecture-lint on third-party crate paths**: lint ignores `std::*` and external crates; only inspects `crate::*` paths.
 - **`#[cfg(test)]` test modules**: tests under `src/data/` may want a helper from another layer. Default is to forbid; allow only with explicit developer approval.
-- **Workspace splits**: if Cargo layout used a workspace, confirm `Cargo.toml` reflects the final shape after `oldsrc/` deletion.
+- **Workspace splits**: if Cargo layout uses a workspace, confirm `Cargo.toml` reflects the correct shape for the new `src/` tree.
 - **Existing user data**: users upgrading must not lose data. `SqliteSessionStore` schema must remain readable; persisted workflow state must load. Confirm with a real database from a prior install if available.
 - **Headless SQLite forward-compatibility**: `HeadlessDb` schema (added in WI 0072) must open legacy databases. Test with a captured fixture.
 - **Release notes**: next release should call out the refactor at a high level (CLI behavior unchanged, internal structure changed). ASK THE DEVELOPER for tone.
-- **CI flake risk**: deleting 50k+ lines + adding a new lint can mask flakes. Run full CI at least twice before merge.
+- **CI flake risk**: adding a new test suite + lint can mask flakes. Run full CI at least twice before merge.
 - **Coverage drop**: new tests should cover equivalent behavior. Run coverage before and after on parity suite to confirm.
 - **TODO(issue-17) in claws/mod.rs**: this is a tracked feature request (fork-and-clone flow), NOT a refactor regression. Leave the TODO; confirm it's in the issue tracker. Do NOT attempt to implement it in this work item.
 
@@ -455,7 +446,6 @@ This work item is the **only** point that adds tests to `tests/` (and `benches/`
 
 - Complete `tests/` tree (§1)
 - `tools/architecture-lint/` unit tests (if implemented as Rust binary)
-- Repo-level guard that fails if any file outside the allowlist mentions `oldsrc` or `amux-next`
 
 ### Tests preserved
 
@@ -480,8 +470,8 @@ All `#[cfg(test)] mod tests` blocks from WIs 0066–0072 remain in place and con
 
 - Follow `aspec/architecture/2026-grand-architecture.md` as the source of truth
 - Follow `aspec/uxui/cli.md` after regeneration from catalogue
-- Do not edit `oldsrc/` before deleting it; do not partially delete it
+- Do not edit or delete `oldsrc/` — the developer will handle deletion manually after testing
 - Do not introduce upward calls or new free `pub fn` for stateful concerns
 - Fix any leftover violations from prior WIs as part of the audit
-- The PR description MUST link to this work item, MUST include the parity report, the architecture audit report, and confirmation that `oldsrc/` is gone, and MUST list any developer-clarification questions raised
-- After this work item lands, the grand architecture refactor is complete. amux is ready for the next decade.
+- The PR description MUST link to this work item, MUST include the parity report, the architecture audit report, and MUST list any developer-clarification questions raised
+- After this work item lands and the developer completes manual testing and `oldsrc/` deletion, the grand architecture refactor is complete.

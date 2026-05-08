@@ -267,7 +267,7 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             if tab.container_window_state != ContainerWindowState::Hidden {
                 if let Ok(size) = crossterm::terminal::size() {
                     let (cols, rows) = compute_container_inner_size(size.0, size.1);
-                    tab.vt100_parser.set_size(rows, cols);
+                    tab.vt100_parser.screen_mut().set_size(rows, cols);
                     if let Some(ref tx) = tab.container_resize_tx {
                         let _ = tx.send((cols, rows));
                     }
@@ -287,12 +287,15 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 app.status_bar.text = "no workflow running".to_string();
             } else if matches!(app.active_dialog, Some(Dialog::WorkflowYoloCountdown(_))) {
                 // During yolo countdown: cancel it and signal the engine to
-                // show the workflow control board.
+                // show the workflow control board. Set the ctrl_w atomic
+                // BEFORE clearing yolo_state so the engine's next tick reads
+                // the atomic first and returns ShowControlBoard rather than
+                // tripping the "yolo_state cleared by user" Cancel path.
+                app.active_tab().yolo_ctrl_w.store(true, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(mut guard) = app.active_tab().yolo_state.lock() {
                     *guard = None;
                 }
                 app.active_tab_mut().yolo_dismissed_at = Some(std::time::Instant::now());
-                app.active_tab().yolo_ctrl_w.store(true, std::sync::atomic::Ordering::Relaxed);
                 app.active_dialog = None;
             } else if matches!(app.active_dialog, Some(Dialog::WorkflowStepConfirm(_))) {
                 // Escalate from lightweight step confirm to full WCB.
@@ -545,15 +548,17 @@ fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
             }
             let tab = app.active_tab_mut();
             if tab.container_window_state == ContainerWindowState::Maximized {
-                // vt100's visible_rows() overflows when scrollback_offset >
-                // screen rows, so cap to min(scrollback_depth, rows).
+                // Cap to the actual scrollback buffer depth so the user
+                // can scroll the full configured history (5000 lines by
+                // default). vt100-ctt 0.17 uses `saturating_sub` in
+                // `visible_rows()`, so offsets > screen height are safe
+                // (the panic in vt100 0.15.2 is fixed upstream).
                 let max_scroll = {
-                    let parser = &mut tab.vt100_parser;
-                    let screen_rows = parser.screen().size().0 as usize;
-                    parser.set_scrollback(usize::MAX);
-                    let depth = parser.screen().scrollback();
-                    parser.set_scrollback(0);
-                    depth.min(screen_rows)
+                    let screen = tab.vt100_parser.screen_mut();
+                    screen.set_scrollback(usize::MAX);
+                    let depth = screen.scrollback();
+                    screen.set_scrollback(0);
+                    depth
                 };
                 tab.container_scroll_offset =
                     (tab.container_scroll_offset + 5).min(max_scroll);
@@ -658,13 +663,11 @@ fn capture_vt100_snapshot(
     parser: &mut vt100::Parser,
     scroll_offset: usize,
 ) -> Vec<Vec<String>> {
-    // Cap to screen rows: vt100's visible_rows() panics if offset > rows.
-    let capped = scroll_offset.min(parser.screen().size().0 as usize);
-    if capped > 0 {
-        parser.set_scrollback(capped);
+    let screen = parser.screen_mut();
+    if scroll_offset > 0 {
+        screen.set_scrollback(scroll_offset);
     }
     let snapshot = {
-        let screen = parser.screen();
         let (rows, cols) = screen.size();
         (0..rows)
             .map(|row| {
@@ -674,7 +677,11 @@ fn capture_vt100_snapshot(
                             .cell(row, col)
                             .map(|c| {
                                 let s = c.contents();
-                                if s.is_empty() { " ".to_string() } else { s }
+                                if s.is_empty() {
+                                    " ".to_string()
+                                } else {
+                                    s.to_string()
+                                }
                             })
                             .unwrap_or_else(|| " ".to_string())
                     })
@@ -682,8 +689,8 @@ fn capture_vt100_snapshot(
             })
             .collect()
     };
-    if capped > 0 {
-        parser.set_scrollback(0);
+    if scroll_offset > 0 {
+        screen.set_scrollback(0);
     }
     snapshot
 }
@@ -741,7 +748,7 @@ fn handle_resize(app: &mut App, cols: u16, rows: u16) {
         tab.mouse_selection = None;
         if tab.container_window_state != ContainerWindowState::Hidden {
             let (inner_cols, inner_rows) = compute_container_inner_size(cols, rows);
-            tab.vt100_parser.set_size(inner_rows, inner_cols);
+            tab.vt100_parser.screen_mut().set_size(inner_rows, inner_cols);
             // Forward the new size to the container's PTY master so its
             // SIGWINCH handler reflows TUI apps inside the container.
             if let Some(ref tx) = tab.container_resize_tx {

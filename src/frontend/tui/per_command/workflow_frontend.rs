@@ -440,6 +440,7 @@ mod tests {
             stdin_tx_shared,
             resize_tx_shared,
             control_board_tx_shared,
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
         );
         (frontend, req_rx, resp_tx)
     }

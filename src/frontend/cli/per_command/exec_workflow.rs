@@ -7,6 +7,7 @@
 //! (`set_pty_active` and `report_workflow_summary`).
 
 use crate::command::commands::exec_workflow::{ExecWorkflowCommandFrontend, WorkflowSummary};
+use crate::command::error::CommandError;
 use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 use crate::frontend::cli::command_frontend::CliFrontend;
@@ -26,5 +27,17 @@ impl ExecWorkflowCommandFrontend for CliFrontend {
                 summary.steps_failed
             ),
         });
+    }
+
+    fn ask_workflow_resume_or_fresh(
+        &mut self,
+        _workflow_name: &str,
+        _completed_steps: usize,
+        _total_steps: usize,
+    ) -> Result<bool, CommandError> {
+        // Non-interactive default: resume from saved state. The CLI/headless
+        // path has no dialog system; preserving state is the safer choice
+        // (matches old-amux behavior).
+        Ok(true)
     }
 }

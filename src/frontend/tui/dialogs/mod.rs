@@ -196,15 +196,39 @@ pub fn render_dialog_frame(
 }
 
 /// Render the YesNo dialog.
+///
+/// Sizes dynamically: width grows to fit the longest body line (clamped to a
+/// usable range) and height grows to fit the body, a blank-line separator,
+/// and the hint row. Body wraps so content is never silently clipped.
 pub fn render_yes_no(
     title: &str,
     body: &str,
     area: Rect,
     frame: &mut Frame,
 ) {
-    let dialog_area = centered_fixed(50, 8, area);
+    let max_w = area.width.saturating_sub(6).max(40);
+    let max_body_w = body
+        .lines()
+        .map(unicode_width::UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0) as u16;
+    // +6 = 2 borders + 2 padding + 2 leading-space margin used in the hint.
+    let title_w = unicode_width::UnicodeWidthStr::width(title) as u16 + 4;
+    let width = max_body_w.saturating_add(6).max(50).max(title_w).min(max_w);
+    // Body lines (after wrapping at content width), blank separator, hint.
+    let inner_w = width.saturating_sub(4) as usize; // subtract borders+padding
+    let wrapped_lines: usize = body
+        .lines()
+        .map(|line| {
+            let w = unicode_width::UnicodeWidthStr::width(line);
+            if inner_w == 0 || w == 0 { 1 } else { w.div_ceil(inner_w) }
+        })
+        .sum();
+    let body_h = wrapped_lines as u16;
+    let height = (body_h + 5).min(area.height.saturating_sub(2)).max(7);
+    let dialog_area = centered_fixed(width, height, area);
     let inner = render_dialog_frame(title, Color::Yellow, dialog_area, frame);
-    let text = format!("{body}\n\n  [y] Yes   [n] No");
+    let text = format!("{body}\n\n  [y] Yes   [n] No   [Esc] Cancel");
     frame.render_widget(
         Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
         inner,
@@ -213,24 +237,35 @@ pub fn render_yes_no(
 
 /// Render the quit confirmation dialog (single tab).
 pub fn render_quit_confirm(area: Rect, frame: &mut Frame) {
-    let dialog_area = centered_fixed(55, 8, area);
+    let width = 56u16.min(area.width.saturating_sub(4).max(40));
+    let dialog_area = centered_fixed(width, 8, area);
     let inner = render_dialog_frame("Quit amux?", Color::Yellow, dialog_area, frame);
-    let text = "\n  Press Ctrl-C again to quit amux\n\n  Press Esc to cancel";
-    frame.render_widget(Paragraph::new(text), inner);
+    let text = "  Press Ctrl-C again to quit amux\n\n  [Esc] cancel";
+    frame.render_widget(
+        Paragraph::new(text)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .style(Style::default()),
+        inner,
+    );
 }
 
 /// Render the close-tab confirmation dialog (multiple tabs).
 pub fn render_close_tab_confirm(area: Rect, frame: &mut Frame) {
-    let dialog_area = centered_fixed(55, 10, area);
+    let width = 60u16.min(area.width.saturating_sub(4).max(40));
+    let dialog_area = centered_fixed(width, 9, area);
     let inner = render_dialog_frame("Close tab?", Color::Yellow, dialog_area, frame);
-    let text = "\n  Press Ctrl-C again to quit amux\n  Press Ctrl-T to close this tab\n\n  Press Esc to cancel";
-    frame.render_widget(Paragraph::new(text), inner);
+    let text = "  Press Ctrl-C again to quit amux\n  Press Ctrl-T to close this tab\n\n  [Esc] cancel";
+    frame.render_widget(
+        Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
 }
 
 /// Render the workflow-cancel confirmation dialog (Ctrl+C while a workflow
 /// is running).
 pub fn render_workflow_cancel_confirm(area: Rect, frame: &mut Frame) {
-    let dialog_area = centered_fixed(58, 10, area);
+    let width = 64u16.min(area.width.saturating_sub(4).max(40));
+    let dialog_area = centered_fixed(width, 11, area);
     let inner = render_dialog_frame(
         "Cancel Workflow Execution",
         Color::Yellow,
@@ -239,7 +274,10 @@ pub fn render_workflow_cancel_confirm(area: Rect, frame: &mut Frame) {
     );
     let text =
         "  Cancel workflow execution?\n\n  The running container will be killed and the\n  current step returned to Pending for resumption.\n\n  [y] cancel execution   [n / Esc] keep running";
-    frame.render_widget(Paragraph::new(text), inner);
+    frame.render_widget(
+        Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
 }
 
 #[cfg(test)]
