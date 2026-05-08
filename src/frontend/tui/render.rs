@@ -821,35 +821,126 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             let dialog_area = dialogs::centered_rect(70, 60, area);
             let inner =
                 dialogs::render_dialog_frame(title, Color::Cyan, dialog_area, frame);
-            // Reserve the bottom row for a hint so it never gets clipped.
-            let content_h = inner.height.saturating_sub(1);
-            let content_area = Rect { height: content_h, ..inner };
-            let text = format!("{prompt}\n{}", editor.text);
+
+            // Layout: prompt lines, 1-row gap, bordered textarea, 1-row gap, hint.
+            let prompt_lines = prompt.lines().count() as u16;
+            let prompt_area = Rect { height: prompt_lines, ..inner };
             frame.render_widget(
-                Paragraph::new(text).wrap(Wrap { trim: false }),
-                content_area,
+                Paragraph::new(prompt.as_str()).style(Style::default().fg(Color::Gray)),
+                prompt_area,
             );
-            let hint_area = Rect {
-                y: inner.y + content_h,
-                height: 1,
-                ..inner
+
+            // Textarea with a visible border.
+            let textarea_y = inner.y + prompt_lines + 1;
+            let hint_reserve: u16 = 2; // 1-row gap + 1-row hint
+            let textarea_h = inner.height
+                .saturating_sub(prompt_lines + 1 + hint_reserve)
+                .max(3);
+            let textarea_area = Rect {
+                x: inner.x,
+                y: textarea_y,
+                width: inner.width,
+                height: textarea_h,
             };
+            let textarea_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan));
+            let textarea_inner = textarea_block.inner(textarea_area);
+            frame.render_widget(textarea_block, textarea_area);
+
+            // Render editor text inside the bordered textarea with wrapping.
+            let inner_w = textarea_inner.width as usize;
+            let inner_h = textarea_inner.height as usize;
+
+            // Compute visual lines from the editor text (split by '\n', then
+            // wrap each logical line at inner_w).
+            let logical_lines: Vec<&str> = editor.text.split('\n').collect();
+            let mut visual_lines: Vec<String> = Vec::new();
+            for line in &logical_lines {
+                if line.is_empty() {
+                    visual_lines.push(String::new());
+                } else if inner_w == 0 {
+                    visual_lines.push(line.to_string());
+                } else {
+                    let chars: Vec<char> = line.chars().collect();
+                    for chunk in chars.chunks(inner_w) {
+                        visual_lines.push(chunk.iter().collect());
+                    }
+                }
+            }
+
+            // Compute cursor position in visual-line space.
+            let text_before_cursor = &editor.text[..editor.cursor];
+            let cursor_logical: Vec<&str> = text_before_cursor.split('\n').collect();
+            let cursor_last_line = cursor_logical.last().unwrap_or(&"");
+            let cursor_col_chars = cursor_last_line.chars().count();
+            let mut cursor_visual_row: usize = 0;
+            // Walk logical lines before the cursor line.
+            for (i, line) in logical_lines.iter().enumerate() {
+                if i >= cursor_logical.len() - 1 {
+                    break;
+                }
+                let line_chars = line.chars().count();
+                if line_chars == 0 || inner_w == 0 {
+                    cursor_visual_row += 1;
+                } else {
+                    cursor_visual_row += (line_chars + inner_w - 1) / inner_w;
+                }
+            }
+            // Add wrapped rows from the current logical line.
+            if inner_w > 0 && cursor_col_chars > 0 {
+                cursor_visual_row += cursor_col_chars / inner_w;
+            }
+            let cursor_visual_col = if inner_w > 0 {
+                cursor_col_chars % inner_w
+            } else {
+                cursor_col_chars
+            };
+
+            // Scroll to keep cursor visible.
+            let scroll_offset = if cursor_visual_row >= inner_h {
+                cursor_visual_row - inner_h + 1
+            } else {
+                0
+            };
+
+            // Render visible lines.
+            let visible: Vec<Line> = visual_lines
+                .iter()
+                .skip(scroll_offset)
+                .take(inner_h)
+                .map(|s| Line::from(s.as_str()))
+                .collect();
             frame.render_widget(
-                Paragraph::new(
-                    "  [Ctrl+Enter] submit   [Enter] newline   [Esc] cancel",
-                )
-                .style(Style::default().fg(Color::DarkGray)),
-                hint_area,
+                Paragraph::new(visible).style(Style::default().fg(Color::White)),
+                textarea_inner,
             );
-            let lines_before: Vec<&str> = editor.text[..editor.cursor].split('\n').collect();
-            let last_line = lines_before.last().unwrap_or(&"");
-            let cursor_display_w = unicode_width::UnicodeWidthStr::width(*last_line) as u16;
-            let prompt_lines = prompt.lines().count() as u16 + 1;
-            let cursor_x = inner.x + cursor_display_w.min(inner.width.saturating_sub(1));
-            let cursor_y =
-                inner.y + prompt_lines + (lines_before.len() as u16).saturating_sub(1);
-            if cursor_x < inner.x + inner.width && cursor_y < inner.y + content_h {
-                frame.set_cursor_position(Position::new(cursor_x, cursor_y));
+
+            // Hint row below the textarea.
+            let hint_y = textarea_area.y + textarea_area.height + 1;
+            if hint_y < inner.y + inner.height {
+                let hint_area = Rect {
+                    y: hint_y,
+                    height: 1,
+                    ..inner
+                };
+                frame.render_widget(
+                    Paragraph::new(
+                        "  [Ctrl+Enter] submit   [Enter] newline   [Esc] cancel",
+                    )
+                    .style(Style::default().fg(Color::DarkGray)),
+                    hint_area,
+                );
+            }
+
+            // Place the cursor at the correct visual position.
+            let display_row = cursor_visual_row.saturating_sub(scroll_offset);
+            let cx = textarea_inner.x + (cursor_visual_col as u16).min(textarea_inner.width.saturating_sub(1));
+            let cy = textarea_inner.y + display_row as u16;
+            if cx < textarea_inner.x + textarea_inner.width
+                && cy < textarea_inner.y + textarea_inner.height
+            {
+                frame.set_cursor_position(Position::new(cx, cy));
             }
         }
         dialogs::Dialog::ListPicker {

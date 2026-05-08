@@ -37,6 +37,19 @@ enum YoloCountdownResult {
     ShowControlBoard,
 }
 
+/// Result of a mid-step yolo countdown (step is still running while
+/// the countdown ticks).
+enum MidStepYoloResult {
+    /// Step completed while the countdown was ticking.
+    StepCompleted(StepOutcome),
+    /// Countdown expired: auto-advance the step.
+    Advanced,
+    /// User pressed Esc: cancel the countdown.
+    Cancelled,
+    /// User pressed Ctrl-W: show the WCB instead.
+    ShowControlBoard,
+}
+
 /// Result of mid-step control board interaction.
 enum MidStepOutcome {
     /// User dismissed the dialog — resume waiting on the step.
@@ -71,6 +84,10 @@ pub enum ControlBoardRequest {
     /// User pressed Ctrl+W while a step is running. The engine computes
     /// mid-step available actions and calls `user_choose_next_action`.
     OpenControlBoard,
+    /// The frontend detected that the current step's container is stuck
+    /// (no PTY output for `STUCK_TIMEOUT`). In yolo mode the engine
+    /// starts a yolo countdown; in non-yolo mode the engine opens the WCB.
+    StepStuck,
 }
 
 /// Configuration the engine consumes at construction.
@@ -627,6 +644,64 @@ impl WorkflowEngine {
                                 }
                             }
                         }
+                        ControlBoardRequest::StepStuck => {
+                            // ENG-1: Frontend detected the step's container is
+                            // stuck. In yolo mode, run a mid-step countdown
+                            // (the step keeps running). In non-yolo mode, open
+                            // the WCB so the user can choose an action.
+                            let step_auto_advance = self.frontend.should_auto_advance(&step_name);
+                            if self.yolo && step_auto_advance {
+                                let countdown_result = self.run_mid_step_yolo_countdown(
+                                    &step_name,
+                                    &cancel_handle,
+                                    &mut wait_rx,
+                                ).await?;
+                                match countdown_result {
+                                    MidStepYoloResult::StepCompleted(o) => {
+                                        return Ok(InterruptibleStepResult::StepCompleted(o));
+                                    }
+                                    MidStepYoloResult::ShowControlBoard => {
+                                        let mid_step_outcome = self.handle_mid_step_control_board(
+                                            &step_name,
+                                            &cancel_handle,
+                                            &mut wait_rx,
+                                        )?;
+                                        match mid_step_outcome {
+                                            MidStepOutcome::Continue => continue,
+                                            MidStepOutcome::StepCompleted(o) => {
+                                                return Ok(InterruptibleStepResult::StepCompleted(o));
+                                            }
+                                            MidStepOutcome::WorkflowEnded(wo) => {
+                                                return Ok(InterruptibleStepResult::WorkflowEnded(wo));
+                                            }
+                                            MidStepOutcome::LoopContinue => {
+                                                return Ok(InterruptibleStepResult::LoopContinue);
+                                            }
+                                        }
+                                    }
+                                    MidStepYoloResult::Cancelled => continue,
+                                    MidStepYoloResult::Advanced => continue,
+                                }
+                            } else {
+                                let mid_step_outcome = self.handle_mid_step_control_board(
+                                    &step_name,
+                                    &cancel_handle,
+                                    &mut wait_rx,
+                                )?;
+                                match mid_step_outcome {
+                                    MidStepOutcome::Continue => continue,
+                                    MidStepOutcome::StepCompleted(o) => {
+                                        return Ok(InterruptibleStepResult::StepCompleted(o));
+                                    }
+                                    MidStepOutcome::WorkflowEnded(wo) => {
+                                        return Ok(InterruptibleStepResult::WorkflowEnded(wo));
+                                    }
+                                    MidStepOutcome::LoopContinue => {
+                                        return Ok(InterruptibleStepResult::LoopContinue);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -788,6 +863,63 @@ impl WorkflowEngine {
                 return Ok(YoloCountdownResult::Advance);
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Run a mid-step yolo countdown while the step container is still
+    /// running. Races the 60-second countdown ticks against the step
+    /// completing and user Ctrl-W / Esc via `yolo_countdown_tick`.
+    async fn run_mid_step_yolo_countdown(
+        &mut self,
+        step_name: &str,
+        _cancel_handle: &Option<crate::engine::container::instance::CancelHandle>,
+        wait_rx: &mut tokio::sync::oneshot::Receiver<(ContainerExecution, Result<ContainerExitInfo, EngineError>)>,
+    ) -> Result<MidStepYoloResult, EngineError> {
+        let total = timing::YOLO_COUNTDOWN_DURATION;
+        let start = std::time::Instant::now();
+
+        loop {
+            let elapsed = start.elapsed();
+            let remaining = if elapsed >= total {
+                std::time::Duration::ZERO
+            } else {
+                total - elapsed
+            };
+
+            match self.frontend.yolo_countdown_tick(remaining)? {
+                YoloTickOutcome::AdvanceNow => {
+                    self.advance_to_next_step()?;
+                    return Ok(MidStepYoloResult::Advanced);
+                }
+                YoloTickOutcome::Cancel => {
+                    return Ok(MidStepYoloResult::Cancelled);
+                }
+                YoloTickOutcome::ShowControlBoard => {
+                    return Ok(MidStepYoloResult::ShowControlBoard);
+                }
+                YoloTickOutcome::Continue => {}
+            }
+
+            if remaining.is_zero() {
+                self.advance_to_next_step()?;
+                return Ok(MidStepYoloResult::Advanced);
+            }
+
+            // Sleep 100ms, but check if the step completed in that window.
+            tokio::select! {
+                biased;
+                result = &mut *wait_rx => {
+                    let (exec_back, exit_result) = result
+                        .map_err(|_| EngineError::Other("step wait task dropped unexpectedly".into()))?;
+                    self.current_execution = Some(exec_back);
+                    return Ok(MidStepYoloResult::StepCompleted(
+                        self.finalize_step(step_name, exit_result?)?
+                    ));
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    // Next tick.
+                }
+            }
         }
     }
 

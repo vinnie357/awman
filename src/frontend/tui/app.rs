@@ -312,6 +312,22 @@ impl App {
             tab.poll_command_completion();
             tab.recompute_stuck(i == active);
 
+            // TUI-4: Sync the vt100 parser size with the actual rendered
+            // container overlay dimensions. The overlay size varies with
+            // workflow strip height and other dynamic chrome; the initial
+            // `compute_container_inner_size` estimate may not match.
+            if tab.container_window_state != crate::frontend::tui::tabs::ContainerWindowState::Hidden {
+                if let Some(inner) = tab.container_inner_area {
+                    let (vt_rows, vt_cols) = tab.vt100_parser.screen().size();
+                    if vt_cols != inner.width || vt_rows != inner.height {
+                        tab.vt100_parser.screen_mut().set_size(inner.height, inner.width);
+                        if let Some(ref tx) = tab.container_resize_tx {
+                            let _ = tx.send((inner.width, inner.height));
+                        }
+                    }
+                }
+            }
+
             // Pick up the container name from the engine (set via
             // `report_status(Running { container_name })`).
             // Also handles workflow step transitions: the engine clears the
@@ -407,9 +423,14 @@ impl App {
             }
         }
 
-        // Stuck-container → trigger yolo countdown or control board.
-        // This mirrors old-amux: when a tab is stuck during a workflow step,
-        // the TUI autonomously opens the appropriate dialog.
+        // ENG-1: Stuck-container → notify the engine.
+        //
+        // The TUI detects stuck (no PTY output for STUCK_TIMEOUT) and sends
+        // `ControlBoardRequest::StepStuck` to the engine. The ENGINE decides
+        // what to do: yolo mode → run a yolo countdown via
+        // `yolo_countdown_tick`; non-yolo → open the WCB via
+        // `user_choose_next_action`. The TUI only renders; it never drives
+        // yolo countdowns.
         let active = self.active_tab;
         {
             let tab = &self.tabs[active];
@@ -422,54 +443,16 @@ impl App {
             let backoff_active = tab.yolo_dismissed_at
                 .map(|t| t.elapsed() < crate::engine::workflow::timing::STUCK_DIALOG_BACKOFF)
                 .unwrap_or(false);
-            let auto_disabled = tab.workflow_state.lock().ok()
-                .and_then(|g| g.as_ref().map(|ws| {
-                    ws.current_step.as_ref()
-                        .map(|s| ws.auto_disabled.contains(s))
-                        .unwrap_or(false)
-                }))
-                .unwrap_or(false);
 
             if tab.stuck
                 && has_workflow_step
                 && !engine_yolo_active
                 && !self.command_dialog_active
                 && !backoff_active
-                && !auto_disabled
             {
-                // Stuck-detection during a running step opens the workflow
-                // control board so the user can choose Restart/Abort/etc.
-                // We don't open a yolo-style countdown here — the engine
-                // owns the inter-step countdown via `yolo_state`. Showing
-                // an undriven countdown that never advances was confusing
-                // (issue ENG-2: "stuck at 60").
-                let step_name = tab.workflow_state.lock().ok()
-                    .and_then(|g| g.as_ref().and_then(|ws| ws.current_step.clone()))
-                    .unwrap_or_default();
-                if !matches!(self.active_dialog, Some(Dialog::WorkflowControlBoard(_))) {
-                    self.active_dialog =
-                        Some(Dialog::WorkflowControlBoard(
-                            crate::frontend::tui::dialogs::WorkflowControlBoardState {
-                                step_name,
-                                can_launch_next: true,
-                                can_continue_current: false,
-                                can_restart: true,
-                                can_go_back: false,
-                                can_finish: true,
-                                continue_unavailable_reason: Some(
-                                    "agent is still running".into(),
-                                ),
-                                cancel_to_previous_unavailable_reason: None,
-                                finish_workflow_unavailable_reason: None,
-                                is_mid_step: false,
-                            },
-                        ));
-                }
-            } else if !tab.stuck && !has_workflow_step {
-                // Clear stuck-triggered countdown when unstuck.
-                if matches!(self.active_dialog, Some(Dialog::WorkflowYoloCountdown(_))) {
-                    if !engine_yolo_active {
-                        self.active_dialog = None;
+                if let Ok(guard) = tab.control_board_tx_shared.lock() {
+                    if let Some(tx) = guard.as_ref() {
+                        let _ = tx.send(crate::engine::workflow::ControlBoardRequest::StepStuck);
                     }
                 }
             }
@@ -500,9 +483,7 @@ impl App {
             self.active_dialog,
             Some(Dialog::WorkflowYoloCountdown(_))
         ) {
-            if self.tabs[active].yolo_countdown.is_none() {
-                self.active_dialog = None;
-            }
+            self.active_dialog = None;
         }
     }
 

@@ -192,6 +192,44 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         return;
     }
 
+    // TUI-2: Yolo countdown dialog allows tab switching — dismiss the dialog
+    // (countdown continues in the tab label) and switch tabs.
+    if matches!(app.active_dialog, Some(Dialog::WorkflowYoloCountdown(_)))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        match key.code {
+            KeyCode::Char('a') => {
+                app.active_dialog = None;
+                app.switch_to_prev_tab();
+                return;
+            }
+            KeyCode::Char('d') => {
+                app.active_dialog = None;
+                app.switch_to_next_tab();
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // TUI-3: In MultilineInput dialogs, bare Enter inserts a newline while
+    // Ctrl+Enter submits. The generic keymap maps Enter → SubmitCommand for
+    // all dialogs, so we intercept here where we can inspect the dialog type.
+    if matches!(app.active_dialog, Some(Dialog::MultilineInput { .. }))
+        && key.code == KeyCode::Enter
+    {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if ctrl || shift {
+            handle_dialog_submit(app);
+        } else {
+            if let Some(Dialog::MultilineInput { editor, .. }) = &mut app.active_dialog {
+                editor.insert_newline();
+            }
+        }
+        return;
+    }
+
     let action = keymap::map_key(key, ctx);
 
     match action {
@@ -286,17 +324,22 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
             if !workflow_active && !yolo_active {
                 app.status_bar.text = "no workflow running".to_string();
             } else if matches!(app.active_dialog, Some(Dialog::WorkflowYoloCountdown(_))) {
-                // During yolo countdown: cancel it and signal the engine to
-                // show the workflow control board. Set the ctrl_w atomic
-                // BEFORE clearing yolo_state so the engine's next tick reads
-                // the atomic first and returns ShowControlBoard rather than
-                // tripping the "yolo_state cleared by user" Cancel path.
+                // During yolo countdown: cancel it and open WCB. Do NOT
+                // auto-advance. Set the ctrl_w atomic BEFORE clearing
+                // yolo_state so the engine's next tick reads ShowControlBoard.
                 app.active_tab().yolo_ctrl_w.store(true, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(mut guard) = app.active_tab().yolo_state.lock() {
                     *guard = None;
                 }
-                app.active_tab_mut().yolo_dismissed_at = Some(std::time::Instant::now());
+                let tab = app.active_tab_mut();
+                tab.yolo_dismissed_at = Some(std::time::Instant::now());
                 app.active_dialog = None;
+                // Now send the control board request so the engine shows WCB.
+                if let Ok(guard) = app.active_tab().control_board_tx_shared.lock() {
+                    if let Some(tx) = guard.as_ref() {
+                        let _ = tx.send(crate::engine::workflow::ControlBoardRequest::OpenControlBoard);
+                    }
+                }
             } else if matches!(app.active_dialog, Some(Dialog::WorkflowStepConfirm(_))) {
                 // Escalate from lightweight step confirm to full WCB.
                 // Send Dismissed so the workflow frontend falls through.
@@ -413,7 +456,8 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 if let Ok(mut guard) = app.active_tab().yolo_state.lock() {
                     *guard = None;
                 }
-                app.active_tab_mut().yolo_dismissed_at = Some(std::time::Instant::now());
+                let tab = app.active_tab_mut();
+                tab.yolo_dismissed_at = Some(std::time::Instant::now());
                 app.active_dialog = None;
                 return;
             }
@@ -762,9 +806,17 @@ fn handle_resize(app: &mut App, cols: u16, rows: u16) {
 /// accounting for the 95% sizing within the execution window area and the
 /// 2-cell border subtraction. The container window lives between the tab
 /// bar (3 rows) and the bottom chrome (5 rows: status bar + command box +
-/// suggestion row).
+/// suggestion row), plus any workflow strip or extra bar below.
+///
+/// `extra_bottom` accounts for the workflow strip height and the
+/// minimized/summary bar (3 rows each when present). Callers that don't
+/// know the exact extra height can pass 0 for a best-effort estimate.
 pub fn compute_container_inner_size(term_cols: u16, term_rows: u16) -> (u16, u16) {
-    let exec_height = term_rows.saturating_sub(8); // 3 top + 5 bottom
+    compute_container_inner_size_with_extra(term_cols, term_rows, 0)
+}
+
+fn compute_container_inner_size_with_extra(term_cols: u16, term_rows: u16, extra_bottom: u16) -> (u16, u16) {
+    let exec_height = term_rows.saturating_sub(8 + extra_bottom); // 3 top + 5 bottom + extras
     let outer_cols = ((term_cols as u32 * 95 / 100) as u16).max(10);
     let outer_rows = ((exec_height as u32 * 95 / 100) as u16).max(5);
     (outer_cols.saturating_sub(2), outer_rows.saturating_sub(2))

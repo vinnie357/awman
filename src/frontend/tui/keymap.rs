@@ -69,12 +69,15 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
-    // Global shortcuts — available in ALL contexts including maximized container.
+    // Global shortcuts — available in most contexts including maximized container.
+    // Tab switching (Ctrl-A/D) is suppressed in Dialog context to prevent
+    // dialogs from leaking across tabs (TUI-2). The yolo countdown dialog
+    // is handled specially in the event loop.
     if ctrl {
         match key.code {
             KeyCode::Char('t') => return Action::OpenNewTabDialog,
-            KeyCode::Char('a') => return Action::PreviousTab,
-            KeyCode::Char('d') => return Action::NextTab,
+            KeyCode::Char('a') if ctx != FocusContext::Dialog => return Action::PreviousTab,
+            KeyCode::Char('d') if ctx != FocusContext::Dialog => return Action::NextTab,
             KeyCode::Char('m') => return Action::CycleContainerWindow,
             KeyCode::Char('w') => return Action::WorkflowControl,
             _ => {}
@@ -302,12 +305,17 @@ mod tests {
     }
 
     #[test]
-    fn global_shortcuts_available_in_dialog() {
+    fn tab_switching_suppressed_in_dialog() {
         let action = map_key(
             key(KeyCode::Char('d'), KeyModifiers::CONTROL),
             FocusContext::Dialog,
         );
-        assert_eq!(action, Action::NextTab);
+        assert_ne!(action, Action::NextTab, "Ctrl-D must not switch tabs while a dialog is open");
+        let action = map_key(
+            key(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            FocusContext::Dialog,
+        );
+        assert_ne!(action, Action::PreviousTab, "Ctrl-A must not switch tabs while a dialog is open");
     }
 
     // ── Command box ───────────────────────────────────────────────────────────
