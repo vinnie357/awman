@@ -945,12 +945,18 @@ fn handle_workflow_control_board_key(app: &mut App, key: crossterm::event::KeyEv
         return true;
     }
 
+    let can_finish = matches!(
+        &app.active_dialog,
+        Some(Dialog::WorkflowControlBoard(state)) if state.can_finish
+    );
+
     let response = match key.code {
         KeyCode::Right => DialogResponse::Char('>'),
         KeyCode::Down => DialogResponse::Char('v'),
         KeyCode::Up => DialogResponse::Char('^'),
         KeyCode::Left => DialogResponse::Char('<'),
-        KeyCode::Enter if ctrl => DialogResponse::Char('f'),
+        KeyCode::Enter if ctrl && can_finish => DialogResponse::Char('f'),
+        KeyCode::Enter if ctrl => return false,
         _ => return false,
     };
     app.send_dialog_response(response);
@@ -1892,6 +1898,33 @@ mod tests {
         press_key(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
         let resp = rx.try_recv().unwrap();
         assert!(matches!(resp, DialogResponse::Char('f')));
+    }
+
+    #[test]
+    fn wcb_ctrl_enter_ignored_when_finish_unavailable() {
+        let mut app = make_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.tabs[app.active_tab].dialog_response_tx = Some(tx);
+        app.active_dialog = Some(Dialog::WorkflowControlBoard(
+            crate::frontend::tui::dialogs::WorkflowControlBoardState {
+                step_name: "test".into(),
+                can_launch_next: true,
+                can_continue_current: true,
+                can_restart: true,
+                can_go_back: true,
+                can_finish: false,
+                continue_unavailable_reason: None,
+                cancel_to_previous_unavailable_reason: None,
+                finish_workflow_unavailable_reason: Some("not last step".into()),
+                is_mid_step: false,
+            },
+        ));
+        app.command_dialog_active = true;
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
+        assert!(
+            rx.try_recv().is_err(),
+            "Ctrl+Enter must not send FinishWorkflow when can_finish is false"
+        );
     }
 
     #[test]

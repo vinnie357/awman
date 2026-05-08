@@ -788,6 +788,11 @@ impl WorkflowEngine {
                 Ok(MidStepOutcome::WorkflowEnded(outcome))
             }
             NextAction::FinishWorkflow => {
+                if !self.is_last_step() {
+                    return Err(EngineError::InvalidAdvanceAction(
+                        "FinishWorkflow only valid on the last step".into(),
+                    ));
+                }
                 if already_finished.is_none() {
                     if let Some(ch) = cancel_handle {
                         let _ = ch.cancel();
@@ -888,7 +893,6 @@ impl WorkflowEngine {
 
             match self.frontend.yolo_countdown_tick(remaining)? {
                 YoloTickOutcome::AdvanceNow => {
-                    self.advance_to_next_step()?;
                     return Ok(MidStepYoloResult::Advanced);
                 }
                 YoloTickOutcome::Cancel => {
@@ -901,7 +905,6 @@ impl WorkflowEngine {
             }
 
             if remaining.is_zero() {
-                self.advance_to_next_step()?;
                 return Ok(MidStepYoloResult::Advanced);
             }
 
@@ -1430,6 +1433,82 @@ mod tests {
 
         let result = engine.run_to_completion().await.unwrap();
         assert_eq!(result, WorkflowOutcome::Completed);
+    }
+
+    #[tokio::test]
+    async fn run_to_completion_runs_all_parallel_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        // A → (B, C) — B and C both depend on A (parallel group).
+        let workflow = make_workflow(
+            Some("wf-parallel"),
+            Some("claude"),
+            vec![
+                make_step("a", &[], None),
+                make_step("b", &["a"], None),
+                make_step("c", &["a"], None),
+            ],
+        );
+        let factory = FakeContainerExecutionFactory::always_success();
+        let mut engine = make_engine(
+            &session,
+            workflow,
+            factory,
+            [NextAction::LaunchNext, NextAction::LaunchNext],
+        );
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+        assert!(matches!(
+            engine.state().status_of("a"),
+            Some(StepState::Succeeded)
+        ));
+        assert!(matches!(
+            engine.state().status_of("b"),
+            Some(StepState::Succeeded)
+        ));
+        assert!(matches!(
+            engine.state().status_of("c"),
+            Some(StepState::Succeeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_to_completion_parallel_fan_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        // A → (B, C) → D — D depends on both B and C.
+        let workflow = make_workflow(
+            Some("wf-fan-in"),
+            Some("claude"),
+            vec![
+                make_step("a", &[], None),
+                make_step("b", &["a"], None),
+                make_step("c", &["a"], None),
+                make_step("d", &["b", "c"], None),
+            ],
+        );
+        let factory = FakeContainerExecutionFactory::always_success();
+        let mut engine = make_engine(
+            &session,
+            workflow,
+            factory,
+            [
+                NextAction::LaunchNext,
+                NextAction::LaunchNext,
+                NextAction::LaunchNext,
+            ],
+        );
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+        for step in &["a", "b", "c", "d"] {
+            assert!(
+                matches!(engine.state().status_of(step), Some(StepState::Succeeded)),
+                "step '{}' should be Succeeded",
+                step
+            );
+        }
     }
 
     #[tokio::test]

@@ -130,33 +130,19 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
     ) -> Result<Option<String>, CommandError> {
         let file_list = format_file_list(files);
         let body = format!(
-            "{} uncommitted file(s) on worktree:\n{}",
+            "{} uncommitted file(s) will be committed before merge:\n{}",
             files.len(),
             file_list
         );
-        let response = self.ask_dialog(DialogRequest::Custom {
-            title: "Commit before merge?".into(),
-            body,
-            keys: vec![
-                ('y', "Commit, then merge".into()),
-                ('n', "Skip commit, merge as-is".into()),
-            ],
+        self.messages.info(body);
+        let msg_response = self.ask_dialog(DialogRequest::TextInput {
+            title: "Commit message".into(),
+            prompt: "Enter commit message (or press Enter to accept):".into(),
+            default_text: Some(suggested_message.to_string()),
         })?;
-        if matches!(
-            response,
-            DialogResponse::Yes | DialogResponse::Char('y')
-        ) {
-            let msg_response = self.ask_dialog(DialogRequest::TextInput {
-                title: "Commit message".into(),
-                prompt: "Enter commit message (or press Enter to accept):".into(),
-                default_text: Some(suggested_message.to_string()),
-            })?;
-            match msg_response {
-                DialogResponse::Text(msg) if !msg.is_empty() => Ok(Some(msg)),
-                _ => Ok(Some(suggested_message.to_string())),
-            }
-        } else {
-            Ok(None)
+        match msg_response {
+            DialogResponse::Text(msg) if !msg.is_empty() => Ok(Some(msg)),
+            _ => Ok(Some(suggested_message.to_string())),
         }
     }
 

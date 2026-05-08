@@ -238,11 +238,10 @@ impl WorktreeLifecycle {
                 let files = self.git_engine.uncommitted_files_logged(&self.worktree_path, frontend)?;
                 if !files.is_empty() {
                     let suggested = format!("Implement {}", self.branch);
-                    if let Some(msg) = frontend
+                    let msg = frontend
                         .ask_worktree_commit_before_merge(&self.branch, &files, &suggested)?
-                    {
-                        self.git_engine.commit_all_logged(&self.worktree_path, &msg, frontend)?;
-                    }
+                        .unwrap_or(suggested);
+                    self.git_engine.commit_all_logged(&self.worktree_path, &msg, frontend)?;
                 }
                 if !frontend.confirm_squash_merge(&self.branch)? {
                     frontend.report_worktree_kept(&self.worktree_path, &self.branch);

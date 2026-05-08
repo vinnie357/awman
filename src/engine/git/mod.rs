@@ -447,6 +447,17 @@ impl GitEngine {
                 worktree_path: worktree_path.to_path_buf(),
             });
         }
+        let has_staged = {
+            let check = run_git_logged(&["diff", "--cached", "--quiet"], git_root, sink)?;
+            !check.status.success()
+        };
+        if !has_staged {
+            sink.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "squash merge staged no changes (branch already up to date)".to_string(),
+            });
+            return Ok(());
+        }
         let message = format!("Implement {branch}");
         let output = run_git_logged(&["commit", "-m", &message], git_root, sink)?;
         if !output.status.success() {

@@ -79,7 +79,9 @@ impl WorkflowFrontend for TuiCommandFrontend {
                             }
                             DialogResponse::Char('^') => NextAction::RestartCurrentStep,
                             DialogResponse::Char('<') => NextAction::CancelToPreviousStep,
-                            DialogResponse::Char('f') => NextAction::FinishWorkflow,
+                            DialogResponse::Char('f') if available.can_finish_workflow => {
+                                NextAction::FinishWorkflow
+                            }
                             DialogResponse::Char('a') => NextAction::Abort,
                             DialogResponse::Dismissed => NextAction::Pause,
                             _ => NextAction::Pause,
@@ -119,7 +121,9 @@ impl WorkflowFrontend for TuiCommandFrontend {
             }
             DialogResponse::Char('^') => NextAction::RestartCurrentStep,
             DialogResponse::Char('<') => NextAction::CancelToPreviousStep,
-            DialogResponse::Char('f') => NextAction::FinishWorkflow,
+            DialogResponse::Char('f') if available.can_finish_workflow => {
+                NextAction::FinishWorkflow
+            }
             DialogResponse::Char('a') => NextAction::Abort,
             DialogResponse::Char('p') if available.is_mid_step => NextAction::Pause,
             DialogResponse::Dismissed if available.is_mid_step => NextAction::Dismiss,
