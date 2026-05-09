@@ -3,7 +3,6 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::chat::open_session_for_cwd;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
@@ -45,11 +44,12 @@ pub enum AuthConsentChoice {
 pub struct AuthCommand {
     flags: AuthCommandFlags,
     engines: Engines,
+    session: crate::data::session::Session,
 }
 
 impl AuthCommand {
-    pub fn new(flags: AuthCommandFlags, engines: Engines) -> Self {
-        Self { flags, engines }
+    pub fn new(flags: AuthCommandFlags, engines: Engines, session: crate::data::session::Session) -> Self {
+        Self { flags, engines, session }
     }
 
     pub fn flags(&self) -> &AuthCommandFlags {
@@ -76,7 +76,8 @@ impl Command for AuthCommand {
         if persist {
             // Persist on the per-repo config so future agent launches respect
             // the choice without re-prompting.
-            if let Ok(session) = open_session_for_cwd(&self.engines) {
+            {
+                let session = &self.session;
                 let mut cfg = session.repo_config().clone();
                 cfg.auto_agent_auth_accepted = Some(accepted);
                 if cfg.save(session.git_root()).is_ok() {
@@ -85,6 +86,9 @@ impl Command for AuthCommand {
             }
         }
         frontend.replay_queued();
-        Ok(AuthOutcome { accepted, persisted })
+        Ok(AuthOutcome {
+            accepted,
+            persisted,
+        })
     }
 }

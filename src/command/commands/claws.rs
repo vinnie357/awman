@@ -75,11 +75,12 @@ impl<T: ClawsFrontend + Send> ClawsCommandFrontend for T {}
 pub struct ClawsCommand {
     flags: ClawsCommandFlags,
     engines: Engines,
+    session: crate::data::session::Session,
 }
 
 impl ClawsCommand {
-    pub fn new(flags: ClawsCommandFlags, engines: Engines) -> Self {
-        Self { flags, engines }
+    pub fn new(flags: ClawsCommandFlags, engines: Engines, session: crate::data::session::Session) -> Self {
+        Self { flags, engines, session }
     }
 
     pub fn flags(&self) -> &ClawsCommandFlags {
@@ -100,16 +101,7 @@ impl Command for ClawsCommand {
             level: MessageLevel::Info,
             text: "claws: opening shell in container…".into(),
         });
-        let session = match open_session() {
-            Ok(s) => s,
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("claws: failed to open session: {e}"),
-                });
-                return Err(e);
-            }
-        };
+        let session = self.session;
         let clone_dir = std::env::temp_dir().join("nanoclaw");
         let mode = self.flags.mode;
         let mut engine = ClawsEngine::new(
@@ -146,14 +138,3 @@ impl Command for ClawsCommand {
     }
 }
 
-fn open_session() -> Result<crate::data::session::Session, CommandError> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| CommandError::Other(format!("cwd unavailable: {e}")))?;
-    let resolver = crate::data::session::StaticGitRootResolver::new(cwd.clone());
-    crate::data::session::Session::open(
-        cwd,
-        &resolver,
-        crate::data::session::SessionOpenOptions::default(),
-    )
-    .map_err(CommandError::from)
-}

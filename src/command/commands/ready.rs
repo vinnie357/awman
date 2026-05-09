@@ -132,11 +132,12 @@ impl<T: ReadyFrontend + Send> ReadyCommandFrontend for T {}
 pub struct ReadyCommand {
     flags: ReadyCommandFlags,
     engines: Engines,
+    session: crate::data::session::Session,
 }
 
 impl ReadyCommand {
-    pub fn new(flags: ReadyCommandFlags, engines: Engines) -> Self {
-        Self { flags, engines }
+    pub fn new(flags: ReadyCommandFlags, engines: Engines, session: crate::data::session::Session) -> Self {
+        Self { flags, engines, session }
     }
 
     pub fn flags(&self) -> &ReadyCommandFlags {
@@ -169,16 +170,7 @@ impl Command for ReadyCommand {
                 return Err(cmd_err);
             }
         };
-        let session = match open_session() {
-            Ok(s) => s,
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("ready: failed to open session: {e}"),
-                });
-                return Err(e);
-            }
-        };
+        let session = self.session;
         let options = ReadyEngineOptions {
             agent,
             refresh: self.flags.refresh,
@@ -244,14 +236,3 @@ impl Command for ReadyCommand {
     }
 }
 
-fn open_session() -> Result<crate::data::session::Session, CommandError> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| CommandError::Other(format!("cwd unavailable: {e}")))?;
-    let resolver = crate::data::session::StaticGitRootResolver::new(cwd.clone());
-    crate::data::session::Session::open(
-        cwd,
-        &resolver,
-        crate::data::session::SessionOpenOptions::default(),
-    )
-    .map_err(CommandError::from)
-}

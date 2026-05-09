@@ -201,10 +201,7 @@ mod tests {
 
     #[test]
     fn esc_in_dialog_dismisses() {
-        let action = map_key(
-            key(KeyCode::Esc, KeyModifiers::NONE),
-            FocusContext::Dialog,
-        );
+        let action = map_key(key(KeyCode::Esc, KeyModifiers::NONE), FocusContext::Dialog);
         assert_eq!(action, Action::DismissDialog);
     }
 
@@ -233,10 +230,7 @@ mod tests {
             FocusContext::ExecutionWindow,
             FocusContext::Dialog,
         ] {
-            let action = map_key(
-                key(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                ctx,
-            );
+            let action = map_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), ctx);
             assert_eq!(action, Action::CloseTabOrQuit);
         }
     }
@@ -497,28 +491,19 @@ mod tests {
 
     #[test]
     fn home_in_dialog_maps_to_cursor_home() {
-        let action = map_key(
-            key(KeyCode::Home, KeyModifiers::NONE),
-            FocusContext::Dialog,
-        );
+        let action = map_key(key(KeyCode::Home, KeyModifiers::NONE), FocusContext::Dialog);
         assert_eq!(action, Action::CursorHome);
     }
 
     #[test]
     fn end_in_dialog_maps_to_cursor_end() {
-        let action = map_key(
-            key(KeyCode::End, KeyModifiers::NONE),
-            FocusContext::Dialog,
-        );
+        let action = map_key(key(KeyCode::End, KeyModifiers::NONE), FocusContext::Dialog);
         assert_eq!(action, Action::CursorEnd);
     }
 
     #[test]
     fn up_in_dialog_maps_to_scroll_up() {
-        let action = map_key(
-            key(KeyCode::Up, KeyModifiers::NONE),
-            FocusContext::Dialog,
-        );
+        let action = map_key(key(KeyCode::Up, KeyModifiers::NONE), FocusContext::Dialog);
         assert_eq!(action, Action::ScrollUp);
     }
 

@@ -44,9 +44,10 @@ pub struct AvailableActions {
     pub continue_unavailable_reason: Option<String>,
     pub cancel_to_previous_unavailable_reason: Option<String>,
     pub finish_workflow_unavailable_reason: Option<String>,
-    /// True when the control board was opened mid-step (container still
-    /// running). Changes Esc semantics from Pause to Dismiss.
-    pub is_mid_step: bool,
+    /// True when a container is currently running (mid-step). The engine
+    /// computes this from `current_execution.is_some()` in
+    /// `compute_available_actions`. Changes Esc semantics from Pause to Dismiss.
+    pub can_dismiss: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,9 +62,6 @@ pub enum YoloTickOutcome {
     Continue,
     Cancel,
     AdvanceNow,
-    /// User pressed Ctrl-W: cancel the countdown and show the workflow
-    /// control board instead of pausing.
-    ShowControlBoard,
 }
 
 /// What `step_once` returned: the step that just executed plus its outcome.

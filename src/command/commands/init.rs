@@ -54,11 +54,12 @@ impl<T: InitFrontend + Send> InitCommandFrontend for T {}
 pub struct InitCommand {
     flags: InitCommandFlags,
     engines: Engines,
+    session: crate::data::session::Session,
 }
 
 impl InitCommand {
-    pub fn new(flags: InitCommandFlags, engines: Engines) -> Self {
-        Self { flags, engines }
+    pub fn new(flags: InitCommandFlags, engines: Engines, session: crate::data::session::Session) -> Self {
+        Self { flags, engines, session }
     }
 
     pub fn flags(&self) -> &InitCommandFlags {
@@ -90,16 +91,7 @@ impl Command for InitCommand {
                 return Err(cmd_err);
             }
         };
-        let session = match build_throwaway_session() {
-            Ok(s) => s,
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("init: failed to create session: {e}"),
-                });
-                return Err(e);
-            }
-        };
+        let session = self.session;
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
             text: format!("init: resolved git root at {:?}", session.git_root()),
@@ -149,18 +141,3 @@ impl Command for InitCommand {
     }
 }
 
-/// Build a throwaway session for the init wrapper. Real wiring routes
-/// through the `Dispatch::session` field; this placeholder lets the
-/// structural API compile until 0069 wires the real plumbing.
-fn build_throwaway_session() -> Result<crate::data::session::Session, CommandError> {
-    let cwd = std::env::current_dir()
-        .map_err(|e| CommandError::Other(format!("cwd unavailable: {e}")))?;
-    let resolver = crate::data::session::StaticGitRootResolver::new(cwd.clone());
-    let s = crate::data::session::Session::open(
-        cwd,
-        &resolver,
-        crate::data::session::SessionOpenOptions::default(),
-    )
-    .map_err(CommandError::from)?;
-    Ok(s)
-}

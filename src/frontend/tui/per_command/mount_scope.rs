@@ -39,8 +39,7 @@ mod tests {
         let (resp_tx, resp_rx) = std::sync::mpsc::channel::<DialogResponse>();
         let (stdout_tx, _stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        let (_resize_tx, resize_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+        let (_resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
         let container_io = crate::engine::container::frontend::ContainerIo {
             stdout: stdout_tx,
             stdin_tx,
@@ -56,12 +55,7 @@ mod tests {
         };
         let workflow_view = std::sync::Arc::new(std::sync::Mutex::new(None));
         let yolo_state = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let yolo_ctrl_w = std::sync::Arc::new(
-            std::sync::atomic::AtomicBool::new(false),
-        );
-        let pty_reset_flag = std::sync::Arc::new(
-            std::sync::atomic::AtomicBool::new(false),
-        );
+        let pty_reset_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let frontend = TuiCommandFrontend::new(
             parsed,
             status_log,
@@ -70,7 +64,6 @@ mod tests {
             container_io,
             workflow_view,
             yolo_state,
-            yolo_ctrl_w,
             pty_reset_flag,
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(None)),

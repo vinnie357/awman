@@ -27,11 +27,7 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
         suggested_message: &str,
     ) -> Result<PreWorktreeDecision, CommandError> {
         let file_list = format_file_list(files);
-        let body = format!(
-            "{} uncommitted file(s):\n\n{}",
-            files.len(),
-            file_list
-        );
+        let body = format!("{} uncommitted file(s):\n\n{}", files.len(), file_list);
         let response = self.ask_dialog(DialogRequest::Custom {
             title: "Uncommitted files".into(),
             body,
@@ -135,14 +131,22 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
             file_list
         );
         self.messages.info(body);
-        let msg_response = self.ask_dialog(DialogRequest::TextInput {
-            title: "Commit message".into(),
-            prompt: "Enter commit message (or press Enter to accept):".into(),
-            default_text: Some(suggested_message.to_string()),
+        let response = self.ask_dialog(DialogRequest::YesNo {
+            title: "Commit before merge?".into(),
+            body: "Commit uncommitted files before merging?".into(),
         })?;
-        match msg_response {
-            DialogResponse::Text(msg) if !msg.is_empty() => Ok(Some(msg)),
-            _ => Ok(Some(suggested_message.to_string())),
+        if matches!(response, DialogResponse::Yes | DialogResponse::Char('y')) {
+            let msg_response = self.ask_dialog(DialogRequest::TextInput {
+                title: "Commit message".into(),
+                prompt: "Enter commit message (or press Enter to accept):".into(),
+                default_text: Some(suggested_message.to_string()),
+            })?;
+            match msg_response {
+                DialogResponse::Text(msg) if !msg.is_empty() => Ok(Some(msg)),
+                _ => Ok(Some(suggested_message.to_string())),
+            }
+        } else {
+            Ok(None)
         }
     }
 
@@ -175,12 +179,7 @@ impl WorktreeLifecycleFrontend for TuiCommandFrontend {
         ))
     }
 
-    fn report_merge_conflict(
-        &mut self,
-        branch: &str,
-        worktree_path: &Path,
-        _git_root: &Path,
-    ) {
+    fn report_merge_conflict(&mut self, branch: &str, worktree_path: &Path, _git_root: &Path) {
         self.messages.error_msg(format!(
             "Merge conflict on branch '{}'. Resolve manually in {}",
             branch,

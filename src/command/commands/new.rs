@@ -3,7 +3,8 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::chat::{open_session_for_cwd, resolve_agent};
+use crate::command::commands::chat::resolve_agent;
+use crate::data::session::Session;
 use crate::command::commands::implement_prompts::{
     render_skill_interview_prompt, render_workflow_interview_prompt,
 };
@@ -77,10 +78,7 @@ pub enum NewOutcome {
 /// summary). Dispatch canonicalizes `specs new` to `new spec`, so this
 /// branch *is* the implementation for both invocations.
 pub trait NewCommandFrontend:
-    UserMessageSink
-    + crate::command::commands::specs::SpecsCommandFrontend
-    + Send
-    + Sync
+    UserMessageSink + crate::command::commands::specs::SpecsCommandFrontend + Send + Sync
 {
     /// Prompt for a workflow name. CLI implementations gate on stdin TTY.
     fn ask_workflow_name(&mut self) -> Result<String, CommandError> {
@@ -107,11 +105,12 @@ pub trait NewCommandFrontend:
 pub struct NewCommand {
     sub: NewSubcommand,
     engines: Engines,
+    session: Session,
 }
 
 impl NewCommand {
-    pub fn new(sub: NewSubcommand, engines: Engines) -> Self {
-        Self { sub, engines }
+    pub fn new(sub: NewSubcommand, engines: Engines, session: Session) -> Self {
+        Self { sub, engines, session }
     }
 
     pub fn subcommand(&self) -> &NewSubcommand {
@@ -136,6 +135,7 @@ impl Command for NewCommand {
                 });
                 let new_outcome = match crate::command::commands::specs::create_new_spec(
                     &self.engines,
+                    self.session.clone(),
                     f.interview,
                     f.non_interactive,
                     frontend.as_mut(),
@@ -171,16 +171,7 @@ impl Command for NewCommand {
                     _ => "toml",
                 };
                 let session = if !f.global || f.interview {
-                    Some(match open_session_for_cwd(&self.engines) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            frontend.write_message(UserMessage {
-                                level: MessageLevel::Error,
-                                text: format!("new workflow: failed to open session: {e}"),
-                            });
-                            return Err(e);
-                        }
-                    })
+                    Some(self.session.clone())
                 } else {
                     None
                 };
@@ -223,22 +214,24 @@ impl Command for NewCommand {
                     };
                     frontend.write_message(UserMessage {
                         level: MessageLevel::Info,
-                        text: format!("new workflow: launching interview agent '{}'", agent.as_str()),
+                        text: format!(
+                            "new workflow: launching interview agent '{}'",
+                            agent.as_str()
+                        ),
                     });
-                    let credentials = match self
-                        .engines
-                        .auth_engine
-                        .resolve_agent_auth(session, &agent)
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            frontend.write_message(UserMessage {
-                                level: MessageLevel::Error,
-                                text: format!("new workflow: failed to resolve agent auth: {e}"),
-                            });
-                            return Err(CommandError::from(e));
-                        }
-                    };
+                    let credentials =
+                        match self.engines.auth_engine.resolve_agent_auth(session, &agent) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                frontend.write_message(UserMessage {
+                                    level: MessageLevel::Error,
+                                    text: format!(
+                                        "new workflow: failed to resolve agent auth: {e}"
+                                    ),
+                                });
+                                return Err(CommandError::from(e));
+                            }
+                        };
                     let summary = frontend.ask_workflow_summary().unwrap_or_default();
                     let filename = path
                         .file_name()
@@ -319,16 +312,7 @@ impl Command for NewCommand {
                 });
                 let name = frontend.ask_skill_name().unwrap_or_else(|_| "skill".into());
                 let session = if !f.global || f.interview {
-                    Some(match open_session_for_cwd(&self.engines) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            frontend.write_message(UserMessage {
-                                level: MessageLevel::Error,
-                                text: format!("new skill: failed to open session: {e}"),
-                            });
-                            return Err(e);
-                        }
-                    })
+                    Some(self.session.clone())
                 } else {
                     None
                 };
@@ -352,9 +336,7 @@ impl Command for NewCommand {
                 let path = dir.join("SKILL.md");
 
                 if f.interview {
-                    let skeleton = format!(
-                        "# Skill: {name}\n\n## Description\n\n## Body\n"
-                    );
+                    let skeleton = format!("# Skill: {name}\n\n## Description\n\n## Body\n");
                     let _ = std::fs::write(&path, skeleton);
                     let session = session.as_ref().unwrap();
                     let agent = match resolve_agent(&None, session) {
@@ -371,20 +353,17 @@ impl Command for NewCommand {
                         level: MessageLevel::Info,
                         text: format!("new skill: launching interview agent '{}'", agent.as_str()),
                     });
-                    let credentials = match self
-                        .engines
-                        .auth_engine
-                        .resolve_agent_auth(session, &agent)
-                    {
-                        Ok(c) => c,
-                        Err(e) => {
-                            frontend.write_message(UserMessage {
-                                level: MessageLevel::Error,
-                                text: format!("new skill: failed to resolve agent auth: {e}"),
-                            });
-                            return Err(CommandError::from(e));
-                        }
-                    };
+                    let credentials =
+                        match self.engines.auth_engine.resolve_agent_auth(session, &agent) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                frontend.write_message(UserMessage {
+                                    level: MessageLevel::Error,
+                                    text: format!("new skill: failed to resolve agent auth: {e}"),
+                                });
+                                return Err(CommandError::from(e));
+                            }
+                        };
                     let summary = frontend.ask_skill_summary().unwrap_or_default();
                     let path_str = path.display().to_string();
                     let prompt = render_skill_interview_prompt(&path_str, &summary);
@@ -536,8 +515,10 @@ mod tests {
             _default: &crate::data::session::AgentName,
             _default_available: bool,
             _image_only: bool,
-        ) -> Result<crate::command::commands::agent_setup::AgentSetupDecision, crate::command::error::CommandError>
-        {
+        ) -> Result<
+            crate::command::commands::agent_setup::AgentSetupDecision,
+            crate::command::error::CommandError,
+        > {
             Ok(crate::command::commands::agent_setup::AgentSetupDecision::Setup)
         }
         fn record_fallback(
@@ -552,8 +533,10 @@ mod tests {
             &mut self,
             _agent: &crate::data::session::AgentName,
             _env_var_names: &[&str],
-        ) -> Result<crate::command::commands::agent_auth::AgentAuthDecision, crate::command::error::CommandError>
-        {
+        ) -> Result<
+            crate::command::commands::agent_auth::AgentAuthDecision,
+            crate::command::error::CommandError,
+        > {
             Ok(crate::command::commands::agent_auth::AgentAuthDecision::DeclineOnce)
         }
     }
@@ -571,11 +554,11 @@ mod tests {
     }
 
     fn make_engines(root: &std::path::Path) -> Engines {
-        use std::sync::Arc;
-        use crate::engine::overlay::OverlayEngine;
-        use crate::engine::container::ContainerRuntime;
         use crate::data::fs::auth_paths::AuthPathResolver;
         use crate::data::fs::headless_paths::HeadlessPaths;
+        use crate::engine::container::ContainerRuntime;
+        use crate::engine::overlay::OverlayEngine;
+        use std::sync::Arc;
         let overlay = Arc::new(OverlayEngine::with_auth_resolver(
             AuthPathResolver::at_home(root),
         ));
@@ -594,28 +577,27 @@ mod tests {
             overlay_engine: overlay,
             auth_engine,
             agent_engine,
-            workflow_state_store: Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(root)),
+            workflow_state_store: Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
+                root,
+            )),
         }
     }
 
-    #[allow(clippy::await_holding_lock)]
-    async fn with_cwd<F, Fut, T>(dir: &std::path::Path, f: F) -> T
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = T>,
-    {
-        let _lock = crate::CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
-        std::env::set_current_dir(dir).unwrap();
-        let result = f().await;
-        let _ = std::env::set_current_dir(&prev);
-        result
+    fn make_session(root: &std::path::Path) -> Session {
+        let resolver = crate::data::session::StaticGitRootResolver::new(root);
+        Session::open(
+            root.to_path_buf(),
+            &resolver,
+            crate::data::session::SessionOpenOptions::default(),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
     async fn new_workflow_toml_writes_file_in_aspec_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let engines = make_engines(tmp.path());
+        let session = make_session(tmp.path());
         let cmd = NewCommand::new(
             NewSubcommand::Workflow(NewWorkflowFlags {
                 interview: false,
@@ -624,18 +606,20 @@ mod tests {
                 format: "toml".into(),
             }),
             engines,
+            session,
         );
-        let outcome = with_cwd(tmp.path(), || async {
-            cmd.run_with_frontend(Box::new(FakeNewFrontend::new("my-wf", "skill", "")))
-                .await
-                .unwrap()
-        }).await;
+        let outcome = cmd.run_with_frontend(Box::new(FakeNewFrontend::new("my-wf", "skill", "")))
+            .await
+            .unwrap();
         if let NewOutcome::Workflow(w) = outcome {
             let path_str = w.path.expect("path must be Some");
             let path = std::path::Path::new(&path_str);
             assert!(path.exists(), "workflow file must exist: {path_str}");
             let content = std::fs::read_to_string(path).unwrap();
-            assert!(content.contains("[[step]]"), "TOML workflow must contain [[step]]");
+            assert!(
+                content.contains("[[step]]"),
+                "TOML workflow must contain [[step]]"
+            );
         } else {
             panic!("unexpected outcome variant");
         }
@@ -645,6 +629,7 @@ mod tests {
     async fn new_workflow_yaml_writes_file() {
         let tmp = tempfile::tempdir().unwrap();
         let engines = make_engines(tmp.path());
+        let session = make_session(tmp.path());
         let cmd = NewCommand::new(
             NewSubcommand::Workflow(NewWorkflowFlags {
                 interview: false,
@@ -653,17 +638,22 @@ mod tests {
                 format: "yaml".into(),
             }),
             engines,
+            session,
         );
-        let outcome = with_cwd(tmp.path(), || async {
-            cmd.run_with_frontend(Box::new(FakeNewFrontend::new("my-wf", "skill", "")))
-                .await
-                .unwrap()
-        }).await;
+        let outcome = cmd.run_with_frontend(Box::new(FakeNewFrontend::new("my-wf", "skill", "")))
+            .await
+            .unwrap();
         if let NewOutcome::Workflow(w) = outcome {
             let path_str = w.path.expect("path must be Some");
-            assert!(path_str.ends_with(".yaml"), "path must have .yaml extension: {path_str}");
+            assert!(
+                path_str.ends_with(".yaml"),
+                "path must have .yaml extension: {path_str}"
+            );
             let content = std::fs::read_to_string(&path_str).unwrap();
-            assert!(content.contains("steps:"), "YAML workflow must contain steps key");
+            assert!(
+                content.contains("steps:"),
+                "YAML workflow must contain steps key"
+            );
         } else {
             panic!("unexpected outcome variant");
         }
@@ -673,6 +663,7 @@ mod tests {
     async fn new_workflow_md_writes_file() {
         let tmp = tempfile::tempdir().unwrap();
         let engines = make_engines(tmp.path());
+        let session = make_session(tmp.path());
         let cmd = NewCommand::new(
             NewSubcommand::Workflow(NewWorkflowFlags {
                 interview: false,
@@ -681,17 +672,22 @@ mod tests {
                 format: "md".into(),
             }),
             engines,
+            session,
         );
-        let outcome = with_cwd(tmp.path(), || async {
-            cmd.run_with_frontend(Box::new(FakeNewFrontend::new("my-wf", "skill", "")))
-                .await
-                .unwrap()
-        }).await;
+        let outcome = cmd.run_with_frontend(Box::new(FakeNewFrontend::new("my-wf", "skill", "")))
+            .await
+            .unwrap();
         if let NewOutcome::Workflow(w) = outcome {
             let path_str = w.path.expect("path must be Some");
-            assert!(path_str.ends_with(".md"), "path must have .md extension: {path_str}");
+            assert!(
+                path_str.ends_with(".md"),
+                "path must have .md extension: {path_str}"
+            );
             let content = std::fs::read_to_string(&path_str).unwrap();
-            assert!(content.contains("## Steps"), "Markdown workflow must contain ## Steps");
+            assert!(
+                content.contains("## Steps"),
+                "Markdown workflow must contain ## Steps"
+            );
         } else {
             panic!("unexpected outcome variant");
         }
@@ -701,6 +697,7 @@ mod tests {
     async fn new_skill_writes_skill_md_file() {
         let tmp = tempfile::tempdir().unwrap();
         let engines = make_engines(tmp.path());
+        let session = make_session(tmp.path());
         let cmd = NewCommand::new(
             NewSubcommand::Skill(NewSkillFlags {
                 interview: false,
@@ -708,12 +705,15 @@ mod tests {
                 global: false,
             }),
             engines,
+            session,
         );
-        let outcome = with_cwd(tmp.path(), || async {
-            cmd.run_with_frontend(Box::new(FakeNewFrontend::new("wf", "my-skill", "Do something useful.")))
-                .await
-                .unwrap()
-        }).await;
+        let outcome = cmd.run_with_frontend(Box::new(FakeNewFrontend::new(
+            "wf",
+            "my-skill",
+            "Do something useful.",
+        )))
+        .await
+        .unwrap();
         if let NewOutcome::Skill(s) = outcome {
             let path_str = s.path.expect("path must be Some");
             let path = std::path::Path::new(&path_str);
@@ -723,8 +723,14 @@ mod tests {
                 "file must be named SKILL.md"
             );
             let content = std::fs::read_to_string(path).unwrap();
-            assert!(content.contains("my-skill"), "skill name must appear in SKILL.md");
-            assert!(content.contains("Do something useful."), "body must appear in SKILL.md");
+            assert!(
+                content.contains("my-skill"),
+                "skill name must appear in SKILL.md"
+            );
+            assert!(
+                content.contains("Do something useful."),
+                "body must appear in SKILL.md"
+            );
         } else {
             panic!("unexpected outcome variant");
         }
@@ -734,6 +740,7 @@ mod tests {
     async fn new_skill_empty_body_writes_default_skeleton() {
         let tmp = tempfile::tempdir().unwrap();
         let engines = make_engines(tmp.path());
+        let session = make_session(tmp.path());
         let cmd = NewCommand::new(
             NewSubcommand::Skill(NewSkillFlags {
                 interview: false,
@@ -741,12 +748,11 @@ mod tests {
                 global: false,
             }),
             engines,
+            session,
         );
-        let outcome = with_cwd(tmp.path(), || async {
-            cmd.run_with_frontend(Box::new(FakeNewFrontend::new("wf", "my-skill", "")))
-                .await
-                .unwrap()
-        }).await;
+        let outcome = cmd.run_with_frontend(Box::new(FakeNewFrontend::new("wf", "my-skill", "")))
+            .await
+            .unwrap();
         if let NewOutcome::Skill(s) = outcome {
             let path_str = s.path.expect("path must be Some");
             let content = std::fs::read_to_string(&path_str).unwrap();

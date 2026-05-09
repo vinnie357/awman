@@ -4,7 +4,6 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::chat::open_session_for_cwd;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
@@ -62,11 +61,12 @@ pub trait DownloadCommandFrontend: UserMessageSink + Send + Sync {}
 pub struct DownloadCommand {
     asset: String,
     engines: Engines,
+    session: crate::data::session::Session,
 }
 
 impl DownloadCommand {
-    pub fn new(asset: String, engines: Engines) -> Self {
-        Self { asset, engines }
+    pub fn new(asset: String, engines: Engines, session: crate::data::session::Session) -> Self {
+        Self { asset, engines, session }
     }
 }
 
@@ -99,17 +99,7 @@ impl Command for DownloadCommand {
         };
         let outcome = match parsed {
             DownloadAsset::AspecTarball => {
-                let session = match open_session_for_cwd(&self.engines) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!("download: failed to open session: {e}"),
-                        });
-                        return Err(e);
-                    }
-                };
-                let dest = RepoDockerfilePaths::new(session.git_root()).aspec_root();
+                let dest = RepoDockerfilePaths::new(self.session.git_root()).aspec_root();
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Info,
                     text: "download: fetching aspec tarball…".into(),
@@ -141,24 +131,18 @@ impl Command for DownloadCommand {
                 }
             }
             DownloadAsset::AgentDockerfile { agent } => {
-                let session = match open_session_for_cwd(&self.engines) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!("download: failed to open session: {e}"),
-                        });
-                        return Err(e);
-                    }
-                };
-                let dest = RepoDockerfilePaths::new(session.git_root()).agent_dockerfile(&agent);
-                let project_tag = crate::data::image_tags::project_image_tag(session.git_root());
+                let dest = RepoDockerfilePaths::new(self.session.git_root()).agent_dockerfile(&agent);
+                let project_tag = crate::data::image_tags::project_image_tag(self.session.git_root());
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Info,
                     text: format!("download: fetching agent image for '{agent}'…"),
                 });
-                if let Err(e) = crate::engine::agent::download::download_agent_dockerfile(&agent, &dest, &project_tag)
-                    .await
+                if let Err(e) = crate::engine::agent::download::download_agent_dockerfile(
+                    &agent,
+                    &dest,
+                    &project_tag,
+                )
+                .await
                 {
                     let err = CommandError::Other(e.to_string());
                     frontend.write_message(UserMessage {
@@ -167,8 +151,9 @@ impl Command for DownloadCommand {
                     });
                     return Err(err);
                 }
-                let bytes_written =
-                    std::fs::metadata(&dest).map(|m| m.len() as usize).unwrap_or(0);
+                let bytes_written = std::fs::metadata(&dest)
+                    .map(|m| m.len() as usize)
+                    .unwrap_or(0);
                 DownloadOutcome {
                     asset: self.asset,
                     bytes_written,
@@ -191,7 +176,10 @@ mod tests {
 
     #[test]
     fn parse_recognises_aspec_aliases() {
-        assert_eq!(DownloadAsset::parse("aspec"), Some(DownloadAsset::AspecTarball));
+        assert_eq!(
+            DownloadAsset::parse("aspec"),
+            Some(DownloadAsset::AspecTarball)
+        );
         assert_eq!(
             DownloadAsset::parse("aspec-tarball"),
             Some(DownloadAsset::AspecTarball)

@@ -5,10 +5,10 @@ use serde::Serialize;
 
 use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
-use crate::command::commands::chat::{open_session_for_cwd, resolve_agent};
+use crate::command::commands::chat::resolve_agent;
 use crate::command::commands::mount_scope::MountScopeFrontend;
-use crate::command::commands::{collect_all_overlay_specs, parse_overlay_spec};
 use crate::command::commands::Command;
+use crate::command::commands::{collect_all_overlay_specs, parse_overlay_spec};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::{AgentName, Session};
@@ -65,13 +65,9 @@ async fn ensure_exec_prompt_agent_setup(
         crate::command::commands::agent_setup::AgentFrontendAdapter::new(frontend.as_mut());
     let runtime = std::sync::Arc::clone(agent_engine.container_runtime_arc());
     agent_engine
-        .ensure_available(
-            session,
-            agent,
-            &config,
-            &mut adapter,
-            move |tag: &str| runtime.image_exists(tag),
-        )
+        .ensure_available(session, agent, &config, &mut adapter, move |tag: &str| {
+            runtime.image_exists(tag)
+        })
         .await
         .map_err(CommandError::from)
 }
@@ -79,11 +75,12 @@ async fn ensure_exec_prompt_agent_setup(
 pub struct ExecPromptCommand {
     flags: ExecPromptCommandFlags,
     engines: Engines,
+    session: Session,
 }
 
 impl ExecPromptCommand {
-    pub fn new(flags: ExecPromptCommandFlags, engines: Engines) -> Self {
-        Self { flags, engines }
+    pub fn new(flags: ExecPromptCommandFlags, engines: Engines, session: Session) -> Self {
+        Self { flags, engines, session }
     }
 
     pub fn flags(&self) -> &ExecPromptCommandFlags {
@@ -100,16 +97,7 @@ impl Command for ExecPromptCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        let session = match open_session_for_cwd(&self.engines) {
-            Ok(s) => s,
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("exec prompt: failed to open session: {e}"),
-                });
-                return Err(e);
-            }
-        };
+        let session = self.session;
         let agent = match resolve_agent(&self.flags.agent, &session) {
             Ok(a) => a,
             Err(e) => {
@@ -215,9 +203,11 @@ impl Command for ExecPromptCommand {
             }
         };
         if !credentials.env_vars.is_empty() {
-            options.push(crate::engine::container::options::ContainerOption::AgentCredentials {
-                env_vars: credentials.env_vars,
-            });
+            options.push(
+                crate::engine::container::options::ContainerOption::AgentCredentials {
+                    env_vars: credentials.env_vars,
+                },
+            );
         }
 
         let instance = match self.engines.runtime.build(options) {

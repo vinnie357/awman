@@ -19,8 +19,8 @@ use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 use crate::engine::overlay::OverlayEngine;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutcome,
-    WorkflowOutcome, WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
+    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutcome, WorkflowOutcome,
+    WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::factory::{ContainerExecutionFactory, WorkflowRuntimeContext};
 use crate::engine::workflow::frontend::WorkflowFrontend;
@@ -287,23 +287,22 @@ impl WorkflowEngine {
                 self.frontend.report_workflow_progress(&progress);
 
                 let step = self.find_step(&outcome.step_name)?;
-                let exit_info = self.last_exit_info.clone().unwrap_or_else(|| {
-                    ContainerExitInfo {
+                let exit_info = self
+                    .last_exit_info
+                    .clone()
+                    .unwrap_or_else(|| ContainerExitInfo {
                         exit_code,
                         signal: None,
                         started_at: chrono::Utc::now(),
                         ended_at: chrono::Utc::now(),
-                    }
-                });
-                let choice = self.frontend.user_choose_after_step_failure(
-                    &step, &exit_info,
-                )?;
+                    });
+                let choice = self
+                    .frontend
+                    .user_choose_after_step_failure(&step, &exit_info)?;
                 match choice {
                     StepFailureChoice::Retry => {
-                        self.state.set_status(
-                            &outcome.step_name,
-                            StepState::Pending,
-                        );
+                        self.state
+                            .set_status(&outcome.step_name, StepState::Pending);
                         self.persist()?;
                         continue;
                     }
@@ -316,10 +315,7 @@ impl WorkflowEngine {
                     StepFailureChoice::Abort => {
                         for s in &self.workflow.steps {
                             if !self.state.completed_steps.contains(&s.name) {
-                                self.state.set_status(
-                                    &s.name,
-                                    StepState::Cancelled,
-                                );
+                                self.state.set_status(&s.name, StepState::Cancelled);
                             }
                         }
                         self.persist()?;
@@ -338,7 +334,9 @@ impl WorkflowEngine {
                 // In yolo mode, replace the interactive prompt with a 60-second
                 // countdown that auto-advances unless the user cancels.
                 // Respect the per-step auto-advance toggle ([d] in TUI).
-                let step_auto_advance = self.current_step_name.as_deref()
+                let step_auto_advance = self
+                    .current_step_name
+                    .as_deref()
                     .map(|n| self.frontend.should_auto_advance(n))
                     .unwrap_or(true);
                 if self.yolo && step_auto_advance {
@@ -369,20 +367,25 @@ impl WorkflowEngine {
                         // must be present.
                         let next_step = match self.next_ready_step()? {
                             Some(s) => s,
-                            None => return Err(EngineError::InvalidAdvanceAction(
-                                "ContinueInCurrentContainer: no next step is ready".into(),
-                            )),
+                            None => {
+                                return Err(EngineError::InvalidAdvanceAction(
+                                    "ContinueInCurrentContainer: no next step is ready".into(),
+                                ))
+                            }
                         };
                         let next_agent = self.resolve_agent(&next_step)?;
                         let next_model = self.resolve_model(&next_step);
-                        let agent_ok = self.current_step_agent.as_ref()
+                        let agent_ok = self
+                            .current_step_agent
+                            .as_ref()
                             .map(|a| *a == next_agent)
                             .unwrap_or(false);
                         let model_ok = self.current_step_model == next_model;
                         if !agent_ok || !model_ok {
                             return Err(EngineError::InvalidAdvanceAction(
                                 "ContinueInCurrentContainer requires the same agent and model \
-                                 for the current and next steps".into(),
+                                 for the current and next steps"
+                                    .into(),
                             ));
                         }
                         match &self.current_execution {
@@ -391,10 +394,8 @@ impl WorkflowEngine {
                                     Some(()) => {
                                         // Injection succeeded: the next step ran inside the
                                         // current container. Mark it Succeeded directly.
-                                        self.state.set_status(
-                                            &next_step.name,
-                                            StepState::Succeeded,
-                                        );
+                                        self.state
+                                            .set_status(&next_step.name, StepState::Succeeded);
                                         self.current_step_name = Some(next_step.name.clone());
                                         self.persist()?;
                                         continue;
@@ -403,7 +404,8 @@ impl WorkflowEngine {
                                         return Err(EngineError::InvalidAdvanceAction(
                                             "container backend does not support prompt \
                                              injection; use LaunchNext to start a fresh \
-                                             container for the next step".into(),
+                                             container for the next step"
+                                                .into(),
                                         ));
                                     }
                                 }
@@ -482,7 +484,10 @@ impl WorkflowEngine {
     pub async fn step_once(&mut self) -> Result<StepOutcome, EngineError> {
         let step_name = self.launch_step().await?;
         let exit = {
-            let exec = self.current_execution.as_mut().expect("launch_step stored execution");
+            let exec = self
+                .current_execution
+                .as_mut()
+                .expect("launch_step stored execution");
             exec.wait().await?
         };
         self.finalize_step(&step_name, exit)
@@ -493,9 +498,10 @@ impl WorkflowEngine {
     /// Returns the step name so the caller can pass it to `finalize_step`.
     async fn launch_step(&mut self) -> Result<String, EngineError> {
         let ready = self.state.next_ready(&self.dag);
-        let step_name = ready.first().cloned().ok_or_else(|| {
-            EngineError::InvalidAdvanceAction("no ready steps remaining".into())
-        })?;
+        let step_name = ready
+            .first()
+            .cloned()
+            .ok_or_else(|| EngineError::InvalidAdvanceAction("no ready steps remaining".into()))?;
         let step = self.find_step(&step_name)?;
 
         let resolved_agent = self.resolve_agent(&step)?;
@@ -520,19 +526,15 @@ impl WorkflowEngine {
             resolved_model.as_deref(),
         );
 
-        self.state.set_status(
-            &step.name,
-            StepState::Running {
-                container_id: None,
-            },
-        );
+        self.state
+            .set_status(&step.name, StepState::Running { container_id: None });
         self.frontend
             .report_step_status(&step, WorkflowStepStatus::Running);
         self.persist()?;
 
-        let execution = self
-            .container_factory
-            .execution_for_step(&step, &self.session, &runtime)?;
+        let execution =
+            self.container_factory
+                .execution_for_step(&step, &self.session, &runtime)?;
 
         self.state.set_status(
             &step.name,
@@ -598,15 +600,21 @@ impl WorkflowEngine {
         // Extract a cancel handle before spawning the wait — once `wait()`
         // moves the backend into a blocking task, the execution can no
         // longer cancel itself.
-        let cancel_handle = self.current_execution.as_ref()
+        let cancel_handle = self
+            .current_execution
+            .as_ref()
             .and_then(|e| e.cancel_handle());
 
         // Move the execution into a spawned task so we can `select!` between
         // it and the control board channel without holding `&mut self`.
-        let mut exec = self.current_execution.take()
+        let mut exec = self
+            .current_execution
+            .take()
             .expect("launch_step stored execution");
-        let (wait_tx, mut wait_rx) =
-            tokio::sync::oneshot::channel::<(ContainerExecution, Result<ContainerExitInfo, EngineError>)>();
+        let (wait_tx, mut wait_rx) = tokio::sync::oneshot::channel::<(
+            ContainerExecution,
+            Result<ContainerExitInfo, EngineError>,
+        )>();
         tokio::spawn(async move {
             let result = exec.wait().await;
             let _ = wait_tx.send((exec, result));
@@ -724,11 +732,15 @@ impl WorkflowEngine {
         &mut self,
         step_name: &str,
         cancel_handle: &Option<crate::engine::container::instance::CancelHandle>,
-        wait_rx: &mut tokio::sync::oneshot::Receiver<(ContainerExecution, Result<ContainerExitInfo, EngineError>)>,
+        wait_rx: &mut tokio::sync::oneshot::Receiver<(
+            ContainerExecution,
+            Result<ContainerExitInfo, EngineError>,
+        )>,
     ) -> Result<MidStepOutcome, EngineError> {
-        let mut available = self.compute_available_actions()?;
-        available.is_mid_step = true;
-        let action = self.frontend.user_choose_next_action(&self.state, &available)?;
+        let available = self.compute_available_actions()?;
+        let action = self
+            .frontend
+            .user_choose_next_action(&self.state, &available)?;
 
         // Check if the container finished while the dialog was open.
         let already_finished = match wait_rx.try_recv() {
@@ -743,7 +755,7 @@ impl WorkflowEngine {
             NextAction::Dismiss => {
                 if let Some(exit_result) = already_finished {
                     return Ok(MidStepOutcome::StepCompleted(
-                        self.finalize_step(step_name, exit_result?)?
+                        self.finalize_step(step_name, exit_result?)?,
                     ));
                 }
                 Ok(MidStepOutcome::Continue)
@@ -754,7 +766,7 @@ impl WorkflowEngine {
                 }
                 if let Some(exit_result) = already_finished {
                     return Ok(MidStepOutcome::StepCompleted(
-                        self.finalize_step(step_name, exit_result?)?
+                        self.finalize_step(step_name, exit_result?)?,
                     ));
                 }
                 Ok(MidStepOutcome::Continue)
@@ -845,7 +857,7 @@ impl WorkflowEngine {
     }
 
     /// Run the 60-second yolo countdown, ticking through the frontend every
-    /// second. Returns the next action to take.
+    /// 100 ms. Returns the next action to take.
     async fn run_yolo_countdown(&mut self) -> Result<YoloCountdownResult, EngineError> {
         let total = std::time::Duration::from_secs(60);
         let start = std::time::Instant::now();
@@ -859,21 +871,31 @@ impl WorkflowEngine {
             match self.frontend.yolo_countdown_tick(remaining)? {
                 YoloTickOutcome::AdvanceNow => return Ok(YoloCountdownResult::Advance),
                 YoloTickOutcome::Cancel => return Ok(YoloCountdownResult::Pause),
-                YoloTickOutcome::ShowControlBoard => {
-                    return Ok(YoloCountdownResult::ShowControlBoard);
-                }
                 YoloTickOutcome::Continue => {}
             }
             if remaining.is_zero() {
                 return Ok(YoloCountdownResult::Advance);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::select! {
+                biased;
+                Some(req) = Self::recv_control_board(&mut self.control_board_rx) => {
+                    match req {
+                        ControlBoardRequest::OpenControlBoard => {
+                            return Ok(YoloCountdownResult::ShowControlBoard);
+                        }
+                        ControlBoardRequest::StepStuck => {
+                            // Already counting down; ignore.
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
         }
     }
 
     /// Run a mid-step yolo countdown while the step container is still
     /// running. Races the 60-second countdown ticks against the step
-    /// completing and user Ctrl-W / Esc via `yolo_countdown_tick`.
+    /// completing and an `OpenControlBoard` request on the channel.
     async fn run_mid_step_yolo_countdown(
         &mut self,
         step_name: &str,
@@ -898,9 +920,6 @@ impl WorkflowEngine {
                 YoloTickOutcome::Cancel => {
                     return Ok(MidStepYoloResult::Cancelled);
                 }
-                YoloTickOutcome::ShowControlBoard => {
-                    return Ok(MidStepYoloResult::ShowControlBoard);
-                }
                 YoloTickOutcome::Continue => {}
             }
 
@@ -908,7 +927,6 @@ impl WorkflowEngine {
                 return Ok(MidStepYoloResult::Advanced);
             }
 
-            // Sleep 100ms, but check if the step completed in that window.
             tokio::select! {
                 biased;
                 result = &mut *wait_rx => {
@@ -919,9 +937,17 @@ impl WorkflowEngine {
                         self.finalize_step(step_name, exit_result?)?
                     ));
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                    // Next tick.
+                Some(req) = Self::recv_control_board(&mut self.control_board_rx) => {
+                    match req {
+                        ControlBoardRequest::OpenControlBoard => {
+                            return Ok(MidStepYoloResult::ShowControlBoard);
+                        }
+                        ControlBoardRequest::StepStuck => {
+                            // Already counting down; ignore.
+                        }
+                    }
                 }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
             }
         }
     }
@@ -934,6 +960,7 @@ impl WorkflowEngine {
             can_pause: true,
             can_abort: true,
             can_finish_workflow: self.is_last_step(),
+            can_dismiss: self.current_execution.is_some(),
             ..Default::default()
         };
         // Continue-in-current-container: requires same agent + same model
@@ -942,9 +969,7 @@ impl WorkflowEngine {
             let next_agent = self.resolve_agent(&next)?;
             let next_model = self.resolve_model(&next);
             let ok = match (&self.current_step_agent, &self.current_step_model) {
-                (Some(curr_a), curr_m) => {
-                    *curr_a == next_agent && *curr_m == next_model
-                }
+                (Some(curr_a), curr_m) => *curr_a == next_agent && *curr_m == next_model,
                 _ => false,
             };
             if ok && self.current_execution.is_some() {
@@ -961,8 +986,7 @@ impl WorkflowEngine {
         if self.previous_step_name().is_some() {
             a.can_cancel_to_previous_step = true;
         } else {
-            a.cancel_to_previous_unavailable_reason =
-                Some("this is the first step".into());
+            a.cancel_to_previous_unavailable_reason = Some("this is the first step".into());
         }
         if !a.can_finish_workflow {
             a.finish_workflow_unavailable_reason =
@@ -1029,37 +1053,40 @@ impl WorkflowEngine {
             .iter()
             .find(|s| s.name == name)
             .cloned()
-            .ok_or_else(|| {
-                EngineError::Other(format!("step '{name}' not found in workflow"))
-            })
+            .ok_or_else(|| EngineError::Other(format!("step '{name}' not found in workflow")))
     }
 
     /// Build a per-step progress snapshot for `report_workflow_progress`.
     fn workflow_progress_info(&self) -> Vec<WorkflowStepProgressInfo> {
         use crate::data::workflow_state::StepState;
-        self.workflow.steps.iter().map(|step| {
-            let agent = self.resolve_agent(step)
-                .map(|a| a.as_str().to_string())
-                .unwrap_or_else(|_| "?".to_string());
-            let model = self.resolve_model(step);
-            let status = match self.state.status_of(&step.name) {
-                None | Some(StepState::Pending) => WorkflowStepStatus::Pending,
-                Some(StepState::Running { .. }) => WorkflowStepStatus::Running,
-                Some(StepState::Succeeded) => WorkflowStepStatus::Succeeded,
-                Some(StepState::Failed { exit_code, .. }) => {
-                    WorkflowStepStatus::Failed { exit_code: *exit_code }
+        self.workflow
+            .steps
+            .iter()
+            .map(|step| {
+                let agent = self
+                    .resolve_agent(step)
+                    .map(|a| a.as_str().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                let model = self.resolve_model(step);
+                let status = match self.state.status_of(&step.name) {
+                    None | Some(StepState::Pending) => WorkflowStepStatus::Pending,
+                    Some(StepState::Running { .. }) => WorkflowStepStatus::Running,
+                    Some(StepState::Succeeded) => WorkflowStepStatus::Succeeded,
+                    Some(StepState::Failed { exit_code, .. }) => WorkflowStepStatus::Failed {
+                        exit_code: *exit_code,
+                    },
+                    Some(StepState::Cancelled) => WorkflowStepStatus::Cancelled,
+                    Some(StepState::Skipped) => WorkflowStepStatus::Skipped,
+                };
+                WorkflowStepProgressInfo {
+                    name: step.name.clone(),
+                    agent,
+                    model,
+                    status,
+                    depends_on: step.depends_on.clone(),
                 }
-                Some(StepState::Cancelled) => WorkflowStepStatus::Cancelled,
-                Some(StepState::Skipped) => WorkflowStepStatus::Skipped,
-            };
-            WorkflowStepProgressInfo {
-                name: step.name.clone(),
-                agent,
-                model,
-                status,
-                depends_on: step.depends_on.clone(),
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     fn resolve_agent(&self, step: &WorkflowStep) -> Result<AgentName, EngineError> {
@@ -1088,7 +1115,9 @@ impl WorkflowEngine {
     }
 
     fn persist(&self) -> Result<(), EngineError> {
-        self.state_store.save(&self.state).map_err(EngineError::Data)?;
+        self.state_store
+            .save(&self.state)
+            .map_err(EngineError::Data)?;
         Ok(())
     }
 }
@@ -1109,11 +1138,7 @@ fn compute_workflow_hash(workflow: &Workflow) -> String {
 /// `Workflow` doesn't carry a name field; derive one from the title or fall
 /// back to "workflow".
 pub fn workflow_name_for(workflow: &Workflow) -> String {
-    workflow
-        .title
-        .as_deref()
-        .unwrap_or("workflow")
-        .to_string()
+    workflow.title.as_deref().unwrap_or("workflow").to_string()
 }
 
 #[cfg(test)]
@@ -1188,10 +1213,7 @@ mod tests {
             Ok(action)
         }
 
-        fn confirm_resume(
-            &mut self,
-            _mismatch: &ResumeMismatch,
-        ) -> Result<bool, EngineError> {
+        fn confirm_resume(&mut self, _mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
             Ok(self.confirm_resume_response)
         }
 
@@ -1210,12 +1232,7 @@ mod tests {
                 .push((step.name.clone(), status));
         }
 
-        fn report_step_output(
-            &mut self,
-            _step: &WorkflowStep,
-            _output: StepOutput,
-        ) {
-        }
+        fn report_step_output(&mut self, _step: &WorkflowStep, _output: StepOutput) {}
 
         fn report_step_stuck(&mut self, _step: &WorkflowStep) {}
         fn report_step_unstuck(&mut self, _step: &WorkflowStep) {}
@@ -1274,12 +1291,7 @@ mod tests {
         ) -> Result<ContainerExecution, EngineError> {
             self.execution_call_count.fetch_add(1, Ordering::Relaxed);
             self.recorded_contexts.lock().unwrap().push(runtime.clone());
-            let code = self
-                .exit_codes
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(0);
+            let code = self.exit_codes.lock().unwrap().pop_front().unwrap_or(0);
             let now = Utc::now();
             let info = ContainerExitInfo {
                 exit_code: code,
@@ -1347,7 +1359,12 @@ mod tests {
         factory: FakeContainerExecutionFactory,
         actions: impl IntoIterator<Item = NextAction>,
     ) -> WorkflowEngine {
-        make_engine_with_frontend(session, workflow, factory, FakeWorkflowFrontend::new(actions))
+        make_engine_with_frontend(
+            session,
+            workflow,
+            factory,
+            FakeWorkflowFrontend::new(actions),
+        )
     }
 
     fn make_engine_with_frontend(
@@ -1680,9 +1697,7 @@ mod tests {
 
         let available = engine.compute_available_actions().unwrap();
         assert!(!available.can_cancel_to_previous_step);
-        assert!(available
-            .cancel_to_previous_unavailable_reason
-            .is_some());
+        assert!(available.cancel_to_previous_unavailable_reason.is_some());
     }
 
     #[tokio::test]
@@ -1990,9 +2005,8 @@ mod tests {
             vec![make_step("a", &[], None), make_step("b", &["a"], None)],
         );
         // Factory supports injection (inject_result = Some(())).
-        let factory = FakeContainerExecutionFactory::with_inject_support(
-            std::iter::repeat_n(0, 100),
-        );
+        let factory =
+            FakeContainerExecutionFactory::with_inject_support(std::iter::repeat_n(0, 100));
         let factory_arc: Arc<FakeContainerExecutionFactory> = Arc::new(factory);
 
         struct InjectFactory(Arc<FakeContainerExecutionFactory>);
@@ -2022,7 +2036,9 @@ mod tests {
             workflow,
             None,
             Box::new(FakeWorkflowFrontend::new([
-                NextAction::ContinueInCurrentContainer { prompt: "next task".into() },
+                NextAction::ContinueInCurrentContainer {
+                    prompt: "next task".into(),
+                },
             ])),
             Box::new(InjectFactory(factory_arc.clone())),
             Arc::new(GitEngine::new()),
@@ -2138,7 +2154,7 @@ mod tests {
         // Workflow has no agent at any level.
         let workflow = make_workflow(
             Some("wf-fallback"),
-            None,  // no workflow-level agent
+            None,                            // no workflow-level agent
             vec![make_step("a", &[], None)], // no step-level agent
         );
         let factory = FakeContainerExecutionFactory::always_success();
@@ -2193,9 +2209,11 @@ mod tests {
 
     use std::sync::Condvar;
 
+    type CompletionArc = Arc<(Mutex<Option<i32>>, Condvar)>;
+
     struct BlockingBackend {
         cancel_flag: Arc<AtomicBool>,
-        completion: Arc<(Mutex<Option<i32>>, Condvar)>,
+        completion: CompletionArc,
     }
 
     impl crate::engine::container::instance::ExecutionBackend for BlockingBackend {
@@ -2212,8 +2230,7 @@ mod tests {
                     });
                 }
                 let guard = lock.lock().unwrap();
-                let (guard, _) =
-                    cvar.wait_timeout(guard, Duration::from_millis(20)).unwrap();
+                let (guard, _) = cvar.wait_timeout(guard, Duration::from_millis(20)).unwrap();
                 if let Some(code) = *guard {
                     let now = Utc::now();
                     return Ok(ContainerExitInfo {
@@ -2236,20 +2253,19 @@ mod tests {
         fn cancel_handle(&self) -> Option<crate::engine::container::instance::CancelHandle> {
             let flag = self.cancel_flag.clone();
             let completion = self.completion.clone();
-            Some(crate::engine::container::instance::CancelHandle::new(move || {
-                flag.store(true, Ordering::Relaxed);
-                let (_, cvar) = &*completion;
-                cvar.notify_all();
-                Ok(())
-            }))
+            Some(crate::engine::container::instance::CancelHandle::new(
+                move || {
+                    flag.store(true, Ordering::Relaxed);
+                    let (_, cvar) = &*completion;
+                    cvar.notify_all();
+                    Ok(())
+                },
+            ))
         }
     }
 
     /// Create a (cancel_flag, completion_arc) pair for a blocking execution.
-    fn make_blocking_entry() -> (
-        Arc<AtomicBool>,
-        Arc<(Mutex<Option<i32>>, Condvar)>,
-    ) {
+    fn make_blocking_entry() -> (Arc<AtomicBool>, CompletionArc) {
         (
             Arc::new(AtomicBool::new(false)),
             Arc::new((Mutex::new(None), Condvar::new())),
@@ -2257,7 +2273,7 @@ mod tests {
     }
 
     /// Signal a blocking execution to complete with the given exit code.
-    fn signal_completion(c: &Arc<(Mutex<Option<i32>>, Condvar)>, code: i32) {
+    fn signal_completion(c: &CompletionArc, code: i32) {
         let (lock, cvar) = &**c;
         *lock.lock().unwrap() = Some(code);
         cvar.notify_all();
@@ -2271,15 +2287,11 @@ mod tests {
         inject_count: Arc<AtomicUsize>,
         inject_result: Option<()>,
         /// Per-execution (cancel_flag, completion) for slow steps.
-        blocking_slots: Mutex<VecDeque<(Arc<AtomicBool>, Arc<(Mutex<Option<i32>>, Condvar)>)>>,
+        blocking_slots: Mutex<VecDeque<(Arc<AtomicBool>, CompletionArc)>>,
     }
 
     impl BlockingFactory {
-        fn new(
-            slots: impl IntoIterator<
-                Item = (Arc<AtomicBool>, Arc<(Mutex<Option<i32>>, Condvar)>),
-            >,
-        ) -> Self {
+        fn new(slots: impl IntoIterator<Item = (Arc<AtomicBool>, CompletionArc)>) -> Self {
             Self {
                 execution_count: Arc::new(AtomicUsize::new(0)),
                 inject_count: Arc::new(AtomicUsize::new(0)),
@@ -2359,9 +2371,7 @@ mod tests {
     impl CapturingFrontend {
         fn new(
             actions: impl IntoIterator<Item = NextAction>,
-            cb_tx: Arc<
-                Mutex<Option<tokio::sync::mpsc::UnboundedSender<ControlBoardRequest>>>,
-            >,
+            cb_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<ControlBoardRequest>>>>,
         ) -> Self {
             Self {
                 actions: Mutex::new(actions.into_iter().collect()),
@@ -2488,7 +2498,11 @@ mod tests {
         );
 
         // Clone the sender BEFORE the engine moves into the async task.
-        let tx = cb_tx.lock().unwrap().clone().expect("cb_tx set on construction");
+        let tx = cb_tx
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("cb_tx set on construction");
 
         let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
@@ -2544,7 +2558,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         // After Dismiss, cancel must still be false — step still running.
-        assert!(!cancel_flag.load(Ordering::Relaxed), "step must still be running after Dismiss");
+        assert!(
+            !cancel_flag.load(Ordering::Relaxed),
+            "step must still be running after Dismiss"
+        );
 
         // Complete the step — engine should continue to step b and finish.
         signal_completion(&completion, 0);
@@ -2556,7 +2573,7 @@ mod tests {
         );
     }
 
-/// RestartCurrentStep mid-step cancels the container AFTER selection, then
+    /// RestartCurrentStep mid-step cancels the container AFTER selection, then
     /// launches a fresh container for the same step.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mid_step_restart_cancels_then_re_runs() {
@@ -2587,7 +2604,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(150)).await;
         // Before sending request, cancel_flag must be false.
-        assert!(!cancel_flag.load(Ordering::Relaxed), "cancel must not fire before WCB opened");
+        assert!(
+            !cancel_flag.load(Ordering::Relaxed),
+            "cancel must not fire before WCB opened"
+        );
 
         tx.send(ControlBoardRequest::OpenControlBoard).unwrap();
         // Give engine time to process RestartCurrentStep (which cancels the container).
@@ -2641,10 +2661,17 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // Cancel must have been called (LaunchNext is destructive mid-step).
-        assert!(cancel_flag.load(Ordering::Relaxed), "cancel must be called for LaunchNext mid-step");
+        assert!(
+            cancel_flag.load(Ordering::Relaxed),
+            "cancel must be called for LaunchNext mid-step"
+        );
 
         let result = engine_task.await.unwrap().unwrap();
-        assert_eq!(result, WorkflowOutcome::Completed, "workflow must complete after force-advance");
+        assert_eq!(
+            result,
+            WorkflowOutcome::Completed,
+            "workflow must complete after force-advance"
+        );
         // a (blocking, force-advanced) + b (instant) = 2 executions.
         assert_eq!(
             execution_count.load(Ordering::Relaxed),
@@ -2699,7 +2726,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // b must have been cancelled.
-        assert!(cancel_b.load(Ordering::Relaxed), "step b must be cancelled for CancelToPreviousStep");
+        assert!(
+            cancel_b.load(Ordering::Relaxed),
+            "step b must be cancelled for CancelToPreviousStep"
+        );
 
         let result = engine_task.await.unwrap().unwrap();
         assert_eq!(result, WorkflowOutcome::Completed);
@@ -2795,10 +2825,19 @@ mod tests {
         let factory2_arc = Arc::new(factory2);
         struct Proxy(Arc<FakeContainerExecutionFactory>);
         impl ContainerExecutionFactory for Proxy {
-            fn execution_for_step(&self, s: &WorkflowStep, sess: &Session, r: &WorkflowRuntimeContext) -> Result<ContainerExecution, EngineError> {
+            fn execution_for_step(
+                &self,
+                s: &WorkflowStep,
+                sess: &Session,
+                r: &WorkflowRuntimeContext,
+            ) -> Result<ContainerExecution, EngineError> {
                 self.0.execution_for_step(s, sess, r)
             }
-            fn inject_prompt(&self, e: &ContainerExecution, p: &str) -> Result<Option<()>, EngineError> {
+            fn inject_prompt(
+                &self,
+                e: &ContainerExecution,
+                p: &str,
+            ) -> Result<Option<()>, EngineError> {
                 self.0.inject_prompt(e, p)
             }
         }
@@ -2877,8 +2916,12 @@ mod tests {
             fn report_step_output(&mut self, s: &WorkflowStep, o: StepOutput) {
                 self.0.report_step_output(s, o);
             }
-            fn report_step_stuck(&mut self, s: &WorkflowStep) { self.0.report_step_stuck(s); }
-            fn report_step_unstuck(&mut self, s: &WorkflowStep) { self.0.report_step_unstuck(s); }
+            fn report_step_stuck(&mut self, s: &WorkflowStep) {
+                self.0.report_step_stuck(s);
+            }
+            fn report_step_unstuck(&mut self, s: &WorkflowStep) {
+                self.0.report_step_unstuck(s);
+            }
             fn yolo_countdown_tick(&mut self, r: Duration) -> Result<YoloTickOutcome, EngineError> {
                 self.0.yolo_countdown_tick(r)
             }
