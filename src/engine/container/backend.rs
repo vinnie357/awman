@@ -31,7 +31,7 @@ pub(super) trait ContainerBackend: Send + Sync {
     fn stop(&self, handle: &ContainerHandle) -> Result<(), EngineError>;
 
     /// Build the CLI arguments for `docker exec -it` (or equivalent) into a
-    /// running container. Used by TUI re-attach and claws exec.
+    /// running container. Used by TUI re-attach.
     fn exec_args(
         &self,
         container_id: &str,

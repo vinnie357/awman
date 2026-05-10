@@ -30,7 +30,11 @@ Credential values are masked (`***`), but everything else is visible. You can al
 
 ## Worktree isolation
 
-The `--worktree` flag on `amux implement` runs the agent in an isolated Git worktree rather than your main working directory. The agent's changes land on a separate branch, completely isolated from your current work until you decide what to do with them.
+The `--worktree` flag runs agent sessions in an isolated Git worktree rather than your main working directory. The agent's changes land on a separate branch, completely isolated from your current work until you decide what to do with them.
+
+```sh
+amux exec workflow path/to/workflow.md --worktree
+```
 
 ### Why use it
 
@@ -116,9 +120,8 @@ When Git commit signing is enabled, amux **suspends the TUI** around each `git c
 ### Examples
 
 ```sh
-amux implement 0030 --worktree                        # isolated run; prompt to merge after
-amux implement 0030 --worktree --workflow wf.md       # multi-step workflow in one worktree
-amux implement 0030 --worktree --mount-ssh            # worktree + SSH keys in container
+amux exec workflow path/to/workflow.md --worktree                    # isolated run; prompt to merge after
+amux exec workflow path/to/workflow.md --worktree --mount-ssh        # worktree + SSH keys in container
 ```
 
 ---
@@ -156,20 +159,20 @@ Mounts `~/.amux/skills/` read-only into the agent's native skills directory (det
 
 ```sh
 # Mount your personal skills library
-amux implement 0042 --overlay "skill()"
+amux exec workflow path/to/workflow.md --overlay "skill()"
 
 # Mount a reference dataset read-only
-amux implement 0042 --overlay "dir(/data/reference:/mnt/reference:ro)"
+amux exec workflow path/to/workflow.md --overlay "dir(/data/reference:/mnt/reference:ro)"
 
 # Mount a shared prompts directory read-write
 amux chat --overlay "dir(~/prompts:/mnt/prompts:rw)"
 
 # Skills + directories (repeated flag or comma-separated â€” both are equivalent)
-amux implement 0042 --overlay "skill()" --overlay "dir(/data/ref:/mnt/ref:ro)" --overlay "dir(~/snippets:/mnt/snippets)"
-amux implement 0042 --overlay "skill(),dir(/data/ref:/mnt/ref:ro),dir(~/snippets:/mnt/snippets)"
+amux exec workflow path/to/workflow.md --overlay "skill()" --overlay "dir(/data/ref:/mnt/ref:ro)" --overlay "dir(~/snippets:/mnt/snippets)"
+amux exec workflow path/to/workflow.md --overlay "skill(),dir(/data/ref:/mnt/ref:ro),dir(~/snippets:/mnt/snippets)"
 ```
 
-Available on all four agent-launching commands: `implement`, `chat`, `exec prompt`, and `exec workflow`.
+Available on all agent-launching commands: `chat`, `exec prompt`, and `exec workflow`.
 
 ### `AMUX_OVERLAYS` environment variable
 
@@ -269,10 +272,10 @@ In the TUI command box, use comma-separated syntax when specifying multiple over
 
 ```
 # Correct: comma-separated in one value
-implement 0042 --overlay "skill(),dir(/data/ref:/mnt/ref:ro),dir(~/prompts:/mnt/prompts)"
+exec workflow path/to/workflow.md --overlay "skill(),dir(/data/ref:/mnt/ref:ro),dir(~/prompts:/mnt/prompts)"
 
 # Incorrect in TUI (second value silently overwrites first):
-implement 0042 --overlay "skill()" --overlay "dir(/data/ref:/mnt/ref:ro)"
+exec workflow path/to/workflow.md --overlay "skill()" --overlay "dir(/data/ref:/mnt/ref:ro)"
 ```
 
 On the CLI, both repeated flags and comma-separated syntax are equivalent.
@@ -313,9 +316,9 @@ Mounting the Docker socket gives the agent root-equivalent access to your host â
 ### Examples
 
 ```sh
-amux implement 0005 --allow-docker     # work item that needs to build a Docker image
-amux chat --allow-docker               # freeform session with Docker access
-amux ready --refresh --allow-docker    # Dockerfile audit with Docker access
+amux exec workflow path/to/workflow.md --allow-docker  # workflow that needs to build a Docker image
+amux chat --allow-docker                               # freeform session with Docker access
+amux ready --refresh --allow-docker                    # Dockerfile audit with Docker access
 ```
 
 ---
@@ -353,9 +356,9 @@ The directory is mounted as `-v /home/user/.ssh:/root/.ssh:ro`. The `:ro` flag p
 ### Examples
 
 ```sh
-amux implement 0030 --mount-ssh        # agent can push/pull over SSH
-amux chat --mount-ssh                  # freeform session with SSH access
-amux implement 0030 --worktree --mount-ssh   # combine with worktree isolation
+amux exec workflow path/to/workflow.md --mount-ssh              # agent can push/pull over SSH
+amux chat --mount-ssh                                           # freeform session with SSH access
+amux exec workflow path/to/workflow.md --worktree --mount-ssh   # combine with worktree isolation
 ```
 
 When used with `--workflow`, the SSH directory is mounted into every workflow-step container.

@@ -1,4 +1,4 @@
-//! `SpecsCommand` — `specs new` and `specs amend`.
+//! `SpecsCommand` — `specs amend`.
 
 use async_trait::async_trait;
 use serde::Serialize;
@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::chat::resolve_agent;
-use crate::command::commands::implement_prompts::{render_amend_prompt, render_interview_prompt};
+use crate::command::commands::prompt_templates::{render_amend_prompt, render_interview_prompt};
 use crate::command::commands::mount_scope::MountScopeFrontend;
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
@@ -17,12 +17,6 @@ use crate::engine::container::options::ContainerOption;
 use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Clone)]
-pub struct SpecsNewFlags {
-    pub interview: bool,
-    pub non_interactive: bool,
-}
-
-#[derive(Debug, Clone)]
 pub struct SpecsAmendFlags {
     pub work_item: String,
     pub non_interactive: bool,
@@ -31,12 +25,11 @@ pub struct SpecsAmendFlags {
 
 #[derive(Debug, Clone)]
 pub enum SpecsSubcommand {
-    New(SpecsNewFlags),
     Amend(SpecsAmendFlags),
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SpecsNewOutcome {
+pub struct NewSpecOutcome {
     pub interview: bool,
     pub created_path: Option<String>,
 }
@@ -51,7 +44,6 @@ pub struct SpecsAmendOutcome {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", content = "payload")]
 pub enum SpecsOutcome {
-    New(SpecsNewOutcome),
     Amend(SpecsAmendOutcome),
 }
 
@@ -173,27 +165,6 @@ impl Command for SpecsCommand {
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
         let outcome = match self.sub {
-            SpecsSubcommand::New(f) => {
-                let new_outcome = match create_new_spec(
-                    &self.engines,
-                    self.session.clone(),
-                    f.interview,
-                    f.non_interactive,
-                    frontend.as_mut(),
-                )
-                .await
-                {
-                    Ok(o) => o,
-                    Err(e) => {
-                        frontend.write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!("specs: failed to create new spec: {e}"),
-                        });
-                        return Err(e);
-                    }
-                };
-                SpecsOutcome::New(new_outcome)
-            }
             SpecsSubcommand::Amend(f) => {
                 let session = self.session;
                 let git_root = session.git_root().to_path_buf();
@@ -306,18 +277,17 @@ impl Command for SpecsCommand {
     }
 }
 
-/// Shared `specs new` / `new spec` body. Resolves the work-items dir + the
-/// template, runs the Q&A through the supplied frontend, writes the
-/// substituted file, and (when `interview` is set) hands the bare file to
-/// an agent for completion. Reused by both `SpecsCommand::SpecsNew` and
-/// `NewCommand::Spec` since dispatch canonicalizes `specs new` → `new spec`.
+/// `new spec` body. Resolves the work-items dir + the template, runs the
+/// Q&A through the supplied frontend, writes the substituted file, and
+/// (when `interview` is set) hands the bare file to an agent for completion.
+/// Called by `NewCommand::Spec`.
 pub(crate) async fn create_new_spec(
     engines: &crate::command::dispatch::Engines,
     session: crate::data::session::Session,
     interview: bool,
     non_interactive: bool,
     frontend: &mut dyn SpecsCommandFrontend,
-) -> Result<SpecsNewOutcome, CommandError> {
+) -> Result<NewSpecOutcome, CommandError> {
     let git_root = session.git_root().to_path_buf();
     let work_items_dir = session.repo_config().work_items_dir_or_default(&git_root);
     let template_path = session
@@ -331,7 +301,7 @@ pub(crate) async fn create_new_spec(
         frontend.write_message(UserMessage {
             level: MessageLevel::Error,
             text: format!(
-                "specs new: spec template missing at {}",
+                "new spec: spec template missing at {}",
                 template_path.display()
             ),
         });
@@ -347,7 +317,7 @@ pub(crate) async fn create_new_spec(
             frontend.write_message(UserMessage {
                 level: MessageLevel::Error,
                 text: format!(
-                    "specs new: failed to read spec template {}: {e}",
+                    "new spec: failed to read spec template {}: {e}",
                     template_path.display()
                 ),
             });
@@ -358,7 +328,7 @@ pub(crate) async fn create_new_spec(
     let next_n = next_work_item_number(&work_items_dir);
     frontend.write_message(UserMessage {
         level: MessageLevel::Info,
-        text: format!("specs new: creating work item {:04}", next_n),
+        text: format!("new spec: creating work item {:04}", next_n),
     });
     let kind = frontend.ask_spec_kind().unwrap_or(WorkItemKind::Task);
     let title = frontend
@@ -379,7 +349,7 @@ pub(crate) async fn create_new_spec(
             frontend.write_message(UserMessage {
                 level: MessageLevel::Error,
                 text: format!(
-                    "specs new: failed to create work-items dir {}: {e}",
+                    "new spec: failed to create work-items dir {}: {e}",
                     work_items_dir.display()
                 ),
             });
@@ -396,7 +366,7 @@ pub(crate) async fn create_new_spec(
             frontend.write_message(UserMessage {
                 level: MessageLevel::Error,
                 text: format!(
-                    "specs new: failed to write work item {}: {e}",
+                    "new spec: failed to write work item {}: {e}",
                     dest.display()
                 ),
             });
@@ -410,7 +380,7 @@ pub(crate) async fn create_new_spec(
             Err(e) => {
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Error,
-                    text: format!("specs new: failed to resolve agent: {e}"),
+                    text: format!("new spec: failed to resolve agent: {e}"),
                 });
                 return Err(e);
             }
@@ -420,7 +390,7 @@ pub(crate) async fn create_new_spec(
             Err(e) => {
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Error,
-                    text: format!("specs new: failed to resolve agent auth: {e}"),
+                    text: format!("new spec: failed to resolve agent auth: {e}"),
                 });
                 return Err(CommandError::from(e));
             }
@@ -440,7 +410,7 @@ pub(crate) async fn create_new_spec(
             Err(e) => {
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Error,
-                    text: format!("specs new: failed to build agent options: {e}"),
+                    text: format!("new spec: failed to build agent options: {e}"),
                 });
                 return Err(CommandError::from(e));
             }
@@ -455,7 +425,7 @@ pub(crate) async fn create_new_spec(
             Err(e) => {
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Error,
-                    text: format!("specs new: failed to build container instance: {e}"),
+                    text: format!("new spec: failed to build container instance: {e}"),
                 });
                 return Err(CommandError::from(e));
             }
@@ -473,7 +443,7 @@ pub(crate) async fn create_new_spec(
                 frontend.replay_queued();
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Error,
-                    text: format!("specs new: failed to run container: {e}"),
+                    text: format!("new spec: failed to run container: {e}"),
                 });
                 return Err(CommandError::from(e));
             }
@@ -483,7 +453,7 @@ pub(crate) async fn create_new_spec(
         frontend.replay_queued();
     }
 
-    Ok(SpecsNewOutcome {
+    Ok(NewSpecOutcome {
         interview,
         created_path: Some(dest.display().to_string()),
     })
@@ -599,7 +569,7 @@ mod tests {
         assert_eq!(next_work_item_number(tmp.path()), 43);
     }
 
-    // ── SpecsCommand::New tests ──────────────────────────────────────────────
+    // ── SpecsCommand::Amend tests ────────────────────────────────────────────
 
     struct FakeSpecsFrontend;
     impl crate::engine::message::UserMessageSink for FakeSpecsFrontend {
@@ -699,114 +669,6 @@ mod tests {
         .unwrap()
     }
 
-    #[tokio::test]
-    async fn specs_new_requires_template_to_exist_returns_error_when_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let engines = make_engines_with_root(tmp.path());
-        let session = make_session(tmp.path());
-        let cmd = super::SpecsCommand::new(
-            super::SpecsSubcommand::New(super::SpecsNewFlags {
-                interview: false,
-                non_interactive: false,
-            }),
-            engines,
-            session,
-        );
-        let result = cmd.run_with_frontend(Box::new(FakeSpecsFrontend)).await;
-        assert!(result.is_err(), "must error when template is missing");
-    }
-
-    #[tokio::test]
-    async fn specs_new_writes_file_when_template_exists() {
-        let tmp = tempfile::tempdir().unwrap();
-        let work_items = tmp.path().join("aspec").join("work-items");
-        std::fs::create_dir_all(&work_items).unwrap();
-        let template = work_items.join("0000-template.md");
-        // Template matches the real 0000-template.md format.
-        std::fs::write(
-            &template,
-            "# Work Item: [Feature | Bug | Task]\n\nTitle: title\n\n- summary\n",
-        )
-        .unwrap();
-
-        let engines = make_engines_with_root(tmp.path());
-        let session = make_session(tmp.path());
-        let cmd = super::SpecsCommand::new(
-            super::SpecsSubcommand::New(super::SpecsNewFlags {
-                interview: false,
-                non_interactive: false,
-            }),
-            engines,
-            session,
-        );
-        let outcome = cmd.run_with_frontend(Box::new(FakeSpecsFrontend))
-            .await
-            .unwrap();
-        if let super::SpecsOutcome::New(n) = outcome {
-            let path = n.created_path.expect("created_path must be Some");
-            assert!(
-                std::path::Path::new(&path).exists(),
-                "created file must exist on disk: {path}"
-            );
-            let content = std::fs::read_to_string(&path).unwrap();
-            assert!(
-                content.contains("My Test Spec"),
-                "title must be substituted: {content}"
-            );
-            assert!(
-                content.contains("# Work Item: Task"),
-                "kind must be substituted: {content}"
-            );
-            assert!(
-                content.contains("A one-line summary."),
-                "summary must be substituted: {content}"
-            );
-        } else {
-            panic!("unexpected outcome variant");
-        }
-    }
-
-    #[tokio::test]
-    async fn specs_new_interview_writes_file_then_invokes_agent() {
-        // With --interview, after writing the bare file the command attempts
-        // to run the interview agent. In a test environment without Docker
-        // the runtime spawn fails — we tolerate that as long as the file
-        // landed first (proving the substitution / write path completed
-        // before the agent step).
-        let tmp = tempfile::tempdir().unwrap();
-        let work_items = tmp.path().join("aspec").join("work-items");
-        std::fs::create_dir_all(&work_items).unwrap();
-        let template = work_items.join("0000-template.md");
-        std::fs::write(
-            &template,
-            "# Work Item: [Feature | Bug | Task]\n\nTitle: title\n",
-        )
-        .unwrap();
-
-        let engines = make_engines_with_root(tmp.path());
-        let session = make_session(tmp.path());
-        let cmd = super::SpecsCommand::new(
-            super::SpecsSubcommand::New(super::SpecsNewFlags {
-                interview: true,
-                non_interactive: false,
-            }),
-            engines,
-            session,
-        );
-        let _ = cmd.run_with_frontend(Box::new(FakeSpecsFrontend)).await;
-
-        // File must have been written before the agent run was attempted.
-        let entries: Vec<_> = std::fs::read_dir(&work_items)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.starts_with("0001-"))
-            .collect();
-        assert!(
-            !entries.is_empty(),
-            "interview must write the bare file before running the agent"
-        );
-    }
 
     #[tokio::test]
     async fn specs_amend_locates_file_then_invokes_agent() {

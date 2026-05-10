@@ -27,12 +27,6 @@ pub fn agent_dockerfile_for(agent: &str) -> Option<&'static str> {
     })
 }
 
-/// Bundled nanoclaw Dockerfile — used by `amux claws init` when network
-/// download is unavailable.
-pub fn nanoclaw_dockerfile() -> &'static str {
-    include_str!("../../../templates/Dockerfile.nanoclaw")
-}
-
 /// Returns `true` when the given content matches the bundled project base
 /// template (ignoring leading/trailing whitespace). Used by the ready engine
 /// to decide whether an audit should be offered.

@@ -839,7 +839,7 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                 if line_chars == 0 || inner_w == 0 {
                     cursor_visual_row += 1;
                 } else {
-                    cursor_visual_row += (line_chars + inner_w - 1) / inner_w;
+                    cursor_visual_row += line_chars.div_ceil(inner_w);
                 }
             }
             // Add wrapped rows from the current logical line.

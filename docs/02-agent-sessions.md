@@ -22,25 +22,7 @@ Press **Ctrl+C** to exit the agent session when you're done.
 
 ---
 
-## Implementing a work item
-
-```sh
-amux implement 0001
-# or, in the TUI:
-implement 0001
-```
-
-`implement` finds the work item file matching `0001-*.md` in the configured work items directory, builds a structured prompt from its contents, and launches the agent in a container. The prompt instructs the agent to implement the work item, iterate on builds and tests, write documentation, and report when complete.
-
-By default, amux looks in `aspec/work-items/`. If your repo uses a different layout, configure the path with `amux config set work_items.dir <path>`. See [Work item paths](07-configuration.md#work-item-paths) for the full resolution order.
-
-The work item number can be written with or without leading zeros: `1` and `0001` are equivalent.
-
-After the agent launches, you can interact with it directly — add follow-up instructions, review output, or let it run autonomously. Press **Ctrl+C** or type `exit` in the agent to end the session.
-
----
-
-## Flags common to `chat` and `implement`
+## Flags common to `chat` and other agent-launching commands
 
 ### `--agent <name>`
 
@@ -49,12 +31,12 @@ Override the configured agent for this session. Available agents: `claude`, `cod
 ```sh
 # CLI
 amux chat --agent codex               # launch a Codex session for this project
-amux implement 0050 --agent gemini    # implement with Gemini instead of the configured agent
+amux exec workflow path/to/workflow.md --agent gemini    # run workflow with Gemini instead of the configured agent
 amux chat --agent=copilot             # --flag=value form is also accepted
 
 # TUI command box
 chat --agent crush
-implement 0042 --agent=cline
+exec workflow path/to/workflow.md --agent=cline
 ```
 
 Both `--agent NAME` and `--agent=NAME` forms are accepted in both the CLI and the TUI command box. The TUI command box honours the flag and passes the correct agent to the container — it is not silently ignored.
@@ -76,12 +58,12 @@ Override the model used by the launched agent for this session.
 ```sh
 # CLI
 amux chat --model claude-opus-4-6
-amux implement 0050 --model claude-haiku-4-5
+amux exec workflow path/to/workflow.md --model claude-haiku-4-5
 amux chat --model=gpt-4o               # --flag=value form is also accepted
 
 # TUI command box
 chat --model claude-opus-4-6
-implement 0042 --model=claude-haiku-4-5
+exec workflow path/to/workflow.md --model=claude-haiku-4-5
 ```
 
 Both `--model NAME` and `--model=NAME` forms are accepted in both the CLI and the TUI command box.
@@ -152,21 +134,21 @@ May be repeated or combined with a comma-separated list. Permission defaults to 
 
 ```sh
 # Mount skills
-amux implement 0030 --overlay "skill()"
+amux exec workflow path/to/workflow.md --overlay "skill()"
 
 # Mount a directory
 amux chat --overlay "dir(/data/reference:/mnt/reference:ro)"
 amux chat --overlay "dir(~/prompts:/mnt/prompts:rw)"
 
 # Skills + directories (repeated flag or comma-separated)
-amux implement 0030 --overlay "skill()" --overlay "dir(/data:/mnt/data:ro)"
-amux implement 0030 --overlay "skill(),dir(/data:/mnt/data:ro)"
+amux exec workflow path/to/workflow.md --overlay "skill()" --overlay "dir(/data:/mnt/data:ro)"
+amux exec workflow path/to/workflow.md --overlay "skill(),dir(/data:/mnt/data:ro)"
 
 # TUI command box (use comma-separated syntax — repeated --overlay in TUI keeps only the last value)
-implement 0030 --overlay "skill(),dir(/data/reference:/mnt/reference:ro),dir(~/prompts:/mnt/prompts)"
+exec workflow path/to/workflow.md --overlay "skill(),dir(/data/reference:/mnt/reference:ro),dir(~/prompts:/mnt/prompts)"
 ```
 
-Available on all four agent-launching commands: `implement`, `chat`, `exec prompt`, and `exec workflow`.
+Available on all agent-launching commands: `chat`, `exec prompt`, and `exec workflow`.
 
 See [Configuration → Overlays](07-configuration.md#overlays) for the full overlay reference including config-based overlays, the `AMUX_OVERLAYS` env var, and conflict resolution rules.
 See [Security & Isolation](03-security-and-isolation.md#overlay-mounts) for security considerations.
@@ -217,16 +199,12 @@ Enable fully autonomous operation — the agent skips all permission prompts. Se
 ### Creating a work item
 
 ```sh
-amux specs new
-# or in TUI:
-specs new
-# or using the unified new subcommand:
 amux new spec
+# or in TUI:
+new spec
 ```
 
 Prompts for a type (Feature, Bug, Task, or Enhancement) and a title, then creates a numbered work item file in the configured work items directory using the project's template.
-
-`amux new spec` is an alias for `amux specs new` — they are identical in behaviour. Use whichever fits your muscle memory.
 
 By default, amux writes to `aspec/work-items/` and uses `aspec/work-items/0000-template.md`. If neither exists, amux auto-discovers any `*template.md` file in the work items directory and prompts you to confirm it. You can also configure the paths explicitly:
 
@@ -238,8 +216,6 @@ amux config set work_items.template docs/work-items/my-template.md
 If no template is found or confirmed, the new file is created with a minimal stub (`# Kind: Title`). See [Work item paths](07-configuration.md#work-item-paths) for full details on path resolution and auto-discovery.
 
 ```sh
-amux specs new --interview
-# or:
 amux new spec --interview
 ```
 
@@ -329,7 +305,7 @@ To make global skills available inside agent containers, enable the skills overl
 Or pass it at the command line:
 
 ```sh
-amux implement 0030 --overlay "skill()"
+amux exec workflow path/to/workflow.md --overlay "skill()"
 ```
 
 Once enabled, your global skills appear as slash commands. See [Configuration → Overlays](07-configuration.md#overlays) for details.
@@ -363,7 +339,7 @@ amux status          # one-shot snapshot
 amux status --watch  # auto-refreshing dashboard (every 3 seconds)
 ```
 
-`status` works outside the TUI. It shows every active code agent container and the nanoclaw container (if running), with CPU usage, memory, project path, and runtime.
+`status` works outside the TUI. It shows every active code agent container with CPU usage, memory, project path, and runtime.
 
 ```
 CODE AGENTS
@@ -667,7 +643,7 @@ Initialises the current Git repository for use with amux. See [Getting Started](
 
 `--aspec` downloads the `aspec/` folder from `github.com/prettysmartdev/aspec`, providing spec templates and work item scaffolding. Skipped without the flag.
 
-When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to configure a custom work items directory and template path interactively. This sets `work_items.dir` (and optionally `work_items.template`) in the repo config so `specs new` and `implement` work without requiring the `aspec/` folder layout. See [Work item paths](07-configuration.md#work-item-paths).
+When `--aspec` is not passed and no `aspec/` folder exists, `init` offers to configure a custom work items directory and template path interactively. This sets `work_items.dir` (and optionally `work_items.template`) in the repo config so commands like `new spec` and `exec workflow` work without requiring the `aspec/` folder layout. See [Work item paths](07-configuration.md#work-item-paths).
 
 ---
 
@@ -751,7 +727,7 @@ If you accept, amux handles the entire migration automatically. Commit the resul
 
 If you decline, your existing image continues to work for the current session with a deprecation warning printed each time.
 
-When `amux chat` or `amux implement` encounters the legacy layout (before you run `amux ready` to migrate), it exits with a short message:
+When `amux chat` encounters the legacy layout (before you run `amux ready` to migrate), it exits with a short message:
 
 ```
 Run `amux ready` to migrate to the modular Dockerfile layout, or pass `--no-migrate` to use the existing image.

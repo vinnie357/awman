@@ -29,9 +29,9 @@ In both cases, terminal raw mode, alternate screen, and mouse capture are enable
 
 ```
 ┌─ Tab 1: myproject ─────────┬─ Tab 2: myproject ──────────┐
-│  implement 0001             │  chat                        │
+│  exec workflow              │  chat                        │
 └─────────────────────────────┴──────────────────────────────┘
-┌─── ● running: implement 0001 ──────────────────────────────┐
+┌─── ● running: exec workflow ───────────────────────────────┐
 │ $ docker run --rm -it ...                                   │
 │                                                             │
 │  ╭─ 🔒 Claude Code (containerized) ── myproj | 5% | 200mb ─╮│
@@ -45,7 +45,7 @@ In both cases, terminal raw mode, alternate screen, and mouse capture are enable
 ┌─── command ──────────────────────────────────────────────────┐
 │ > _                                                           │
 └───────────────────────────────────────────────────────────────┘
-  init  ·  ready  ·  implement  ·  chat  ·  specs
+  init  ·  ready  ·  chat  ·  specs
 ```
 
 The TUI is composed of three areas:
@@ -91,7 +91,7 @@ When the command box is empty and the tab is idle (no command running), you'll s
 As you type, matching command completions appear in the suggestion row below the command box:
 
 ```
-> implement · init · status
+> chat · init · status
 ```
 
 When you type a partial command, the list narrows. Use **Tab** / **Shift+Tab** to cycle through suggestions and fill them into the input. Every command available in `amux` is also available in the TUI command box. Both `--flag value` and `--flag=value` forms are accepted. For example:
@@ -99,7 +99,7 @@ When you type a partial command, the list narrows. Use **Tab** / **Shift+Tab** t
 ```
 chat --agent codex
 chat --agent=codex
-implement 0042 --agent opencode --plan
+exec workflow path/to/workflow.md --agent opencode --plan
 ```
 
 Suggestions include flag hints from the command catalogue:
@@ -131,7 +131,7 @@ Using Worktree: /home/user/myproject-worktree
 If you type an unrecognised command, amux suggests the closest known one:
 
 ```
-'implemnt' is not an amux command.  Did you mean: implement
+'exex' is not an amux command.  Did you mean: exec
 ```
 
 ### Quitting
@@ -344,7 +344,7 @@ Tab names are truncated at 14 characters with `…`. The tab bar distributes wid
 | Grey | Idle or completed |
 | Blue | Running (no container) |
 | Green | Running with active container |
-| Purple / Magenta | Running a claws (nanoclaw) session, **or** permanently bound to a remote headless session |
+| Purple / Magenta | Permanently bound to a remote headless session |
 | Red | Exited with error |
 | Yellow | Container silent for >30 seconds (stuck warning) |
 | Alternating Yellow / Purple | Background yolo countdown in progress: tab label alternates between `⚠️ yolo in Ns` and `🤘 yolo in Ns` every 2 seconds (see [Yolo Mode](05-yolo-mode.md#background-yolo-countdown)) |
@@ -361,7 +361,7 @@ For full details on creating remote-bound tabs, the create-session sub-modal, an
 
 ### Stuck detection
 
-If a running container produces no output for more than 30 seconds, the tab turns yellow and the subcommand label gains a `⚠️` prefix (e.g. `⚠️ implement 0001`). The warning clears automatically when you:
+If a running container produces no output for more than 30 seconds, the tab turns yellow and the subcommand label gains a `⚠️` prefix (e.g. `⚠️ chat`). The warning clears automatically when you:
 
 - Switch to the yellow tab
 - Press any key while the tab is active

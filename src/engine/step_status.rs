@@ -1,4 +1,4 @@
-//! Shared `StepStatus` for Ready/Init/Claws/Agent engine summaries — Layer 1.
+//! Shared `StepStatus` for Ready/Init/Agent engine summaries — Layer 1.
 
 use serde::{Deserialize, Serialize};
 

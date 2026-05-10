@@ -4,18 +4,15 @@
 /// any given invocation is selected by [`select_random_tip`] using the current
 /// unix-second as a seed.
 pub const TIPS: &[&str] = &[
-    "`amux status` shows all running code agents and nanoclaw containers.",
+    "`amux status` shows all running code agents.",
     "`amux status --watch` auto-refreshes every 3 seconds. Press Ctrl-C to stop.",
-    "`amux implement <work-item-number>` starts a code agent on a work item.",
+    "`amux exec workflow <file>` runs a workflow inside a container.",
     "`amux chat` opens an interactive chat session with your configured agent.",
     "`amux ready` checks your environment and builds the Docker image if needed.",
     "`amux ready --refresh` re-runs the OAuth token refresh before launching.",
     "`amux ready --build` forces a Docker image rebuild even if one exists.",
     "`amux ready --no-cache` rebuilds the Docker image from scratch with no layer cache.",
     "`amux ready --build --no-cache` is the nuclear option for a fully clean image.",
-    "`amux claws init` sets up the nanoclaw parallel agent system for the first time.",
-    "`amux claws ready` (re)launches the nanoclaw controller container.",
-    "`amux claws chat` attaches an interactive shell to the running nanoclaw container.",
     "`amux new` guides you through creating a new work item interactively.",
     "Work items live in `aspec/work-items/` and use a numbered Markdown format.",
     "Per-repo config lives at `<git-root>/aspec/.amux.json`.",
@@ -38,15 +35,13 @@ pub const TIPS: &[&str] = &[
     "A yellow tab name means the container has been idle for over 30 seconds.",
     "CPU and memory stats for running containers are polled and displayed live.",
     "Agent credentials are read from the system keychain automatically.",
-    "Nanoclaw worker containers are named with the `nanoclaw-` prefix.",
-    "The nanoclaw controller container is always named `amux-claws-controller`.",
     "Multiple tabs let you monitor and run agents in different repos simultaneously.",
     "The `ready` command checks local agent installation before launching a container.",
     "Docker images are built from `Dockerfile.dev` in your repo root.",
     "amux supports Claude Code, Codex, and Opencode as agent backends.",
     "Work items can be of type Feature, Bug, or Task.",
     "The TUI auto-starts `status --watch` when launched outside a Git repo.",
-    "`amux implement` finds work items by their number (e.g. `implement 42`).",
+    "`amux exec workflow` runs a workflow file inside a sandboxed container.",
     "The `new` command creates work items using the template in `aspec/work-items/0000-template.md`.",
     "Container output streams live to the TUI execution window with full ANSI colour.",
     "The VT100 terminal emulator in the container window supports colours, bold, and cursor movement.",
@@ -72,8 +67,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tips_count_is_50() {
-        assert_eq!(TIPS.len(), 50);
+    fn tips_count_is_45() {
+        assert_eq!(TIPS.len(), 45);
     }
 
     #[test]

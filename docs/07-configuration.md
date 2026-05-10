@@ -288,7 +288,7 @@ By default, amux looks for work items in `aspec/work-items/` and uses `aspec/wor
 amux config set work_items.dir docs/work-items
 ```
 
-Once set, `specs new` and `implement` look for work items in that directory instead of `aspec/work-items/`. The path may be relative to the repo root (recommended) or absolute.
+Once set, work items are loaded from that directory instead of `aspec/work-items/`. The path may be relative to the repo root (recommended) or absolute.
 
 ### Configuring a custom template
 
@@ -296,11 +296,11 @@ Once set, `specs new` and `implement` look for work items in that directory inst
 amux config set work_items.template docs/work-items/0000-template.md
 ```
 
-When set, `specs new` uses this file as the template for new work items. If the path is set but the file doesn't exist, amux warns and falls back to auto-discovery.
+When set, this file is used as the template for new work items created with `new spec`. If the path is set but the file doesn't exist, amux warns and falls back to auto-discovery.
 
 ### Template auto-discovery
 
-If no template is configured (and no legacy `aspec/work-items/0000-template.md` exists), `specs new` scans the work items directory for any file whose name ends in `template.md`. If it finds a candidate, it prompts:
+If no template is configured (and no legacy `aspec/work-items/0000-template.md` exists), the work item creation command scans the work items directory for any file whose name ends in `template.md`. If it finds a candidate, it prompts:
 
 ```
 Found potential template: docs/work-items/my-template.md. Use it? [Y/n]
@@ -324,10 +324,10 @@ If no template is found and you decline, the new work item is created with a min
 
 ### Graceful degradation
 
-If neither `work_items.dir` is configured nor `aspec/work-items/` exists, `specs new` and `implement` fail with a helpful message:
+If neither `work_items.dir` is configured nor `aspec/work-items/` exists, work item creation fails with a helpful message:
 
 ```
-`specs new` requires a work items directory.
+Work items directory not configured.
 Run `amux config set work_items.dir <path>` to configure one,
 or run `amux init --aspec` to set up the aspec folder.
 ```
@@ -637,18 +637,18 @@ WARN overlay host path '/data/reference' does not exist; skipping
 
 ### CLI flag
 
-The `--overlay` flag is available on all four agent-launching commands: `implement`, `chat`, `exec prompt`, and `exec workflow`. It accepts both `skill()` and `dir(...)` entries.
+The `--overlay` flag is available on all agent-launching commands: `chat`, `exec prompt`, and `exec workflow`. It accepts both `skill()` and `dir(...)` entries.
 
 ```sh
 # Skills overlay alone
-amux implement 0042 --overlay "skill()"
+amux exec workflow path/to/workflow.md --overlay "skill()"
 
 # Skills overlay with directory overlays (repeated flag or comma-separated)
 amux chat --overlay "skill()" --overlay "dir(/data:/mnt/data:ro)"
 amux chat --overlay "skill(),dir(/data:/mnt/data:ro)"
 
 # Directory overlays (tilde expansion supported)
-amux implement 0042 --overlay "dir(~/prompts:/mnt/prompts)"
+amux exec workflow path/to/workflow.md --overlay "dir(~/prompts:/mnt/prompts)"
 
 # Multiple directory overlays
 amux chat --overlay "dir(/a:/mnt/a:ro)" --overlay "dir(/b:/mnt/b:rw)"
@@ -767,7 +767,6 @@ Apple Containers (`container` CLI, macOS 26+) is an OCI-compatible container run
 **Limitations:**
 
 - **`--allow-docker`**: Docker socket passthrough is not meaningful under Apple Containers. Passing `--allow-docker` produces a warning and the socket is not mounted. If your task needs Docker-in-container, switch to the Docker runtime.
-- **Nanoclaw (`amux claws`)**: Nanoclaw requires detached container mode and Docker socket access. `claws init`, `claws ready`, and `claws chat` are not supported with `"apple-containers"`. Use the Docker runtime for nanoclaw.
 - **macOS only**: If `"apple-containers"` is configured on Linux or Windows, amux exits with an error at startup rather than silently falling back to Docker.
 
 ---
@@ -798,4 +797,4 @@ The tag push triggers the release CI pipeline, which builds binaries for all pla
 
 ---
 
-[← Nanoclaw](06-nanoclaw.md) · [Next: Headless Mode →](08-headless-mode.md)
+[← Yolo Mode](05-yolo-mode.md) · [Next: Headless Mode →](08-headless-mode.md)

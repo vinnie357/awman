@@ -31,7 +31,6 @@ use crate::command::commands::exec_prompt::ExecPromptCommandFrontend;
 use crate::command::commands::exec_workflow::{ExecWorkflowCommandFrontend, WorkflowSummary};
 use crate::command::commands::headless::HeadlessCommandFrontend;
 use crate::command::commands::headless::HeadlessServeConfig;
-use crate::command::commands::implement::ImplementCommandFrontend;
 use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFrontend};
 use crate::command::commands::new::NewCommandFrontend;
 use crate::command::commands::remote::RemoteCommandFrontend;
@@ -46,9 +45,6 @@ use crate::command::error::CommandError;
 use crate::data::config::repo::WorkItemsConfig;
 use crate::data::session::AgentName;
 use crate::data::workflow_definition::WorkflowStep;
-use crate::engine::claws::frontend::ClawsFrontend;
-use crate::engine::claws::phase::ClawsPhase;
-use crate::engine::claws::summary::ClawsSummary;
 use crate::engine::container::frontend::{ContainerFrontend, ContainerProgress, ContainerStatus};
 use crate::engine::container::instance::ContainerExitInfo;
 use crate::engine::error::EngineError;
@@ -181,11 +177,6 @@ fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
 
     // Map positionals to argument names based on subcommand.
     match subcommand {
-        "implement" => {
-            if let Some(wi) = positionals.first() {
-                positional_args.insert("work_item".to_string(), wi.clone());
-            }
-        }
         "exec prompt" => {
             if !positionals.is_empty() {
                 positional_args.insert("prompt".to_string(), positionals.join(" "));
@@ -656,29 +647,6 @@ impl ReadyFrontend for HeadlessDispatchFrontend {
     fn report_summary(&mut self, _summary: &ReadySummary) {}
 }
 
-// ─── ClawsFrontend ──────────────────────────────────────────────────────────
-
-impl ClawsFrontend for HeadlessDispatchFrontend {
-    fn ask_replace_existing_clone(&mut self, _path: &Path) -> Result<bool, EngineError> {
-        Ok(false)
-    }
-    fn ask_run_audit(&mut self) -> Result<bool, EngineError> {
-        Ok(false)
-    }
-    fn report_phase(&mut self, phase: &ClawsPhase) {
-        self.write_to_log(&format!("[INFO] Claws phase: {phase:?}"));
-    }
-    fn report_step_status(&mut self, step: &str, status: StepStatus) {
-        self.write_to_log(&format!("[INFO] Claws step '{step}': {status:?}"));
-    }
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
-        Box::new(HeadlessContainerSink {
-            log_file: Arc::clone(&self.log_file),
-        })
-    }
-    fn report_summary(&mut self, _summary: &ClawsSummary) {}
-}
-
 // ─── Per-command frontend markers ───────────────────────────────────────────
 
 impl RemoteCommandFrontend for HeadlessDispatchFrontend {}
@@ -732,17 +700,6 @@ impl ExecWorkflowCommandFrontend for HeadlessDispatchFrontend {
     ) -> Result<bool, CommandError> {
         // Headless mode has no interactive prompt; resume by default.
         Ok(true)
-    }
-}
-
-#[async_trait]
-impl ImplementCommandFrontend for HeadlessDispatchFrontend {
-    fn set_pty_active(&mut self, _active: bool) {}
-    fn report_implement_summary(&mut self, summary: &WorkflowSummary) {
-        self.write_to_log(&format!(
-            "[INFO] Implement summary: {} completed, {} failed",
-            summary.steps_completed, summary.steps_failed
-        ));
     }
 }
 
@@ -852,16 +809,6 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("hello world")
-        );
-    }
-
-    #[test]
-    fn argument_implement_maps_first_positional_to_work_item() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend("implement", &["0072"], tmp.path());
-        assert_eq!(
-            f.argument(&["implement"], "work_item").unwrap().as_deref(),
-            Some("0072")
         );
     }
 

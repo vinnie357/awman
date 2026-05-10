@@ -1,20 +1,8 @@
-//! Prompt templates for `ImplementCommand` and `SpecsCommand`. Literal
-//! strings are preserved from `oldsrc/commands/{implement,specs}.rs` so
+//! Prompt templates for `SpecsCommand` and `NewCommand`. Literal
+//! strings are preserved from `oldsrc/commands/specs.rs` so
 //! user-visible prompts remain stable across the refactor.
 
-/// Default single-step prompt used when `--workflow` is omitted.
-/// `{{work_item_number}}` is substituted at command-build time.
-pub const DEFAULT_IMPLEMENT_PROMPT: &str = "Implement work item {{work_item_number}}. Iterate \
-    until the build succeeds. Implement tests as described in the work item and the project \
-    aspec. Iterate until tests are comprehensive and pass. Write documentation as described \
-    in the project aspec. Ensure final build and test success.";
-
-/// Substitute the canonical placeholder.
-pub fn render_default_prompt(work_item: &str) -> String {
-    DEFAULT_IMPLEMENT_PROMPT.replace("{{work_item_number}}", work_item)
-}
-
-/// Interview prompt for `specs new --interview`. Ports `oldsrc/commands/
+/// Interview prompt for `new spec --interview`. Ports `oldsrc/commands/
 /// specs.rs::INTERVIEW_PROMPT_TEMPLATE` verbatim.
 pub const INTERVIEW_PROMPT: &str = "Work item {number} template has been created for \
 {kind}: {title}. Help complete the work item based on the following summary, making sure to \

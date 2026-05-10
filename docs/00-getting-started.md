@@ -57,7 +57,7 @@ By default, amux looks for work items in `aspec/work-items/`. If your repo uses 
 amux config set work_items.dir docs/work-items
 ```
 
-When you run `amux implement 0001`, amux finds the matching file in the configured directory, constructs a prompt from its contents, and launches the agent inside a container to do the work.
+Work items can be executed via workflows using `amux exec workflow`. See the [Workflows](04-workflows.md) and [Agent Sessions](02-agent-sessions.md) guides for more details.
 
 ---
 
@@ -167,7 +167,7 @@ Set up work items? You can configure a custom work items directory or use the bu
 1. **Download the bundled `aspec/` template** — gives you spec templates and work item scaffolding matching the `aspec/` standard layout.
 2. **Configure a custom directory** — point amux to an existing `docs/specs/`, `workitems/`, or other directory where you keep work item files.
 
-Either way, amux writes the configuration so that `specs new` and `implement 0001` can find your work item files without extra flags.
+Either way, amux writes the configuration so that `new spec` and workflow commands can find your work item files without extra flags.
 
 **Decline:** You can set this up later with `amux init --aspec` or `amux config set work_items.dir docs/specs`.
 
@@ -269,24 +269,24 @@ Press **Ctrl-M** to toggle the container window between maximized and minimized 
 
 ### Implementing a work item
 
-If you have a work item at `aspec/work-items/0001-add-auth.md`:
+To execute a work item, create a workflow that references it, then run the workflow with `amux exec workflow`. See the [Workflows](04-workflows.md) guide for how to create and run workflows.
+
+For example, to run a workflow bundled with amux:
 
 ```sh
-implement 0001
+amux exec workflow aspec/workflows/implement-feature.md --work-item 0001
 ```
 
-amux finds the file, builds a structured prompt from its contents, and launches the agent in a container. The agent reads the spec, writes code, runs tests, and reports back — all inside the container.
+The agent reads the work item spec, writes code, runs tests, and reports back — all inside a container.
 
 ---
 
 ## Creating work items
 
 ```sh
-specs new               # prompts for type and title, creates the file
-specs new --interview   # creates the skeleton, then opens an agent to help fill it out
+new spec               # prompts for type and title, creates the file
+new spec --interview   # creates the skeleton, then opens an agent to help fill it out
 ```
-
-`new spec` is an alias for `specs new` — they are identical.
 
 Four work item types are available: Feature, Bug, Task, and Enhancement.
 
@@ -309,7 +309,7 @@ specs amend 0001
 The `new` subcommand is a unified entry point for creating amux artefacts:
 
 ```sh
-new spec                # alias for specs new
+new spec                # prompts for type and title, creates a work item file
 new workflow            # interactively build a workflow file step by step
 new workflow --interview  # let an agent write the workflow from a summary
 new skill               # interactively create a Claude Code skill file
@@ -323,11 +323,10 @@ Both `new workflow` and `new skill` accept `--global` to write to `~/.amux/` ins
 ## What's next
 
 - **[Using the TUI](01-using-the-tui.md)** — tabs, keyboard shortcuts, container window controls, scrollback
-- **[Agent Sessions](02-agent-sessions.md)** — all `chat` and `implement` flags, authentication, work item management
+- **[Agent Sessions](02-agent-sessions.md)** — all `chat` flags, authentication, work item management
 - **[Security & Isolation](03-security-and-isolation.md)** — worktrees, SSH keys, Docker socket access
-- **[Workflows](04-workflows.md)** — multi-step agent runs with plan → implement → review phases
+- **[Workflows](04-workflows.md)** — multi-step agent runs with plan, review, and documentation phases
 - **[Yolo Mode](05-yolo-mode.md)** — fully autonomous operation for long-running tasks
-- **[Nanoclaw](06-nanoclaw.md)** — persistent 24/7 background agents
 - **[Configuration](07-configuration.md)** — all config file options
 
 ---

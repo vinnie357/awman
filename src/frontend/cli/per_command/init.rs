@@ -102,7 +102,7 @@ impl InitFrontend for CliFrontend {
             ("Work items", &summary.work_items_setup),
         ];
         let box_str = render_summary_box("Init Summary", &rows);
-        let footer = "\nWhat's Next?\n  Run `amux` to launch the interactive TUI.\n\n  Available commands:\n    amux chat        — Start a freeform chat session with the agent\n    amux new spec    — Create a new work item from the aspec template\n    amux implement   — Implement a work item inside a container\n";
+        let footer = "\nWhat's Next?\n  Run `amux` to launch the interactive TUI.\n\n  Available commands:\n    amux chat          — Start a freeform chat session with the agent\n    amux new spec      — Create a new work item from the aspec template\n    amux exec workflow — Run a workflow inside a container\n";
         let _ = std::io::Write::write_all(
             &mut std::io::stderr(),
             format!("\n{box_str}{footer}").as_bytes(),

@@ -58,7 +58,7 @@ impl ContainerFrontend for CliFrontend {
     fn resize_pty(&mut self, _cols: u16, _rows: u16) {}
 }
 
-// ─── Standalone proxy used by InitFrontend / ReadyFrontend / ClawsFrontend ─
+// ─── Standalone proxy used by InitFrontend / ReadyFrontend ─────────────────
 
 /// Stand-alone `ContainerFrontend` returned by engines that need a
 /// `Box<dyn ContainerFrontend>` for a single container's lifetime
@@ -67,7 +67,7 @@ pub(crate) struct CliContainerProxy;
 
 impl UserMessageSink for CliContainerProxy {
     fn write_message(&mut self, msg: UserMessage) {
-        // This proxy is used by Init/Ready/Claws container phases which don't
+        // This proxy is used by Init/Ready container phases which don't
         // have a PTY gate — write immediately to stderr.
         use crate::engine::message::MessageLevel;
         let prefix = match msg.level {

@@ -11,7 +11,6 @@
 
 use crate::command::commands::auth::AuthOutcome;
 use crate::command::commands::chat::ChatOutcome;
-use crate::command::commands::claws::ClawsOutcome;
 use crate::command::commands::config::{
     ConfigGetOutcome, ConfigOutcome, ConfigSetOutcome, ConfigShowOutcome,
 };
@@ -22,7 +21,6 @@ use crate::command::commands::headless::{
     HeadlessKillOutcome, HeadlessLogsOutcome, HeadlessOutcome, HeadlessStartOutcome,
     HeadlessStatusOutcome,
 };
-use crate::command::commands::implement::ImplementOutcome;
 use crate::command::commands::init::InitOutcome;
 use crate::command::commands::new::{
     NewOutcome, NewSkillOutcome, NewSpecOutcome, NewWorkflowOutcome,
@@ -31,8 +29,8 @@ use crate::command::commands::ready::ReadyOutcome;
 use crate::command::commands::remote::{
     RemoteOutcome, RemoteRunOutcome, RemoteSessionKillOutcome, RemoteSessionStartOutcome,
 };
-use crate::command::commands::specs::{SpecsAmendOutcome, SpecsNewOutcome, SpecsOutcome};
-use crate::command::commands::status::{ContainerKind, StatusContainerRow, StatusOutcome};
+use crate::command::commands::specs::{SpecsAmendOutcome, SpecsOutcome};
+use crate::command::commands::status::{StatusContainerRow, StatusOutcome};
 use crate::command::CommandOutcome;
 
 // ─── Top-level dispatcher ────────────────────────────────────────────────────
@@ -47,8 +45,6 @@ pub fn render(outcome: &CommandOutcome) -> Option<String> {
         CommandOutcome::Chat(o) => render_chat(o),
         CommandOutcome::Init(o) => render_init(o),
         CommandOutcome::Ready(o) => render_ready(o),
-        CommandOutcome::Claws(o) => render_claws(o),
-        CommandOutcome::Implement(o) => render_implement(o),
         CommandOutcome::ExecPrompt(o) => render_exec_prompt(o),
         CommandOutcome::ExecWorkflow(o) => render_exec_workflow(o),
         CommandOutcome::Config(o) => render_config(o),
@@ -64,59 +60,16 @@ pub fn render(outcome: &CommandOutcome) -> Option<String> {
 // ─── status ──────────────────────────────────────────────────────────────────
 
 pub fn render_status(o: &StatusOutcome) -> String {
-    let agents: Vec<&StatusContainerRow> = o
-        .containers
-        .iter()
-        .filter(|c| c.kind == ContainerKind::Agent)
-        .collect();
-    let claws: Vec<&StatusContainerRow> = o
-        .containers
-        .iter()
-        .filter(|c| c.kind == ContainerKind::Claws)
-        .collect();
-
     let mut out = String::new();
     out.push_str("AMUX STATUS DASHBOARD\n\n");
 
     out.push_str("CODE AGENTS\n");
-    if agents.is_empty() {
+    if o.containers.is_empty() {
         out.push_str("  No code agents running.\n");
-        out.push_str("  To start one: amux implement <work-item>  or  amux chat\n");
+        out.push_str("  To start one: amux exec workflow <file>  or  amux chat\n");
     } else {
         let headers = ["●", "Container", "ID", "Image", "CPU%", "Mem MB", "Started"];
-        let rows: Vec<Vec<String>> = agents.iter().map(|c| render_container_row(c)).collect();
-        out.push_str(&format_table(&headers, &rows));
-    }
-
-    out.push('\n');
-
-    out.push_str("NANOCLAW\n");
-    if claws.is_empty() {
-        out.push_str("  Nanoclaw is not running.\n");
-        out.push_str("  To start it: amux claws init\n");
-    } else {
-        let headers = ["●", "Container", "ID", "CPU%", "Mem MB"];
-        let rows: Vec<Vec<String>> = claws
-            .iter()
-            .map(|c| {
-                let indicator = if c.stuck { "🟡" } else { "🟢" };
-                let cpu = c
-                    .cpu_percent
-                    .map(|v| format!("{v:>5.1}"))
-                    .unwrap_or_else(|| "  -  ".to_string());
-                let mem = c
-                    .memory_mb
-                    .map(|v| format!("{v:>6.1}"))
-                    .unwrap_or_else(|| "   -  ".to_string());
-                vec![
-                    indicator.to_string(),
-                    c.name.clone(),
-                    c.id.chars().take(12).collect(),
-                    cpu,
-                    mem,
-                ]
-            })
-            .collect();
+        let rows: Vec<Vec<String>> = o.containers.iter().map(render_container_row).collect();
         out.push_str(&format_table(&headers, &rows));
     }
 
@@ -189,7 +142,7 @@ fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     out
 }
 
-// ─── chat / exec prompt / exec workflow / implement ──────────────────────────
+// ─── chat / exec prompt / exec workflow ──────────────────────────────────────
 //
 // These commands stream the container's stdout/stderr directly to the host
 // during the run. The success outcome is intentionally minimal — a one-line
@@ -222,28 +175,8 @@ fn render_exec_workflow(o: &ExecWorkflowOutcome) -> Option<String> {
     Some(format!("Workflow {} completed{exit}{wt}.", o.workflow))
 }
 
-fn render_implement(o: &ImplementOutcome) -> Option<String> {
-    let workflow = o
-        .workflow_used
-        .as_deref()
-        .map(|w| format!(" (workflow {w})"))
-        .unwrap_or_default();
-    let wt = if o.worktree_used {
-        " in isolated worktree"
-    } else {
-        ""
-    };
-    let exit = match o.exit_code {
-        Some(c) if c != 0 => format!(" — exit {c}"),
-        _ => String::new(),
-    };
-    Some(format!(
-        "Implement run for work item {}{workflow}{wt}{exit}.",
-        o.work_item,
-    ))
-}
 
-// ─── init / ready / claws ────────────────────────────────────────────────────
+// ─── init / ready ────────────────────────────────────────────────────────────
 //
 // These engines emit their summary box via `report_summary` (replayed to
 // stderr from the message queue). The success-path stdout output is None.
@@ -254,16 +187,10 @@ fn render_init(_o: &InitOutcome) -> Option<String> {
 
 fn render_ready(o: &ReadyOutcome) -> Option<String> {
     if o.json_requested {
-        // Emit the legacy schema {ready, runtime, steps:{...}} so existing
-        // CI / scripting consumers piping `amux ready --json` keep working.
         Some(serde_json::to_string_pretty(&o.to_legacy_json()).unwrap_or_else(|_| "{}".into()))
     } else {
         None
     }
-}
-
-fn render_claws(_o: &ClawsOutcome) -> Option<String> {
-    None
 }
 
 // ─── config ──────────────────────────────────────────────────────────────────
@@ -458,16 +385,7 @@ fn render_new_skill(o: &NewSkillOutcome) -> String {
 
 fn render_specs(o: &SpecsOutcome) -> Option<String> {
     match o {
-        SpecsOutcome::New(n) => Some(render_specs_new(n)),
         SpecsOutcome::Amend(a) => Some(render_specs_amend(a)),
-    }
-}
-
-fn render_specs_new(o: &SpecsNewOutcome) -> String {
-    let interview = if o.interview { " (interview)" } else { "" };
-    match &o.created_path {
-        Some(p) => format!("Created spec{interview}: {p}"),
-        None => format!("Spec created{interview}."),
     }
 }
 
@@ -501,7 +419,7 @@ fn render_download(o: &DownloadOutcome) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::commands::status::StatusOutcome;
+    use crate::command::commands::status::{ContainerKind, StatusOutcome};
     use crate::engine::step_status::StepStatus;
 
     #[test]
@@ -519,7 +437,6 @@ mod tests {
         let s = render_status(&o);
         assert!(s.contains("AMUX STATUS DASHBOARD"));
         assert!(s.contains("No code agents running"));
-        assert!(s.contains("Nanoclaw is not running"));
         assert!(s.contains("Tip: test tip"));
     }
 
@@ -544,82 +461,6 @@ mod tests {
         let s = render_status(&o);
         assert!(s.contains("CODE AGENTS"), "{s}");
         assert!(s.contains("amux-1"), "{s}");
-        assert!(
-            s.contains("Nanoclaw is not running"),
-            "empty nanoclaw section: {s}"
-        );
-    }
-
-    #[test]
-    fn render_status_with_claws_container() {
-        let o = StatusOutcome {
-            containers: vec![StatusContainerRow {
-                id: "claws123456789".into(),
-                name: "amux-claws-controller".into(),
-                image: "amux-claws:latest".into(),
-                started_at: "2025-01-01T00:00:00Z".into(),
-                kind: ContainerKind::Claws,
-                tab_number: None,
-                stuck: false,
-                command_label: None,
-                cpu_percent: None,
-                memory_mb: None,
-            }],
-            watched: false,
-            tip: "test tip".into(),
-        };
-        let s = render_status(&o);
-        assert!(s.contains("NANOCLAW"), "{s}");
-        assert!(s.contains("amux-claws-controller"), "{s}");
-        assert!(
-            s.contains("No code agents running"),
-            "empty agents section: {s}"
-        );
-    }
-
-    #[test]
-    fn render_status_both_sections() {
-        let o = StatusOutcome {
-            containers: vec![
-                StatusContainerRow {
-                    id: "agent123456789".into(),
-                    name: "amux-1".into(),
-                    image: "amux/dev:latest".into(),
-                    started_at: "2025-01-01T00:00:00Z".into(),
-                    kind: ContainerKind::Agent,
-                    tab_number: None,
-                    stuck: false,
-                    command_label: None,
-                    cpu_percent: None,
-                    memory_mb: None,
-                },
-                StatusContainerRow {
-                    id: "claws123456789".into(),
-                    name: "amux-claws-abc".into(),
-                    image: "amux-claws:latest".into(),
-                    started_at: "2025-01-01T00:00:00Z".into(),
-                    kind: ContainerKind::Claws,
-                    tab_number: None,
-                    stuck: false,
-                    command_label: None,
-                    cpu_percent: None,
-                    memory_mb: None,
-                },
-            ],
-            watched: false,
-            tip: "test tip".into(),
-        };
-        let s = render_status(&o);
-        assert!(s.contains("amux-1"), "agent row: {s}");
-        assert!(s.contains("amux-claws-abc"), "claws row: {s}");
-        assert!(
-            !s.contains("No code agents running"),
-            "agents section not empty: {s}"
-        );
-        assert!(
-            !s.contains("Nanoclaw is not running"),
-            "nanoclaw section not empty: {s}"
-        );
     }
 
     #[test]
@@ -958,27 +799,7 @@ mod tests {
 
     // ── render_specs ──────────────────────────────────────────────────────────
 
-    use crate::command::commands::specs::{SpecsAmendOutcome, SpecsNewOutcome};
-
-    #[test]
-    fn render_specs_new_with_created_path() {
-        let o = SpecsNewOutcome {
-            interview: false,
-            created_path: Some("/aspec/work-items/0001-foo.md".into()),
-        };
-        let s = render_specs_new(&o);
-        assert!(s.contains("0001-foo.md"), "created path must appear: {s}");
-    }
-
-    #[test]
-    fn render_specs_new_interview_flag_shows_interview() {
-        let o = SpecsNewOutcome {
-            interview: true,
-            created_path: None,
-        };
-        let s = render_specs_new(&o);
-        assert!(s.contains("interview"), "must mention interview mode: {s}");
-    }
+    use crate::command::commands::specs::SpecsAmendOutcome;
 
     #[test]
     fn render_specs_amend_shows_work_item_number() {
@@ -991,75 +812,6 @@ mod tests {
         assert!(s.contains("0042"), "work item number must appear: {s}");
     }
 
-    // ── render_claws ──────────────────────────────────────────────────────────
-
-    use crate::command::commands::claws::ClawsOutcome;
-
-    #[test]
-    fn render_claws_returns_none() {
-        let o = ClawsOutcome {
-            mode: "init".into(),
-            clone: StepStatus::Done,
-            permissions_check: StepStatus::Done,
-            image_build: StepStatus::Done,
-            audit: StepStatus::Skipped,
-            configure: StepStatus::Done,
-            controller: StepStatus::Done,
-        };
-        assert!(
-            render_claws(&o).is_none(),
-            "claws must return None (summary via report_summary)"
-        );
-    }
-
-    // ── render_implement ──────────────────────────────────────────────────────
-
-    use crate::command::commands::implement::ImplementOutcome;
-
-    #[test]
-    fn render_implement_clean_exit_shows_work_item() {
-        let o = ImplementOutcome {
-            work_item: "0042".into(),
-            agent: Some("claude".into()),
-            exit_code: Some(0),
-            worktree_used: false,
-            workflow_used: None,
-            synthetic_prompt: None,
-        };
-        let s = render_implement(&o).expect("implement must produce output");
-        assert!(s.contains("0042"), "work item must appear: {s}");
-    }
-
-    #[test]
-    fn render_implement_nonzero_exit_includes_exit_code() {
-        let o = ImplementOutcome {
-            work_item: "0007".into(),
-            agent: None,
-            exit_code: Some(1),
-            worktree_used: false,
-            workflow_used: None,
-            synthetic_prompt: None,
-        };
-        let s = render_implement(&o).expect("implement must produce output");
-        assert!(
-            s.contains("1") || s.contains("exit"),
-            "exit code info must appear: {s}"
-        );
-    }
-
-    #[test]
-    fn render_implement_worktree_flag_shows_worktree_info() {
-        let o = ImplementOutcome {
-            work_item: "0001".into(),
-            agent: None,
-            exit_code: Some(0),
-            worktree_used: true,
-            workflow_used: None,
-            synthetic_prompt: None,
-        };
-        let s = render_implement(&o).expect("implement must produce output");
-        assert!(s.contains("worktree"), "worktree info must appear: {s}");
-    }
 
     // ── render_exec_workflow ──────────────────────────────────────────────────
 

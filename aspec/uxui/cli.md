@@ -20,12 +20,10 @@ This document is the authoritative specification of the `amux` CLI surface. It i
 | `amux` | Launch the interactive TUI. |
 | `amux init` | Initialize the current Git repo for use with amux. |
 | `amux ready` | Verify the Docker daemon, ensure `Dockerfile.dev`, build the dev image. |
-| `amux implement <work_item>` | Launch the dev container to implement a work item. |
 | `amux chat` | Freeform chat session with the configured agent. |
 | `amux specs <subcommand>` | Manage work item specs. |
 | `amux new <subcommand>` | Create a new amux artefact (spec, workflow, skill). |
-| `amux exec <subcommand>` | Run a one-shot prompt or workflow without a work item. |
-| `amux claws <subcommand>` | Manage persistent background nanoclaw containers. |
+| `amux exec <subcommand>` | Run a one-shot prompt or workflow. |
 | `amux config <subcommand>` | View and edit global/repo configuration. |
 | `amux status` | Show all running amux containers. |
 | `amux headless <subcommand>` | Run amux as a headless HTTP server. |
@@ -63,17 +61,13 @@ Initialize the current Git repo for use with amux.
 | `--allow-docker` | bool | false | Mount the host Docker daemon socket into the agent container. |
 | `--json` | bool | false | Suppress human output and print structured JSON. **Implies `--non-interactive`.** |
 
-### `amux implement <work_item>`
-
-Positional argument: `<work_item>` — work item number (e.g. `0001`).
+### `amux chat`
 
 | Flag | Kind | Default | Description |
 |---|---|---|---|
 | `-n, --non-interactive` | bool | false | Non-interactive (print) mode. |
 | `--plan` | bool | false | Plan mode (read-only). |
 | `--allow-docker` | bool | false | Mount the host Docker daemon socket. |
-| `--workflow <path>` | path | — | Path to a workflow Markdown/TOML/YAML file. |
-| `--worktree` | bool | false | Run inside a Git worktree under `~/.amux/worktrees/`. |
 | `--mount-ssh` | bool | false | Mount host `~/.ssh` read-only. |
 | `--yolo` | bool | false | Fully autonomous mode. |
 | `--auto` | bool | false | Auto permission mode. |
@@ -81,24 +75,17 @@ Positional argument: `<work_item>` — work item number (e.g. `0001`).
 | `--model <name>` | string | — | Override the model for this run. |
 | `--overlay <spec>` | repeatable string | — | Mount a host directory into the container. |
 
-Implication rule: `--yolo` combined with `--workflow` implies `--worktree`.
-
-### `amux chat`
-
-Same flag set as `amux implement` minus `--workflow` and `--worktree`.
-
 ### `amux specs`
 
 | Subcommand | Arguments | Flags |
 |---|---|---|
-| `new` | — | `--interview`, `-n/--non-interactive` |
 | `amend <work_item>` | `<work_item>` | `-n/--non-interactive`, `--allow-docker` |
 
 ### `amux new`
 
 | Subcommand | Arguments | Flags |
 |---|---|---|
-| `spec` | — | `--interview`, `-n/--non-interactive`. **Path alias for `specs new`.** |
+| `spec` | — | `--interview`, `-n/--non-interactive`. |
 | `workflow` | — | `--interview`, `-n/--non-interactive`, `--global`, `--format <toml\|yaml\|md>` (default `toml`). |
 | `skill` | — | `--interview`, `-n/--non-interactive`, `--global`. |
 
@@ -108,14 +95,6 @@ Same flag set as `amux implement` minus `--workflow` and `--worktree`.
 |---|---|---|
 | `prompt <prompt>` | `<prompt>` | `-n/--non-interactive`, `--plan`, `--allow-docker`, `--mount-ssh`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--overlay <spec>` (repeatable). |
 | `workflow <path>` (alias `wf`) | `<path>` | `--work-item <num>`, `-n/--non-interactive`, `--plan`, `--allow-docker`, `--worktree`, `--mount-ssh`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--overlay <spec>` (repeatable). `--yolo`/`--auto` imply `--worktree`. |
-
-### `amux claws`
-
-| Subcommand | Description |
-|---|---|
-| `init` | First-time setup: fork/clone nanoclaw, build the image, launch the container. |
-| `ready` | Check whether the nanoclaw container is running and show status. |
-| `chat` | Attach to the running nanoclaw container for a freeform chat. |
 
 ### `amux config`
 
