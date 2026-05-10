@@ -6,7 +6,6 @@
 //! operations, no workflow execution, no command logic, and no frontend code
 //! is permitted at this layer. See `aspec/architecture/2026-grand-architecture.md`.
 
-pub mod claws_paths;
 pub mod config;
 pub mod error;
 pub mod fs;

@@ -3,14 +3,13 @@
 //! Built on top of Layer 0 (`src/data/`). Exposes typed objects that own
 //! every concern Layer 2 commands need to compose: container runtime,
 //! workflow execution, git operations, overlays, auth, agent management,
-//! and the multi-phase `ready`/`init`/`claws` engines.
+//! and the multi-phase `ready`/`init` engines.
 //!
 //! No upward calls. When an engine needs user I/O, it accepts a frontend
 //! trait *defined here* and Layer 3 implements it.
 
 pub mod agent;
 pub mod auth;
-pub mod claws;
 pub mod container;
 pub mod error;
 pub mod git;

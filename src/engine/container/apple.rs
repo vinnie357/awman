@@ -103,10 +103,7 @@ impl ContainerBackend for AppleBackend {
                     None => String::new(),
                 }
             };
-            if !labels.contains("amux")
-                && !row_name.starts_with("amux-")
-                && !row_name.contains("nanoclaw")
-            {
+            if !labels.contains("amux") && !row_name.starts_with("amux-") {
                 continue;
             }
 
@@ -195,10 +192,7 @@ impl ContainerBackend for AppleBackend {
                     None => String::new(),
                 }
             };
-            if !labels.contains("amux")
-                && !row_name.starts_with("amux-")
-                && !row_name.contains("nanoclaw")
-            {
+            if !labels.contains("amux") && !row_name.starts_with("amux-") {
                 continue;
             }
             let id = row

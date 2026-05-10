@@ -100,10 +100,7 @@ pub struct ArgumentSpec {
 #[derive(Debug, Clone, Copy)]
 pub struct CommandSpec {
     pub name: &'static str,
-    /// Aliases (string only, e.g. `"wf"` for `exec workflow`). Path aliases
-    /// (e.g. `["specs", "new"]` ↔ `["new", "spec"]`) are resolved by
-    /// [`CommandCatalogue::lookup_with_aliases`] using the dedicated
-    /// [`CommandCatalogue::path_aliases`] table.
+    /// Aliases (string only, e.g. `"wf"` for `exec workflow`).
     pub aliases: &'static [&'static str],
     pub help: &'static str,
     pub long_help: Option<&'static str>,
@@ -165,8 +162,6 @@ impl CommandCatalogue {
     }
 
     /// Same as `lookup`, but first applies any registered path alias rewrites.
-    /// E.g. `["specs", "new"]` is rewritten to `["new", "spec"]` before
-    /// the descent.
     pub fn lookup_with_aliases(&self, path: &[&str]) -> Option<&'static CommandSpec> {
         let canonical = self.canonical_path(path);
         self.lookup(&canonical)
@@ -209,7 +204,7 @@ impl CommandCatalogue {
 const ROOT: CommandSpec = CommandSpec {
     name: "amux",
     aliases: &[],
-    help: "amux — containerized code and claw agent manager",
+    help: "amux — containerized code agent manager",
     long_help: None,
     arguments: &[],
     flags: &[
@@ -248,13 +243,12 @@ const ROOT: CommandSpec = CommandSpec {
         },
     ],
     subcommands: &[
-        &INIT, &READY, &IMPLEMENT, &CHAT, &SPECS, &CLAWS, &STATUS, &CONFIG, &EXEC, &HEADLESS,
+        &INIT, &READY, &CHAT, &SPECS, &STATUS, &CONFIG, &EXEC, &HEADLESS,
         &REMOTE, &NEW,
     ],
 };
 
-// `specs new` is preserved as an alias for `new spec`.
-const PATH_ALIASES: &[(&[&str], &[&str])] = &[(&["specs", "new"], &["new", "spec"])];
+const PATH_ALIASES: &[(&[&str], &[&str])] = &[];
 
 // ── init ─────────────────────────────────────────────────────────────────────
 
@@ -374,23 +368,6 @@ const READY: CommandSpec = CommandSpec {
     subcommands: &[],
 };
 
-// ── implement ────────────────────────────────────────────────────────────────
-
-const IMPLEMENT: CommandSpec = CommandSpec {
-    name: "implement",
-    aliases: &[],
-    help: "Launch the dev container to implement a work item.",
-    long_help: None,
-    arguments: &[ArgumentSpec {
-        name: "work_item",
-        help: "Work item number (e.g. 0001).",
-        kind: ArgumentKind::String,
-        optional: false,
-    }],
-    flags: &AGENT_RUN_FLAGS_WITH_WORKTREE_AND_WORKFLOW,
-    subcommands: &[],
-};
-
 // ── chat ─────────────────────────────────────────────────────────────────────
 
 const CHAT: CommandSpec = CommandSpec {
@@ -408,44 +385,11 @@ const CHAT: CommandSpec = CommandSpec {
 const SPECS: CommandSpec = CommandSpec {
     name: "specs",
     aliases: &[],
-    help: "Manage work item specs (create, interview, amend).",
+    help: "Manage work item specs (amend).",
     long_help: None,
     arguments: &[],
     flags: &[],
-    subcommands: &[&SPECS_NEW, &SPECS_AMEND],
-};
-
-const SPECS_NEW: CommandSpec = CommandSpec {
-    name: "new",
-    aliases: &[],
-    help: "Create a new work item from the template.",
-    long_help: None,
-    arguments: &[],
-    flags: &[
-        FlagSpec {
-            long: "interview",
-            short: None,
-            help: "Use interview mode: have the agent complete the work item based on a summary you provide.",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
-        FlagSpec {
-            long: "non-interactive",
-            short: Some('n'),
-            help: "Run the interview agent in non-interactive (print) mode.",
-            kind: FlagKind::Bool,
-            default: FlagDefault::Bool(false),
-            frontends: FrontendVisibility::All,
-            conflicts_with: &[],
-            implies: &[],
-            optional: true,
-        },
-    ],
-    subcommands: &[],
+    subcommands: &[&SPECS_AMEND],
 };
 
 const SPECS_AMEND: CommandSpec = CommandSpec {
@@ -486,54 +430,12 @@ const SPECS_AMEND: CommandSpec = CommandSpec {
     subcommands: &[],
 };
 
-// ── claws ───────────────────────────────────────────────────────────────────
-
-const CLAWS: CommandSpec = CommandSpec {
-    name: "claws",
-    aliases: &[],
-    help: "Manage persistent background agent containers (claws agents).",
-    long_help: None,
-    arguments: &[],
-    flags: &[],
-    subcommands: &[&CLAWS_INIT, &CLAWS_READY, &CLAWS_CHAT],
-};
-
-const CLAWS_INIT: CommandSpec = CommandSpec {
-    name: "init",
-    aliases: &[],
-    help: "First-time setup: fork/clone nanoclaw, build the image, and launch the container.",
-    long_help: None,
-    arguments: &[],
-    flags: &[],
-    subcommands: &[],
-};
-
-const CLAWS_READY: CommandSpec = CommandSpec {
-    name: "ready",
-    aliases: &[],
-    help: "Check whether the nanoclaw container is running and show status.",
-    long_help: None,
-    arguments: &[],
-    flags: &[],
-    subcommands: &[],
-};
-
-const CLAWS_CHAT: CommandSpec = CommandSpec {
-    name: "chat",
-    aliases: &[],
-    help: "Attach to the running nanoclaw container for a freeform chat session.",
-    long_help: None,
-    arguments: &[],
-    flags: &[],
-    subcommands: &[],
-};
-
 // ── status ───────────────────────────────────────────────────────────────────
 
 const STATUS: CommandSpec = CommandSpec {
     name: "status",
     aliases: &[],
-    help: "Show the status of all running code-agent and nanoclaw containers.",
+    help: "Show the status of all running code-agent containers.",
     long_help: None,
     arguments: &[],
     flags: &[FlagSpec {
@@ -929,7 +831,7 @@ const NEW: CommandSpec = CommandSpec {
 const NEW_SPEC: CommandSpec = CommandSpec {
     name: "spec",
     aliases: &[],
-    help: "Create a new work item spec (alias for `specs new`).",
+    help: "Create a new work item spec.",
     long_help: None,
     arguments: &[],
     flags: &[
@@ -1167,133 +1069,6 @@ const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
     },
 ];
 
-/// Agent-run flag set used by `implement` (worktree + workflow).
-/// `yolo` and `auto` imply `worktree` only when `--workflow` is also set;
-/// the implication is computed in `Dispatch::build_command`.
-const AGENT_RUN_FLAGS_WITH_WORKTREE_AND_WORKFLOW: [FlagSpec; 11] = [
-    FlagSpec {
-        long: "non-interactive",
-        short: Some('n'),
-        help: "Run the agent in non-interactive (print) mode.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "plan",
-        short: None,
-        help: "Run the agent in plan mode (read-only).",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &["yolo"],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "allow-docker",
-        short: None,
-        help: "Mount the host Docker daemon socket into the agent container.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "workflow",
-        short: None,
-        help: "Path to a workflow Markdown file. If omitted, the work item is implemented in a single agent run.",
-        kind: FlagKind::OptionalPath,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "worktree",
-        short: None,
-        help: "Run in an isolated Git worktree under ~/.amux/worktrees/.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "mount-ssh",
-        short: None,
-        help: "Mount host ~/.ssh read-only into the agent container.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "yolo",
-        short: None,
-        help: "Enable fully autonomous mode.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &["plan"],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "auto",
-        short: None,
-        help: "Enable auto permission mode.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "agent",
-        short: None,
-        help: "Agent to use.",
-        kind: FlagKind::OptionalString,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "model",
-        short: None,
-        help: "Override the model used by the launched agent.",
-        kind: FlagKind::OptionalString,
-        default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "overlay",
-        short: None,
-        help: "Mount a host directory into the agent container. Repeatable.",
-        kind: FlagKind::VecString,
-        default: FlagDefault::EmptyVec,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-];
-
 const EXEC_WORKFLOW_FLAGS: [FlagSpec; 11] = [
     FlagSpec {
         long: "work-item",
@@ -1446,15 +1221,6 @@ mod tests {
     }
 
     #[test]
-    fn alias_specs_new_resolves_to_new_spec() {
-        let cat = CommandCatalogue::get();
-        let spec = cat.lookup_with_aliases(&["specs", "new"]).unwrap();
-        assert_eq!(spec.name, "spec");
-        let canonical = cat.canonical_path(&["specs", "new"]);
-        assert_eq!(canonical, vec!["new", "spec"]);
-    }
-
-    #[test]
     fn string_alias_wf_resolves_to_workflow() {
         let cat = CommandCatalogue::get();
         let spec = cat.lookup(&["exec", "wf"]).unwrap();
@@ -1486,17 +1252,6 @@ mod tests {
     }
 
     #[test]
-    fn implement_yolo_does_not_imply_worktree_unconditionally() {
-        // Per spec: implement's yolo only implies worktree when --workflow is set;
-        // that conditional is enforced in Dispatch::build_command, not in the
-        // catalogue's static `implies` list.
-        let cat = CommandCatalogue::get();
-        let imp = cat.lookup(&["implement"]).unwrap();
-        let yolo = imp.find_flag("yolo").unwrap();
-        assert!(!yolo.implies.contains(&"worktree"));
-    }
-
-    #[test]
     fn plan_and_yolo_are_mutually_exclusive_on_chat() {
         let cat = CommandCatalogue::get();
         let chat = cat.lookup(&["chat"]).unwrap();
@@ -1507,15 +1262,13 @@ mod tests {
     }
 
     #[test]
-    fn every_top_level_legacy_command_is_present() {
+    fn every_top_level_command_is_present() {
         let cat = CommandCatalogue::get();
         for name in [
             "init",
             "ready",
-            "implement",
             "chat",
             "specs",
-            "claws",
             "status",
             "config",
             "exec",
@@ -1804,12 +1557,6 @@ mod tests {
             is_optional: true,
         },
         FlagCheck {
-            path: &["specs", "new"],
-            flag: "interview",
-            is_bool: true,
-            is_optional: true,
-        },
-        FlagCheck {
             path: &["specs", "amend"],
             flag: "non-interactive",
             is_bool: true,
@@ -1818,36 +1565,6 @@ mod tests {
         FlagCheck {
             path: &["specs", "amend"],
             flag: "allow-docker",
-            is_bool: true,
-            is_optional: true,
-        },
-        FlagCheck {
-            path: &["implement"],
-            flag: "worktree",
-            is_bool: true,
-            is_optional: true,
-        },
-        FlagCheck {
-            path: &["implement"],
-            flag: "workflow",
-            is_bool: false,
-            is_optional: true,
-        },
-        FlagCheck {
-            path: &["implement"],
-            flag: "yolo",
-            is_bool: true,
-            is_optional: true,
-        },
-        FlagCheck {
-            path: &["implement"],
-            flag: "auto",
-            is_bool: true,
-            is_optional: true,
-        },
-        FlagCheck {
-            path: &["implement"],
-            flag: "plan",
             is_bool: true,
             is_optional: true,
         },
@@ -1882,11 +1599,7 @@ mod tests {
     fn all_expected_subcommands_are_present() {
         let cat = CommandCatalogue::get();
         let cases: &[(&[&str], &str)] = &[
-            (&["specs"], "new"),
             (&["specs"], "amend"),
-            (&["claws"], "init"),
-            (&["claws"], "ready"),
-            (&["claws"], "chat"),
             (&["config"], "show"),
             (&["config"], "get"),
             (&["config"], "set"),

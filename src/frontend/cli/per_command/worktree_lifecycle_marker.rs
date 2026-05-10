@@ -208,7 +208,7 @@ mod tests {
     fn make_frontend() -> CliFrontend {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "implement", "0069"])
+            .try_get_matches_from(["amux", "exec", "workflow", "deploy.toml"])
             .unwrap();
         CliFrontend::new(m)
     }

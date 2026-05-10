@@ -211,13 +211,8 @@ mod tests {
         let expected_paths = &[
             "/v1/init",
             "/v1/ready",
-            "/v1/implement",
             "/v1/chat",
-            "/v1/specs/new",
             "/v1/specs/amend",
-            "/v1/claws/init",
-            "/v1/claws/ready",
-            "/v1/claws/chat",
             "/v1/status",
             "/v1/config/show",
             "/v1/config/get",

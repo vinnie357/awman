@@ -8,7 +8,7 @@ Workflows are files you write and commit to your repo — in Markdown, TOML, or 
 
 ## When to use workflows
 
-Single-step `implement` works well for focused, well-specified tasks. Workflows are better when:
+Workflows are useful when:
 
 - The task is complex enough that you want the agent to plan before coding
 - You want multiple review checkpoints (e.g. review the plan before implementation starts)
@@ -20,17 +20,17 @@ Single-step `implement` works well for focused, well-specified tasks. Workflows 
 ## Quick start
 
 ```sh
-# Run the bundled example workflow against work item 0027
-amux implement 0027 --workflow aspec/workflows/implement-feature.md
-
-# Run a workflow without a work item (exec workflow)
-amux exec workflow aspec/workflows/review.md
+# Run a workflow file
+amux exec workflow aspec/workflows/implement-feature.md
 
 # Run a workflow and associate a work item for template variable substitution
 amux exec workflow aspec/workflows/implement-feature.md --work-item 0027
+
+# Run a workflow without a work item
+amux exec workflow aspec/workflows/review.md
 ```
 
-`exec workflow` and `implement --workflow` behave identically, except the work item is optional with `exec workflow`. Use `exec workflow` when you want to run a workflow file independently of any specific work item — for example, a standing code review or documentation workflow. See [Headless Mode](08-headless-mode.md#amux-exec-workflow-path--amux-exec-wf-path) for usage in CI and scripting contexts.
+Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution. See [Headless Mode](08-headless-mode.md#amux-exec-workflow-path--amux-exec-wf-path) for usage in CI and scripting contexts.
 
 The TUI shows a **workflow status strip** between the execution window and the command box, with one coloured box per step. After each step completes, a confirmation dialog appears — press **Enter** to advance, **q** to pause. State is saved to disk so you can resume later.
 
@@ -85,7 +85,7 @@ amux new workflow --format md     # writes aspec/workflows/<name>.md
 amux new workflow --interview
 ```
 
-Enter a one-paragraph summary of what the workflow should accomplish. A code agent writes the complete workflow file for you — filling in step names, dependencies, agents, models, and detailed prompts — the same way `specs new --interview` writes a work item.
+Enter a one-paragraph summary of what the workflow should accomplish. A code agent writes the complete workflow file for you — filling in step names, dependencies, agents, models, and detailed prompts — the same way `new spec --interview` writes a work item.
 
 In the TUI, the dialog switches to a two-field layout: workflow name and summary. Press **Ctrl-Enter** to start the interview agent.
 
@@ -383,7 +383,7 @@ Per-step model values from `Model:` fields are persisted in the workflow state f
 ### In the TUI
 
 ```
-implement 0027 --workflow=aspec/workflows/implement-feature.md
+exec workflow aspec/workflows/implement-feature.md --work-item 0027
 ```
 
 A **workflow status strip** appears, showing each step as a coloured box:
@@ -401,7 +401,7 @@ When a step completes, a confirmation dialog appears. Press **Enter** or **y** t
 ### In command mode
 
 ```sh
-amux implement 0027 --workflow aspec/workflows/implement-feature.md
+amux exec workflow aspec/workflows/implement-feature.md --work-item 0027
 ```
 
 Between steps, amux prints the step summary and prompts:
@@ -421,7 +421,7 @@ Press [r] to retry, or any other key to abort:
 
 ### Flags
 
-All flags available on `implement` work with `--workflow`:
+`exec workflow` accepts the following flags:
 
 | Flag | Description |
 |------|-------------|
@@ -601,7 +601,7 @@ The file records the status of every step, the container ID used for each step, 
 
 ### Resuming
 
-If a saved state file exists when you run `implement --workflow`, amux offers to resume:
+If a saved state file exists when you run `exec workflow`, amux offers to resume:
 
 ```
 Found a saved workflow state for 'implement-feature' (work item 0027).
@@ -671,7 +671,6 @@ All three files define the same four steps (`implement`, `tests`, `docs`, `revie
 | `Model:` field with no value | Treated as absent; agent launches with its built-in default or `--model` flag value |
 | `Model:` appearing after `Prompt:` | Treated as prompt text, not a directive |
 | Invalid model name in `Model:` field | Passed verbatim to the agent; the agent surfaces its own error |
-| `--model` flag on single-step `implement` (no workflow) | Behaves identically to `chat --model` |
 | Resume with a different `--model` flag | Persisted per-step model values take precedence; `--model` applies only to steps with no persisted model |
 | All steps specify non-default agents | Pre-flight still runs for each; default fallback offered only if setup is declined |
 | Parallel steps with different agents | Each step runs in its own container — no cross-step sharing |

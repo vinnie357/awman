@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::command::commands::chat::resolve_agent;
 use crate::data::session::Session;
-use crate::command::commands::implement_prompts::{
+use crate::command::commands::prompt_templates::{
     render_skill_interview_prompt, render_workflow_interview_prompt,
 };
 use crate::command::commands::Command;
@@ -74,9 +74,7 @@ pub enum NewOutcome {
 }
 
 /// `NewCommandFrontend` extends `SpecsCommandFrontend` so the `Spec`
-/// subcommand can drive the same Q&A as `specs new` (kind / title /
-/// summary). Dispatch canonicalizes `specs new` to `new spec`, so this
-/// branch *is* the implementation for both invocations.
+/// subcommand can drive the same Q&A (kind / title / summary).
 pub trait NewCommandFrontend:
     UserMessageSink + crate::command::commands::specs::SpecsCommandFrontend + Send + Sync
 {

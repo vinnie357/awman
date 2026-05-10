@@ -13,9 +13,6 @@ use tokio::sync::RwLock;
 
 use crate::command::commands::auth::{AuthCommand, AuthCommandFrontend};
 use crate::command::commands::chat::{ChatCommand, ChatCommandFlags, ChatCommandFrontend};
-use crate::command::commands::claws::{
-    ClawsCommand, ClawsCommandFlags, ClawsCommandFrontend, ClawsCommandMode,
-};
 use crate::command::commands::config::{
     ConfigCommand, ConfigCommandFrontend, ConfigGetFlags, ConfigSetFlags, ConfigShowFlags,
     ConfigSubcommand,
@@ -31,9 +28,6 @@ use crate::command::commands::headless::{
     HeadlessCommand, HeadlessCommandFrontend, HeadlessKillFlags, HeadlessLogsFlags,
     HeadlessStartFlags, HeadlessStatusFlags, HeadlessSubcommand,
 };
-use crate::command::commands::implement::{
-    ImplementCommand, ImplementCommandFlags, ImplementCommandFrontend,
-};
 use crate::command::commands::init::{InitCommand, InitCommandFlags, InitCommandFrontend};
 use crate::command::commands::new::{
     NewCommand, NewCommandFrontend, NewSkillFlags, NewSpecFlags, NewSubcommand, NewWorkflowFlags,
@@ -44,7 +38,7 @@ use crate::command::commands::remote::{
     RemoteSessionStartFlags, RemoteSubcommand,
 };
 use crate::command::commands::specs::{
-    SpecsAmendFlags, SpecsCommand, SpecsCommandFrontend, SpecsNewFlags, SpecsSubcommand,
+    SpecsAmendFlags, SpecsCommand, SpecsCommandFrontend, SpecsSubcommand,
 };
 use crate::command::commands::status::{StatusCommand, StatusCommandFlags, StatusCommandFrontend};
 use crate::command::commands::Command;
@@ -67,8 +61,8 @@ pub use parsed_input::ParsedCommandBoxInput;
 // ─── Pre-wired engines bundle ───────────────────────────────────────────────
 
 /// All Layer 1 engine handles a `Dispatch` needs to construct a `*Command`.
-/// `ReadyEngine`, `InitEngine`, and `ClawsEngine` are NOT pre-constructed
-/// here — those engines accept per-invocation flag values.
+/// `ReadyEngine` and `InitEngine` are NOT pre-constructed here — those
+/// engines accept per-invocation flag values.
 #[derive(Clone)]
 pub struct Engines {
     pub runtime: Arc<ContainerRuntime>,
@@ -120,9 +114,7 @@ pub trait DispatchFrontend:
     CommandFrontend
     + InitCommandFrontend
     + ReadyCommandFrontend
-    + ImplementCommandFrontend
     + ChatCommandFrontend
-    + ClawsCommandFrontend
     + StatusCommandFrontend
     + ConfigCommandFrontend
     + ExecPromptCommandFrontend
@@ -141,9 +133,7 @@ impl<T> DispatchFrontend for T where
     T: CommandFrontend
         + InitCommandFrontend
         + ReadyCommandFrontend
-        + ImplementCommandFrontend
         + ChatCommandFrontend
-        + ClawsCommandFrontend
         + StatusCommandFrontend
         + ConfigCommandFrontend
         + ExecPromptCommandFrontend
@@ -167,9 +157,7 @@ impl<T> DispatchFrontend for T where
 pub enum CommandOutcome {
     Init(crate::command::commands::init::InitOutcome),
     Ready(crate::command::commands::ready::ReadyOutcome),
-    Implement(crate::command::commands::implement::ImplementOutcome),
     Chat(crate::command::commands::chat::ChatOutcome),
-    Claws(crate::command::commands::claws::ClawsOutcome),
     Status(crate::command::commands::status::StatusOutcome),
     Config(crate::command::commands::config::ConfigOutcome),
     ExecPrompt(crate::command::commands::exec_prompt::ExecPromptOutcome),
@@ -189,10 +177,8 @@ pub enum CommandOutcome {
 pub enum BuiltCommand {
     Init(InitCommand),
     Ready(ReadyCommand),
-    Implement(ImplementCommand),
     Chat(ChatCommand),
     Specs(SpecsCommand),
-    Claws(ClawsCommand),
     Status(StatusCommand),
     Config(ConfigCommand),
     ExecPrompt(ExecPromptCommand),
@@ -290,40 +276,10 @@ impl<F: CommandFrontend> Dispatch<F> {
                     session.clone(),
                 )))
             }
-            ["implement"] => {
-                let mut flags = read_implement_flags(&self.frontend, &canonical_refs)?;
-                // implement: --yolo or --auto + --workflow imply --worktree.
-                if (flags.yolo || flags.auto) && flags.workflow.is_some() {
-                    flags.worktree = true;
-                }
-                Ok(BuiltCommand::Implement(ImplementCommand::new(
-                    flags,
-                    self.engines.clone(),
-                    session.clone(),
-                )))
-            }
             ["chat"] => {
                 let flags = read_chat_flags(&self.frontend, &canonical_refs)?;
                 Ok(BuiltCommand::Chat(ChatCommand::new(
                     flags,
-                    self.engines.clone(),
-                    session.clone(),
-                )))
-            }
-            ["specs", "new"] => {
-                let interview = self
-                    .frontend
-                    .flag_bool(&canonical_refs, "interview")?
-                    .unwrap_or(false);
-                let non_interactive = self
-                    .frontend
-                    .flag_bool(&canonical_refs, "non-interactive")?
-                    .unwrap_or(false);
-                Ok(BuiltCommand::Specs(SpecsCommand::new(
-                    SpecsSubcommand::New(SpecsNewFlags {
-                        interview,
-                        non_interactive,
-                    }),
                     self.engines.clone(),
                     session.clone(),
                 )))
@@ -349,19 +305,6 @@ impl<F: CommandFrontend> Dispatch<F> {
                         non_interactive,
                         allow_docker,
                     }),
-                    self.engines.clone(),
-                    session.clone(),
-                )))
-            }
-            ["claws", sub] => {
-                let mode = match *sub {
-                    "init" => ClawsCommandMode::Init,
-                    "ready" => ClawsCommandMode::Ready,
-                    "chat" => ClawsCommandMode::Chat,
-                    _ => return Err(CommandError::unknown_command(&canonical_refs)),
-                };
-                Ok(BuiltCommand::Claws(ClawsCommand::new(
-                    ClawsCommandFlags { mode },
                     self.engines.clone(),
                     session.clone(),
                 )))
@@ -639,12 +582,6 @@ impl<F: DispatchFrontend> Dispatch<F> {
                     .await
                     .map(CommandOutcome::Ready)
             }
-            BuiltCommand::Implement(cmd) => {
-                let boxed: Box<dyn ImplementCommandFrontend> = Box::new(frontend);
-                cmd.run_with_frontend(boxed)
-                    .await
-                    .map(CommandOutcome::Implement)
-            }
             BuiltCommand::Chat(cmd) => {
                 let boxed: Box<dyn ChatCommandFrontend> = Box::new(frontend);
                 cmd.run_with_frontend(boxed).await.map(CommandOutcome::Chat)
@@ -654,12 +591,6 @@ impl<F: DispatchFrontend> Dispatch<F> {
                 cmd.run_with_frontend(boxed)
                     .await
                     .map(CommandOutcome::Specs)
-            }
-            BuiltCommand::Claws(cmd) => {
-                let boxed: Box<dyn ClawsCommandFrontend> = Box::new(frontend);
-                cmd.run_with_frontend(boxed)
-                    .await
-                    .map(CommandOutcome::Claws)
             }
             BuiltCommand::Status(cmd) => {
                 let boxed: Box<dyn StatusCommandFrontend> = Box::new(frontend);
@@ -766,29 +697,6 @@ fn read_ready_flags<F: CommandFrontend>(
         non_interactive: f.flag_bool(p, "non-interactive")?.unwrap_or(false),
         allow_docker: f.flag_bool(p, "allow-docker")?.unwrap_or(false),
         json: f.flag_bool(p, "json")?.unwrap_or(false),
-    })
-}
-
-fn read_implement_flags<F: CommandFrontend>(
-    f: &F,
-    p: &[&str],
-) -> Result<ImplementCommandFlags, CommandError> {
-    let work_item = f
-        .argument(p, "work_item")?
-        .ok_or_else(|| CommandError::missing_required_argument(p, "work_item"))?;
-    Ok(ImplementCommandFlags {
-        work_item,
-        non_interactive: f.flag_bool(p, "non-interactive")?.unwrap_or(false),
-        plan: f.flag_bool(p, "plan")?.unwrap_or(false),
-        allow_docker: f.flag_bool(p, "allow-docker")?.unwrap_or(false),
-        workflow: f.flag_path(p, "workflow")?,
-        worktree: f.flag_bool(p, "worktree")?.unwrap_or(false),
-        mount_ssh: f.flag_bool(p, "mount-ssh")?.unwrap_or(false),
-        yolo: f.flag_bool(p, "yolo")?.unwrap_or(false),
-        auto: f.flag_bool(p, "auto")?.unwrap_or(false),
-        agent: f.flag_string(p, "agent")?,
-        model: f.flag_string(p, "model")?,
-        overlay: f.flag_strings(p, "overlay")?,
     })
 }
 
@@ -994,16 +902,6 @@ mod tests {
     }
 
     #[test]
-    fn alias_specs_new_dispatches_to_new_spec() {
-        let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), make_engines());
-        let built = dispatch.build_command(&["specs", "new"]).unwrap();
-        match built {
-            BuiltCommand::New(_) => {}
-            _ => panic!("expected New (via specs new alias), got something else"),
-        }
-    }
-
-    #[test]
     fn build_chat_with_yolo_and_plan_returns_mutually_exclusive() {
         let mut frontend = FakeCommandFrontend::new();
         frontend.bools.insert("yolo".into(), true);
@@ -1076,46 +974,6 @@ mod tests {
     }
 
     #[test]
-    fn build_implement_with_yolo_and_workflow_implies_worktree() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.args.insert("work_item".into(), "0001".into());
-        frontend.bools.insert("yolo".into(), true);
-        frontend
-            .paths
-            .insert("workflow".into(), std::path::PathBuf::from("/tmp/wf.toml"));
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
-        let built = dispatch.build_command(&["implement"]).unwrap();
-        match built {
-            BuiltCommand::Implement(cmd) => {
-                assert!(
-                    cmd.flags().worktree,
-                    "yolo + workflow on implement must imply worktree"
-                );
-            }
-            _ => panic!("expected Implement"),
-        }
-    }
-
-    #[test]
-    fn build_implement_with_yolo_but_no_workflow_does_not_imply_worktree() {
-        let mut frontend = FakeCommandFrontend::new();
-        frontend.args.insert("work_item".into(), "0001".into());
-        frontend.bools.insert("yolo".into(), true);
-        // No workflow flag set.
-        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
-        let built = dispatch.build_command(&["implement"]).unwrap();
-        match built {
-            BuiltCommand::Implement(cmd) => {
-                assert!(
-                    !cmd.flags().worktree,
-                    "yolo without workflow on implement must NOT imply worktree"
-                );
-            }
-            _ => panic!("expected Implement"),
-        }
-    }
-
-    #[test]
     fn build_config_show_succeeds_with_no_args() {
         let dispatch = Dispatch::new(FakeCommandFrontend::new(), make_session(), make_engines());
         let built = dispatch.build_command(&["config", "show"]).unwrap();
@@ -1171,19 +1029,6 @@ mod tests {
                 assert!(!f.yolo && !f.plan && !f.non_interactive && !f.allow_docker);
             }
             _ => panic!("expected Chat"),
-        }
-    }
-
-    #[test]
-    fn build_claws_init_ready_chat_succeed() {
-        for sub in &["init", "ready", "chat"] {
-            let dispatch =
-                Dispatch::new(FakeCommandFrontend::new(), make_session(), make_engines());
-            let built = dispatch.build_command(&["claws", sub]).unwrap();
-            assert!(
-                matches!(built, BuiltCommand::Claws(_)),
-                "claws {sub} must build Claws"
-            );
         }
     }
 
@@ -1356,45 +1201,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn specs_new_and_new_spec_build_commands_with_same_interview_flag() {
-        // `specs new --interview` and `new spec --interview` must produce
-        // equivalent commands (both are aliased to New(NewSubcommand::Spec)).
-        for interview in [false, true] {
-            let mut frontend = FakeCommandFrontend::new();
-            if interview {
-                frontend.bools.insert("interview".into(), true);
-            }
-
-            let dispatch = Dispatch::new(frontend, make_session(), make_engines());
-            let via_specs = dispatch.build_command(&["specs", "new"]).unwrap();
-            let via_new = dispatch.build_command(&["new", "spec"]).unwrap();
-
-            match (via_specs, via_new) {
-                (BuiltCommand::New(a), BuiltCommand::New(b)) => {
-                    // Both should be NewSubcommand::Spec with the same interview flag.
-                    let a_flags = a.subcommand();
-                    let b_flags = b.subcommand();
-                    match (a_flags, b_flags) {
-                        (
-                            crate::command::commands::new::NewSubcommand::Spec(af),
-                            crate::command::commands::new::NewSubcommand::Spec(bf),
-                        ) => {
-                            assert_eq!(
-                                af.interview, bf.interview,
-                                "interview flag mismatch: specs new={} vs new spec={}",
-                                af.interview, bf.interview
-                            );
-                            assert_eq!(
-                                af.interview, interview,
-                                "interview flag must match what was set"
-                            );
-                        }
-                        _ => panic!("expected NewSubcommand::Spec from both paths"),
-                    }
-                }
-                _ => panic!("expected New from both paths"),
-            }
-        }
-    }
 }

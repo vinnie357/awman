@@ -201,7 +201,6 @@ pub struct Tab {
     pub mouse_selection: Option<TextSelection>,
     pub workflow_agent_fallbacks: HashMap<String, String>,
     pub is_remote: bool,
-    pub is_claws: bool,
     pub output_lines: Vec<String>,
     pub stuck: bool,
     pub yolo_mode: bool,
@@ -265,7 +264,6 @@ impl Tab {
             mouse_selection: None,
             workflow_agent_fallbacks: HashMap::new(),
             is_remote: false,
-            is_claws: false,
             output_lines: Vec::new(),
             stuck: false,
             yolo_mode: false,
@@ -698,9 +696,7 @@ pub fn tab_color(tab: &Tab) -> ratatui::style::Color {
     match &tab.execution_phase {
         ExecutionPhase::Error { .. } => Color::Red,
         ExecutionPhase::Running { .. } => {
-            if tab.is_claws {
-                Color::Magenta
-            } else if tab.container_window_state != ContainerWindowState::Hidden {
+            if tab.container_window_state != ContainerWindowState::Hidden {
                 Color::Green
             } else {
                 Color::Blue
@@ -1134,17 +1130,6 @@ mod tests {
         };
         tab.container_window_state = ContainerWindowState::Hidden;
         assert_eq!(tab_color(&tab), Color::Blue);
-    }
-
-    #[test]
-    fn tab_color_running_claws_is_magenta() {
-        use ratatui::style::Color;
-        let mut tab = make_tab();
-        tab.execution_phase = ExecutionPhase::Running {
-            command: "claws".into(),
-        };
-        tab.is_claws = true;
-        assert_eq!(tab_color(&tab), Color::Magenta);
     }
 
     #[test]

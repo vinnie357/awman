@@ -16,7 +16,6 @@ pub struct StatusCommandFlags {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ContainerKind {
     Agent,
-    Claws,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,12 +44,8 @@ pub struct StatusContainerRow {
     pub memory_mb: Option<f64>,
 }
 
-fn classify_container(name: &str) -> ContainerKind {
-    if name.starts_with("amux-claws-") || name.contains("nanoclaw") {
-        ContainerKind::Claws
-    } else {
-        ContainerKind::Agent
-    }
+fn classify_container(_name: &str) -> ContainerKind {
+    ContainerKind::Agent
 }
 
 /// Optional context supplied by the TUI; CLI / headless leave this `None`.
@@ -194,15 +189,6 @@ fn write_status_table(
     containers: &[StatusContainerRow],
     tip: &str,
 ) {
-    let agents: Vec<&StatusContainerRow> = containers
-        .iter()
-        .filter(|c| c.kind == ContainerKind::Agent)
-        .collect();
-    let claws: Vec<&StatusContainerRow> = containers
-        .iter()
-        .filter(|c| c.kind == ContainerKind::Claws)
-        .collect();
-
     frontend.write_message(UserMessage {
         level: MessageLevel::Info,
         text: "AMUX STATUS DASHBOARD".into(),
@@ -215,17 +201,17 @@ fn write_status_table(
         level: MessageLevel::Info,
         text: "CODE AGENTS".into(),
     });
-    if agents.is_empty() {
+    if containers.is_empty() {
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
             text: "  No code agents running.".into(),
         });
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
-            text: "  To start one: amux implement <work-item>  or  amux chat".into(),
+            text: "  To start one: amux exec workflow <file>  or  amux chat".into(),
         });
     } else {
-        for c in &agents {
+        for c in containers {
             let indicator = if c.stuck { "Y" } else { "G" };
             let cpu = c
                 .cpu_percent
@@ -246,36 +232,6 @@ fn write_status_table(
                     name = c.name,
                     img = c.image,
                 ),
-            });
-        }
-    }
-    frontend.write_message(UserMessage {
-        level: MessageLevel::Info,
-        text: String::new(),
-    });
-    frontend.write_message(UserMessage {
-        level: MessageLevel::Info,
-        text: "NANOCLAW".into(),
-    });
-    if claws.is_empty() {
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: "  Nanoclaw is not running.".into(),
-        });
-    } else {
-        for c in &claws {
-            let indicator = if c.stuck { "Y" } else { "G" };
-            let cpu = c
-                .cpu_percent
-                .map(|v| format!("{v:.1}%"))
-                .unwrap_or_else(|| "-".into());
-            let mem = c
-                .memory_mb
-                .map(|v| format!("{v:.0}MB"))
-                .unwrap_or_else(|| "-".into());
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Info,
-                text: format!("  {indicator} {name}  {cpu}  {mem}", name = c.name),
             });
         }
     }
@@ -303,7 +259,7 @@ mod tests {
                 tab_number: 2,
                 container_name: None,
                 is_stuck: true,
-                command_label: "implement".into(),
+                command_label: "exec workflow".into(),
             },
         ];
         let ctx = StatusCommandTuiContext::new(tabs.clone());
@@ -320,7 +276,7 @@ mod tests {
             tab_number: 3,
             container_name: Some("amux-mycontainer".into()),
             is_stuck: true,
-            command_label: "implement 0042".into(),
+            command_label: "exec workflow 0042".into(),
         }]);
         let name = "amux-mycontainer".to_string();
         let mut row = StatusContainerRow {
@@ -347,7 +303,7 @@ mod tests {
         }
         assert_eq!(row.tab_number, Some(3));
         assert!(row.stuck);
-        assert_eq!(row.command_label.as_deref(), Some("implement 0042"));
+        assert_eq!(row.command_label.as_deref(), Some("exec workflow 0042"));
     }
 
     #[test]
@@ -410,23 +366,4 @@ mod tests {
         assert_eq!(classify_container("amux-abc"), ContainerKind::Agent);
     }
 
-    #[test]
-    fn classify_claws_containers() {
-        assert_eq!(
-            classify_container("amux-claws-controller"),
-            ContainerKind::Claws
-        );
-        assert_eq!(
-            classify_container("amux-claws-abc123"),
-            ContainerKind::Claws
-        );
-        assert_eq!(
-            classify_container("nanoclaw-worker-1"),
-            ContainerKind::Claws
-        );
-        assert_eq!(
-            classify_container("something-nanoclaw-x"),
-            ContainerKind::Claws
-        );
-    }
 }

@@ -221,9 +221,9 @@ impl CommandFrontend for CliFrontend {
 // the supertrait `UserMessageSink + Send + Sync` impls already in scope —
 // just declare the marker impl here.
 //
-// The richer per-command traits (`Init`, `Ready`, `Claws`, `Implement`,
-// `Chat`, `ExecPrompt`, `ExecWorkflow`, `Headless`) gain method bodies in
-// the per-command modules under `src/frontend/cli/per_command/`.
+// The richer per-command traits (`Init`, `Ready`, `Chat`, `ExecPrompt`,
+// `ExecWorkflow`, `Headless`) gain method bodies in the per-command
+// modules under `src/frontend/cli/per_command/`.
 
 impl AuthCommandFrontend for CliFrontend {
     fn ask_consent(
@@ -430,8 +430,6 @@ fn ensure_watch_signal_handler_installed() {
 // so the catalogue's default field carries through.
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
 
     // ─── command_path_from_matches ─────────────────────────────────────────────
@@ -691,31 +689,16 @@ mod tests {
     // ─── flag_path (Path / OptionalPath) ─────────────────────────────────────
 
     #[test]
-    fn flag_path_reads_optional_path_flag() {
+    fn flag_path_reads_path_argument_for_exec_workflow() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from([
-                "amux",
-                "implement",
-                "0069",
-                "--workflow",
-                "/path/to/wf.toml",
-            ])
+            .try_get_matches_from(["amux", "exec", "workflow", "/path/to/wf.toml"])
             .unwrap();
         let frontend = CliFrontend::new(m);
-        let v = frontend.flag_path(&["implement"], "workflow").unwrap();
-        assert_eq!(v, Some(PathBuf::from("/path/to/wf.toml")));
-    }
-
-    #[test]
-    fn flag_path_returns_none_when_optional_path_absent() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["amux", "implement", "0069"])
+        let v = frontend
+            .argument(&["exec", "workflow"], "workflow")
             .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.flag_path(&["implement"], "workflow").unwrap();
-        assert_eq!(v, None);
+        assert_eq!(v, Some("/path/to/wf.toml".to_string()));
     }
 
     #[test]
@@ -771,10 +754,10 @@ mod tests {
     fn argument_reads_work_item_positional() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "implement", "0069"])
+            .try_get_matches_from(["amux", "specs", "amend", "0069"])
             .unwrap();
         let frontend = CliFrontend::new(m);
-        let v = frontend.argument(&["implement"], "work_item").unwrap();
+        let v = frontend.argument(&["specs", "amend"], "work_item").unwrap();
         assert_eq!(v, Some("0069".to_string()));
     }
 
@@ -782,11 +765,11 @@ mod tests {
     fn argument_trailing_var_args_joins_multi_token_command() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "remote", "run", "implement", "0069"])
+            .try_get_matches_from(["amux", "remote", "run", "exec", "prompt", "hello"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.argument(&["remote", "run"], "command").unwrap();
-        assert_eq!(v, Some("implement 0069".to_string()));
+        assert_eq!(v, Some("exec prompt hello".to_string()));
     }
 
     #[test]
@@ -805,7 +788,7 @@ mod tests {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd.try_get_matches_from(["amux", "status"]).unwrap();
         let frontend = CliFrontend::new(m);
-        let v = frontend.argument(&["implement"], "work_item").unwrap();
+        let v = frontend.argument(&["specs", "amend"], "work_item").unwrap();
         assert_eq!(v, None);
     }
 
@@ -815,11 +798,11 @@ mod tests {
     fn arguments_reads_trailing_var_args_as_vec() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["amux", "remote", "run", "implement", "0069"])
+            .try_get_matches_from(["amux", "remote", "run", "exec", "prompt", "hello"])
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.arguments(&["remote", "run"], "command").unwrap();
-        assert_eq!(v, vec!["implement".to_string(), "0069".to_string()]);
+        assert_eq!(v, vec!["exec".to_string(), "prompt".to_string(), "hello".to_string()]);
     }
 
     #[test]

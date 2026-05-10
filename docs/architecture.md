@@ -37,7 +37,7 @@ Layer 0: data      Session, config, filesystem, database, typed data
 
 **Layer 0 (data)** owns every data definition, config concern, filesystem access, and database interaction. No business logic, no container calls, no git operations, no workflow execution. See [Layer 0 reference](#layer-0-data-srcdata) below.
 
-**Layer 1 (engine)** owns core runtime primitives: container lifecycle, workflow execution, git operations, overlay construction, authentication, agent management, and the multi-phase `ready`/`init`/`claws` engines. See [Layer 1 reference](#layer-1-engine-srcengine) below.
+**Layer 1 (engine)** owns core runtime primitives: container lifecycle, workflow execution, git operations, overlay construction, authentication, agent management, and the multi-phase `ready`/`init` engines. See [Layer 1 reference](#layer-1-engine-srcengine) below.
 
 **Layer 2 (command)** owns higher-level business logic: the `Dispatch` type that routes input to typed command objects, and command-specific types (`ChatCommand`, `InitCommand`, etc.). Implemented in work item 0068.
 
@@ -97,7 +97,7 @@ src/
     mod.rs                Re-exports: EngineError, UserMessage*, StepStatus
     error.rs              EngineError
     message.rs            UserMessage, MessageLevel, UserMessageSink, RecordingMessageSink
-    step_status.rs        StepStatus (shared by ReadyEngine, InitEngine, ClawsEngine)
+    step_status.rs        StepStatus (shared by ReadyEngine, InitEngine)
     container/
       mod.rs              Re-exports: ContainerRuntime, ContainerOption*, ContainerFrontend, …
       runtime.rs          ContainerRuntime::detect / build / list_running / stats / stop
@@ -136,11 +136,6 @@ src/
       phase.rs            InitPhase state machine, InitFailure
       frontend.rs         InitFrontend trait
       summary.rs          InitSummary
-    claws/
-      mod.rs              ClawsEngine, ClawsEngineOptions, ClawsMode
-      phase.rs            ClawsPhase state machine, ClawsFailure
-      frontend.rs         ClawsFrontend trait
-      summary.rs          ClawsSummary
   command/
     mod.rs                Re-exports: CommandCatalogue, Dispatch, CommandFrontend, CommandOutcome, CommandError
     error.rs              CommandError (wraps EngineError and DataError)
@@ -160,7 +155,6 @@ src/
       agent_setup.rs      AgentSetupFrontend trait, AgentSetupDecision
       auth.rs             AuthCommand, AuthCommandFrontend, AuthOutcome
       chat.rs             ChatCommand, ChatCommandFrontend, ChatCommandFlags, ChatOutcome
-      claws.rs            ClawsCommand, ClawsCommandFrontend, ClawsCommandFlags, ClawsCommandMode, ClawsOutcome
       config.rs           ConfigCommand, ConfigSubcommand, ConfigShowFlags, ConfigGetFlags, ConfigSetFlags, ConfigOutcome
       download.rs         DownloadCommand, DownloadOutcome
       exec_prompt.rs      ExecPromptCommand, ExecPromptCommandFrontend, ExecPromptCommandFlags, ExecPromptOutcome
@@ -168,15 +162,14 @@ src/
       headless.rs         HeadlessCommand, HeadlessSubcommand, HeadlessStartFlags, HeadlessKillFlags, HeadlessLogsFlags, HeadlessStatusFlags, HeadlessOutcome
       headless/
         banner.rs         Legacy headless banner format constants
-      implement.rs        ImplementCommand, ImplementCommandFrontend, ImplementCommandFlags, ImplementOutcome
-      implement_prompts.rs DEFAULT_IMPLEMENT_PROMPT constant
+      prompt_templates.rs Interview/amend prompt builders for `specs amend` and `new {spec,workflow,skill}`
       init.rs             InitCommand, InitCommandFrontend, InitCommandFlags, InitOutcome
       mount_scope.rs      MountScope, MountScopeFrontend, MountScopeDecision
       new.rs              NewCommand, NewSubcommand, NewSkillFlags, NewSpecFlags, NewWorkflowFlags, NewOutcome
       ready.rs            ReadyCommand, ReadyCommandFrontend, ReadyCommandFlags, ReadyOutcome
       remote.rs           RemoteCommand, RemoteSubcommand, RemoteRunFlags, RemoteSessionStartFlags, RemoteSessionKillFlags, RemoteOutcome
       remote_client.rs    RemoteClient, RemoteResponse, RemoteEventSink
-      specs.rs            SpecsCommand, SpecsSubcommand, SpecsAmendFlags, SpecsNewFlags, SpecsOutcome
+      specs.rs            SpecsCommand, SpecsSubcommand, SpecsAmendFlags, SpecsOutcome
       status.rs           StatusCommand, StatusCommandFrontend, StatusCommandFlags, StatusCommandTuiContext, TuiTabSnapshot, StatusOutcome
       worktree_lifecycle.rs WorktreeLifecycle, WorktreeLifecycleFrontend, PreWorktreeDecision, ExistingWorktreeDecision, PostWorkflowWorktreeAction
   frontend/
@@ -189,11 +182,9 @@ src/
       per_command/
         mod.rs
         chat.rs           ChatCommandFrontend impl
-        claws.rs          ClawsCommandFrontend + ClawsFrontend impls
         exec_prompt.rs    ExecPromptCommandFrontend impl
         exec_workflow.rs  ExecWorkflowCommandFrontend + ContainerFrontend + WorkflowFrontend impls
         headless.rs       HeadlessStartCommandFrontend impl (calls frontend::headless::serve)
-        implement.rs      ImplementCommandFrontend impl
         init.rs           InitCommandFrontend + InitFrontend impls
         ready.rs          ReadyCommandFrontend + ReadyFrontend impls
         agent_auth.rs     AgentAuthFrontend impl
@@ -219,14 +210,12 @@ src/
         agent_setup.rs    AgentSetupFrontend impl
         auth.rs           AuthCommandFrontend impl
         chat.rs           ChatCommandFrontend impl
-        claws.rs          ClawsCommandFrontend impl
         config.rs         ConfigCommandFrontend impl
         container_frontend.rs  ContainerFrontend impl
         download.rs       DownloadCommandFrontend impl
         exec_prompt.rs    ExecPromptCommandFrontend impl
         exec_workflow.rs  ExecWorkflowCommandFrontend impl
         headless.rs       HeadlessCommandFrontend impl
-        implement.rs      ImplementCommandFrontend impl
         init.rs           InitCommandFrontend impl
         mount_scope.rs    MountScopeFrontend impl
         new.rs            NewCommandFrontend impl
@@ -758,7 +747,7 @@ Three rules govern every engine in this layer:
 
 ### `UserMessageSink` and `UserMessage` (`src/engine/message.rs`)
 
-`UserMessageSink` is a supertrait of every frontend trait in Layer 1. Any type that implements `ContainerFrontend`, `WorkflowFrontend`, `ReadyFrontend`, `InitFrontend`, `ClawsFrontend`, or `AgentFrontend` also implements `UserMessageSink`, so engine code can call `frontend.info(…)`, `frontend.warning(…)`, etc. anywhere a frontend reference is held.
+`UserMessageSink` is a supertrait of every frontend trait in Layer 1. Any type that implements `ContainerFrontend`, `WorkflowFrontend`, `ReadyFrontend`, `InitFrontend`, or `AgentFrontend` also implements `UserMessageSink`, so engine code can call `frontend.info(…)`, `frontend.warning(…)`, etc. anywhere a frontend reference is held.
 
 ```rust
 pub struct UserMessage {
@@ -808,7 +797,7 @@ Key variants:
 
 ### `StepStatus` (`src/engine/step_status.rs`)
 
-Shared across `ReadyEngine`, `InitEngine`, and `ClawsEngine` for their summary structs.
+Shared across `ReadyEngine` and `InitEngine` for their summary structs.
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1167,7 +1156,7 @@ All cryptographic comparisons in `verify_api_key` use `subtle::ConstantTimeEq`, 
 
 ### Agent Engine (`src/engine/agent/`)
 
-`AgentEngine` centralises the cross-cutting agent concerns called from multiple commands (`implement`, `chat`, `exec`, `ready`, `claws`): ensuring the agent is available (Dockerfile + image), and building the `ContainerOption` list for a given invocation. Centralising here ensures adding a new agent type or changing model-flag injection is a single-file edit.
+`AgentEngine` centralises the cross-cutting agent concerns called from multiple commands (`chat`, `exec`, `ready`, `specs amend`): ensuring the agent is available (Dockerfile + image), and building the `ContainerOption` list for a given invocation. Centralising here ensures adding a new agent type or changing model-flag injection is a single-file edit.
 
 ```rust
 pub struct AgentEngine {
@@ -1407,79 +1396,6 @@ pub struct InitSummary {
 
 ---
 
-### Claws Engine (`src/engine/claws/`)
-
-`ClawsEngine` owns all multi-phase logic for `amux claws init` and related subcommands: repo clone, SSH/sudo permission check, nanoclaw image build, audit container run, per-user configuration, and controller launch. Replaces `oldsrc/commands/claws.rs` (1327 lines).
-
-#### Phase state machine
-
-```rust
-pub enum ClawsPhase {
-    Preflight,                // runtime detection, git root, config load, existing-clone check
-    AwaitingCloneDecision,    // existing clone found at target path
-    CloningRepo,              // clone the nanoclaw repository
-    CheckingPermissions,      // probe container verifies SSH key + sudo
-    BuildingImage,            // build nanoclaw Docker image
-    AwaitingAuditDecision,    // ask whether to run audit before configuring
-    RunningAudit,             // nanoclaw audit container
-    Configuring,              // write per-user nanoclaw configuration
-    LaunchingController,      // start nanoclaw controller container
-    Complete,
-    Failed(ClawsFailure),
-}
-```
-
-`claws ready` and `claws chat` enter the state machine at `Preflight` with a `ClawsMode` that skips satisfied phases:
-- `ClawsMode::Ready`: skips to `LaunchingController` when image already exists.
-- `ClawsMode::Chat`: transitions directly to `Complete` when controller is already running.
-
-#### `ClawsEngine` API
-
-```rust
-pub struct ClawsEngineOptions {
-    pub mode: ClawsMode,          // Init | Ready | Chat
-    pub nanoclaw_url: Option<String>,
-    pub refresh: bool,
-    pub no_cache: bool,
-}
-
-impl ClawsEngine {
-    pub fn new(session, git_engine, overlay_engine, container_runtime, options) -> Self;
-    pub fn phase(&self) -> &ClawsPhase;
-    pub async fn step(&mut self, frontend: &mut dyn ClawsFrontend) -> Result<ClawsPhase, EngineError>;
-    pub async fn run_to_completion(&mut self, frontend: &mut dyn ClawsFrontend) -> Result<ClawsSummary, EngineError>;
-    pub fn summary(&self) -> ClawsSummary;
-}
-```
-
-#### `ClawsFrontend` trait
-
-```rust
-pub trait ClawsFrontend: UserMessageSink + Send + Sync {
-    fn ask_replace_existing_clone(&mut self, path: &Path) -> Result<bool, EngineError>;
-    fn ask_run_audit(&mut self) -> Result<bool, EngineError>;
-    fn report_phase(&mut self, phase: &ClawsPhase);
-    fn report_step_status(&mut self, step: &str, status: StepStatus);
-    fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
-    fn report_summary(&mut self, summary: &ClawsSummary);
-}
-```
-
-#### `ClawsSummary`
-
-```rust
-pub struct ClawsSummary {
-    pub clone: StepStatus,
-    pub permissions_check: StepStatus,
-    pub image_build: StepStatus,
-    pub audit: StepStatus,
-    pub configure: StepStatus,
-    pub controller: StepStatus,
-}
-```
-
----
-
 ### Layer 0 additions required by Layer 1 (`src/data/`)
 
 Three modules were added to Layer 0 as part of work item 0067 because they are stateless functions over serializable types — not engine logic.
@@ -1692,15 +1608,13 @@ impl CommandCatalogue {
 }
 ```
 
-`lookup_with_aliases` resolves both string aliases (`"wf"` → `["exec", "workflow"]`) and path aliases (`["specs", "new"]` → `["new", "spec"]`) so frontends get the canonical spec regardless of invocation form.
+`lookup_with_aliases` resolves string aliases (e.g. `"wf"` → `["exec", "workflow"]`) so frontends get the canonical spec regardless of invocation form.
 
 #### Commands enumerated
 
-The catalogue covers every command defined in `oldsrc/cli.rs` with the same names, aliases, flag names, flag kinds, and defaults:
+The catalogue covers:
 
-`init`, `ready`, `implement`, `chat`, `specs` (with `amend`, `new`), `claws` (with `init`, `ready`, `chat`), `status`, `config` (with `show`, `get`, `set`), `exec` (with `prompt`, `workflow`/`wf`), `headless` (with `start`, `kill`, `logs`, `status`), `remote` (with `run`, `session start`, `session kill`), `new` (with `spec`, `workflow`, `skill`).
-
-`specs new` is preserved as a path alias for `new spec`; both produce identical behavior. `implement` is preserved as a top-level command (most-used user surface, delegates internally to `ExecWorkflowCommand`).
+`init`, `ready`, `chat`, `specs` (with `amend`), `status`, `config` (with `show`, `get`, `set`), `exec` (with `prompt`, `workflow`/`wf`), `headless` (with `start`, `kill`, `logs`, `status`), `remote` (with `run`, `session start`, `session kill`), `new` (with `spec`, `workflow`, `skill`).
 
 ---
 
@@ -1764,7 +1678,7 @@ pub struct Engines {
 }
 ```
 
-`ReadyEngine`, `InitEngine`, and `ClawsEngine` are **not** pre-constructed on `Dispatch` — their constructors accept per-invocation flag values. The corresponding commands construct them fresh from the `Engines` references above.
+`ReadyEngine` and `InitEngine` are **not** pre-constructed on `Dispatch` — their constructors accept per-invocation flag values. The corresponding commands construct them fresh from the `Engines` references above.
 
 #### `CommandFrontend` trait
 
@@ -1817,9 +1731,7 @@ impl<F: CommandFrontend> Dispatch<F> {
 pub enum CommandOutcome {
     Init(InitOutcome),
     Ready(ReadyOutcome),
-    Implement(ImplementOutcome),
     Chat(ChatOutcome),
-    Claws(ClawsOutcome),
     Status(StatusOutcome),
     Config(ConfigOutcome),
     ExecPrompt(ExecPromptOutcome),
@@ -1836,7 +1748,6 @@ pub enum CommandOutcome {
 pub enum BuiltCommand {
     Init(InitCommand),
     Ready(ReadyCommand),
-    Implement(ImplementCommand),
     Chat(ChatCommand),
     /* … one variant per command … */
 }
@@ -1862,13 +1773,11 @@ Each amux command is one module under `src/command/commands/` containing:
 |--------|-----------|-------|
 | `init.rs` | `amux init` | Thin wrapper over `InitEngine`; `InitCommandFrontend: InitFrontend + Send` |
 | `ready.rs` | `amux ready` | Thin wrapper over `ReadyEngine`; `ReadyCommandFrontend: ReadyFrontend + Send`; `--json` implies `--non-interactive` |
-| `implement.rs` | `amux implement` | Top-level command preserved; delegates to shared agent-launching pattern; uses `DEFAULT_IMPLEMENT_PROMPT` when `--workflow` absent |
 | `chat.rs` | `amux chat` | Agent-launching command |
 | `exec_prompt.rs` | `amux exec prompt` | Agent-launching command with inline prompt |
 | `exec_workflow.rs` | `amux exec workflow` | Agent-launching command with full workflow file; `--yolo`/`--auto` imply `--worktree` |
-| `claws.rs` | `amux claws {init,ready,chat}` | Thin wrapper over `ClawsEngine`; `ClawsCommandFrontend: ClawsFrontend + Send` |
 | `status.rs` | `amux status` | Accepts optional `StatusCommandTuiContext` for tab annotations; `--watch` for continuous refresh |
-| `specs.rs` | `amux specs {amend,new}` | `specs new` is an alias for `new spec` |
+| `specs.rs` | `amux specs amend` | Review/amend agent runs; shares `create_new_spec` with `new spec` |
 | `config.rs` | `amux config {show,get,set}` | Config read/write; `config set --global` writes to global config |
 | `headless.rs` | `amux headless {start,kill,logs,status}` | Daemonization, PID management, workdir allowlist; delegates HTTP server boot to Layer 3 frontend |
 | `remote.rs` | `amux remote {run, session start, session kill}` | Uses `RemoteClient` for HTTP + SSE |
@@ -1878,7 +1787,7 @@ Each amux command is one module under `src/command/commands/` containing:
 
 #### Agent-launching command canonical order
 
-Every command that launches an agent (`implement`, `chat`, `exec prompt`, `exec workflow`, `specs amend`, `claws *`, `init` audit, `ready` audit) follows this sequence in `run_with_frontend`:
+Every command that launches an agent (`chat`, `exec prompt`, `exec workflow`, `specs amend`, `new spec --interview`, `init` audit, `ready` audit) follows this sequence in `run_with_frontend`:
 
 1. Resolve mount path via `MountScope::resolve`.
 2. Resolve effective agent + model (flags > repo config > global config).
@@ -2261,11 +2170,9 @@ Each module in this directory implements the richer `*CommandFrontend` trait (an
 | Module | Traits implemented | Key behavior |
 |--------|--------------------|-------------|
 | `chat.rs` | `ChatCommandFrontend` | Marker (no extra methods beyond `UserMessageSink`) |
-| `claws.rs` | `ClawsCommandFrontend`, `ClawsFrontend` | Reports `ClawsPhase` transitions to stderr; prompts on stdin for clone-replacement and audit decisions; falls back to safe defaults when stdin is not a TTY |
 | `exec_prompt.rs` | `ExecPromptCommandFrontend` | Marker |
 | `exec_workflow.rs` | `ExecWorkflowCommandFrontend`, `ContainerFrontend`, `WorkflowFrontend` | Integrates container output, workflow control, and worktree lifecycle for the exec-workflow command path |
 | `headless.rs` | `HeadlessStartCommandFrontend` | Calls `crate::frontend::headless::serve(config)` — a peer Layer 3 call, not an upward call |
-| `implement.rs` | `ImplementCommandFrontend` | Marker |
 | `init.rs` | `InitCommandFrontend`, `InitFrontend` | Reports `InitPhase` transitions to stderr; prompts on stdin for aspec replacement, audit, and work-items config |
 | `ready.rs` | `ReadyCommandFrontend`, `ReadyFrontend` | Reports `ReadyPhase` transitions to stderr; prompts for Dockerfile creation and legacy-migration decisions |
 | `agent_auth.rs` | `AgentAuthFrontend` | Asks auth consent on stdin; defaults to `DeclineOnce` when stdin is not a TTY |
@@ -2349,7 +2256,6 @@ pub struct Tab {
     pub workflow_agent_fallbacks: HashMap<String, String>,
     pub auto_workflow_disabled_steps: HashSet<String>,
     pub is_remote: bool,
-    pub is_claws: bool,
     pub output_lines: Vec<String>,
     pub stuck: bool,
     pub yolo_countdown: Option<u64>,
@@ -2373,7 +2279,7 @@ pub struct Tab {
 
 | Function | Purpose |
 |----------|---------|
-| `tab_color(tab)` | Stuck→Yellow, Remote→Magenta, Error→Red, Running+PTY→Green, Running→Blue, Claws→Magenta, Idle/Done→DarkGray |
+| `tab_color(tab)` | Stuck→Yellow, Remote→Magenta, Error→Red, Running+PTY→Green, Running→Blue, Idle/Done→DarkGray |
 | `window_border_color(phase, focused)` | Maps phase + focus to a Ratatui `Color` |
 | `phase_label(phase)` | Phase label string for the execution window border title |
 | `compute_tab_bar_width(n, width)` | 1 tab → ¼ width; 2 → ½; 3 → ¾/3; N → 1/N |
@@ -2754,7 +2660,6 @@ templates/
   Dockerfile.opencode      Agent template (same pattern as claude)
   Dockerfile.maki          Agent template (same pattern as claude)
   Dockerfile.gemini        Agent template (same pattern as claude)
-  Dockerfile.nanoclaw      Nanoclaw persistent-agent template (see docs/06-nanoclaw.md)
 tests/
   cli_integration.rs       Binary-level integration tests
   command_tui_parity.rs    Verifies command/TUI mode share the same logic

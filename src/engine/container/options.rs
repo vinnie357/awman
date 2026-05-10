@@ -30,7 +30,7 @@ impl Entrypoint {
     }
 }
 
-/// Stable name for a container (e.g. `amux-claws-controller`).
+/// Stable name for a container (e.g. `amux-abc123`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerName(pub String);
 

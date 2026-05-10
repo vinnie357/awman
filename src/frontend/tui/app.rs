@@ -250,7 +250,7 @@ impl App {
         // Show the "Interactive Mode" banner for containerized commands.
         let is_containerized = matches!(
             parsed.path.first().map(|s| s.as_str()),
-            Some("chat" | "implement" | "exec")
+            Some("chat" | "exec")
         );
         if is_containerized {
             use crate::engine::message::UserMessageSink;

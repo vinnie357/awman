@@ -159,15 +159,15 @@ fn skill_empty_overlay_flag_is_recognized_by_cli() {
     let repo = make_git_repo();
     let out = Command::new(amux_bin())
         .current_dir(repo.path())
-        .args(["implement", "--help"])
+        .args(["exec", "workflow", "--help"])
         .output()
-        .expect("failed to run amux implement --help");
+        .expect("failed to run amux exec workflow --help");
 
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("--overlay"),
-        "implement --help must mention --overlay so skill() can be passed; got: {stdout}"
+        "exec workflow --help must mention --overlay so skill() can be passed; got: {stdout}"
     );
 }
 
@@ -176,13 +176,13 @@ fn skill_empty_overlay_flag_is_recognized_by_cli() {
 fn skill_in_amux_overlays_env_does_not_break_help() {
     let out = Command::new(amux_bin())
         .env("AMUX_OVERLAYS", "skill()")
-        .args(["implement", "--help"])
+        .args(["exec", "workflow", "--help"])
         .output()
-        .expect("failed to run amux implement --help");
+        .expect("failed to run amux exec workflow --help");
 
     assert!(
         out.status.success(),
-        "amux implement --help must succeed even when AMUX_OVERLAYS=skill(); stderr: {}",
+        "amux exec workflow --help must succeed even when AMUX_OVERLAYS=skill(); stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 }

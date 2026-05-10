@@ -28,11 +28,6 @@ fn catalogue_has_ready_command() {
 }
 
 #[test]
-fn catalogue_has_implement_command() {
-    assert!(top_level_names().contains(&"implement"));
-}
-
-#[test]
 fn catalogue_has_chat_command() {
     assert!(top_level_names().contains(&"chat"));
 }
@@ -40,11 +35,6 @@ fn catalogue_has_chat_command() {
 #[test]
 fn catalogue_has_specs_command() {
     assert!(top_level_names().contains(&"specs"));
-}
-
-#[test]
-fn catalogue_has_claws_command() {
-    assert!(top_level_names().contains(&"claws"));
 }
 
 #[test]
@@ -90,18 +80,9 @@ fn subcommand_names(parent: &str) -> Vec<&'static str> {
 }
 
 #[test]
-fn specs_has_new_and_amend_subcommands() {
+fn specs_has_amend_subcommand() {
     let names = subcommand_names("specs");
-    assert!(names.contains(&"new"), "missing 'new': {names:?}");
     assert!(names.contains(&"amend"), "missing 'amend': {names:?}");
-}
-
-#[test]
-fn claws_has_init_ready_chat_subcommands() {
-    let names = subcommand_names("claws");
-    assert!(names.contains(&"init"));
-    assert!(names.contains(&"ready"));
-    assert!(names.contains(&"chat"));
 }
 
 #[test]
@@ -151,30 +132,6 @@ fn remote_session_has_start_and_kill_subcommands() {
     let sub_names: Vec<&str> = session.subcommands.iter().map(|s| s.name).collect();
     assert!(sub_names.contains(&"start"));
     assert!(sub_names.contains(&"kill"));
-}
-
-// ─── Path alias resolution ────────────────────────────────────────────────────
-
-#[test]
-fn specs_new_is_alias_for_new_spec() {
-    let cat = CommandCatalogue::get();
-    // specs new should resolve to new spec
-    let canonical = cat.canonical_path(&["specs", "new"]);
-    assert_eq!(
-        canonical,
-        vec!["new", "spec"],
-        "alias not resolved: {canonical:?}"
-    );
-}
-
-#[test]
-fn new_spec_lookup_via_lookup_with_aliases() {
-    let cat = CommandCatalogue::get();
-    let spec_via_alias = cat.lookup_with_aliases(&["specs", "new"]);
-    let spec_direct = cat.lookup(&["new", "spec"]);
-    assert!(spec_via_alias.is_some(), "alias lookup failed");
-    assert!(spec_direct.is_some(), "direct lookup failed");
-    assert_eq!(spec_via_alias.unwrap().name, spec_direct.unwrap().name);
 }
 
 // ─── Flag enumeration ─────────────────────────────────────────────────────────

@@ -81,13 +81,12 @@ impl ContainerBackend for DockerBackend {
 
     fn list_running(&self, _session: &Session) -> Result<Vec<ContainerHandle>, EngineError> {
         // Query by label AND by name prefix so old-amux containers (which may
-        // lack the label) and nanoclaw workers are included. Results from all
-        // queries are merged and deduplicated by container ID.
+        // lack the label) are included. Results from all queries are merged and
+        // deduplicated by container ID.
         let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
         let queries: &[&[&str]] = &[
             &["ps", "--filter", "label=amux=true", "--format", format],
             &["ps", "--filter", "name=amux-", "--format", format],
-            &["ps", "--filter", "name=nanoclaw", "--format", format],
         ];
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -140,7 +139,6 @@ impl ContainerBackend for DockerBackend {
         let queries: &[&[&str]] = &[
             &["ps", "--filter", "label=amux=true", "--format", format],
             &["ps", "--filter", "name=amux-", "--format", format],
-            &["ps", "--filter", "name=nanoclaw", "--format", format],
         ];
 
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();

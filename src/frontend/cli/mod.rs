@@ -383,7 +383,7 @@ mod tests {
                 flag: "agent".into(),
             },
             CommandError::MissingRequiredArgument {
-                command: path(&["implement"]),
+                command: path(&["specs", "amend"]),
                 argument: "work_item".into(),
             },
             CommandError::MutuallyExclusive {
@@ -397,7 +397,7 @@ mod tests {
                 reason: "not a valid agent".into(),
             },
             CommandError::InvalidArgumentValue {
-                command: path(&["implement"]),
+                command: path(&["specs", "amend"]),
                 argument: "work_item".into(),
                 reason: "must be 4 digits".into(),
             },

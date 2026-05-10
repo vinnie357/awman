@@ -38,7 +38,7 @@ pub trait HasContainerFrontend: UserMessageSink + Send {
     /// bridging via `ContainerFrontend::take_container_io`.
     ///
     /// Commands that intend to launch an *interactive* PTY container (chat,
-    /// claws, exec prompt) call this variant so the container's PTY is wired
+    /// exec prompt) call this variant so the container's PTY is wired
     /// to the frontend's renderer instead of inheriting host stdio.
     /// Build/pull/probe paths keep using `container_frontend` so the io stays
     /// reserved for the actual interactive launch.

@@ -1,5 +1,5 @@
 //! `engine::agent` — `AgentEngine`. Cross-cutting agent concerns called by
-//! `implement`, `chat`, `exec`, `ready`, and `claws`.
+//! `chat`, `exec`, and `ready`.
 //!
 //! All agent-name branching lives in `agent_matrix.rs`. Adding a new agent
 //! is a single-file edit.

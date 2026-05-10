@@ -1,6 +1,6 @@
 //! `ContainerFrontend` impls for the TUI — both on `TuiCommandFrontend`
 //! (direct container I/O) and on a standalone `TuiContainerProxy` (used by
-//! `container_frontend()` return values in Init/Ready/Claws).
+//! `container_frontend()` return values in Init/Ready).
 //!
 //! For TUI mode, the engine's container backend takes ownership of the byte
 //! channels via `take_container_io` and bridges them directly to the
@@ -63,15 +63,15 @@ impl ContainerFrontend for TuiCommandFrontend {
 
 // ─── TuiContainerProxy ──────────────────────────────────────────────────
 
-/// Standalone proxy returned by `container_frontend()` in Init/Ready/Chat/
-/// Claws/etc. trait impls.
+/// Standalone proxy returned by `container_frontend()` in Init/Ready/Chat
+/// trait impls.
 ///
 /// Two modes:
 /// - **Without `ContainerIo`** (`new`): routes stdout/stderr line-by-line into
 ///   the shared status log. Used by non-PTY text commands like `ready`/`init`.
 /// - **With `ContainerIo`** (`with_io`): hands the byte channels to the
 ///   engine's container backend so it can bridge a real PTY directly. Used by
-///   PTY commands like `chat`/`claws` so their output renders inside the TUI's
+///   PTY commands like `chat` so their output renders inside the TUI's
 ///   container overlay.
 pub struct TuiContainerProxy {
     log: SharedStatusLog,

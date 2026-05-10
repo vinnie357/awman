@@ -133,10 +133,8 @@ mod tests {
         for n in [
             "init",
             "ready",
-            "implement",
             "chat",
             "specs",
-            "claws",
             "status",
             "config",
             "exec",

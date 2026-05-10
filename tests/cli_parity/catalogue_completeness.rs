@@ -17,10 +17,8 @@ fn all_documented_top_level_commands_present() {
     for expected in &[
         "init",
         "ready",
-        "implement",
         "chat",
         "specs",
-        "claws",
         "status",
         "config",
         "exec",
@@ -38,13 +36,6 @@ fn all_documented_top_level_commands_present() {
 // ─── specs subcommands ────────────────────────────────────────────────────────
 
 #[test]
-fn specs_new_flags_interview_and_non_interactive() {
-    let spec_new = cat().lookup(&["specs", "new"]).unwrap();
-    assert!(spec_new.find_flag("interview").is_some());
-    assert!(spec_new.find_flag("non-interactive").is_some());
-}
-
-#[test]
 fn specs_amend_has_work_item_argument() {
     let amend = cat().lookup(&["specs", "amend"]).unwrap();
     assert!(
@@ -59,71 +50,6 @@ fn specs_amend_has_work_item_argument() {
 fn init_has_aspec_flag() {
     let init = cat().lookup(&["init"]).unwrap();
     assert!(init.find_flag("aspec").is_some());
-}
-
-// ─── implement flags ──────────────────────────────────────────────────────────
-
-#[test]
-fn implement_has_work_item_argument() {
-    let cmd = cat().lookup(&["implement"]).unwrap();
-    assert!(
-        !cmd.arguments.is_empty(),
-        "implement must accept a work-item number argument"
-    );
-}
-
-#[test]
-fn implement_has_workflow_flag() {
-    let cmd = cat().lookup(&["implement"]).unwrap();
-    assert!(cmd.find_flag("workflow").is_some());
-}
-
-#[test]
-fn implement_has_worktree_flag() {
-    let cmd = cat().lookup(&["implement"]).unwrap();
-    assert!(cmd.find_flag("worktree").is_some());
-}
-
-#[test]
-fn implement_has_yolo_flag() {
-    let cmd = cat().lookup(&["implement"]).unwrap();
-    assert!(cmd.find_flag("yolo").is_some());
-}
-
-#[test]
-fn implement_has_auto_flag() {
-    let cmd = cat().lookup(&["implement"]).unwrap();
-    assert!(cmd.find_flag("auto").is_some());
-}
-
-#[test]
-fn implement_has_plan_flag() {
-    let cmd = cat().lookup(&["implement"]).unwrap();
-    assert!(cmd.find_flag("plan").is_some());
-}
-
-#[test]
-fn implement_has_agent_flag() {
-    let cmd = cat().lookup(&["implement"]).unwrap();
-    assert!(cmd.find_flag("agent").is_some());
-}
-
-#[test]
-fn implement_has_model_flag() {
-    let cmd = cat().lookup(&["implement"]).unwrap();
-    assert!(cmd.find_flag("model").is_some());
-}
-
-#[test]
-fn implement_has_non_interactive_flag() {
-    let cmd = cat().lookup(&["implement"]).unwrap();
-    assert!(cmd.find_flag("non-interactive").is_some());
-}
-
-#[test]
-fn implement_has_overlay_flag() {
-    let cmd = cat().lookup(&["implement"]).unwrap();
-    assert!(cmd.find_flag("overlay").is_some());
 }
 
 // ─── exec workflow ────────────────────────────────────────────────────────────
@@ -212,15 +138,3 @@ fn config_get_has_field_argument() {
     assert!(!cmd.arguments.is_empty());
 }
 
-// ─── Alias: `new spec` ← `specs new` ─────────────────────────────────────────
-
-#[test]
-fn new_spec_and_specs_new_both_resolve() {
-    assert!(cat().lookup(&["new", "spec"]).is_some());
-    assert!(cat().lookup_with_aliases(&["specs", "new"]).is_some());
-    // Both point to the same spec.
-    assert_eq!(
-        cat().lookup(&["new", "spec"]).unwrap().name,
-        cat().lookup_with_aliases(&["specs", "new"]).unwrap().name,
-    );
-}
