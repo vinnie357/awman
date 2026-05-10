@@ -37,13 +37,6 @@ impl OverlayPathResolver {
         }
     }
 
-    /// Expand `~` and resolve a relative path to absolute against the process's
-    /// current working directory.
-    pub fn make_absolute(path: &str) -> PathBuf {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        Self::make_absolute_with_cwd(path, &cwd)
-    }
-
     /// Resolve `.` and `..` components without touching the filesystem.
     ///
     /// Necessary before `canonicalize_lossy` so that `..` segments in

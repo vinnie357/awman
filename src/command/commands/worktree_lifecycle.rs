@@ -202,20 +202,21 @@ impl WorktreeLifecycle {
                     )?;
                 }
             }
-        } else {
-            let files = self
-                .git_engine
-                .uncommitted_files_logged(&self.git_root, frontend)?;
-            if !files.is_empty() {
-                let suggested = format!("WIP: pre-worktree commit for {}", self.branch);
-                match frontend.ask_pre_worktree_uncommitted_files(&files, &suggested)? {
-                    PreWorktreeDecision::Commit { message } => {
-                        self.git_engine
-                            .commit_all_logged(&self.git_root, &message, frontend)?;
-                    }
-                    PreWorktreeDecision::UseLastCommit => {}
-                    PreWorktreeDecision::Abort => return Err(CommandError::Aborted),
+        }
+        // Always check for dirty state before creating a new worktree,
+        // regardless of whether we're creating fresh or recreating.
+        let files = self
+            .git_engine
+            .uncommitted_files_logged(&self.git_root, frontend)?;
+        if !files.is_empty() {
+            let suggested = format!("WIP: pre-worktree commit for {}", self.branch);
+            match frontend.ask_pre_worktree_uncommitted_files(&files, &suggested)? {
+                PreWorktreeDecision::Commit { message } => {
+                    self.git_engine
+                        .commit_all_logged(&self.git_root, &message, frontend)?;
                 }
+                PreWorktreeDecision::UseLastCommit => {}
+                PreWorktreeDecision::Abort => return Err(CommandError::Aborted),
             }
         }
         self.git_engine.create_worktree_logged(
@@ -655,6 +656,60 @@ mod tests {
             1,
             "create_worktree must be called on Recreate"
         );
+    }
+
+    #[tokio::test]
+    async fn prepare_existing_worktree_recreate_with_dirty_files_commits() {
+        let repo = tempfile::tempdir().unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let git_root = repo.path().to_path_buf();
+        let wt_path = wt_dir.path().join("wt");
+        let branch = "amux/test-recreate-dirty";
+        let engine = Arc::new(GitEngine::new());
+        engine.create_worktree(&git_root, &wt_path, branch).unwrap();
+        // Make the main branch dirty AFTER the worktree already exists.
+        std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
+
+        let lifecycle =
+            WorktreeLifecycle::new_for_test(engine, git_root.clone(), wt_path.clone(), branch.to_string());
+        let mut fe = RecordingWorktreeLifecycleFrontend::new();
+        fe.existing_worktree_response = ExistingWorktreeDecision::Recreate;
+        fe.pre_uncommitted_response = PreWorktreeDecision::Commit {
+            message: "pre-recreate commit".to_string(),
+        };
+        let before = git_log_count(&git_root);
+        let result = lifecycle.prepare(&mut fe).await;
+        assert!(result.is_ok(), "prepare(Recreate+dirty) must succeed: {result:?}");
+        let after = git_log_count(&git_root);
+        assert_eq!(after, before + 1, "dirty files must be committed before recreating worktree");
+        assert!(wt_path.exists(), "worktree must exist after Recreate");
+        assert_eq!(fe.worktree_created_calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prepare_existing_worktree_recreate_with_dirty_files_abort() {
+        let repo = tempfile::tempdir().unwrap();
+        let wt_dir = tempfile::tempdir().unwrap();
+        init_repo(repo.path());
+        let git_root = repo.path().to_path_buf();
+        let wt_path = wt_dir.path().join("wt");
+        let branch = "amux/test-recreate-abort";
+        let engine = Arc::new(GitEngine::new());
+        engine.create_worktree(&git_root, &wt_path, branch).unwrap();
+        std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
+
+        let lifecycle =
+            WorktreeLifecycle::new_for_test(engine, git_root, wt_path.clone(), branch.to_string());
+        let mut fe = RecordingWorktreeLifecycleFrontend::new();
+        fe.existing_worktree_response = ExistingWorktreeDecision::Recreate;
+        fe.pre_uncommitted_response = PreWorktreeDecision::Abort;
+        let result = lifecycle.prepare(&mut fe).await;
+        assert!(
+            matches!(result, Err(CommandError::Aborted)),
+            "Abort must return CommandError::Aborted on Recreate path"
+        );
+        assert!(fe.worktree_created_calls.is_empty());
     }
 
     #[tokio::test]

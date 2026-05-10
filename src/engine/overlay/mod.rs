@@ -104,14 +104,14 @@ impl OverlayEngine {
     /// canonicalized host path; most restrictive permission wins.
     pub fn build_overlays(
         &self,
-        _session: &Session,
+        session: &Session,
         request: &OverlayRequest,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
         let mut by_key: HashMap<String, OverlaySpec> = HashMap::new();
 
         // 1. User-supplied directory overlays.
         for spec in &request.directories {
-            let resolved = self.resolve_user_overlay(spec)?;
+            let resolved = self.resolve_user_overlay(spec, session.working_dir())?;
             let key = OverlayPathResolver::conflict_key(&resolved.host_path);
             insert_or_merge(&mut by_key, key, resolved);
         }
@@ -119,7 +119,7 @@ impl OverlayEngine {
         // 2. Agent settings overlays. Forward the yolo flag so Claude's
         //    settings sanitization can inject the bypass-permissions overlay.
         if let Some(agent) = &request.agent {
-            for spec in self.agent_settings_overlays_with(agent, request.yolo)? {
+            for spec in self.agent_settings_overlays_with(agent, request.yolo, session.git_root())? {
                 let key = OverlayPathResolver::conflict_key(&spec.host_path);
                 insert_or_merge(&mut by_key, key, spec);
             }
@@ -128,7 +128,7 @@ impl OverlayEngine {
         // 3. Skills overlay (mount ~/.amux/skills/ read-only into agent's native path).
         if request.include_skills {
             if let Some(agent) = &request.agent {
-                for spec in self.skill_overlays(agent, &request.container_home)? {
+                for spec in self.skill_overlays(agent, &request.container_home, session.git_root())? {
                     let key = OverlayPathResolver::conflict_key(&spec.host_path);
                     insert_or_merge(&mut by_key, key, spec);
                 }
@@ -141,14 +141,21 @@ impl OverlayEngine {
     }
 
     /// Resolve a single user-supplied overlay spec into its canonical form.
-    pub fn resolve_user_overlay(&self, spec: &DirectorySpec) -> Result<OverlaySpec, EngineError> {
+    ///
+    /// Relative host paths are resolved against `cwd` (the session's working
+    /// directory), not the process's current directory.
+    pub fn resolve_user_overlay(
+        &self,
+        spec: &DirectorySpec,
+        cwd: &Path,
+    ) -> Result<OverlaySpec, EngineError> {
         if !Path::new(&spec.container).is_absolute() {
             return Err(EngineError::Other(format!(
                 "overlay container path '{}' must be absolute",
                 spec.container
             )));
         }
-        let host_abs = OverlayPathResolver::make_absolute(&spec.host);
+        let host_abs = OverlayPathResolver::make_absolute_with_cwd(&spec.host, cwd);
         let host_canon = OverlayPathResolver::canonicalize_lossy(&host_abs);
         Ok(OverlaySpec {
             host_path: host_canon,
@@ -162,8 +169,9 @@ impl OverlayEngine {
     pub fn agent_settings_overlays(
         &self,
         agent: &AgentName,
+        git_root: &Path,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
-        self.agent_settings_overlays_with(agent, false)
+        self.agent_settings_overlays_with(agent, false, git_root)
     }
 
     /// Like `agent_settings_overlays` but threading the `yolo` flag so the
@@ -172,12 +180,14 @@ impl OverlayEngine {
         &self,
         agent: &AgentName,
         yolo: bool,
+        git_root: &Path,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
         let home = self.auth_resolver.home();
         let paths = self.auth_resolver.resolve(agent.as_str());
         let mut out = Vec::new();
         let container_home =
-            detect_container_home(home, agent.as_str()).unwrap_or_else(|| "/root".to_string());
+            detect_container_home(home, agent.as_str(), git_root)
+                .unwrap_or_else(|| "/root".to_string());
 
         match agent.as_str() {
             "claude" => {
@@ -322,6 +332,7 @@ impl OverlayEngine {
         &self,
         agent: &AgentName,
         container_home_override: &Option<String>,
+        git_root: &Path,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
         let skill_dirs =
             crate::data::fs::skill_dirs::SkillDirs::from_process_env(None).map_err(EngineError::Data)?;
@@ -338,7 +349,7 @@ impl OverlayEngine {
         let container_home = container_home_override
             .clone()
             .unwrap_or_else(|| {
-                detect_container_home(home, agent.as_str())
+                detect_container_home(home, agent.as_str(), git_root)
                     .unwrap_or_else(|| "/root".to_string())
             });
 
@@ -549,16 +560,13 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Detect the container home directory by inspecting `Dockerfile.<agent>`.
 ///
 /// Looks for a `USER <name>` directive (where `<name>` is not "root" or "0")
-/// in `Dockerfile.<agent>` files under `<cwd>/.amux/` and `<home>/.amux/`.
+/// in `Dockerfile.<agent>` files under `<git_root>/.amux/` and `<home>/.amux/`.
 /// Returns `Some("/home/<name>")` when found, `None` otherwise.
-fn detect_container_home(home: &Path, agent: &str) -> Option<String> {
+fn detect_container_home(home: &Path, agent: &str, git_root: &Path) -> Option<String> {
     let dockerfile_name = format!("Dockerfile.{agent}");
-    let search_dirs: Vec<PathBuf> = [
-        std::env::current_dir().ok()?.join(".amux"),
-        home.join(".amux"),
-    ]
-    .into_iter()
-    .collect();
+    let search_dirs: Vec<PathBuf> = [git_root.join(".amux"), home.join(".amux")]
+        .into_iter()
+        .collect();
 
     for dir in &search_dirs {
         let path = dir.join(&dockerfile_name);
@@ -650,7 +658,7 @@ mod tests {
         let agent = AgentName::new("claude").unwrap();
 
         let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
 
         assert_eq!(specs.len(), 1, "expected 1 OverlaySpec; got {specs:?}");
         assert_eq!(specs[0].host_path, skills_canon, "host path must be global skills dir");
@@ -669,7 +677,7 @@ mod tests {
         let agent = AgentName::new("codex").unwrap();
 
         let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].host_path, skills_canon);
@@ -688,7 +696,7 @@ mod tests {
         let agent = AgentName::new("gemini").unwrap();
 
         let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].host_path, skills_canon);
@@ -707,7 +715,7 @@ mod tests {
         let agent = AgentName::new("opencode").unwrap();
 
         let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].host_path, skills_canon);
@@ -729,7 +737,7 @@ mod tests {
         let agent = AgentName::new("copilot").unwrap();
 
         let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].host_path, skills_canon);
@@ -751,7 +759,7 @@ mod tests {
         let agent = AgentName::new("crush").unwrap();
 
         let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].host_path, skills_canon);
@@ -773,7 +781,7 @@ mod tests {
         let agent = AgentName::new("cline").unwrap();
 
         let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].host_path, skills_canon);
@@ -793,7 +801,7 @@ mod tests {
         let agent = AgentName::new("claude").unwrap();
 
         let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
 
         assert!(
             specs.is_empty(),
@@ -808,7 +816,7 @@ mod tests {
         let agent = AgentName::new("maki").unwrap();
 
         let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
 
         assert!(
             specs.is_empty(),
@@ -824,7 +832,7 @@ mod tests {
         let override_home = Some("/home/appuser".to_string());
 
         let specs = with_amux_config_home(tmp.path(), || {
-            engine.skill_overlays(&agent, &override_home).unwrap()
+            engine.skill_overlays(&agent, &override_home, Path::new("/")).unwrap()
         });
 
         assert_eq!(specs.len(), 1);
@@ -844,16 +852,11 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
 
-        // Ensure no Dockerfile.claude in cwd or home.
-        let prev_cwd = std::env::current_dir().ok();
-        std::env::set_current_dir(tmp.path()).ok();
-
-        let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
-
-        if let Some(p) = prev_cwd {
-            let _ = std::env::set_current_dir(p);
-        }
+        let specs = with_amux_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, &None, tmp.path())
+                .unwrap()
+        });
 
         assert_eq!(specs.len(), 1);
         assert!(
@@ -872,7 +875,9 @@ mod tests {
             container: "rel/path".into(),
             permission: OverlayPermission::ReadOnly,
         };
-        let err = engine.resolve_user_overlay(&spec).unwrap_err();
+        let err = engine
+            .resolve_user_overlay(&spec, Path::new("/"))
+            .unwrap_err();
         assert!(matches!(err, EngineError::Other(_)));
     }
 
@@ -881,7 +886,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
-        let out = engine.agent_settings_overlays(&agent).unwrap();
+        let out = engine.agent_settings_overlays(&agent, tmp.path()).unwrap();
         assert!(
             out.iter().any(|o| o
                 .container_path
@@ -899,7 +904,7 @@ mod tests {
         std::fs::write(&config_file, r#"{"model":"claude-sonnet-4-6"}"#).unwrap();
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
-        let overlays = engine.agent_settings_overlays(&agent).unwrap();
+        let overlays = engine.agent_settings_overlays(&agent, tmp.path()).unwrap();
         // The overlay engine sanitizes the .claude.json file (strips
         // oauthAccount) and writes it to a temp path; we expect at least one
         // overlay mounting a file as `/root/.claude.json`.
@@ -970,7 +975,7 @@ mod tests {
             container: "relative/path".into(),
             permission: OverlayPermission::ReadOnly,
         };
-        assert!(engine.resolve_user_overlay(&spec).is_err());
+        assert!(engine.resolve_user_overlay(&spec, Path::new("/")).is_err());
     }
 
     #[test]
@@ -984,7 +989,9 @@ mod tests {
         .unwrap();
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
-        let overlays = engine.agent_settings_overlays(&agent).unwrap();
+        let overlays = engine
+            .agent_settings_overlays(&agent, tmp.path())
+            .unwrap();
         // One overlay for the config file.
         let config_overlay = overlays
             .iter()
@@ -1013,7 +1020,9 @@ mod tests {
         std::fs::write(&config_file, r#"{"model":"claude-sonnet-4-6"}"#).unwrap();
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
-        let overlays = engine.agent_settings_overlays(&agent).unwrap();
+        let overlays = engine
+            .agent_settings_overlays(&agent, tmp.path())
+            .unwrap();
         let config_overlay = overlays
             .iter()
             .find(|o| {
@@ -1043,7 +1052,9 @@ mod tests {
 
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
-        let overlays = engine.agent_settings_overlays(&agent).unwrap();
+        let overlays = engine
+            .agent_settings_overlays(&agent, tmp.path())
+            .unwrap();
         let dir_overlay = overlays
             .iter()
             .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))
@@ -1068,7 +1079,9 @@ mod tests {
 
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
-        let overlays = engine.agent_settings_overlays(&agent).unwrap();
+        let overlays = engine
+            .agent_settings_overlays(&agent, tmp.path())
+            .unwrap();
         let dir_overlay = overlays
             .iter()
             .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))
@@ -1092,7 +1105,9 @@ mod tests {
 
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
-        let overlays = engine.agent_settings_overlays_with(&agent, true).unwrap();
+        let overlays = engine
+            .agent_settings_overlays_with(&agent, true, tmp.path())
+            .unwrap();
         let dir_overlay = overlays
             .iter()
             .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))
@@ -1119,16 +1134,7 @@ mod tests {
         )
         .unwrap();
 
-        // Temporarily change cwd to tmp so detect_container_home can find the file.
-        let prev = std::env::current_dir().ok();
-        std::env::set_current_dir(tmp.path()).ok();
-
-        let result = detect_container_home(tmp.path(), "claude");
-
-        // Restore cwd.
-        if let Some(p) = prev {
-            let _ = std::env::set_current_dir(p);
-        }
+        let result = detect_container_home(tmp.path(), "claude", tmp.path());
 
         assert_eq!(
             result,
@@ -1140,13 +1146,7 @@ mod tests {
     #[test]
     fn detect_container_home_returns_none_when_no_dockerfile() {
         let tmp = tempfile::tempdir().unwrap();
-        // Change cwd to the empty temp dir so the cwd-based search finds nothing.
-        let prev = std::env::current_dir().ok();
-        std::env::set_current_dir(tmp.path()).ok();
-        let result = detect_container_home(tmp.path(), "claude");
-        if let Some(p) = prev {
-            let _ = std::env::set_current_dir(p);
-        }
+        let result = detect_container_home(tmp.path(), "claude", tmp.path());
         assert!(
             result.is_none(),
             "detect_container_home must return None when no Dockerfile found"
@@ -1164,14 +1164,7 @@ mod tests {
         )
         .unwrap();
 
-        let prev = std::env::current_dir().ok();
-        std::env::set_current_dir(tmp.path()).ok();
-
-        let result = detect_container_home(tmp.path(), "claude");
-
-        if let Some(p) = prev {
-            let _ = std::env::set_current_dir(p);
-        }
+        let result = detect_container_home(tmp.path(), "claude", tmp.path());
 
         assert!(
             result.is_none(),
@@ -1190,14 +1183,7 @@ mod tests {
         )
         .unwrap();
 
-        let prev = std::env::current_dir().ok();
-        std::env::set_current_dir(tmp.path()).ok();
-
-        let result = detect_container_home(tmp.path(), "claude");
-
-        if let Some(p) = prev {
-            let _ = std::env::set_current_dir(p);
-        }
+        let result = detect_container_home(tmp.path(), "claude", tmp.path());
 
         assert!(
             result.is_none(),
@@ -1213,7 +1199,9 @@ mod tests {
 
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
-        let overlays = engine.agent_settings_overlays_with(&agent, false).unwrap();
+        let overlays = engine
+            .agent_settings_overlays_with(&agent, false, tmp.path())
+            .unwrap();
         let dir_overlay = overlays
             .iter()
             .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))

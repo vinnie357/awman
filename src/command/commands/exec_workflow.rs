@@ -399,7 +399,14 @@ impl Command for ExecWorkflowCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        let workflow_path = self.flags.workflow.display().to_string();
+        // Resolve the workflow path relative to the session's working
+        // directory so that relative paths work regardless of where the
+        // amux process was originally launched.
+        let workflow_path = if self.flags.workflow.is_absolute() {
+            self.flags.workflow.clone()
+        } else {
+            self.session.working_dir().join(&self.flags.workflow)
+        };
 
         if self.flags.yolo && self.flags.worktree {
             frontend.write_message(UserMessage {
@@ -409,20 +416,20 @@ impl Command for ExecWorkflowCommand {
         }
 
         // 1. Load the workflow file.
-        if !self.flags.workflow.exists() {
+        if !workflow_path.exists() {
             let err = CommandError::WorkflowFileNotFound {
-                path: self.flags.workflow.clone(),
+                path: workflow_path.clone(),
             };
             frontend.write_message(UserMessage {
                 level: MessageLevel::Error,
                 text: format!(
                     "exec workflow: workflow file not found: {}",
-                    self.flags.workflow.display()
+                    workflow_path.display()
                 ),
             });
             return Err(err);
         }
-        let workflow = match Workflow::load(&self.flags.workflow) {
+        let workflow = match Workflow::load(&workflow_path) {
             Ok(w) => w,
             Err(e) => {
                 let err = CommandError::Other(format!("loading workflow: {e}"));
@@ -792,7 +799,7 @@ impl Command for ExecWorkflowCommand {
         }
 
         Ok(ExecWorkflowOutcome {
-            workflow: workflow_path,
+            workflow: workflow_path.display().to_string(),
             exit_code,
             worktree_used: self.flags.worktree,
         })

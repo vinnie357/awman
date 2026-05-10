@@ -469,6 +469,10 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                     .yolo_cancel_flag
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 app.active_dialog = None;
+                // Clear user-activity so the tab stays "stuck" without
+                // cycling through unstuck→stuck (which would re-send
+                // StepStuck and restart the yolo countdown).
+                app.active_tab_mut().last_user_activity_time = None;
                 return;
             }
             dismiss_dialog(app);
@@ -944,8 +948,11 @@ fn handle_workflow_control_board_key(app: &mut App, key: crossterm::event::KeyEv
         KeyCode::Down => DialogResponse::Char('v'),
         KeyCode::Up => DialogResponse::Char('^'),
         KeyCode::Left => DialogResponse::Char('<'),
-        KeyCode::Enter if ctrl && can_finish => DialogResponse::Char('f'),
+        // Many terminals cannot distinguish Ctrl+Enter from bare Enter
+        // without the kitty keyboard protocol, so accept plain Enter too.
+        KeyCode::Enter if can_finish => DialogResponse::Char('f'),
         KeyCode::Enter if ctrl => return false,
+        KeyCode::Char('c') if ctrl => DialogResponse::Char('a'),
         _ => return false,
     };
     app.send_dialog_response(response);
@@ -1282,7 +1289,12 @@ fn handle_new_tab_path(app: &mut App, path: &str) {
     if path.is_empty() {
         return;
     }
-    let dir = std::path::PathBuf::from(path);
+    let raw = std::path::PathBuf::from(path);
+    let dir = if raw.is_absolute() {
+        raw
+    } else {
+        app.active_tab().session.working_dir().join(raw)
+    };
     if !dir.is_dir() {
         app.status_bar.text = format!("Not a directory: {path}");
         return;
@@ -1982,7 +1994,16 @@ mod tests {
     }
 
     #[test]
-    fn wcb_ctrl_enter_ignored_when_finish_unavailable() {
+    fn wcb_plain_enter_sends_finish_workflow() {
+        let mut app = make_app();
+        let rx = setup_wcb_dialog(&mut app);
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        let resp = rx.try_recv().unwrap();
+        assert!(matches!(resp, DialogResponse::Char('f')));
+    }
+
+    #[test]
+    fn wcb_enter_ignored_when_finish_unavailable() {
         let mut app = make_app();
         let (tx, rx) = std::sync::mpsc::channel();
         app.tabs[app.active_tab].dialog_response_tx = Some(tx);
@@ -2001,18 +2022,18 @@ mod tests {
             },
         ));
         app.command_dialog_active = true;
-        press_key(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
+        press_key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
         assert!(
             rx.try_recv().is_err(),
-            "Ctrl+Enter must not send FinishWorkflow when can_finish is false"
+            "Enter must not send FinishWorkflow when can_finish is false"
         );
     }
 
     #[test]
-    fn wcb_char_a_sends_abort() {
+    fn wcb_ctrl_c_sends_abort() {
         let mut app = make_app();
         let rx = setup_wcb_dialog(&mut app);
-        press_char(&mut app, 'a');
+        press_key(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL);
         let resp = rx.try_recv().unwrap();
         assert!(matches!(resp, DialogResponse::Char('a')));
     }

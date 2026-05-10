@@ -105,8 +105,11 @@ fn skill_overlays_claude_ro_mount_when_skills_dir_exists() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
 
-    let specs =
-        with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+    let specs = with_amux_config_home(tmp.path(), || {
+        engine
+            .skill_overlays(&agent, &None, std::path::Path::new("/"))
+            .unwrap()
+    });
 
     assert_eq!(specs.len(), 1, "expected 1 OverlaySpec; got {specs:?}");
     assert_eq!(
@@ -135,8 +138,11 @@ fn skill_overlays_empty_when_global_skills_dir_absent() {
     let engine = make_engine(tmp.path());
     let agent = AgentName::new("claude").unwrap();
 
-    let specs =
-        with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None).unwrap());
+    let specs = with_amux_config_home(tmp.path(), || {
+        engine
+            .skill_overlays(&agent, &None, std::path::Path::new("/"))
+            .unwrap()
+    });
 
     assert!(
         specs.is_empty(),
@@ -153,8 +159,9 @@ fn skill_overlays_empty_for_maki_agent_no_error() {
     let agent = AgentName::new("maki").unwrap();
 
     // Must return Ok(vec![]) — not an error — even though maki has no known skills dir.
-    let result =
-        with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None));
+    let result = with_amux_config_home(tmp.path(), || {
+        engine.skill_overlays(&agent, &None, std::path::Path::new("/"))
+    });
 
     assert!(result.is_ok(), "maki must not produce an error; got {result:?}");
     assert!(result.unwrap().is_empty(), "maki must produce no mount");

@@ -16,6 +16,131 @@ use crate::engine::error::EngineError;
 
 const AMUX_LABEL: &str = "amux=true";
 
+/// Extract the container name from an Apple Containers JSON row.
+///
+/// Apple's schema uses `configuration.id` as the container name/identifier
+/// (there is no separate short hex ID). Falls back to Docker-style fields
+/// for forward-compatibility.
+fn extract_apple_name(row: &serde_json::Value) -> String {
+    if let Some(id) = row
+        .get("configuration")
+        .and_then(|c| c.get("id"))
+        .and_then(|v| v.as_str())
+    {
+        return id.to_string();
+    }
+    let val = row
+        .get("Names")
+        .or_else(|| row.get("Name"))
+        .or_else(|| row.get("name"));
+    match val {
+        Some(v) if v.is_array() => v
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|s| s.as_str())
+            .map(|s| s.trim_start_matches('/'))
+            .unwrap_or_default()
+            .to_string(),
+        Some(v) => v
+            .as_str()
+            .map(|s| s.trim_start_matches('/'))
+            .unwrap_or_default()
+            .to_string(),
+        None => String::new(),
+    }
+}
+
+/// Extract the image reference from an Apple Containers JSON row.
+///
+/// Apple stores the image as `configuration.image` (an object); we serialize
+/// it for display. Falls back to Docker-style string `Image`/`image` fields.
+fn extract_apple_image(row: &serde_json::Value) -> String {
+    if let Some(img_obj) = row.get("configuration").and_then(|c| c.get("image")) {
+        if let Some(s) = img_obj.as_str() {
+            return s.to_string();
+        }
+        return serde_json::to_string(img_obj).unwrap_or_default();
+    }
+    row.get("Image")
+        .or_else(|| row.get("image"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Extract the started-at timestamp from an Apple Containers JSON row.
+///
+/// Apple uses `startedDate` (float epoch seconds). Falls back to
+/// Docker-style `CreatedAt`/`Created` RFC3339 strings.
+fn extract_apple_started_at(row: &serde_json::Value) -> chrono::DateTime<chrono::Utc> {
+    if let Some(ts) = row.get("startedDate").and_then(|v| v.as_f64()) {
+        let secs = ts as i64;
+        let nanos = ((ts - secs as f64) * 1_000_000_000.0) as u32;
+        if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos) {
+            return dt;
+        }
+    }
+    row.get("CreatedAt")
+        .or_else(|| row.get("Created"))
+        .or_else(|| row.get("created"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now)
+}
+
+/// Check whether the row represents a running container.
+///
+/// Apple uses a `status` field: "running" | "stopped" | "stopping" | "unknown".
+/// If absent (Docker-style output from `ps`), assume running.
+fn is_apple_running(row: &serde_json::Value) -> bool {
+    match row.get("status").and_then(|v| v.as_str()) {
+        Some(s) => s == "running",
+        None => true,
+    }
+}
+
+/// Check whether the row's name matches amux container patterns.
+fn is_amux_container(name: &str) -> bool {
+    name.starts_with("amux-") || name.contains("nanoclaw")
+}
+
+/// Parse the JSON output of `container list --format json` into container
+/// handles, filtering for running amux containers.
+fn parse_apple_list_output(stdout: &str) -> Vec<ContainerHandle> {
+    let arr: Result<Vec<serde_json::Value>, _> = serde_json::from_str(stdout);
+    let rows: Vec<serde_json::Value> = match arr {
+        Ok(v) => v,
+        Err(_) => stdout
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect(),
+    };
+    let mut handles = Vec::new();
+    for row in rows {
+        if !is_apple_running(&row) {
+            continue;
+        }
+        let name = extract_apple_name(&row);
+        if !is_amux_container(&name) {
+            continue;
+        }
+        let id = name.clone();
+        let image_tag = extract_apple_image(&row);
+        let started_at = extract_apple_started_at(&row);
+        if id.is_empty() && name.is_empty() {
+            continue;
+        }
+        handles.push(ContainerHandle {
+            id,
+            image_tag,
+            name,
+            started_at,
+        });
+    }
+    handles
+}
+
 #[derive(Debug, Default)]
 pub(super) struct AppleBackend;
 
@@ -45,107 +170,17 @@ impl ContainerBackend for AppleBackend {
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<ContainerHandle>, EngineError> {
-        // Apple Containers uses `container list`, not `container ps`.
-        // It does not support `--filter` for label filtering, so we list all
-        // containers and filter client-side by name pattern.
         let output = Command::new("container")
             .args(["list", "--format", "json"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output();
         let output = match output {
-            Ok(o) => o,
-            Err(_) => return Ok(Vec::new()),
+            Ok(o) if o.status.success() => o,
+            _ => return Ok(Vec::new()),
         };
-        if !output.status.success() {
-            return Ok(Vec::new());
-        }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut handles = Vec::new();
-        // Parse either a JSON array (the documented Apple shape) or one JSON
-        // object per line (the format other CLIs sometimes emit).
-        let arr: Result<Vec<serde_json::Value>, _> = serde_json::from_str(&stdout);
-        let rows: Vec<serde_json::Value> = match arr {
-            Ok(v) => v,
-            Err(_) => stdout
-                .lines()
-                .filter_map(|l| serde_json::from_str(l).ok())
-                .collect(),
-        };
-        for row in rows {
-            // Client-side filtering: only include containers that have the
-            // amux label or whose name starts with "amux-".
-            let labels = row
-                .get("Labels")
-                .or_else(|| row.get("labels"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            // Apple `container list` outputs Names as a JSON array ["name"],
-            // not a string. Handle both array and string forms.
-            let row_name = {
-                let val = row
-                    .get("Names")
-                    .or_else(|| row.get("Name"))
-                    .or_else(|| row.get("name"));
-                match val {
-                    Some(v) if v.is_array() => v
-                        .as_array()
-                        .and_then(|a| a.first())
-                        .and_then(|s| s.as_str())
-                        .map(|s| s.trim_start_matches('/'))
-                        .unwrap_or_default()
-                        .to_string(),
-                    Some(v) => v
-                        .as_str()
-                        .map(|s| s.trim_start_matches('/'))
-                        .unwrap_or_default()
-                        .to_string(),
-                    None => String::new(),
-                }
-            };
-            if !labels.contains("amux")
-                && !row_name.starts_with("amux-")
-                && !row_name.contains("nanoclaw")
-            {
-                continue;
-            }
-
-            let id = row
-                .get("ID")
-                .or_else(|| row.get("Id"))
-                .or_else(|| row.get("id"))
-                .or_else(|| row.get("ContainerID"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let name = row_name;
-            let image_tag = row
-                .get("Image")
-                .or_else(|| row.get("image"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            // Started/Created timestamp — try multiple keys in order of
-            // likelihood. RFC3339-parsed when present; falls back to now().
-            let started_at = row
-                .get("CreatedAt")
-                .or_else(|| row.get("Created"))
-                .or_else(|| row.get("created"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|d| d.with_timezone(&chrono::Utc))
-                .unwrap_or_else(chrono::Utc::now);
-            if id.is_empty() && name.is_empty() {
-                continue;
-            }
-            handles.push(ContainerHandle {
-                id,
-                image_tag,
-                name,
-                started_at,
-            });
-        }
-        Ok(handles)
+        Ok(parse_apple_list_output(&stdout))
     }
 
     fn list_running_all(&self) -> Result<Vec<ContainerHandle>, EngineError> {
@@ -159,82 +194,7 @@ impl ContainerBackend for AppleBackend {
             _ => return Ok(Vec::new()),
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut handles = Vec::new();
-        let arr: Result<Vec<serde_json::Value>, _> = serde_json::from_str(&stdout);
-        let rows: Vec<serde_json::Value> = match arr {
-            Ok(v) => v,
-            Err(_) => stdout
-                .lines()
-                .filter_map(|l| serde_json::from_str(l).ok())
-                .collect(),
-        };
-        for row in rows {
-            let labels = row
-                .get("Labels")
-                .or_else(|| row.get("labels"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
-            let row_name = {
-                let val = row
-                    .get("Names")
-                    .or_else(|| row.get("Name"))
-                    .or_else(|| row.get("name"));
-                match val {
-                    Some(v) if v.is_array() => v
-                        .as_array()
-                        .and_then(|a| a.first())
-                        .and_then(|s| s.as_str())
-                        .map(|s| s.trim_start_matches('/'))
-                        .unwrap_or_default()
-                        .to_string(),
-                    Some(v) => v
-                        .as_str()
-                        .map(|s| s.trim_start_matches('/'))
-                        .unwrap_or_default()
-                        .to_string(),
-                    None => String::new(),
-                }
-            };
-            if !labels.contains("amux")
-                && !row_name.starts_with("amux-")
-                && !row_name.contains("nanoclaw")
-            {
-                continue;
-            }
-            let id = row
-                .get("ID")
-                .or_else(|| row.get("Id"))
-                .or_else(|| row.get("id"))
-                .or_else(|| row.get("ContainerID"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let name = row_name;
-            let image_tag = row
-                .get("Image")
-                .or_else(|| row.get("image"))
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let started_at = row
-                .get("CreatedAt")
-                .or_else(|| row.get("Created"))
-                .or_else(|| row.get("created"))
-                .and_then(|v| v.as_str())
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|d| d.with_timezone(&chrono::Utc))
-                .unwrap_or_else(chrono::Utc::now);
-            if id.is_empty() && name.is_empty() {
-                continue;
-            }
-            handles.push(ContainerHandle {
-                id,
-                image_tag,
-                name,
-                started_at,
-            });
-        }
-        Ok(handles)
+        Ok(parse_apple_list_output(&stdout))
     }
 
     fn stats(&self, handle: &ContainerHandle) -> Result<ContainerStats, EngineError> {
@@ -696,12 +656,94 @@ mod apple_tests {
         assert!((parse_memory_mb("1.5GB") - 1536.0).abs() < 0.001);
         assert!((parse_memory_mb("512KB") - 0.5).abs() < 0.001);
         assert!((parse_memory_mb("1024B") - (1024.0 / (1024.0 * 1024.0))).abs() < 0.001);
-        // No unit -> default MB
         assert!((parse_memory_mb("64") - 64.0).abs() < 0.001);
     }
 
     #[test]
     fn parse_memory_mb_unknown_unit_assumes_mb() {
         assert!((parse_memory_mb("128wat") - 128.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_apple_list_picks_up_running_amux_containers() {
+        let json = r#"[
+            {
+                "status": "running",
+                "configuration": {
+                    "id": "amux-12345-999",
+                    "image": {"repository": "amux/dev", "tag": "latest"}
+                },
+                "startedDate": 1715000000.0
+            },
+            {
+                "status": "running",
+                "configuration": {
+                    "id": "amux-claws-controller",
+                    "image": {"repository": "amux/dev", "tag": "latest"}
+                },
+                "startedDate": 1715000100.5
+            },
+            {
+                "status": "stopped",
+                "configuration": {
+                    "id": "amux-old-stopped",
+                    "image": {"repository": "amux/dev", "tag": "latest"}
+                },
+                "startedDate": 1714000000.0
+            },
+            {
+                "status": "running",
+                "configuration": {
+                    "id": "unrelated-container",
+                    "image": {"repository": "nginx", "tag": "latest"}
+                },
+                "startedDate": 1715000200.0
+            }
+        ]"#;
+        let handles = parse_apple_list_output(json);
+        assert_eq!(handles.len(), 2);
+        assert_eq!(handles[0].name, "amux-12345-999");
+        assert_eq!(handles[0].id, "amux-12345-999");
+        assert_eq!(handles[1].name, "amux-claws-controller");
+    }
+
+    #[test]
+    fn parse_apple_list_handles_nanoclaw_containers() {
+        let json = r#"[{
+            "status": "running",
+            "configuration": {
+                "id": "nanoclaw-worker-1",
+                "image": {"repository": "amux/dev"}
+            },
+            "startedDate": 1715000000.0
+        }]"#;
+        let handles = parse_apple_list_output(json);
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].name, "nanoclaw-worker-1");
+    }
+
+    #[test]
+    fn parse_apple_list_empty_array() {
+        let handles = parse_apple_list_output("[]");
+        assert!(handles.is_empty());
+    }
+
+    #[test]
+    fn parse_apple_list_skips_non_running() {
+        let json = r#"[{
+            "status": "stopping",
+            "configuration": { "id": "amux-dying" },
+            "startedDate": 1715000000.0
+        }]"#;
+        let handles = parse_apple_list_output(json);
+        assert!(handles.is_empty());
+    }
+
+    #[test]
+    fn extract_apple_started_at_from_float() {
+        let row: serde_json::Value =
+            serde_json::from_str(r#"{"startedDate": 1715000000.5}"#).unwrap();
+        let dt = extract_apple_started_at(&row);
+        assert_eq!(dt.timestamp(), 1715000000);
     }
 }

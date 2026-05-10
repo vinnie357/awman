@@ -996,8 +996,7 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             .iter()
             .filter(|x| **x)
             .count() as u16;
-            let mid_step_extra: u16 = if state.can_dismiss { 2 } else { 0 };
-            let base_height: u16 = if state.can_finish { 15 } else { 13 };
+            let base_height: u16 = if state.can_finish { 14 } else { 12 };
             // Width fits the longest reason line (+ left margin) when present;
             // otherwise the diamond layout's natural minimum is comfortable.
             let max_reason_w = [
@@ -1007,7 +1006,7 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             ]
             .into_iter()
             .flatten()
-            .map(|s| unicode_width::UnicodeWidthStr::width(s) + 12)
+            .map(|s| unicode_width::UnicodeWidthStr::width(s) + 15)
             .max()
             .unwrap_or(0) as u16;
             let step_w =
@@ -1017,7 +1016,7 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                 .max(56)
                 .min(area.width.saturating_sub(4));
             let dialog_area =
-                dialogs::centered_fixed(width, base_height + extra_reasons + mid_step_extra, area);
+                dialogs::centered_fixed(width, base_height + extra_reasons, area);
             let title = if state.can_dismiss {
                 "Workflow Control (step running)"
             } else {
@@ -1033,8 +1032,6 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             let step_style = Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD);
-            let cancel_style = Style::default().fg(Color::Red);
-
             let (right_arrow_style, right_label_style) = if state.can_launch_next {
                 (arrow_style, label_style)
             } else {
@@ -1088,11 +1085,6 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             } else {
                 lines.push(Line::from(""));
             }
-            lines.push(Line::from(vec![
-                Span::raw("         "),
-                Span::styled("^C", cancel_style),
-                Span::styled(" Cancel workflow execution", cancel_style),
-            ]));
             if state.can_finish {
                 lines.push(Line::from(""));
                 let finish_style = Style::default()
@@ -1100,23 +1092,19 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                     .add_modifier(Modifier::BOLD);
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled("Ctrl+Enter", finish_style),
+                    Span::styled("[Enter]", finish_style),
                     Span::styled(" Finish workflow", finish_style),
                 ]));
             }
             lines.push(Line::from(""));
             if state.can_dismiss {
                 lines.push(Line::from(Span::styled(
-                    "  [a] Abort   [p] Pause",
-                    dimmed_style,
-                )));
-                lines.push(Line::from(Span::styled(
-                    "  [Esc] dismiss (step keeps running)",
+                    "  [^C] Abort   [p] Pause   [Esc] Dismiss",
                     dimmed_style,
                 )));
             } else {
                 lines.push(Line::from(Span::styled(
-                    "  [a] Abort   [Esc] Pause",
+                    "  [^C] Abort   [Esc] Pause",
                     dimmed_style,
                 )));
             }
