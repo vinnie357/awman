@@ -105,8 +105,7 @@ fn run_event_loop(app: &mut App) -> io::Result<()> {
     // Enable the kitty keyboard protocol so the terminal can distinguish
     // modifier+key combos (e.g. Ctrl+Enter vs bare Enter). Terminals that
     // don't support this silently ignore the escape sequence.
-    let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement()
-        .unwrap_or(false);
+    let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     if keyboard_enhanced {
         execute!(
             stdout,
@@ -370,9 +369,7 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
                 } else if app.command_dialog_active {
                     dismiss_dialog(app);
                 }
-                let _ = tx.send(
-                    crate::engine::workflow::EngineRequest::OpenControlBoard,
-                );
+                let _ = tx.send(crate::engine::workflow::EngineRequest::OpenControlBoard);
             }
         }
         Action::OpenConfigShow => {
@@ -826,7 +823,11 @@ pub fn compute_container_inner_size(term_cols: u16, term_rows: u16) -> (u16, u16
     compute_container_inner_size_with_extra(term_cols, term_rows, 0)
 }
 
-fn compute_container_inner_size_with_extra(term_cols: u16, term_rows: u16, extra_bottom: u16) -> (u16, u16) {
+fn compute_container_inner_size_with_extra(
+    term_cols: u16,
+    term_rows: u16,
+    extra_bottom: u16,
+) -> (u16, u16) {
     let exec_height = term_rows.saturating_sub(8 + extra_bottom); // 3 top + 5 bottom + extras
     let outer_cols = ((term_cols as u32 * 95 / 100) as u16).max(10);
     let outer_rows = ((exec_height as u32 * 95 / 100) as u16).max(5);
@@ -1710,7 +1711,8 @@ mod tests {
         let before = app.active_tab().container_window_state;
         press_key(&mut app, KeyCode::Char('m'), KeyModifiers::CONTROL);
         assert_eq!(
-            app.active_tab().container_window_state, before,
+            app.active_tab().container_window_state,
+            before,
             "Ctrl+M must not cycle container window while a dialog is open"
         );
     }
@@ -2270,9 +2272,7 @@ mod tests {
 
         press_key(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
 
-        let msg = rx
-            .try_recv()
-            .expect("engine tx must receive a message");
+        let msg = rx.try_recv().expect("engine tx must receive a message");
         assert!(
             matches!(msg, EngineRequest::OpenControlBoard),
             "Ctrl+W during a running step must send OpenControlBoard"
@@ -2286,8 +2286,7 @@ mod tests {
         let mut app = make_app();
 
         // Wire up an engine channel so Ctrl-W handler fires.
-        let (engine_tx, _engine_rx) =
-            tokio::sync::mpsc::unbounded_channel::<EngineRequest>();
+        let (engine_tx, _engine_rx) = tokio::sync::mpsc::unbounded_channel::<EngineRequest>();
         *app.active_tab_mut().engine_tx_shared.lock().unwrap() = Some(engine_tx);
 
         // Open a StepConfirm dialog with a response channel.
@@ -2437,7 +2436,7 @@ mod tests {
                     agent: None,
                     model: None,
                     depends_on: vec![],
-                    })
+                })
                 .collect(),
             current_step: None,
         };

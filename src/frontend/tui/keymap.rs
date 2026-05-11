@@ -78,7 +78,9 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
             KeyCode::Char('t') => return Action::OpenNewTabDialog,
             KeyCode::Char('a') if ctx != FocusContext::Dialog => return Action::PreviousTab,
             KeyCode::Char('d') if ctx != FocusContext::Dialog => return Action::NextTab,
-            KeyCode::Char('m') if ctx != FocusContext::Dialog => return Action::CycleContainerWindow,
+            KeyCode::Char('m') if ctx != FocusContext::Dialog => {
+                return Action::CycleContainerWindow
+            }
             KeyCode::Char('w') => return Action::WorkflowControl,
             _ => {}
         }
@@ -304,12 +306,20 @@ mod tests {
             key(KeyCode::Char('d'), KeyModifiers::CONTROL),
             FocusContext::Dialog,
         );
-        assert_ne!(action, Action::NextTab, "Ctrl-D must not switch tabs while a dialog is open");
+        assert_ne!(
+            action,
+            Action::NextTab,
+            "Ctrl-D must not switch tabs while a dialog is open"
+        );
         let action = map_key(
             key(KeyCode::Char('a'), KeyModifiers::CONTROL),
             FocusContext::Dialog,
         );
-        assert_ne!(action, Action::PreviousTab, "Ctrl-A must not switch tabs while a dialog is open");
+        assert_ne!(
+            action,
+            Action::PreviousTab,
+            "Ctrl-A must not switch tabs while a dialog is open"
+        );
     }
 
     #[test]
@@ -318,7 +328,11 @@ mod tests {
             key(KeyCode::Char('m'), KeyModifiers::CONTROL),
             FocusContext::Dialog,
         );
-        assert_ne!(action, Action::CycleContainerWindow, "Ctrl-M must not cycle container window while a dialog is open");
+        assert_ne!(
+            action,
+            Action::CycleContainerWindow,
+            "Ctrl-M must not cycle container window while a dialog is open"
+        );
     }
 
     // ── Command box ───────────────────────────────────────────────────────────

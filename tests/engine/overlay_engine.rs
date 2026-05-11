@@ -163,7 +163,10 @@ fn skill_overlays_empty_for_maki_agent_no_error() {
         engine.skill_overlays(&agent, &None, std::path::Path::new("/"))
     });
 
-    assert!(result.is_ok(), "maki must not produce an error; got {result:?}");
+    assert!(
+        result.is_ok(),
+        "maki must not produce an error; got {result:?}"
+    );
     assert!(result.unwrap().is_empty(), "maki must produce no mount");
 }
 
@@ -216,7 +219,8 @@ fn build_overlays_skills_and_dir_overlay_both_present() {
     let skills_canon = std::fs::canonicalize(&skills).unwrap_or(skills.clone());
 
     let host_dir = tempfile::tempdir().unwrap();
-    let host_canon = std::fs::canonicalize(host_dir.path()).unwrap_or(host_dir.path().to_path_buf());
+    let host_canon =
+        std::fs::canonicalize(host_dir.path()).unwrap_or(host_dir.path().to_path_buf());
 
     let engine = make_engine(tmp.path());
     let session_tmp = tempfile::tempdir().unwrap();

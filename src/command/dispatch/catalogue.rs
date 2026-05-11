@@ -243,8 +243,7 @@ const ROOT: CommandSpec = CommandSpec {
         },
     ],
     subcommands: &[
-        &INIT, &READY, &CHAT, &SPECS, &STATUS, &CONFIG, &EXEC, &HEADLESS,
-        &REMOTE, &NEW,
+        &INIT, &READY, &CHAT, &SPECS, &STATUS, &CONFIG, &EXEC, &HEADLESS, &REMOTE, &NEW,
     ],
 };
 
@@ -1265,15 +1264,7 @@ mod tests {
     fn every_top_level_command_is_present() {
         let cat = CommandCatalogue::get();
         for name in [
-            "init",
-            "ready",
-            "chat",
-            "specs",
-            "status",
-            "config",
-            "exec",
-            "headless",
-            "remote",
+            "init", "ready", "chat", "specs", "status", "config", "exec", "headless", "remote",
             "new",
         ] {
             assert!(cat.lookup(&[name]).is_some(), "missing top-level '{name}'");

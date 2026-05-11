@@ -306,8 +306,16 @@ pub struct ConfigCommand {
 }
 
 impl ConfigCommand {
-    pub fn new(sub: ConfigSubcommand, engines: Engines, session: crate::data::session::Session) -> Self {
-        Self { sub, engines, session }
+    pub fn new(
+        sub: ConfigSubcommand,
+        engines: Engines,
+        session: crate::data::session::Session,
+    ) -> Self {
+        Self {
+            sub,
+            engines,
+            session,
+        }
     }
 
     pub fn subcommand(&self) -> &ConfigSubcommand {
@@ -387,8 +395,11 @@ impl Command for ConfigCommand {
                                 let wd = session.working_dir().to_path_buf();
                                 let gr = session.git_root().to_path_buf();
                                 crate::data::session::Session::open_at_git_root(
-                                    wd, gr, crate::data::session::SessionOpenOptions::default(),
-                                ).map_err(CommandError::from)?
+                                    wd,
+                                    gr,
+                                    crate::data::session::SessionOpenOptions::default(),
+                                )
+                                .map_err(CommandError::from)?
                             };
                         }
                     }
@@ -550,7 +561,6 @@ fn set_config_field(json: &mut serde_json::Value, field: &str, value: serde_json
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

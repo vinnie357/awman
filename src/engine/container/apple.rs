@@ -769,19 +769,16 @@ mod apple_tests {
 
     #[test]
     fn extract_apple_image_repo_only_without_tag() {
-        let row: serde_json::Value = serde_json::from_str(
-            r#"{"configuration": {"image": {"repository": "amux/dev"}}}"#,
-        )
-        .unwrap();
+        let row: serde_json::Value =
+            serde_json::from_str(r#"{"configuration": {"image": {"repository": "amux/dev"}}}"#)
+                .unwrap();
         assert_eq!(extract_apple_image(&row), "amux/dev");
     }
 
     #[test]
     fn extract_apple_image_plain_string() {
-        let row: serde_json::Value = serde_json::from_str(
-            r#"{"configuration": {"image": "amux/dev:latest"}}"#,
-        )
-        .unwrap();
+        let row: serde_json::Value =
+            serde_json::from_str(r#"{"configuration": {"image": "amux/dev:latest"}}"#).unwrap();
         assert_eq!(extract_apple_image(&row), "amux/dev:latest");
     }
 
@@ -796,7 +793,8 @@ mod apple_tests {
 
     #[test]
     fn extract_apple_image_descriptor_annotations() {
-        let row: serde_json::Value = serde_json::from_str(r#"{
+        let row: serde_json::Value = serde_json::from_str(
+            r#"{
             "configuration": {
                 "image": {
                     "descriptor": {
@@ -806,7 +804,9 @@ mod apple_tests {
                     }
                 }
             }
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
         assert_eq!(extract_apple_image(&row), "amux-amux-claude:latest");
     }
 

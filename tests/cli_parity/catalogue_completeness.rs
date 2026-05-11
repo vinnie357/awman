@@ -15,16 +15,7 @@ fn cat() -> &'static CommandCatalogue {
 fn all_documented_top_level_commands_present() {
     let names: Vec<&str> = cat().root().subcommands.iter().map(|s| s.name).collect();
     for expected in &[
-        "init",
-        "ready",
-        "chat",
-        "specs",
-        "status",
-        "config",
-        "exec",
-        "headless",
-        "remote",
-        "new",
+        "init", "ready", "chat", "specs", "status", "config", "exec", "headless", "remote", "new",
     ] {
         assert!(
             names.contains(expected),
@@ -137,4 +128,3 @@ fn config_get_has_field_argument() {
     let cmd = cat().lookup(&["config", "get"]).unwrap();
     assert!(!cmd.arguments.is_empty());
 }
-

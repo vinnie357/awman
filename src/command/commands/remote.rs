@@ -133,8 +133,16 @@ pub struct RemoteCommand {
 }
 
 impl RemoteCommand {
-    pub fn new(sub: RemoteSubcommand, engines: Engines, session: crate::data::session::Session) -> Self {
-        Self { sub, engines, session }
+    pub fn new(
+        sub: RemoteSubcommand,
+        engines: Engines,
+        session: crate::data::session::Session,
+    ) -> Self {
+        Self {
+            sub,
+            engines,
+            session,
+        }
     }
 
     pub fn subcommand(&self) -> &RemoteSubcommand {

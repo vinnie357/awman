@@ -119,7 +119,9 @@ impl InitEngine {
                             Err(e) => {
                                 frontend.write_message(crate::engine::message::UserMessage {
                                     level: crate::engine::message::MessageLevel::Warning,
-                                    text: format!("aspec download failed: {e}; using empty aspec directory"),
+                                    text: format!(
+                                        "aspec download failed: {e}; using empty aspec directory"
+                                    ),
                                 });
                             }
                         }

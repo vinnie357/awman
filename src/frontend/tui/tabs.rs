@@ -122,14 +122,12 @@ pub type SharedResizeTx = Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<(u
 /// Shared engine sender. The engine creates the channel and publishes
 /// the sender via `set_engine_sender`; the TUI event loop reads it
 /// to send Ctrl-W, StepStuck, and StepUnstuck requests.
-pub type SharedEngineTx = Arc<
-    Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::engine::workflow::EngineRequest>>>,
->;
+pub type SharedEngineTx =
+    Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::engine::workflow::EngineRequest>>>>;
 
 /// Shared TUI context for the status command. The event loop refreshes this
 /// on every tick so the status watch loop always sees live tab data.
-pub type SharedTuiContext =
-    Arc<Mutex<crate::command::commands::status::StatusCommandTuiContext>>;
+pub type SharedTuiContext = Arc<Mutex<crate::command::commands::status::StatusCommandTuiContext>>;
 
 #[derive(Debug, Clone)]
 pub struct YoloState {

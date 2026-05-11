@@ -80,7 +80,11 @@ pub struct ExecPromptCommand {
 
 impl ExecPromptCommand {
     pub fn new(flags: ExecPromptCommandFlags, engines: Engines, session: Session) -> Self {
-        Self { flags, engines, session }
+        Self {
+            flags,
+            engines,
+            session,
+        }
     }
 
     pub fn flags(&self) -> &ExecPromptCommandFlags {

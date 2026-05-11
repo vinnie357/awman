@@ -48,8 +48,16 @@ pub struct AuthCommand {
 }
 
 impl AuthCommand {
-    pub fn new(flags: AuthCommandFlags, engines: Engines, session: crate::data::session::Session) -> Self {
-        Self { flags, engines, session }
+    pub fn new(
+        flags: AuthCommandFlags,
+        engines: Engines,
+        session: crate::data::session::Session,
+    ) -> Self {
+        Self {
+            flags,
+            engines,
+            session,
+        }
     }
 
     pub fn flags(&self) -> &AuthCommandFlags {

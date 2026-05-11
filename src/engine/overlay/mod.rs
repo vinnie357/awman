@@ -119,7 +119,9 @@ impl OverlayEngine {
         // 2. Agent settings overlays. Forward the yolo flag so Claude's
         //    settings sanitization can inject the bypass-permissions overlay.
         if let Some(agent) = &request.agent {
-            for spec in self.agent_settings_overlays_with(agent, request.yolo, session.git_root())? {
+            for spec in
+                self.agent_settings_overlays_with(agent, request.yolo, session.git_root())?
+            {
                 let key = OverlayPathResolver::conflict_key(&spec.host_path);
                 insert_or_merge(&mut by_key, key, spec);
             }
@@ -128,7 +130,9 @@ impl OverlayEngine {
         // 3. Skills overlay (mount ~/.amux/skills/ read-only into agent's native path).
         if request.include_skills {
             if let Some(agent) = &request.agent {
-                for spec in self.skill_overlays(agent, &request.container_home, session.git_root())? {
+                for spec in
+                    self.skill_overlays(agent, &request.container_home, session.git_root())?
+                {
                     let key = OverlayPathResolver::conflict_key(&spec.host_path);
                     insert_or_merge(&mut by_key, key, spec);
                 }
@@ -185,9 +189,8 @@ impl OverlayEngine {
         let home = self.auth_resolver.home();
         let paths = self.auth_resolver.resolve(agent.as_str());
         let mut out = Vec::new();
-        let container_home =
-            detect_container_home(home, agent.as_str(), git_root)
-                .unwrap_or_else(|| "/root".to_string());
+        let container_home = detect_container_home(home, agent.as_str(), git_root)
+            .unwrap_or_else(|| "/root".to_string());
 
         match agent.as_str() {
             "claude" => {
@@ -334,8 +337,8 @@ impl OverlayEngine {
         container_home_override: &Option<String>,
         git_root: &Path,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
-        let skill_dirs =
-            crate::data::fs::skill_dirs::SkillDirs::from_process_env(None).map_err(EngineError::Data)?;
+        let skill_dirs = crate::data::fs::skill_dirs::SkillDirs::from_process_env(None)
+            .map_err(EngineError::Data)?;
         let host_skills_dir = skill_dirs.global_dir();
         if !host_skills_dir.exists() {
             tracing::debug!(
@@ -346,12 +349,10 @@ impl OverlayEngine {
         }
 
         let home = self.auth_resolver.home();
-        let container_home = container_home_override
-            .clone()
-            .unwrap_or_else(|| {
-                detect_container_home(home, agent.as_str(), git_root)
-                    .unwrap_or_else(|| "/root".to_string())
-            });
+        let container_home = container_home_override.clone().unwrap_or_else(|| {
+            detect_container_home(home, agent.as_str(), git_root)
+                .unwrap_or_else(|| "/root".to_string())
+        });
 
         let container_path = match agent.as_str() {
             "claude" => format!("{container_home}/.claude/commands"),
@@ -369,10 +370,7 @@ impl OverlayEngine {
                 return Ok(vec![]);
             }
             other => {
-                tracing::warn!(
-                    agent = other,
-                    "skills overlay: unknown agent, skipping"
-                );
+                tracing::warn!(agent = other, "skills overlay: unknown agent, skipping");
                 return Ok(vec![]);
             }
         };
@@ -657,14 +655,27 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
 
-        let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
+        let specs = with_amux_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, &None, Path::new("/"))
+                .unwrap()
+        });
 
         assert_eq!(specs.len(), 1, "expected 1 OverlaySpec; got {specs:?}");
-        assert_eq!(specs[0].host_path, skills_canon, "host path must be global skills dir");
-        assert_eq!(specs[0].permission, OverlayPermission::ReadOnly, "must be :ro");
+        assert_eq!(
+            specs[0].host_path, skills_canon,
+            "host path must be global skills dir"
+        );
+        assert_eq!(
+            specs[0].permission,
+            OverlayPermission::ReadOnly,
+            "must be :ro"
+        );
         assert!(
-            specs[0].container_path.to_string_lossy().contains("/.claude/commands"),
+            specs[0]
+                .container_path
+                .to_string_lossy()
+                .contains("/.claude/commands"),
             "claude container path must contain /.claude/commands; got {:?}",
             specs[0].container_path
         );
@@ -676,14 +687,20 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("codex").unwrap();
 
-        let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
+        let specs = with_amux_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, &None, Path::new("/"))
+                .unwrap()
+        });
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].host_path, skills_canon);
         assert_eq!(specs[0].permission, OverlayPermission::ReadOnly);
         assert!(
-            specs[0].container_path.to_string_lossy().contains("/.codex/skills"),
+            specs[0]
+                .container_path
+                .to_string_lossy()
+                .contains("/.codex/skills"),
             "codex container path must contain /.codex/skills; got {:?}",
             specs[0].container_path
         );
@@ -695,14 +712,20 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("gemini").unwrap();
 
-        let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
+        let specs = with_amux_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, &None, Path::new("/"))
+                .unwrap()
+        });
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].host_path, skills_canon);
         assert_eq!(specs[0].permission, OverlayPermission::ReadOnly);
         assert!(
-            specs[0].container_path.to_string_lossy().contains("/.gemini/commands"),
+            specs[0]
+                .container_path
+                .to_string_lossy()
+                .contains("/.gemini/commands"),
             "gemini container path must contain /.gemini/commands; got {:?}",
             specs[0].container_path
         );
@@ -714,8 +737,11 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("opencode").unwrap();
 
-        let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
+        let specs = with_amux_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, &None, Path::new("/"))
+                .unwrap()
+        });
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].host_path, skills_canon);
@@ -736,8 +762,11 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("copilot").unwrap();
 
-        let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
+        let specs = with_amux_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, &None, Path::new("/"))
+                .unwrap()
+        });
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].host_path, skills_canon);
@@ -758,8 +787,11 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("crush").unwrap();
 
-        let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
+        let specs = with_amux_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, &None, Path::new("/"))
+                .unwrap()
+        });
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].host_path, skills_canon);
@@ -780,14 +812,20 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("cline").unwrap();
 
-        let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
+        let specs = with_amux_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, &None, Path::new("/"))
+                .unwrap()
+        });
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].host_path, skills_canon);
         assert_eq!(specs[0].permission, OverlayPermission::ReadOnly);
         assert!(
-            specs[0].container_path.to_string_lossy().contains("/.cline/skills"),
+            specs[0]
+                .container_path
+                .to_string_lossy()
+                .contains("/.cline/skills"),
             "cline container path must contain /.cline/skills; got {:?}",
             specs[0].container_path
         );
@@ -800,8 +838,11 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
 
-        let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
+        let specs = with_amux_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, &None, Path::new("/"))
+                .unwrap()
+        });
 
         assert!(
             specs.is_empty(),
@@ -815,8 +856,11 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("maki").unwrap();
 
-        let specs =
-            with_amux_config_home(tmp.path(), || engine.skill_overlays(&agent, &None, Path::new("/")).unwrap());
+        let specs = with_amux_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, &None, Path::new("/"))
+                .unwrap()
+        });
 
         assert!(
             specs.is_empty(),
@@ -832,7 +876,9 @@ mod tests {
         let override_home = Some("/home/appuser".to_string());
 
         let specs = with_amux_config_home(tmp.path(), || {
-            engine.skill_overlays(&agent, &override_home, Path::new("/")).unwrap()
+            engine
+                .skill_overlays(&agent, &override_home, Path::new("/"))
+                .unwrap()
         });
 
         assert_eq!(specs.len(), 1);
@@ -853,9 +899,7 @@ mod tests {
         let agent = AgentName::new("claude").unwrap();
 
         let specs = with_amux_config_home(tmp.path(), || {
-            engine
-                .skill_overlays(&agent, &None, tmp.path())
-                .unwrap()
+            engine.skill_overlays(&agent, &None, tmp.path()).unwrap()
         });
 
         assert_eq!(specs.len(), 1);
@@ -989,9 +1033,7 @@ mod tests {
         .unwrap();
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
-        let overlays = engine
-            .agent_settings_overlays(&agent, tmp.path())
-            .unwrap();
+        let overlays = engine.agent_settings_overlays(&agent, tmp.path()).unwrap();
         // One overlay for the config file.
         let config_overlay = overlays
             .iter()
@@ -1020,9 +1062,7 @@ mod tests {
         std::fs::write(&config_file, r#"{"model":"claude-sonnet-4-6"}"#).unwrap();
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
-        let overlays = engine
-            .agent_settings_overlays(&agent, tmp.path())
-            .unwrap();
+        let overlays = engine.agent_settings_overlays(&agent, tmp.path()).unwrap();
         let config_overlay = overlays
             .iter()
             .find(|o| {
@@ -1052,9 +1092,7 @@ mod tests {
 
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
-        let overlays = engine
-            .agent_settings_overlays(&agent, tmp.path())
-            .unwrap();
+        let overlays = engine.agent_settings_overlays(&agent, tmp.path()).unwrap();
         let dir_overlay = overlays
             .iter()
             .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))
@@ -1079,9 +1117,7 @@ mod tests {
 
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
-        let overlays = engine
-            .agent_settings_overlays(&agent, tmp.path())
-            .unwrap();
+        let overlays = engine.agent_settings_overlays(&agent, tmp.path()).unwrap();
         let dir_overlay = overlays
             .iter()
             .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))

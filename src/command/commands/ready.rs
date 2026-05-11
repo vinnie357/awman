@@ -136,8 +136,16 @@ pub struct ReadyCommand {
 }
 
 impl ReadyCommand {
-    pub fn new(flags: ReadyCommandFlags, engines: Engines, session: crate::data::session::Session) -> Self {
-        Self { flags, engines, session }
+    pub fn new(
+        flags: ReadyCommandFlags,
+        engines: Engines,
+        session: crate::data::session::Session,
+    ) -> Self {
+        Self {
+            flags,
+            engines,
+            session,
+        }
     }
 
     pub fn flags(&self) -> &ReadyCommandFlags {
@@ -235,4 +243,3 @@ impl Command for ReadyCommand {
         Ok(outcome)
     }
 }
-

@@ -16,10 +16,10 @@ pub mod download;
 pub mod exec_prompt;
 pub mod exec_workflow;
 pub mod headless;
-pub mod prompt_templates;
 pub mod init;
 pub mod mount_scope;
 pub mod new;
+pub mod prompt_templates;
 pub mod ready;
 pub mod remote;
 pub(super) mod remote_client;
@@ -410,8 +410,7 @@ mod collect_overlay_specs_tests {
     #[test]
     fn skills_enabled_when_cli_typed_overlays_contains_skill() {
         let tmp = tempfile::tempdir().unwrap();
-        let env =
-            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![TypedOverlay::Skill]);
@@ -424,12 +423,14 @@ mod collect_overlay_specs_tests {
     #[test]
     fn skills_disabled_when_no_source_enables_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let env =
-            EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AMUX_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let (_, skills_enabled) = collect_all_overlay_specs(&session, vec![]);
-        assert!(!skills_enabled, "skills must be disabled when no source sets it");
+        assert!(
+            !skills_enabled,
+            "skills must be disabled when no source sets it"
+        );
     }
 
     #[test]

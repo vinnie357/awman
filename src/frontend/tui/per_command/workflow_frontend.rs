@@ -190,10 +190,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
         }
     }
 
-    fn report_workflow_progress(
-        &mut self,
-        steps: &[WorkflowStepProgressInfo],
-    ) {
+    fn report_workflow_progress(&mut self, steps: &[WorkflowStepProgressInfo]) {
         if let Ok(mut guard) = self.workflow_view.lock() {
             let view =
                 guard.get_or_insert_with(crate::frontend::tui::tabs::WorkflowViewState::default);
@@ -283,10 +280,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
         })
     }
 
-    fn set_engine_sender(
-        &mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>,
-    ) {
+    fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
         if let Ok(mut guard) = self.engine_tx_shared.lock() {
             *guard = Some(tx);
         }

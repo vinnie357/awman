@@ -123,12 +123,7 @@ fn skill_with_args_flag_exits_nonzero_with_descriptive_error() {
     // Use `chat --non-interactive` which accepts --overlay without a required positional arg.
     let out = Command::new(amux_bin())
         .current_dir(repo.path())
-        .args([
-            "chat",
-            "--non-interactive",
-            "--overlay",
-            "skill(something)",
-        ])
+        .args(["chat", "--non-interactive", "--overlay", "skill(something)"])
         .output()
         .expect("failed to run amux");
 

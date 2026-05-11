@@ -398,7 +398,7 @@ fn render_status_dashboard(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD)
                 };
-                let indicator = if c.stuck { "\u{25cf}" } else { "\u{25cf}" };
+                let indicator = "\u{25cf}";
 
                 let cpu = c
                     .cpu_percent
@@ -943,12 +943,14 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             editor,
         } => {
             let dialog_area = dialogs::centered_rect(70, 60, area);
-            let inner =
-                dialogs::render_dialog_frame(title, Color::Cyan, dialog_area, frame);
+            let inner = dialogs::render_dialog_frame(title, Color::Cyan, dialog_area, frame);
 
             // Layout: prompt lines, 1-row gap, bordered textarea, 1-row gap, hint.
             let prompt_lines = prompt.lines().count() as u16;
-            let prompt_area = Rect { height: prompt_lines, ..inner };
+            let prompt_area = Rect {
+                height: prompt_lines,
+                ..inner
+            };
             frame.render_widget(
                 Paragraph::new(prompt.as_str()).style(Style::default().fg(Color::Gray)),
                 prompt_area,
@@ -957,7 +959,8 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
             // Textarea with a visible border.
             let textarea_y = inner.y + prompt_lines + 1;
             let hint_reserve: u16 = 2; // 1-row gap + 1-row hint
-            let textarea_h = inner.height
+            let textarea_h = inner
+                .height
                 .saturating_sub(prompt_lines + 1 + hint_reserve)
                 .max(3);
             let textarea_area = Rect {
@@ -1059,7 +1062,8 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
 
             // Place the cursor at the correct visual position.
             let display_row = cursor_visual_row.saturating_sub(scroll_offset);
-            let cx = textarea_inner.x + (cursor_visual_col as u16).min(textarea_inner.width.saturating_sub(1));
+            let cx = textarea_inner.x
+                + (cursor_visual_col as u16).min(textarea_inner.width.saturating_sub(1));
             let cy = textarea_inner.y + display_row as u16;
             if cx < textarea_inner.x + textarea_inner.width
                 && cy < textarea_inner.y + textarea_inner.height
@@ -1184,8 +1188,7 @@ fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Frame) {
                 .max(step_w)
                 .max(56)
                 .min(area.width.saturating_sub(4));
-            let dialog_area =
-                dialogs::centered_fixed(width, base_height + extra_reasons, area);
+            let dialog_area = dialogs::centered_fixed(width, base_height + extra_reasons, area);
             let title = if state.can_dismiss {
                 "Workflow Control (step running)"
             } else {

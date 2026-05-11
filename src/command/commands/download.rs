@@ -66,7 +66,11 @@ pub struct DownloadCommand {
 
 impl DownloadCommand {
     pub fn new(asset: String, engines: Engines, session: crate::data::session::Session) -> Self {
-        Self { asset, engines, session }
+        Self {
+            asset,
+            engines,
+            session,
+        }
     }
 }
 
@@ -131,8 +135,10 @@ impl Command for DownloadCommand {
                 }
             }
             DownloadAsset::AgentDockerfile { agent } => {
-                let dest = RepoDockerfilePaths::new(self.session.git_root()).agent_dockerfile(&agent);
-                let project_tag = crate::data::image_tags::project_image_tag(self.session.git_root());
+                let dest =
+                    RepoDockerfilePaths::new(self.session.git_root()).agent_dockerfile(&agent);
+                let project_tag =
+                    crate::data::image_tags::project_image_tag(self.session.git_root());
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Info,
                     text: format!("download: fetching agent image for '{agent}'…"),

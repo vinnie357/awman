@@ -175,7 +175,6 @@ fn render_exec_workflow(o: &ExecWorkflowOutcome) -> Option<String> {
     Some(format!("Workflow {} completed{exit}{wt}.", o.workflow))
 }
 
-
 // ─── init / ready ────────────────────────────────────────────────────────────
 //
 // These engines emit their summary box via `report_summary` (replayed to
@@ -811,7 +810,6 @@ mod tests {
         let s = render_specs_amend(&o);
         assert!(s.contains("0042"), "work item number must appear: {s}");
     }
-
 
     // ── render_exec_workflow ──────────────────────────────────────────────────
 

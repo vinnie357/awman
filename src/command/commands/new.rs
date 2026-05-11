@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::command::commands::chat::resolve_agent;
-use crate::data::session::Session;
 use crate::command::commands::prompt_templates::{
     render_skill_interview_prompt, render_workflow_interview_prompt,
 };
@@ -12,6 +11,7 @@ use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::fs::{SkillDirs, WorkflowDirs};
+use crate::data::session::Session;
 use crate::engine::agent::AgentRunOptions;
 use crate::engine::container::options::ContainerOption;
 use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -212,7 +212,11 @@ pub struct NewCommand {
 
 impl NewCommand {
     pub fn new(sub: NewSubcommand, engines: Engines, session: Session) -> Self {
-        Self { sub, engines, session }
+        Self {
+            sub,
+            engines,
+            session,
+        }
     }
 
     pub fn subcommand(&self) -> &NewSubcommand {
@@ -412,8 +416,14 @@ impl Command for NewCommand {
                 } else {
                     // Non-interview: collect title and steps from the user,
                     // then serialize the complete workflow to disk.
-                    let title = frontend.ask_workflow_title().unwrap_or_else(|_| name.clone());
-                    let title = if title.is_empty() { name.clone() } else { title };
+                    let title = frontend
+                        .ask_workflow_title()
+                        .unwrap_or_else(|_| name.clone());
+                    let title = if title.is_empty() {
+                        name.clone()
+                    } else {
+                        title
+                    };
 
                     let mut steps: Vec<WorkflowStepInput> = Vec::new();
                     loop {
@@ -727,7 +737,9 @@ mod tests {
         fn ask_workflow_title(&mut self) -> Result<String, crate::command::error::CommandError> {
             Ok(self.workflow_title.clone())
         }
-        fn ask_workflow_step_name(&mut self) -> Result<String, crate::command::error::CommandError> {
+        fn ask_workflow_step_name(
+            &mut self,
+        ) -> Result<String, crate::command::error::CommandError> {
             let idx = self.step_index.load(std::sync::atomic::Ordering::Relaxed);
             if idx < self.steps.len() {
                 Ok(self.steps[idx].name.clone())
@@ -766,7 +778,10 @@ mod tests {
             }
         }
         fn ask_add_another_step(&mut self) -> Result<bool, crate::command::error::CommandError> {
-            let idx = self.step_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let idx = self
+                .step_index
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
             Ok(idx < self.steps.len())
         }
         fn ask_skill_name(&mut self) -> Result<String, crate::command::error::CommandError> {
@@ -888,7 +903,8 @@ mod tests {
             engines,
             session,
         );
-        let outcome = cmd.run_with_frontend(Box::new(FakeNewFrontend::new("my-wf", "skill", "")))
+        let outcome = cmd
+            .run_with_frontend(Box::new(FakeNewFrontend::new("my-wf", "skill", "")))
             .await
             .unwrap();
         if let NewOutcome::Workflow(w) = outcome {
@@ -930,7 +946,8 @@ mod tests {
             engines,
             session,
         );
-        let outcome = cmd.run_with_frontend(Box::new(FakeNewFrontend::new("my-wf", "skill", "")))
+        let outcome = cmd
+            .run_with_frontend(Box::new(FakeNewFrontend::new("my-wf", "skill", "")))
             .await
             .unwrap();
         if let NewOutcome::Workflow(w) = outcome {
@@ -967,13 +984,14 @@ mod tests {
             engines,
             session,
         );
-        let outcome = cmd.run_with_frontend(Box::new(FakeNewFrontend::new(
-            "wf",
-            "my-skill",
-            "Do something useful.",
-        )))
-        .await
-        .unwrap();
+        let outcome = cmd
+            .run_with_frontend(Box::new(FakeNewFrontend::new(
+                "wf",
+                "my-skill",
+                "Do something useful.",
+            )))
+            .await
+            .unwrap();
         if let NewOutcome::Skill(s) = outcome {
             let path_str = s.path.expect("path must be Some");
             let path = std::path::Path::new(&path_str);
@@ -1010,7 +1028,8 @@ mod tests {
             engines,
             session,
         );
-        let outcome = cmd.run_with_frontend(Box::new(FakeNewFrontend::new("wf", "my-skill", "")))
+        let outcome = cmd
+            .run_with_frontend(Box::new(FakeNewFrontend::new("wf", "my-skill", "")))
             .await
             .unwrap();
         if let NewOutcome::Skill(s) = outcome {

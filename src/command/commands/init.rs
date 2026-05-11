@@ -58,8 +58,16 @@ pub struct InitCommand {
 }
 
 impl InitCommand {
-    pub fn new(flags: InitCommandFlags, engines: Engines, session: crate::data::session::Session) -> Self {
-        Self { flags, engines, session }
+    pub fn new(
+        flags: InitCommandFlags,
+        engines: Engines,
+        session: crate::data::session::Session,
+    ) -> Self {
+        Self {
+            flags,
+            engines,
+            session,
+        }
     }
 
     pub fn flags(&self) -> &InitCommandFlags {
@@ -140,4 +148,3 @@ impl Command for InitCommand {
         })
     }
 }
-

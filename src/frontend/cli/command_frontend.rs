@@ -828,7 +828,14 @@ mod tests {
             .unwrap();
         let frontend = CliFrontend::new(m);
         let v = frontend.arguments(&["remote", "run"], "command").unwrap();
-        assert_eq!(v, vec!["exec".to_string(), "prompt".to_string(), "hello".to_string()]);
+        assert_eq!(
+            v,
+            vec![
+                "exec".to_string(),
+                "prompt".to_string(),
+                "hello".to_string()
+            ]
+        );
     }
 
     #[test]

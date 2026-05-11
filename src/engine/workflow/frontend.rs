@@ -90,9 +90,5 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// Called by the engine after creating its EngineRequest channel.
     /// The frontend stores the sender so the TUI event loop can route
     /// Ctrl-W and stuck notifications to this specific engine instance.
-    fn set_engine_sender(
-        &mut self,
-        _tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>,
-    ) {
-    }
+    fn set_engine_sender(&mut self, _tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {}
 }

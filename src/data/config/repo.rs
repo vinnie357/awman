@@ -401,7 +401,10 @@ mod tests {
         let json = r#"{"overlays": {"directories": [{"host": "/h", "container": "/c", "permission": "ro"}]}}"#;
         let cfg: RepoConfig = serde_json::from_str(json).unwrap();
         let overlays = cfg.overlays.expect("overlays must be present");
-        assert!(overlays.skills.is_none(), "skills must be None when not in JSON");
+        assert!(
+            overlays.skills.is_none(),
+            "skills must be None when not in JSON"
+        );
         assert_eq!(
             overlays.directories.as_ref().map(|d| d.len()),
             Some(1),

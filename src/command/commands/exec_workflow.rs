@@ -101,7 +101,11 @@ pub struct ExecWorkflowCommand {
 
 impl ExecWorkflowCommand {
     pub fn new(flags: ExecWorkflowCommandFlags, engines: Engines, session: Session) -> Self {
-        Self { flags, engines, session }
+        Self {
+            flags,
+            engines,
+            session,
+        }
     }
 
     pub fn flags(&self) -> &ExecWorkflowCommandFlags {
@@ -203,10 +207,7 @@ impl WorkflowFrontend for WorkflowProxy {
             .user_choose_after_step_failure(step, exit)
     }
 
-    fn set_engine_sender(
-        &mut self,
-        tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>,
-    ) {
+    fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
         self.0.lock().unwrap().set_engine_sender(tx);
     }
 }
@@ -672,7 +673,9 @@ impl Command for ExecWorkflowCommand {
                     let err = CommandError::from(e);
                     shared.lock().unwrap().write_message(UserMessage {
                         level: MessageLevel::Error,
-                        text: format!("exec workflow: failed to resolve git root for worktree session: {err}"),
+                        text: format!(
+                            "exec workflow: failed to resolve git root for worktree session: {err}"
+                        ),
                     });
                     return Err(err);
                 }

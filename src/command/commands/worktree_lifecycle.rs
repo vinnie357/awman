@@ -671,8 +671,12 @@ mod tests {
         // Make the main branch dirty AFTER the worktree already exists.
         std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
 
-        let lifecycle =
-            WorktreeLifecycle::new_for_test(engine, git_root.clone(), wt_path.clone(), branch.to_string());
+        let lifecycle = WorktreeLifecycle::new_for_test(
+            engine,
+            git_root.clone(),
+            wt_path.clone(),
+            branch.to_string(),
+        );
         let mut fe = RecordingWorktreeLifecycleFrontend::new();
         fe.existing_worktree_response = ExistingWorktreeDecision::Recreate;
         fe.pre_uncommitted_response = PreWorktreeDecision::Commit {
@@ -680,9 +684,16 @@ mod tests {
         };
         let before = git_log_count(&git_root);
         let result = lifecycle.prepare(&mut fe).await;
-        assert!(result.is_ok(), "prepare(Recreate+dirty) must succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "prepare(Recreate+dirty) must succeed: {result:?}"
+        );
         let after = git_log_count(&git_root);
-        assert_eq!(after, before + 1, "dirty files must be committed before recreating worktree");
+        assert_eq!(
+            after,
+            before + 1,
+            "dirty files must be committed before recreating worktree"
+        );
         assert!(wt_path.exists(), "worktree must exist after Recreate");
         assert_eq!(fe.worktree_created_calls.len(), 1);
     }

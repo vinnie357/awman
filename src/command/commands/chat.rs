@@ -54,7 +54,11 @@ pub struct ChatCommand {
 
 impl ChatCommand {
     pub fn new(flags: ChatCommandFlags, engines: Engines, session: Session) -> Self {
-        Self { flags, engines, session }
+        Self {
+            flags,
+            engines,
+            session,
+        }
     }
 
     pub fn flags(&self) -> &ChatCommandFlags {
@@ -293,14 +297,18 @@ pub(crate) fn resolve_agent(
     AgentName::new("claude").map_err(CommandError::from)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn make_session(root: &std::path::Path) -> Session {
         let resolver = crate::data::session::StaticGitRootResolver::new(root);
-        Session::open(root.to_path_buf(), &resolver, crate::data::session::SessionOpenOptions::default()).unwrap()
+        Session::open(
+            root.to_path_buf(),
+            &resolver,
+            crate::data::session::SessionOpenOptions::default(),
+        )
+        .unwrap()
     }
 
     #[test]

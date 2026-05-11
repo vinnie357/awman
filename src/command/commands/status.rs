@@ -363,5 +363,4 @@ mod tests {
         assert_eq!(classify_container("amux-123-456"), ContainerKind::Agent);
         assert_eq!(classify_container("amux-abc"), ContainerKind::Agent);
     }
-
 }

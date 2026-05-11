@@ -90,12 +90,8 @@ pub fn render_workflow_strip(
                 .as_ref()
                 .map(|c| c == &step.name)
                 .unwrap_or(false);
-            let (label, style) = step_box_label_and_style(
-                &step.name,
-                &step.status,
-                is_current,
-                box_w,
-            );
+            let (label, style) =
+                step_box_label_and_style(&step.name, &step.status, is_current, box_w);
 
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -382,8 +378,7 @@ mod tests {
 
     #[test]
     fn step_box_label_truncates_long_name() {
-        let (label, _) =
-            step_box_label_and_style("very-long-step-name", "pending", false, 12);
+        let (label, _) = step_box_label_and_style("very-long-step-name", "pending", false, 12);
         assert!(label.contains('\u{2026}'));
     }
 }

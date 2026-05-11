@@ -357,11 +357,15 @@ impl App {
             // container overlay dimensions. The overlay size varies with
             // workflow strip height and other dynamic chrome; the initial
             // `compute_container_inner_size` estimate may not match.
-            if tab.container_window_state != crate::frontend::tui::tabs::ContainerWindowState::Hidden {
+            if tab.container_window_state
+                != crate::frontend::tui::tabs::ContainerWindowState::Hidden
+            {
                 if let Some(inner) = tab.container_inner_area {
                     let (vt_rows, vt_cols) = tab.vt100_parser.screen().size();
                     if vt_cols != inner.width || vt_rows != inner.height {
-                        tab.vt100_parser.screen_mut().set_size(inner.height, inner.width);
+                        tab.vt100_parser
+                            .screen_mut()
+                            .set_size(inner.height, inner.width);
                         if let Some(ref tx) = tab.container_resize_tx {
                             let _ = tx.send((inner.width, inner.height));
                         }

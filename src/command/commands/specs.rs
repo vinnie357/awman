@@ -6,8 +6,8 @@ use serde::Serialize;
 use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::chat::resolve_agent;
-use crate::command::commands::prompt_templates::{render_amend_prompt, render_interview_prompt};
 use crate::command::commands::mount_scope::MountScopeFrontend;
+use crate::command::commands::prompt_templates::{render_amend_prompt, render_interview_prompt};
 use crate::command::commands::Command;
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
@@ -146,8 +146,16 @@ pub struct SpecsCommand {
 }
 
 impl SpecsCommand {
-    pub fn new(sub: SpecsSubcommand, engines: Engines, session: crate::data::session::Session) -> Self {
-        Self { sub, engines, session }
+    pub fn new(
+        sub: SpecsSubcommand,
+        engines: Engines,
+        session: crate::data::session::Session,
+    ) -> Self {
+        Self {
+            sub,
+            engines,
+            session,
+        }
     }
 
     pub fn subcommand(&self) -> &SpecsSubcommand {
@@ -668,7 +676,6 @@ mod tests {
         )
         .unwrap()
     }
-
 
     #[tokio::test]
     async fn specs_amend_locates_file_then_invokes_agent() {

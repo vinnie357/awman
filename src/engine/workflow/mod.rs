@@ -116,22 +116,25 @@ pub struct WorkflowEngine {
 
 impl WorkflowEngine {
     fn msg_info(&mut self, text: impl Into<String>) {
-        self.frontend.write_message(crate::engine::message::UserMessage {
-            level: crate::engine::message::MessageLevel::Info,
-            text: text.into(),
-        });
+        self.frontend
+            .write_message(crate::engine::message::UserMessage {
+                level: crate::engine::message::MessageLevel::Info,
+                text: text.into(),
+            });
     }
     fn msg_warning(&mut self, text: impl Into<String>) {
-        self.frontend.write_message(crate::engine::message::UserMessage {
-            level: crate::engine::message::MessageLevel::Warning,
-            text: text.into(),
-        });
+        self.frontend
+            .write_message(crate::engine::message::UserMessage {
+                level: crate::engine::message::MessageLevel::Warning,
+                text: text.into(),
+            });
     }
     fn msg_success(&mut self, text: impl Into<String>) {
-        self.frontend.write_message(crate::engine::message::UserMessage {
-            level: crate::engine::message::MessageLevel::Success,
-            text: text.into(),
-        });
+        self.frontend
+            .write_message(crate::engine::message::UserMessage {
+                level: crate::engine::message::MessageLevel::Success,
+                text: text.into(),
+            });
     }
 
     pub fn new(
@@ -326,10 +329,7 @@ impl WorkflowEngine {
                     .user_choose_after_step_failure(&step, &exit_info)?;
                 match choice {
                     StepFailureChoice::Retry => {
-                        self.msg_info(format!(
-                            "Retrying step '{}'",
-                            outcome.step_name,
-                        ));
+                        self.msg_info(format!("Retrying step '{}'", outcome.step_name,));
                         self.state
                             .set_status(&outcome.step_name, StepState::Pending);
                         self.persist()?;
@@ -838,16 +838,16 @@ impl WorkflowEngine {
                 total - elapsed
             };
 
-            match self.frontend.yolo_countdown_tick(step_name, remaining, total)? {
+            match self
+                .frontend
+                .yolo_countdown_tick(step_name, remaining, total)?
+            {
                 YoloTickOutcome::AdvanceNow => {
                     self.frontend.yolo_countdown_finished(step_name);
                     return Ok(MidStepYoloResult::Advanced);
                 }
                 YoloTickOutcome::Cancel => {
-                    self.msg_info(format!(
-                        "Yolo countdown cancelled for step '{}'",
-                        step_name,
-                    ));
+                    self.msg_info(format!("Yolo countdown cancelled for step '{}'", step_name,));
                     self.frontend.yolo_countdown_finished(step_name);
                     return Ok(MidStepYoloResult::Cancelled);
                 }
@@ -953,16 +953,10 @@ impl WorkflowEngine {
             self.state.set_status(name, StepState::Skipped);
         }
         if !skipped.is_empty() {
-            self.msg_info(format!(
-                "Skipping remaining steps: {}",
-                skipped.join(", "),
-            ));
+            self.msg_info(format!("Skipping remaining steps: {}", skipped.join(", "),));
         }
         self.persist()?;
-        self.msg_success(format!(
-            "Workflow '{}' completed",
-            self.state.workflow_name,
-        ));
+        self.msg_success(format!("Workflow '{}' completed", self.state.workflow_name,));
         let outcome = WorkflowOutcome::Completed;
         self.frontend.report_workflow_completed(&outcome);
         Ok(outcome)
@@ -982,10 +976,7 @@ impl WorkflowEngine {
     }
 
     fn log_wcb_action(&mut self, action: &NextAction) {
-        let step = self
-            .current_step_name
-            .as_deref()
-            .unwrap_or("unknown");
+        let step = self.current_step_name.as_deref().unwrap_or("unknown");
         match action {
             NextAction::Dismiss => {}
             NextAction::LaunchNext => {
@@ -1001,10 +992,7 @@ impl WorkflowEngine {
                 self.msg_info(format!("Restarting step '{}'", step));
             }
             NextAction::CancelToPreviousStep => {
-                self.msg_info(format!(
-                    "Cancelling step '{}', returning to previous",
-                    step,
-                ));
+                self.msg_info(format!("Cancelling step '{}', returning to previous", step,));
             }
             NextAction::FinishWorkflow => {
                 self.msg_info("Finishing workflow");
@@ -1060,22 +1048,19 @@ impl WorkflowEngine {
             ));
         }
         match &self.current_execution {
-            Some(exec) => {
-                match self.container_factory.inject_prompt(exec, prompt)? {
-                    Some(()) => {
-                        self.state
-                            .set_status(&next_step.name, StepState::Succeeded);
-                        self.current_step_name = Some(next_step.name.clone());
-                        self.persist()?;
-                        Ok(())
-                    }
-                    None => Err(EngineError::InvalidAdvanceAction(
-                        "container backend does not support prompt injection; \
-                         use LaunchNext to start a fresh container"
-                            .into(),
-                    )),
+            Some(exec) => match self.container_factory.inject_prompt(exec, prompt)? {
+                Some(()) => {
+                    self.state.set_status(&next_step.name, StepState::Succeeded);
+                    self.current_step_name = Some(next_step.name.clone());
+                    self.persist()?;
+                    Ok(())
                 }
-            }
+                None => Err(EngineError::InvalidAdvanceAction(
+                    "container backend does not support prompt injection; \
+                         use LaunchNext to start a fresh container"
+                        .into(),
+                )),
+            },
             None => Err(EngineError::InvalidAdvanceAction(
                 "no container execution is available to inject into".into(),
             )),
@@ -2083,10 +2068,7 @@ mod tests {
             *self.completed.lock().unwrap() = Some(outcome.clone());
         }
 
-        fn set_engine_sender(
-            &mut self,
-            tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>,
-        ) {
+        fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
             *self.engine_tx.lock().unwrap() = Some(tx);
         }
     }
@@ -2305,7 +2287,12 @@ mod tests {
                 _: &WorkflowState,
                 _: &AvailableActions,
             ) -> Result<NextAction, EngineError> {
-                Ok(self.actions.lock().unwrap().pop_front().unwrap_or(NextAction::Pause))
+                Ok(self
+                    .actions
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(NextAction::Pause))
             }
             fn yolo_countdown_tick(
                 &mut self,
@@ -2437,7 +2424,8 @@ mod tests {
 
         let (_, completion) = make_blocking_entry();
         let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
-        let factory = BlockingFactory::new([(Arc::new(AtomicBool::new(false)), completion.clone())]);
+        let factory =
+            BlockingFactory::new([(Arc::new(AtomicBool::new(false)), completion.clone())]);
         let mut engine = make_capturing_engine(
             &session,
             workflow,

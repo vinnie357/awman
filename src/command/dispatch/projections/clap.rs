@@ -131,15 +131,7 @@ mod tests {
             .map(|c| c.get_name().to_string())
             .collect();
         for n in [
-            "init",
-            "ready",
-            "chat",
-            "specs",
-            "status",
-            "config",
-            "exec",
-            "headless",
-            "remote",
+            "init", "ready", "chat", "specs", "status", "config", "exec", "headless", "remote",
             "new",
         ] {
             assert!(
