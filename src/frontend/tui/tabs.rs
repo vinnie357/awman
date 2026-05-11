@@ -126,6 +126,11 @@ pub type SharedEngineTx = Arc<
     Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::engine::workflow::EngineRequest>>>,
 >;
 
+/// Shared TUI context for the status command. The event loop refreshes this
+/// on every tick so the status watch loop always sees live tab data.
+pub type SharedTuiContext =
+    Arc<Mutex<crate::command::commands::status::StatusCommandTuiContext>>;
+
 #[derive(Debug, Clone)]
 pub struct YoloState {
     pub step_name: String,
@@ -251,6 +256,10 @@ pub struct Tab {
     /// after a worktree is created/resumed, cleared after the workflow
     /// finalize step. Drives the "Using worktree: <path>" bottom-bar line.
     pub active_worktree_path: SharedActiveWorktreePath,
+    /// Live TUI context for the status command. The event loop refreshes this
+    /// on every tick; `TuiCommandFrontend` reads from it on each watch
+    /// iteration so the status table always reflects current tab state.
+    pub tui_context_shared: SharedTuiContext,
 }
 
 impl Tab {
@@ -294,6 +303,9 @@ impl Tab {
             resize_tx_shared: Arc::new(Mutex::new(None)),
             engine_tx_shared: Arc::new(Mutex::new(None)),
             active_worktree_path: Arc::new(Mutex::new(None)),
+            tui_context_shared: Arc::new(Mutex::new(
+                crate::command::commands::status::StatusCommandTuiContext::default(),
+            )),
         }
     }
 

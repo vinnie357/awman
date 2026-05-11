@@ -424,13 +424,42 @@ fn render_status_dashboard(tab: &tabs::Tab, area: Rect, frame: &mut Frame) {
             })
             .collect();
 
+        // Column widths: start from header label widths, then expand to the
+        // widest value in each column, then add 2 chars of trailing padding.
+        let pad: usize = 2;
+        let mut w_indicator: usize = 1;
+        let mut w_name: usize = "NAME".len();
+        let mut w_cpu: usize = "CPU".len();
+        let mut w_mem: usize = "MEM".len();
+        let mut w_image: usize = "IMAGE".len();
+        let mut w_tab: usize = "TAB".len();
+        for c in &data.containers {
+            w_indicator = w_indicator.max(1);
+            w_name = w_name.max(c.name.len());
+            let cpu = c
+                .cpu_percent
+                .map(|v| format!("{v:.1}%"))
+                .unwrap_or_else(|| "-".into());
+            w_cpu = w_cpu.max(cpu.len());
+            let mem = c
+                .memory_mb
+                .map(|v| format!("{v:.0}MB"))
+                .unwrap_or_else(|| "-".into());
+            w_mem = w_mem.max(mem.len());
+            w_image = w_image.max(c.image.len());
+            let tab_label = c
+                .tab_number
+                .map(|t| format!("{t}"))
+                .unwrap_or_else(|| "-".into());
+            w_tab = w_tab.max(tab_label.len());
+        }
         let widths = [
-            Constraint::Length(2),
-            Constraint::Min(16),
-            Constraint::Length(8),
-            Constraint::Length(8),
-            Constraint::Min(20),
-            Constraint::Length(4),
+            Constraint::Length((w_indicator + pad) as u16),
+            Constraint::Length((w_name + pad) as u16),
+            Constraint::Length((w_cpu + pad) as u16),
+            Constraint::Length((w_mem + pad) as u16),
+            Constraint::Length((w_image + pad) as u16),
+            Constraint::Length((w_tab + pad) as u16),
         ];
 
         let table = Table::new(rows, widths)

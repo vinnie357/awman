@@ -159,6 +159,9 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::command::commands::status::StatusCommandTuiContext::default(),
+            )),
         );
         (frontend, req_rx, resp_tx)
     }

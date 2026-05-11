@@ -49,12 +49,12 @@ fn classify_container(_name: &str) -> ContainerKind {
 }
 
 /// Optional context supplied by the TUI; CLI / headless leave this `None`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StatusCommandTuiContext {
     pub tabs: Vec<TuiTabSnapshot>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TuiTabSnapshot {
     pub tab_number: u32,
     pub container_name: Option<String>,
@@ -63,8 +63,10 @@ pub struct TuiTabSnapshot {
 }
 
 pub trait StatusCommandFrontend: UserMessageSink + Send + Sync {
-    /// Optional TUI context. Defaults to `None` for CLI / headless.
-    fn tui_context(&self) -> Option<&StatusCommandTuiContext> {
+    /// Optional TUI context, returned as an owned clone so implementations
+    /// can serve a fresh value from a shared slot on every call.
+    /// Defaults to `None` for CLI / headless.
+    fn tui_context(&self) -> Option<StatusCommandTuiContext> {
         None
     }
 
@@ -174,7 +176,7 @@ impl Command for StatusCommand {
                     return Err(err);
                 }
             };
-            let context = frontend.tui_context().cloned();
+            let context = frontend.tui_context();
             let containers: Vec<StatusContainerRow> = handles
                 .into_iter()
                 .map(|h| {

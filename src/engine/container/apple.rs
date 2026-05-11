@@ -59,6 +59,19 @@ fn extract_apple_image(row: &serde_json::Value) -> String {
         if let Some(s) = img_obj.as_str() {
             return s.to_string();
         }
+        // Apple Containers stores the image name in descriptor.annotations.
+        if let Some(s) = img_obj
+            .get("descriptor")
+            .and_then(|d| d.get("annotations"))
+            .and_then(|a| a.get("com.apple.containerization.image.name"))
+            .and_then(|v| v.as_str())
+        {
+            return s.to_string();
+        }
+        // Apple Containers uses "reference" for a full OCI image reference string.
+        if let Some(s) = img_obj.get("reference").and_then(|v| v.as_str()) {
+            return s.to_string();
+        }
         if let Some(repo) = img_obj.get("repository").and_then(|v| v.as_str()) {
             return match img_obj.get("tag").and_then(|v| v.as_str()) {
                 Some(tag) if !tag.is_empty() => format!("{repo}:{tag}"),
@@ -773,18 +786,49 @@ mod apple_tests {
     }
 
     #[test]
+    fn extract_apple_image_reference_field() {
+        let row: serde_json::Value = serde_json::from_str(
+            r#"{"configuration": {"image": {"reference": "ghcr.io/amux/dev:latest"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_apple_image(&row), "ghcr.io/amux/dev:latest");
+    }
+
+    #[test]
+    fn extract_apple_image_descriptor_annotations() {
+        let row: serde_json::Value = serde_json::from_str(r#"{
+            "configuration": {
+                "image": {
+                    "descriptor": {
+                        "annotations": {
+                            "com.apple.containerization.image.name": "amux-amux-claude:latest"
+                        }
+                    }
+                }
+            }
+        }"#).unwrap();
+        assert_eq!(extract_apple_image(&row), "amux-amux-claude:latest");
+    }
+
+    #[test]
     fn parse_apple_list_formats_image_correctly() {
         let json = r#"[{
             "status": "running",
             "configuration": {
                 "id": "amux-test",
-                "image": {"repository": "amux/dev", "tag": "latest"}
+                "image": {
+                    "descriptor": {
+                        "annotations": {
+                            "com.apple.containerization.image.name": "amux-amux-claude:latest"
+                        }
+                    }
+                }
             },
             "startedDate": 1715000000.0
         }]"#;
         let handles = parse_apple_list_output(json);
         assert_eq!(handles.len(), 1);
-        assert_eq!(handles[0].image_tag, "amux/dev:latest");
+        assert_eq!(handles[0].image_tag, "amux-amux-claude:latest");
     }
 
     #[test]

@@ -226,6 +226,7 @@ impl App {
             tab.engine_tx_shared.clone(),
             tab.active_worktree_path.clone(),
             tab.status_dashboard.clone(),
+            tab.tui_context_shared.clone(),
         );
 
         // Store the receiving/sending ends in the tab.
@@ -396,6 +397,43 @@ impl App {
             if let Ok(mut guard) = tab.resize_tx_shared.lock() {
                 if let Some(new_tx) = guard.take() {
                     tab.container_resize_tx = Some(new_tx);
+                }
+            }
+        }
+
+        // Refresh the TUI context shared with the status command. Each tab
+        // holds a shared slot; the status watch loop reads it on every tick
+        // so it always sees current container-name and stuck state.
+        {
+            use crate::command::commands::status::{StatusCommandTuiContext, TuiTabSnapshot};
+            let snapshots: Vec<TuiTabSnapshot> = self
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let container_name = t
+                        .container_info
+                        .as_ref()
+                        .map(|info| info.container_name.clone())
+                        .filter(|n| !n.is_empty());
+                    let command_label = match &t.execution_phase {
+                        ExecutionPhase::Running { command } => command.clone(),
+                        ExecutionPhase::Done { command, .. } => command.clone(),
+                        ExecutionPhase::Error { command, .. } => command.clone(),
+                        ExecutionPhase::Idle => String::new(),
+                    };
+                    TuiTabSnapshot {
+                        tab_number: (i + 1) as u32,
+                        container_name,
+                        is_stuck: t.stuck,
+                        command_label,
+                    }
+                })
+                .collect();
+            let ctx = StatusCommandTuiContext::new(snapshots);
+            for tab in &self.tabs {
+                if let Ok(mut g) = tab.tui_context_shared.lock() {
+                    *g = ctx.clone();
                 }
             }
         }

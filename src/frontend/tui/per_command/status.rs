@@ -5,6 +5,10 @@ use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::tabs::StatusDashboardData;
 
 impl StatusCommandFrontend for TuiCommandFrontend {
+    fn tui_context(&self) -> Option<crate::command::commands::status::StatusCommandTuiContext> {
+        self.tui_context_shared.lock().ok().map(|g| g.clone())
+    }
+
     fn should_continue_watching(&mut self) -> bool {
         true
     }

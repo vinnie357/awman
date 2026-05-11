@@ -18,8 +18,8 @@ use crate::engine::message::{UserMessage, UserMessageSink};
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 use crate::frontend::tui::tabs::{
     SharedActiveWorktreePath, SharedContainerName, SharedEngineTx, SharedPtyResetFlag,
-    SharedResizeTx, SharedStatusDashboard, SharedStdinTx, SharedWorkflowViewState,
-    SharedYoloCancelFlag, SharedYoloState,
+    SharedResizeTx, SharedStatusDashboard, SharedStdinTx, SharedTuiContext,
+    SharedWorkflowViewState, SharedYoloCancelFlag, SharedYoloState,
 };
 use crate::frontend::tui::user_message::{SharedStatusLog, TuiUserMessageSink};
 
@@ -71,6 +71,9 @@ pub struct TuiCommandFrontend {
     /// container data here; the TUI renderer reads it to display a proper
     /// `Table` widget.
     pub(crate) status_dashboard: SharedStatusDashboard,
+    /// Live TUI context shared with the event loop. The event loop refreshes
+    /// this on every tick; the status command reads it on each watch iteration.
+    pub(crate) tui_context_shared: SharedTuiContext,
 }
 
 impl TuiCommandFrontend {
@@ -91,6 +94,7 @@ impl TuiCommandFrontend {
         engine_tx_shared: SharedEngineTx,
         active_worktree_path: SharedActiveWorktreePath,
         status_dashboard: SharedStatusDashboard,
+        tui_context_shared: SharedTuiContext,
     ) -> Self {
         let stdout_tx = container_io.stdout.clone();
         Self {
@@ -112,6 +116,7 @@ impl TuiCommandFrontend {
             engine_tx_shared,
             active_worktree_path,
             status_dashboard,
+            tui_context_shared,
         }
     }
 
