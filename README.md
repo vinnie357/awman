@@ -130,7 +130,7 @@ Agent: claude
 Prompt: Review for correctness and style.
 ```
 
-Supported agents: `claude`, `codex`, `opencode`, `maki`, `gemini`. Steps without an `Agent:` field use your configured default.
+Supported agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, `cline`. Steps without an `Agent:` field use your configured default.
 
 
 ### Hand off to the agent completely (yolo mode)
@@ -146,7 +146,7 @@ amux exec workflow ./aspec/workflows/implement-feature.md --yolo --work-item 004
 
 When a workflow step completes, a 60-second yolo countdown starts. If the agent doesn't resume, the workflow advances automatically. The countdown is visible in the tab bar across all tabs — you can monitor multiple autonomous sessions without switching to each one.
 
-`--yolo --workflow` automatically runs in an isolated Git worktree, so you can review and discard the result if it isn't right.
+`--yolo` with `exec workflow` automatically runs in an isolated Git worktree, so you can review and discard the result if it isn't right.
 
 For lighter autonomy, `--auto` approves file edits automatically but still requires permission for other commands.
 
@@ -165,7 +165,7 @@ From your local machine, use `amux remote` or cURL:
 amux config set remote.defaultAPIKey <key>
 amux config set remote.defaultAddr <host>
 amux remote session start /workspace/myproject
-amux remote run implement 0027 --session <id> --follow
+amux remote run "exec workflow aspec/workflows/implement-feature.md --work-item 0027" --session <id> --follow
 ```
 
 ```sh
@@ -180,7 +180,7 @@ curl -s -X POST http://localhost:9090/v1/commands \
   -H "Authorization: Bearer <key>" \
   -H "x-amux-session: <session-id>" \
   -H "Content-Type: application/json" \
-  -d '{"subcommand": "implement", "args": ["0027"]}'
+  -d '{"subcommand": "exec", "args": ["workflow", "aspec/workflows/implement-feature.md", "--work-item", "0027"]}'
 
 # Poll for completion, then fetch the log
 curl -s http://localhost:9090/v1/commands/<command-id>
