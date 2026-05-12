@@ -34,7 +34,7 @@ The installer detects your platform and puts `amux` on your `PATH`.
 mise use -g github:prettysmartdev/amux
 ```
 
-To pin to a specific version: `mise use -g github:prettysmartdev/amux@0.7.0`
+To pin to a specific version: `mise use -g github:prettysmartdev/amux@0.8.0`
 
 **From GitHub Releases** — download the binary for your platform from [GitHub Releases](https://github.com/prettysmartdev/amux/releases):
 
@@ -190,16 +190,6 @@ Headless commands run inside containers with the same isolation as running amux 
 
 See [Headless Mode](docs/08-headless-mode.md) and [Remote Mode](docs/09-remote-mode.md) for details.
 
-### Keep a persistent background agent
-
-`amux claws` manages a long-lived [nanoclaw](https://github.com/qwibitai/nanoclaw) container — a machine-global background agent accessible via your messaging app (Slack, Discord, WhatsApp). Unlike per-project sessions, it survives reboots and accumulates context across sessions.
-
-```sh
-amux claws init    # guided first-time setup
-amux claws ready   # check status / restart after reboot
-amux claws chat    # attach for an interactive session (Ctrl+C to detach)
-```
-
 ---
 
 ## Security
@@ -224,13 +214,14 @@ amux                                  # open the TUI
 amux init [--agent <name>]            # set up a project
 amux ready [--refresh]                # verify environment; rebuild Dockerfile.dev
 amux chat [--agent <name>] [--plan] [--auto] [--yolo]
-amux implement <nnnn> [--agent <name>] [--plan] [--auto] [--yolo] [--workflow <path>] [--worktree]
-amux specs new [--interview]          # create a work item
+amux exec prompt "<prompt>"           # run a one-off prompt in a container
+amux exec workflow <path> [--work-item <nnnn>] [--yolo] [--worktree]
+amux new spec [--interview]           # create a work item
+amux new workflow [--interview]       # create a workflow file
+amux new skill [--interview]          # create a skill file
 amux specs amend <nnnn>               # update a spec to match what was built
 amux status [--watch]                 # dashboard of all running agent containers
 amux config show                      # view all config values
-amux claws init                       # set up the persistent nanoclaw container
-amux claws ready                      # check / restart nanoclaw
 amux headless start [--port <n>]      # start the HTTP server (generates API key on first run)
 amux headless status                  # check if the server is running
 amux headless kill                    # stop the server
@@ -251,7 +242,6 @@ All commands work in both TUI mode (without the `amux` prefix) and CLI mode.
 - [Security & Isolation](docs/03-security-and-isolation.md)
 - [Workflows](docs/04-workflows.md)
 - [Yolo Mode](docs/05-yolo-mode.md)
-- [Nanoclaw](docs/06-nanoclaw.md)
 - [Configuration](docs/07-configuration.md)
 - [Headless Mode](docs/08-headless-mode.md)
 - [Remote Mode](docs/09-remote-mode.md)

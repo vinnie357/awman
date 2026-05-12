@@ -88,7 +88,7 @@ The installer detects your platform and installs `amux` to `/usr/local/bin`.
 mise use -g github:prettysmartdev/amux
 ```
 
-To pin to a specific version: `mise use -g github:prettysmartdev/amux@0.7.0`
+To pin to a specific version: `mise use -g github:prettysmartdev/amux@0.8.0`
 
 **From GitHub Releases** — download the binary for your platform from the [Releases page](https://github.com/prettysmartdev/amux/releases), make it executable, and move it onto your `PATH`:
 

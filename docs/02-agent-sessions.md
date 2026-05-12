@@ -87,11 +87,11 @@ For agents that support multiple providers (`opencode`, `crush`, `maki`), the `p
 
 If an agent does not support `--model`, a `WARNING:` is printed to stderr and the session launches without the flag — it is not aborted. GitHub Copilot CLI selects models via the `/model` interactive slash command rather than a CLI flag, so `--model` is silently dropped for copilot sessions.
 
-`--model` can be combined freely with `--agent`, `--yolo`, `--auto`, and all other flags. When used with `--workflow` on `implement`, the flag value acts as the default model for every workflow step that does not define its own `Model:` field. See [Per-step model overrides](04-workflows.md#per-step-model-overrides).
+`--model` can be combined freely with `--agent`, `--yolo`, `--auto`, and all other flags. When used with `exec workflow`, the flag value acts as the default model for every workflow step that does not define its own `Model:` field. See [Per-step model overrides](04-workflows.md#per-step-model-overrides).
 
 ### `--non-interactive` / `-n`
 
-Run the agent in print/batch mode — no interactivity required. The agent executes, produces output, and exits. `-n` is a short alias for `--non-interactive` and works on all commands that support the flag (`chat`, `implement`, `exec prompt`, `exec workflow`, `ready`, `specs amend`).
+Run the agent in print/batch mode — no interactivity required. The agent executes, produces output, and exits. `-n` is a short alias for `--non-interactive` and works on all commands that support the flag (`chat`, `exec prompt`, `exec workflow`, `ready`, `specs amend`).
 
 | Agent | Flag used |
 |-------|-----------|
@@ -188,9 +188,9 @@ When both `--yolo` and `--auto` are passed, `--yolo` wins.
 
 Enable fully autonomous operation — the agent skips all permission prompts. See [Yolo Mode](05-yolo-mode.md).
 
-### `--workflow=<path>`
+### `--worktree`
 
-(`implement` only) Run a multi-step workflow instead of a single agent session. See [Workflows](04-workflows.md).
+(`exec workflow` only) Run in an isolated Git worktree under `~/.amux/worktrees/`. Implied by `--yolo` and `--auto` when used with `exec workflow`. See [Security & Isolation](03-security-and-isolation.md).
 
 ---
 
@@ -769,21 +769,21 @@ When `--refresh` is also set, the audit runs and its results are included once c
 
 ---
 
-## Reference: all `implement`, `chat`, and `exec` flags
+## Reference: all `chat` and `exec` flags
 
-| Flag | `chat` | `implement` | `exec prompt` | `exec workflow` | Description |
-|------|--------|-------------|---------------|-----------------|-------------|
-| `--agent=<name>` | ✓ | ✓ | ✓ | ✓ | Override the agent for this session |
-| `--model=<NAME>` | ✓ | ✓ | ✓ | ✓ | Override the model used by the agent |
-| `--non-interactive` / `-n` | ✓ | ✓ | ✓ | ✓ | Print/batch mode |
-| `--plan` | ✓ | ✓ | ✓ | ✓ | Read-only analysis mode |
-| `--allow-docker` | ✓ | ✓ | ✓ | ✓ | Mount host Docker socket |
-| `--mount-ssh` | ✓ | ✓ | ✓ | ✓ | Mount `~/.ssh` read-only |
-| `--worktree` | — | ✓ | — | ✓ | Run in isolated Git worktree |
-| `--auto` | ✓ | ✓ | ✓ | ✓ | Auto-approve file edits, prompt for shell commands |
-| `--yolo` | ✓ | ✓ | ✓ | ✓ | Fully autonomous mode |
-| `--workflow=<path>` | — | ✓ | — | — | Multi-step workflow file (use `exec workflow <path>` instead) |
-| `--work-item <N>` / `-w <N>` | — | — | — | ✓ | Work item number for template variable substitution |
+| Flag | `chat` | `exec prompt` | `exec workflow` | Description |
+|------|--------|---------------|-----------------|-------------|
+| `--agent=<name>` | ✓ | ✓ | ✓ | Override the agent for this session |
+| `--model=<NAME>` | ✓ | ✓ | ✓ | Override the model used by the agent |
+| `--non-interactive` / `-n` | ✓ | ✓ | ✓ | Print/batch mode |
+| `--plan` | ✓ | ✓ | ✓ | Read-only analysis mode |
+| `--allow-docker` | ✓ | ✓ | ✓ | Mount host Docker socket |
+| `--mount-ssh` | ✓ | ✓ | ✓ | Mount `~/.ssh` read-only |
+| `--overlay=<path>` | ✓ | ✓ | ✓ | Mount a host directory into the container (repeatable) |
+| `--worktree` | — | — | ✓ | Run in isolated Git worktree |
+| `--auto` | ✓ | ✓ | ✓ | Auto-approve file edits, prompt for shell commands |
+| `--yolo` | ✓ | ✓ | ✓ | Fully autonomous mode |
+| `--work-item <N>` | — | — | ✓ | Work item number for template variable substitution |
 
 ---
 
