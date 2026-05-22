@@ -291,6 +291,90 @@ impl GitEngine {
         Ok(())
     }
 
+    /// `git clone [-b <branch>] <url> <dest>`.
+    /// When `branch` is `None`, clones the repository's default branch.
+    pub fn clone_repo(
+        &self,
+        url: &str,
+        branch: Option<&str>,
+        dest: &Path,
+    ) -> Result<(), EngineError> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| EngineError::io(parent, e))?;
+        }
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| EngineError::Git("clone dest path not UTF-8".into()))?;
+        let mut args: Vec<&str> = vec!["clone"];
+        if let Some(b) = branch {
+            args.push("-b");
+            args.push(b);
+        }
+        args.push(url);
+        args.push(dest_str);
+        let output = Command::new("git")
+            .args(&args)
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git clone`: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git clone failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Check out `branch` if it already exists; otherwise create it from HEAD.
+    /// Returns the disposition: `"checked-out"` for an existing branch or
+    /// `"created"` for a new one. Errors propagate as `EngineError::Git`.
+    pub fn checkout_or_create_branch(
+        &self,
+        path: &Path,
+        branch: &str,
+    ) -> Result<&'static str, EngineError> {
+        if self.branch_exists(path, branch) {
+            let output = Command::new("git")
+                .args(["checkout", branch])
+                .current_dir(path)
+                .output()
+                .map_err(|e| EngineError::Git(format!("invoke `git checkout`: {e}")))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(EngineError::Git(format!(
+                    "git checkout {branch} failed: {}",
+                    stderr.trim()
+                )));
+            }
+            Ok("checked-out")
+        } else {
+            let output = Command::new("git")
+                .args(["checkout", "-b", branch])
+                .current_dir(path)
+                .output()
+                .map_err(|e| EngineError::Git(format!("invoke `git checkout -b`: {e}")))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(EngineError::Git(format!(
+                    "git checkout -b {branch} failed: {}",
+                    stderr.trim()
+                )));
+            }
+            Ok("created")
+        }
+    }
+
+    /// Recursively delete a directory, ignoring missing paths. Used to clean up
+    /// a cloned repo when remote-session setup fails.
+    pub fn delete_directory(&self, path: &Path) -> Result<(), EngineError> {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(EngineError::io(path, e)),
+        }
+    }
+
     pub fn branch_exists(&self, git_root: &Path, branch: &str) -> bool {
         Command::new("git")
             .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])

@@ -103,6 +103,72 @@ fn awman_remote_help_exits_zero() {
     assert!(out.status.success());
 }
 
+/// WI 0078: `awman remote chat` (old arbitrary-command style) must NOT
+/// silently parse — it returns a non-zero exit and points the user to the
+/// new subcommand structure.
+#[test]
+fn awman_remote_old_style_chat_rejected() {
+    let out = run_awman(&["remote", "chat"]);
+    assert!(
+        !out.status.success(),
+        "remote chat (old style) must fail; got exit {:?}",
+        out.status.code()
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Must mention either a usage hint or surface that `chat` is not a known
+    // remote subcommand. We accept any error that names the offending token.
+    assert!(
+        combined.to_lowercase().contains("chat")
+            || combined.to_lowercase().contains("subcommand")
+            || combined.to_lowercase().contains("remote"),
+        "rejection error must reference the bad `chat` argument or remote subcommands; got: {combined}"
+    );
+}
+
+/// `awman remote exec --help` lists exactly `workflow` and `prompt` subcommands.
+#[test]
+fn awman_remote_exec_help_lists_workflow_and_prompt() {
+    let out = run_awman(&["remote", "exec", "--help"]);
+    assert!(
+        out.status.success(),
+        "remote exec --help must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("workflow"),
+        "remote exec --help must list `workflow`; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("prompt"),
+        "remote exec --help must list `prompt`; got: {stdout}"
+    );
+}
+
+/// `awman remote session --help` lists exactly `start` and `kill` subcommands.
+#[test]
+fn awman_remote_session_help_lists_start_and_kill() {
+    let out = run_awman(&["remote", "session", "--help"]);
+    assert!(
+        out.status.success(),
+        "remote session --help must exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("start"),
+        "remote session --help must list `start`; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("kill"),
+        "remote session --help must list `kill`; got: {stdout}"
+    );
+}
+
 // ─── skill() overlay flag behaviour (WI 0075) ────────────────────────────────
 
 fn make_git_repo() -> tempfile::TempDir {

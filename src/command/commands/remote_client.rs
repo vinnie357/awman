@@ -7,7 +7,9 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::command::error::CommandError;
+use crate::data::execution_event::ExecutionEvent;
 use crate::data::session::Session;
+use crate::data::session_setup_event::SessionSetupState;
 use crate::engine::auth::ApiKey;
 
 pub struct RemoteClient {
@@ -21,9 +23,68 @@ pub struct RemoteResponse {
     pub body: serde_json::Value,
 }
 
+/// Test-only sink used by the legacy SSE parser test. Production code never
+/// uses this; see `ExecutionEventSink` for the typed surface.
+#[cfg(test)]
 pub trait RemoteEventSink: Send + Sync {
     fn on_event(&mut self, event_type: &str, data: &str);
     fn on_done(&mut self);
+}
+
+/// Sink for typed `ExecutionEvent`s streaming over SSE from the per-job
+/// `/logs` endpoint. The default impl ignores everything — callers override
+/// the methods they care about. Each callback returns `bool`; returning
+/// `true` from any callback ends the stream early (e.g. on Ctrl-C).
+pub trait ExecutionEventSink: Send {
+    fn on_event(&mut self, event: ExecutionEvent) -> bool {
+        let _ = event;
+        false
+    }
+
+    /// Called once when the stream terminates cleanly.
+    fn on_stream_end(&mut self) {}
+}
+
+/// Request body for `POST /v1/sessions`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StartSessionRequest {
+    pub session_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+}
+
+/// `StartSession` response body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StartSessionResponse {
+    pub session_id: String,
+}
+
+/// Exec routing argument — either a workflow path or a one-shot prompt.
+#[derive(Debug, Clone)]
+pub enum ExecArg {
+    Workflow(String),
+    Prompt(String),
+}
+
+/// Response for `POST /v1/commands`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecJobResponse {
+    pub command_id: String,
+    #[serde(default)]
+    pub flags_applied: serde_json::Value,
+}
+
+/// Response body for `GET /v1/sessions/{id}/status`. Wraps a `SessionSetupState`
+/// with the session id echoed back.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionSetupStatusResponse {
+    pub session_id: String,
+    #[serde(flatten)]
+    pub state: SessionSetupState,
 }
 
 impl RemoteClient {
@@ -125,7 +186,189 @@ impl RemoteClient {
         Ok(None)
     }
 
-    pub async fn send_command(
+    // ─── Typed methods (preferred public surface) ────────────────────────────
+
+    /// `POST /v1/sessions` — request session creation. Returns the new session
+    /// id; setup runs asynchronously and the session is not ready for jobs
+    /// until its `/status` endpoint returns `"ready"`.
+    pub async fn start_session(
+        &self,
+        req: &StartSessionRequest,
+    ) -> Result<StartSessionResponse, CommandError> {
+        let url = format!("{}/v1/sessions", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .json(req)
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        let status = resp.status().as_u16();
+        let body = resp
+            .json::<serde_json::Value>()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        if status >= 400 {
+            return Err(CommandError::RemoteHttpStatus {
+                status,
+                body: body.to_string(),
+            });
+        }
+        serde_json::from_value::<StartSessionResponse>(body)
+            .map_err(|e| CommandError::Other(format!("invalid start-session response: {e}")))
+    }
+
+    /// `DELETE /v1/sessions/{id}` — kill a session.
+    pub async fn kill_session(&self, session_id: &str) -> Result<(), CommandError> {
+        let _ = self.delete(&["sessions", session_id]).await?;
+        Ok(())
+    }
+
+    /// `GET /v1/sessions/{id}/status` — fetch the deserialized setup state.
+    pub async fn get_session_status(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionSetupStatusResponse, CommandError> {
+        let resp = self.get(&["sessions", session_id, "status"]).await?;
+        serde_json::from_value::<SessionSetupStatusResponse>(resp.body).map_err(|e| {
+            CommandError::Other(format!("invalid session-status response: {e}"))
+        })
+    }
+
+    /// Submit an exec-prompt or exec-workflow job. Returns the command id.
+    pub async fn exec_job(
+        &self,
+        session_id: &str,
+        exec: ExecArg,
+        extra_args: &[String],
+    ) -> Result<ExecJobResponse, CommandError> {
+        let (subcommand, mut args) = match exec {
+            ExecArg::Workflow(path) => ("exec workflow", vec![path]),
+            ExecArg::Prompt(text) => ("exec prompt", vec![text]),
+        };
+        args.extend(extra_args.iter().cloned());
+
+        let resp = self
+            .send_command_with_headers(
+                &["commands"],
+                &[
+                    ("subcommand", serde_json::json!(subcommand)),
+                    (
+                        "args",
+                        serde_json::json!(args
+                            .iter()
+                            .map(|s| serde_json::json!(s))
+                            .collect::<Vec<_>>()),
+                    ),
+                ],
+                &[("x-awman-session", session_id)],
+            )
+            .await?;
+
+        serde_json::from_value::<ExecJobResponse>(resp.body)
+            .map_err(|e| CommandError::Other(format!("invalid exec response: {e}")))
+    }
+
+    /// `GET /v1/commands/{id}` — fetch a job's metadata.
+    pub async fn get_job(&self, command_id: &str) -> Result<RemoteResponse, CommandError> {
+        self.get(&["commands", command_id]).await
+    }
+
+    /// `GET /v1/workflows/{id}` — fetch the workflow state JSON for a job.
+    /// Returns `None` on HTTP 404 (job is a prompt job or pending).
+    pub async fn get_workflow_state(
+        &self,
+        command_id: &str,
+    ) -> Result<Option<serde_json::Value>, CommandError> {
+        match self.get(&["workflows", command_id]).await {
+            Ok(resp) => Ok(Some(resp.body)),
+            Err(CommandError::RemoteHttpStatus { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `GET /v1/sessions/{sid}/jobs/{jid}/logs` (SSE) — stream typed
+    /// `ExecutionEvent` values to the sink. Terminates when the server sends
+    /// a `Done` event or the sink returns `true` from any callback.
+    pub async fn stream_job_logs(
+        &self,
+        session_id: &str,
+        job_id: &str,
+        sink: &mut dyn ExecutionEventSink,
+    ) -> Result<(), CommandError> {
+        use crate::data::execution_event::EventPayload;
+        use futures_util::StreamExt;
+
+        let url = format!(
+            "{}/v1/sessions/{session_id}/jobs/{job_id}/logs",
+            self.base_url
+        );
+
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(86400))
+            .send()
+            .await
+            .map_err(Self::map_reqwest_error)?;
+        if resp.status().as_u16() >= 400 {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(CommandError::RemoteHttpStatus { status, body });
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut buffer = String::new();
+
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res.map_err(|e| CommandError::RemoteTransport(e.to_string()))?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(pos) = buffer.find("\n\n") {
+                let block: String = buffer.drain(..pos + 2).collect();
+                let trimmed = block.trim_end_matches('\n');
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // SSE comment lines start with `:` — surface as a sink hook
+                // by ignoring them here.
+                let mut data_lines: Vec<&str> = Vec::new();
+                for line in trimmed.lines() {
+                    if let Some(rest) = line.strip_prefix("data: ") {
+                        data_lines.push(rest);
+                    } else if let Some(rest) = line.strip_prefix("data:") {
+                        data_lines.push(rest);
+                    }
+                    // event: and : (comment) lines are ignored — the typed
+                    // payload already includes the event kind.
+                }
+                let data = data_lines.join("\n");
+                if data.is_empty() {
+                    continue;
+                }
+                let event: ExecutionEvent = match serde_json::from_str(&data) {
+                    Ok(e) => e,
+                    Err(_) => continue, // skip malformed lines
+                };
+                let is_done = matches!(event.payload, EventPayload::Done);
+                if sink.on_event(event) {
+                    sink.on_stream_end();
+                    return Ok(());
+                }
+                if is_done {
+                    sink.on_stream_end();
+                    return Ok(());
+                }
+            }
+        }
+
+        sink.on_stream_end();
+        Ok(())
+    }
+
+    // ─── Generic low-level helpers (crate-private) ───────────────────────────
+
+    pub(crate) async fn send_command(
         &self,
         path: &[&str],
         flags: &[(&str, serde_json::Value)],
@@ -136,7 +379,7 @@ impl RemoteClient {
     /// Like `send_command` but also attaches request headers — used to set
     /// `x-awman-session` on `POST /v1/commands` (the server reads the session
     /// from the header, not the body).
-    pub async fn send_command_with_headers(
+    pub(crate) async fn send_command_with_headers(
         &self,
         path: &[&str],
         flags: &[(&str, serde_json::Value)],
@@ -166,7 +409,7 @@ impl RemoteClient {
         Ok(RemoteResponse { status, body })
     }
 
-    pub async fn get(&self, path: &[&str]) -> Result<RemoteResponse, CommandError> {
+    pub(crate) async fn get(&self, path: &[&str]) -> Result<RemoteResponse, CommandError> {
         let url = format!("{}/v1/{}", self.base_url, path.join("/"));
         let resp = self
             .http
@@ -188,7 +431,7 @@ impl RemoteClient {
         Ok(RemoteResponse { status, body })
     }
 
-    pub async fn delete(&self, path: &[&str]) -> Result<RemoteResponse, CommandError> {
+    pub(crate) async fn delete(&self, path: &[&str]) -> Result<RemoteResponse, CommandError> {
         let url = format!("{}/v1/{}", self.base_url, path.join("/"));
         let resp = self
             .http
@@ -210,12 +453,10 @@ impl RemoteClient {
         Ok(RemoteResponse { status, body })
     }
 
-    /// Stream SSE events from the remote server progressively. Reads byte
-    /// chunks as they arrive, splits on the `\n\n` event separator, and
-    /// dispatches each event to the sink the moment it is parsed. The
-    /// per-request timeout is set to 24h so a long-running command doesn't
-    /// get cut off by the default client read timeout.
-    pub async fn stream_command(
+    /// Stream raw SSE events to the given sink. Kept crate-private for tests
+    /// of the SSE parser; production code should use `stream_job_logs`.
+    #[cfg(test)]
+    pub(crate) async fn stream_command_legacy(
         &self,
         path: &[&str],
         _flags: &[(&str, serde_json::Value)],
@@ -272,6 +513,7 @@ impl RemoteClient {
     /// Parse one `\n\n`-delimited SSE event block and forward it to the sink.
     /// Returns `true` when the block was the `[awman:done]` sentinel (caller
     /// should stop streaming).
+    #[cfg(test)]
     fn dispatch_sse_event(block: &str, sink: &mut dyn RemoteEventSink) -> bool {
         if block.trim().is_empty() {
             return false;
@@ -607,7 +849,7 @@ mod tests {
             done: false,
         };
         let result = client
-            .stream_command(&["commands", "cmd-1", "logs", "stream"], &[], &mut sink)
+            .stream_command_legacy(&["commands", "cmd-1", "logs", "stream"], &[], &mut sink)
             .await;
         assert!(result.is_ok(), "stream_command should succeed: {result:?}");
         assert!(sink.done, "on_done must be called");

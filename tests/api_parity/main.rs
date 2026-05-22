@@ -16,3 +16,4 @@ mod auth_modes;
 mod live_server;
 mod rename_0077;
 mod routes;
+mod wi_0078;

@@ -23,6 +23,9 @@ pub enum CommandError {
     #[error("unknown command: {path:?}")]
     UnknownCommand { path: Vec<String> },
 
+    #[error("command '{command}' is not available via the {frontend} frontend")]
+    NotAvailableForFrontend { command: String, frontend: String },
+
     #[error("unknown flag '{flag}' for command {command:?}")]
     UnknownFlag { command: Vec<String>, flag: String },
 

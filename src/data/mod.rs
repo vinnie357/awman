@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod error;
+pub mod execution_event;
 pub mod fs;
 pub mod migration;
 pub mod image_tags;
@@ -15,6 +16,7 @@ pub mod network;
 pub mod repo_dockerfile_paths;
 pub mod session;
 pub mod session_manager;
+pub mod session_setup_event;
 pub mod templates;
 pub mod workflow_dag;
 pub mod workflow_definition;

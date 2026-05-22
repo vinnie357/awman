@@ -12,10 +12,11 @@
 //! same defaults the CLI uses when stdin is not a TTY).
 
 use std::collections::HashMap;
-use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use crate::frontend::api::event_bus::EventBusSender;
+use crate::data::execution_event::EventPayload;
 
 use async_trait::async_trait;
 
@@ -75,39 +76,110 @@ struct ParsedArgs {
     args_vec: HashMap<String, Vec<String>>,
 }
 
-/// The API dispatch frontend. Owns a handle to the command's log file
-/// for streaming output.
+/// The API dispatch frontend. Emits typed events to an `EventBusSender`
+/// for distribution to logfile writers and SSE clients.
 pub struct ApiDispatchFrontend {
     parsed: ParsedArgs,
-    log_file: Arc<Mutex<std::fs::File>>,
+    event_bus: EventBusSender,
+    line_buffer_stdout: String,
+    line_buffer_stderr: String,
+    /// Map of step name → 0-based index, populated lazily on the first
+    /// `report_step_status` call for each unique step. Used to emit
+    /// `WorkflowStepTransition.step_index` accurately.
+    step_indices: std::sync::Mutex<HashMap<String, usize>>,
+    /// Set to `true` after the first `WorkflowPhaseTransition` event is
+    /// emitted. Prevents duplicate phase events for the same workflow run.
+    phase_emitted: std::sync::Mutex<bool>,
+    /// Latched once `Done` has been emitted, so both `emit_done` and `Drop`
+    /// stay idempotent.
+    done_emitted: std::sync::atomic::AtomicBool,
 }
 
 impl ApiDispatchFrontend {
     /// Construct a new frontend from the HTTP request's subcommand + args.
     ///
-    /// `log_path` is the `output.log` file that all output will be written to.
+    /// `event_bus` is the sender handle for emitting execution events.
     /// `subcommand` is the command path (e.g. "exec prompt" → ["exec", "prompt"]).
     /// `args` is the raw args vector from the HTTP request body.
-    pub fn new(subcommand: &str, args: &[String], log_path: &Path) -> Result<Self, CommandError> {
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(log_path)
-            .map_err(|e| CommandError::Other(format!("Failed to open log file: {e}")))?;
-
+    pub fn new(subcommand: &str, args: &[String], event_bus: EventBusSender) -> Self {
         let parsed = parse_args_to_flags(subcommand, args);
 
-        Ok(Self {
+        Self {
             parsed,
-            log_file: Arc::new(Mutex::new(log_file)),
-        })
+            event_bus,
+            line_buffer_stdout: String::new(),
+            line_buffer_stderr: String::new(),
+            step_indices: std::sync::Mutex::new(HashMap::new()),
+            phase_emitted: std::sync::Mutex::new(false),
+            done_emitted: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
-    fn write_to_log(&self, text: &str) {
-        if let Ok(mut f) = self.log_file.lock() {
-            let _ = writeln!(f, "{text}");
-            let _ = f.flush();
+    /// Look up (or assign on first sight) the 0-based step index for a step
+    /// name. The first time a given step name is reported, it gets the next
+    /// available index; subsequent reports return the same index.
+    fn step_index_for(&self, name: &str) -> usize {
+        let mut map = self
+            .step_indices
+            .lock()
+            .expect("step_indices lock poisoned");
+        if let Some(idx) = map.get(name) {
+            return *idx;
+        }
+        let idx = map.len();
+        map.insert(name.to_string(), idx);
+        idx
+    }
+
+    /// Flush any remaining partial lines in the stdout/stderr buffers.
+    pub fn flush_line_buffers(&mut self) {
+        if !self.line_buffer_stdout.is_empty() {
+            let line = std::mem::take(&mut self.line_buffer_stdout);
+            self.event_bus.emit(EventPayload::StdoutLine(line));
+        }
+        if !self.line_buffer_stderr.is_empty() {
+            let line = std::mem::take(&mut self.line_buffer_stderr);
+            self.event_bus.emit(EventPayload::StderrLine(line));
+        }
+    }
+
+    /// Flush partial line buffers and emit `Done`. Calling this multiple
+    /// times — or in addition to `Drop` — is safe; the second emission is
+    /// elided via `done_emitted`.
+    pub fn emit_done(&mut self) {
+        self.flush_line_buffers();
+        if !self
+            .done_emitted
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.event_bus.emit(EventPayload::Done);
+        }
+    }
+
+    /// Get a clone of the event bus sender (for creating child sinks).
+    pub fn event_bus_sender(&self) -> EventBusSender {
+        self.event_bus.clone()
+    }
+}
+
+impl Drop for ApiDispatchFrontend {
+    fn drop(&mut self) {
+        // The engine writes container output in arbitrary byte chunks. Anything
+        // not terminated by `\n` lives in the line buffers — flush it as a
+        // final event so SSE clients and `events.log` see the trailing line.
+        if !self.line_buffer_stdout.is_empty() {
+            let line = std::mem::take(&mut self.line_buffer_stdout);
+            self.event_bus.emit(EventPayload::StdoutLine(line));
+        }
+        if !self.line_buffer_stderr.is_empty() {
+            let line = std::mem::take(&mut self.line_buffer_stderr);
+            self.event_bus.emit(EventPayload::StderrLine(line));
+        }
+        if !self
+            .done_emitted
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            self.event_bus.emit(EventPayload::Done);
         }
     }
 }
@@ -121,7 +193,7 @@ fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
     let mut enums = HashMap::new();
     let mut u16s = HashMap::new();
     let mut positional_args = HashMap::new();
-    let mut positional_args_vec: HashMap<String, Vec<String>> = HashMap::new();
+    let positional_args_vec: HashMap<String, Vec<String>> = HashMap::new();
 
     let mut i = 0;
     let mut positionals: Vec<String> = Vec::new();
@@ -206,16 +278,18 @@ fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
                 positional_args.insert("value".to_string(), v.clone());
             }
         }
-        "remote run" => {
+        "remote exec workflow" => {
+            if let Some(wf) = positionals.first() {
+                positional_args.insert("workflow".to_string(), wf.clone());
+                paths.insert("workflow".to_string(), PathBuf::from(wf));
+            }
+        }
+        "remote exec prompt" => {
             if !positionals.is_empty() {
-                positional_args_vec.insert("command".to_string(), positionals.clone());
+                positional_args.insert("prompt".to_string(), positionals.join(" "));
             }
         }
-        "remote session start" => {
-            if let Some(d) = positionals.first() {
-                positional_args.insert("dir".to_string(), d.clone());
-            }
-        }
+        "remote session start" => {}
         "remote session kill" => {
             if let Some(s) = positionals.first() {
                 positional_args.insert("session_id".to_string(), s.clone());
@@ -229,8 +303,9 @@ fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
         }
     }
 
-    // --non-interactive is always implied for API dispatch.
+    // --yolo and --non-interactive are always implied for API dispatch.
     bools.insert("non-interactive".to_string(), true);
+    bools.insert("yolo".to_string(), true);
 
     ParsedArgs {
         bools,
@@ -248,13 +323,16 @@ fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
 
 impl UserMessageSink for ApiDispatchFrontend {
     fn write_message(&mut self, msg: UserMessage) {
-        let prefix = match msg.level {
-            crate::engine::message::MessageLevel::Info => "[INFO]",
-            crate::engine::message::MessageLevel::Warning => "[WARN]",
-            crate::engine::message::MessageLevel::Error => "[ERROR]",
-            crate::engine::message::MessageLevel::Success => "[OK]",
+        let phase = match msg.level {
+            crate::engine::message::MessageLevel::Info => "info",
+            crate::engine::message::MessageLevel::Warning => "warn",
+            crate::engine::message::MessageLevel::Error => "error",
+            crate::engine::message::MessageLevel::Success => "ok",
         };
-        self.write_to_log(&format!("{prefix} {}", msg.text));
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: phase.to_string(),
+            message: msg.text,
+        });
     }
 
     fn replay_queued(&mut self) {}
@@ -322,49 +400,54 @@ impl CommandFrontend for ApiDispatchFrontend {
 #[async_trait]
 impl ContainerFrontend for ApiDispatchFrontend {
     fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        if let Ok(mut f) = self.log_file.lock() {
-            let _ = f.write_all(bytes);
-            let _ = f.flush();
+        let text = String::from_utf8_lossy(bytes);
+        self.line_buffer_stdout.push_str(&text);
+        while let Some(pos) = self.line_buffer_stdout.find('\n') {
+            let line = self.line_buffer_stdout[..pos].to_string();
+            self.line_buffer_stdout = self.line_buffer_stdout[pos + 1..].to_string();
+            self.event_bus.emit(EventPayload::StdoutLine(line));
         }
         Ok(())
     }
 
     fn write_stderr(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        if let Ok(mut f) = self.log_file.lock() {
-            let _ = f.write_all(bytes);
-            let _ = f.flush();
+        let text = String::from_utf8_lossy(bytes);
+        self.line_buffer_stderr.push_str(&text);
+        while let Some(pos) = self.line_buffer_stderr.find('\n') {
+            let line = self.line_buffer_stderr[..pos].to_string();
+            self.line_buffer_stderr = self.line_buffer_stderr[pos + 1..].to_string();
+            self.event_bus.emit(EventPayload::StderrLine(line));
         }
         Ok(())
     }
 
     async fn read_stdin(&mut self, _buf: &mut [u8]) -> Result<usize, EngineError> {
-        Ok(0) // EOF — API frontend has no interactive stdin
+        Ok(0)
     }
 
     fn report_status(&mut self, status: ContainerStatus) {
-        let msg = match &status {
-            ContainerStatus::Building => "Container: building",
-            ContainerStatus::Pulling => "Container: pulling image",
-            ContainerStatus::Starting => "Container: starting",
+        let message = match &status {
+            ContainerStatus::Building => "Building container image...".to_string(),
+            ContainerStatus::Pulling => "Pulling container image...".to_string(),
+            ContainerStatus::Starting => "Starting container...".to_string(),
             ContainerStatus::Running { container_name } => {
-                self.write_to_log(&format!("[INFO] Container running: {container_name}"));
-                return;
+                format!("Container running: {container_name}")
             }
-            ContainerStatus::Stopping => "Container: stopping",
-            ContainerStatus::Exited(code) => {
-                self.write_to_log(&format!("[INFO] Container exited with code {code}"));
-                return;
-            }
-            ContainerStatus::Failed(reason) => {
-                self.write_to_log(&format!("[ERROR] Container failed: {reason}"));
-                return;
-            }
+            ContainerStatus::Stopping => "Stopping container...".to_string(),
+            ContainerStatus::Exited(code) => format!("Container exited with code {code}"),
+            ContainerStatus::Failed(reason) => format!("Container failed: {reason}"),
         };
-        self.write_to_log(&format!("[INFO] {msg}"));
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "container".to_string(),
+            message,
+        });
     }
 
     fn report_progress(&mut self, progress: ContainerProgress) {
-        self.write_to_log(&format!("[INFO] {}: {}", progress.stage, progress.message));
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: progress.stage,
+            message: progress.message,
+        });
     }
 
     fn resize_pty(&mut self, _cols: u16, _rows: u16) {}
@@ -375,28 +458,32 @@ impl ContainerFrontend for ApiDispatchFrontend {
 impl HasContainerFrontend for ApiDispatchFrontend {
     fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
         Box::new(ApiContainerSink {
-            log_file: Arc::clone(&self.log_file),
+            event_bus: self.event_bus.clone(),
+            line_buffer_stdout: String::new(),
+            line_buffer_stderr: String::new(),
         })
     }
 }
 
-/// Standalone container frontend that writes to the shared log file.
+/// Standalone container frontend that emits events to the EventBus.
 struct ApiContainerSink {
-    log_file: Arc<Mutex<std::fs::File>>,
+    event_bus: EventBusSender,
+    line_buffer_stdout: String,
+    line_buffer_stderr: String,
 }
 
 impl UserMessageSink for ApiContainerSink {
     fn write_message(&mut self, msg: UserMessage) {
-        let prefix = match msg.level {
-            crate::engine::message::MessageLevel::Info => "[INFO]",
-            crate::engine::message::MessageLevel::Warning => "[WARN]",
-            crate::engine::message::MessageLevel::Error => "[ERROR]",
-            crate::engine::message::MessageLevel::Success => "[OK]",
+        let phase = match msg.level {
+            crate::engine::message::MessageLevel::Info => "info",
+            crate::engine::message::MessageLevel::Warning => "warn",
+            crate::engine::message::MessageLevel::Error => "error",
+            crate::engine::message::MessageLevel::Success => "ok",
         };
-        if let Ok(mut f) = self.log_file.lock() {
-            let _ = writeln!(f, "{prefix} {}", msg.text);
-            let _ = f.flush();
-        }
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: phase.to_string(),
+            message: msg.text,
+        });
     }
     fn replay_queued(&mut self) {}
 }
@@ -404,24 +491,51 @@ impl UserMessageSink for ApiContainerSink {
 #[async_trait]
 impl ContainerFrontend for ApiContainerSink {
     fn write_stdout(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        if let Ok(mut f) = self.log_file.lock() {
-            let _ = f.write_all(bytes);
-            let _ = f.flush();
+        let text = String::from_utf8_lossy(bytes);
+        self.line_buffer_stdout.push_str(&text);
+        while let Some(pos) = self.line_buffer_stdout.find('\n') {
+            let line = self.line_buffer_stdout[..pos].to_string();
+            self.line_buffer_stdout = self.line_buffer_stdout[pos + 1..].to_string();
+            self.event_bus.emit(EventPayload::StdoutLine(line));
         }
         Ok(())
     }
     fn write_stderr(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        if let Ok(mut f) = self.log_file.lock() {
-            let _ = f.write_all(bytes);
-            let _ = f.flush();
+        let text = String::from_utf8_lossy(bytes);
+        self.line_buffer_stderr.push_str(&text);
+        while let Some(pos) = self.line_buffer_stderr.find('\n') {
+            let line = self.line_buffer_stderr[..pos].to_string();
+            self.line_buffer_stderr = self.line_buffer_stderr[pos + 1..].to_string();
+            self.event_bus.emit(EventPayload::StderrLine(line));
         }
         Ok(())
     }
     async fn read_stdin(&mut self, _buf: &mut [u8]) -> Result<usize, EngineError> {
         Ok(0)
     }
-    fn report_status(&mut self, _status: ContainerStatus) {}
-    fn report_progress(&mut self, _progress: ContainerProgress) {}
+    fn report_status(&mut self, status: ContainerStatus) {
+        let message = match &status {
+            ContainerStatus::Building => "Building container image...".to_string(),
+            ContainerStatus::Pulling => "Pulling container image...".to_string(),
+            ContainerStatus::Starting => "Starting container...".to_string(),
+            ContainerStatus::Running { container_name } => {
+                format!("Container running: {container_name}")
+            }
+            ContainerStatus::Stopping => "Stopping container...".to_string(),
+            ContainerStatus::Exited(code) => format!("Container exited with code {code}"),
+            ContainerStatus::Failed(reason) => format!("Container failed: {reason}"),
+        };
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "container".to_string(),
+            message,
+        });
+    }
+    fn report_progress(&mut self, progress: ContainerProgress) {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: progress.stage,
+            message: progress.message,
+        });
+    }
     fn resize_pty(&mut self, _cols: u16, _rows: u16) {}
 }
 
@@ -494,10 +608,47 @@ impl WorkflowFrontend for ApiDispatchFrontend {
     }
 
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
-        self.write_to_log(&format!("[INFO] Step '{}': {:?}", step.name, status));
+        let (from_str, to_str) = match &status {
+            WorkflowStepStatus::Pending => return,
+            WorkflowStepStatus::Running => ("pending", "running"),
+            WorkflowStepStatus::Succeeded => ("running", "succeeded"),
+            WorkflowStepStatus::Failed { .. } => ("running", "failed"),
+            WorkflowStepStatus::Cancelled => ("pending", "cancelled"),
+            WorkflowStepStatus::Skipped => ("pending", "skipped"),
+        };
+        let idx = self.step_index_for(&step.name);
+        self.event_bus.emit(EventPayload::WorkflowStepTransition {
+            step_name: step.name.clone(),
+            step_index: idx,
+            from_status: from_str.to_string(),
+            to_status: to_str.to_string(),
+        });
     }
 
     fn report_step_output(&mut self, _step: &WorkflowStep, _output: StepOutput) {}
+
+    fn report_workflow_progress(
+        &mut self,
+        steps: &[crate::engine::workflow::actions::WorkflowStepProgressInfo],
+    ) {
+        // Emit one WorkflowPhaseTransition event the first time the engine
+        // reports progress (the workflow has entered the main phase) and one
+        // more on completion (handled in report_workflow_completed).
+        let mut phase_emitted = self
+            .phase_emitted
+            .lock()
+            .expect("phase_emitted lock poisoned");
+        if !*phase_emitted {
+            *phase_emitted = true;
+            drop(phase_emitted);
+            let total = steps.len();
+            self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
+                phase: "main".to_string(),
+                step_desc: format!("Running workflow ({total} step{})", if total == 1 { "" } else { "s" }),
+                status: "running".to_string(),
+            });
+        }
+    }
 
     fn confirm_resume(&mut self, _mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
         Ok(true)
@@ -512,7 +663,49 @@ impl WorkflowFrontend for ApiDispatchFrontend {
     }
 
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
-        self.write_to_log(&format!("[INFO] Workflow completed: {outcome:?}"));
+        let (status, exit_code, error, phase_status, step_desc) = match outcome {
+            WorkflowOutcome::Completed => (
+                "done".to_string(),
+                Some(0),
+                None,
+                "succeeded",
+                "Workflow completed".to_string(),
+            ),
+            WorkflowOutcome::Paused => (
+                "paused".to_string(),
+                None,
+                None,
+                "paused",
+                "Workflow paused".to_string(),
+            ),
+            WorkflowOutcome::Aborted => (
+                "aborted".to_string(),
+                Some(1),
+                None,
+                "failed",
+                "Workflow aborted".to_string(),
+            ),
+            WorkflowOutcome::Failed {
+                last_step,
+                exit_code,
+            } => (
+                "error".to_string(),
+                Some(*exit_code),
+                Some(format!("Step '{last_step}' failed")),
+                "failed",
+                format!("Step '{last_step}' failed"),
+            ),
+        };
+        self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
+            phase: "main".to_string(),
+            step_desc,
+            status: phase_status.to_string(),
+        });
+        self.event_bus.emit(EventPayload::CommandStatus {
+            status,
+            exit_code,
+            error,
+        });
     }
 }
 
@@ -538,10 +731,10 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
     }
 
     fn report_worktree_created(&mut self, path: &Path, branch: &str) {
-        self.write_to_log(&format!(
-            "[INFO] Worktree created: {} (branch: {branch})",
-            path.display()
-        ));
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "worktree".to_string(),
+            message: format!("Worktree created: {} (branch: {branch})", path.display()),
+        });
     }
 
     fn ask_post_workflow_action(
@@ -577,21 +770,27 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
     }
 
     fn report_merge_conflict(&mut self, branch: &str, worktree_path: &Path, _git_root: &Path) {
-        self.write_to_log(&format!(
-            "[WARN] Merge conflict on branch '{branch}' at {}",
-            worktree_path.display()
-        ));
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "worktree".to_string(),
+            message: format!(
+                "Merge conflict on branch '{branch}' at {}",
+                worktree_path.display()
+            ),
+        });
     }
 
     fn report_worktree_discarded(&mut self, branch: &str) {
-        self.write_to_log(&format!("[INFO] Worktree discarded: {branch}"));
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "worktree".to_string(),
+            message: format!("Worktree discarded: {branch}"),
+        });
     }
 
     fn report_worktree_kept(&mut self, path: &Path, branch: &str) {
-        self.write_to_log(&format!(
-            "[INFO] Worktree kept: {} (branch: {branch})",
-            path.display()
-        ));
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "worktree".to_string(),
+            message: format!("Worktree kept: {} (branch: {branch})", path.display()),
+        });
     }
 }
 
@@ -608,14 +807,22 @@ impl InitFrontend for ApiDispatchFrontend {
         Ok(None)
     }
     fn report_phase(&mut self, phase: &InitPhase) {
-        self.write_to_log(&format!("[INFO] Init phase: {phase:?}"));
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "init".to_string(),
+            message: format!("Init phase: {phase:?}"),
+        });
     }
     fn report_step_status(&mut self, step: &str, status: StepStatus) {
-        self.write_to_log(&format!("[INFO] Init step '{step}': {status:?}"));
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "init".to_string(),
+            message: format!("Init step '{step}': {status:?}"),
+        });
     }
     fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
         Box::new(ApiContainerSink {
-            log_file: Arc::clone(&self.log_file),
+            event_bus: self.event_bus.clone(),
+            line_buffer_stdout: String::new(),
+            line_buffer_stderr: String::new(),
         })
     }
     fn report_summary(&mut self, _summary: &InitSummary) {}
@@ -634,14 +841,22 @@ impl ReadyFrontend for ApiDispatchFrontend {
         Ok(true)
     }
     fn report_phase(&mut self, phase: &ReadyPhase) {
-        self.write_to_log(&format!("[INFO] Ready phase: {phase:?}"));
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "ready".to_string(),
+            message: format!("Ready phase: {phase:?}"),
+        });
     }
     fn report_step_status(&mut self, step: &str, status: StepStatus) {
-        self.write_to_log(&format!("[INFO] Ready step '{step}': {status:?}"));
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "ready".to_string(),
+            message: format!("Ready step '{step}': {status:?}"),
+        });
     }
     fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
         Box::new(ApiContainerSink {
-            log_file: Arc::clone(&self.log_file),
+            event_bus: self.event_bus.clone(),
+            line_buffer_stdout: String::new(),
+            line_buffer_stderr: String::new(),
         })
     }
     fn report_summary(&mut self, _summary: &ReadySummary) {}
@@ -687,10 +902,13 @@ impl ExecPromptCommandFrontend for ApiDispatchFrontend {}
 impl ExecWorkflowCommandFrontend for ApiDispatchFrontend {
     fn set_pty_active(&mut self, _active: bool) {}
     fn report_workflow_summary(&mut self, summary: &WorkflowSummary) {
-        self.write_to_log(&format!(
-            "[INFO] Workflow summary: {} completed, {} failed",
-            summary.steps_completed, summary.steps_failed
-        ));
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "workflow".to_string(),
+            message: format!(
+                "Workflow summary: {} completed, {} failed",
+                summary.steps_completed, summary.steps_failed
+            ),
+        });
     }
     fn ask_workflow_resume_or_fresh(
         &mut self,
@@ -711,36 +929,24 @@ impl NewCommandFrontend for ApiDispatchFrontend {}
 mod tests {
     use super::*;
 
-    fn make_frontend(
-        subcommand: &str,
-        args: &[&str],
-        tmp: &std::path::Path,
-    ) -> ApiDispatchFrontend {
-        let log_path = tmp.join("test.log");
+    fn make_frontend(subcommand: &str, args: &[&str]) -> ApiDispatchFrontend {
+        let bus = crate::frontend::api::event_bus::EventBus::new(16);
+        let sender = bus.sender();
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        ApiDispatchFrontend::new(subcommand, &args, &log_path).unwrap()
+        ApiDispatchFrontend::new(subcommand, &args, sender)
     }
 
     // ─── flag_bool ────────────────────────────────────────────────────────────
 
     #[test]
     fn flag_bool_bare_flag_is_true() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend("chat", &["--yolo"], tmp.path());
+        let f = make_frontend("chat", &["--yolo"]);
         assert_eq!(f.flag_bool(&["chat"], "yolo").unwrap(), Some(true));
     }
 
     #[test]
-    fn flag_bool_absent_flag_returns_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend("chat", &[], tmp.path());
-        assert_eq!(f.flag_bool(&["chat"], "yolo").unwrap(), None);
-    }
-
-    #[test]
     fn flag_bool_with_explicit_true_value() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend("chat", &["--background", "true"], tmp.path());
+        let f = make_frontend("chat", &["--background", "true"]);
         assert_eq!(
             f.flag_bool(&["api", "start"], "background").unwrap(),
             Some(true)
@@ -749,8 +955,7 @@ mod tests {
 
     #[test]
     fn flag_bool_with_explicit_false_value() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend("chat", &["--background", "false"], tmp.path());
+        let f = make_frontend("chat", &["--background", "false"]);
         assert_eq!(
             f.flag_bool(&["api", "start"], "background").unwrap(),
             Some(false)
@@ -761,8 +966,7 @@ mod tests {
 
     #[test]
     fn flag_string_parses_value_after_flag() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend("chat", &["--session", "sess-123"], tmp.path());
+        let f = make_frontend("chat", &["--session", "sess-123"]);
         assert_eq!(
             f.flag_string(&["chat"], "session").unwrap().as_deref(),
             Some("sess-123")
@@ -771,8 +975,7 @@ mod tests {
 
     #[test]
     fn flag_string_parses_equals_syntax() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend("chat", &["--session=sess-456"], tmp.path());
+        let f = make_frontend("chat", &["--session=sess-456"]);
         assert_eq!(
             f.flag_string(&["chat"], "session").unwrap().as_deref(),
             Some("sess-456")
@@ -781,8 +984,7 @@ mod tests {
 
     #[test]
     fn flag_string_absent_returns_none() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend("chat", &[], tmp.path());
+        let f = make_frontend("chat", &[]);
         assert_eq!(f.flag_string(&["chat"], "session").unwrap(), None);
     }
 
@@ -790,8 +992,7 @@ mod tests {
 
     #[test]
     fn flag_u16_parses_port_value() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend("api start", &["--port", "9876"], tmp.path());
+        let f = make_frontend("api start", &["--port", "9876"]);
         assert_eq!(
             f.flag_u16(&["api", "start"], "port").unwrap(),
             Some(9876)
@@ -802,8 +1003,7 @@ mod tests {
 
     #[test]
     fn argument_exec_prompt_maps_positional_to_prompt() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend("exec prompt", &["hello", "world"], tmp.path());
+        let f = make_frontend("exec prompt", &["hello", "world"]);
         assert_eq!(
             f.argument(&["exec", "prompt"], "prompt")
                 .unwrap()
@@ -812,22 +1012,11 @@ mod tests {
         );
     }
 
-    // ─── arguments (positional vec) ───────────────────────────────────────────
-
-    #[test]
-    fn arguments_remote_run_maps_trailing_args_after_double_dash() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend("remote run", &["--", "exec", "prompt", "hi"], tmp.path());
-        let cmd = f.arguments(&["remote", "run"], "command").unwrap();
-        assert_eq!(cmd, vec!["exec", "prompt", "hi"]);
-    }
-
-    // ─── non-interactive flag is always set ───────────────────────────────────
+    // ─── non-interactive and yolo flags are always set ────────────────────────
 
     #[test]
     fn non_interactive_flag_always_set() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend("chat", &[], tmp.path());
+        let f = make_frontend("chat", &[]);
         assert_eq!(
             f.flag_bool(&["chat"], "non-interactive").unwrap(),
             Some(true),
@@ -835,18 +1024,102 @@ mod tests {
         );
     }
 
+    #[test]
+    fn yolo_flag_always_set() {
+        let f = make_frontend("chat", &[]);
+        assert_eq!(
+            f.flag_bool(&["chat"], "yolo").unwrap(),
+            Some(true),
+            "yolo must always be set in API mode"
+        );
+    }
+
     // ─── flag_strings (multi-value) ───────────────────────────────────────────
 
     #[test]
     fn flag_strings_collects_multiple_values() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = make_frontend(
-            "api start",
-            &["--workdirs", "/a", "--workdirs", "/b"],
-            tmp.path(),
-        );
+        let f = make_frontend("api start", &["--workdirs", "/a", "--workdirs", "/b"]);
         let dirs = f.flag_strings(&["api", "start"], "workdirs").unwrap();
         assert!(dirs.contains(&"/a".to_string()));
         assert!(dirs.contains(&"/b".to_string()));
+    }
+
+    // ─── Drop emits Done and flushes partial lines ─────────────────────────────
+
+    #[tokio::test]
+    async fn drop_emits_done_sentinel_when_emit_done_was_not_called() {
+        use crate::engine::container::frontend::ContainerFrontend;
+        let bus = crate::frontend::api::event_bus::EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
+        fe.write_stdout(b"a line\n").unwrap();
+        drop(fe);
+
+        let line = rx.recv().await.unwrap();
+        assert!(matches!(line.payload, EventPayload::StdoutLine(ref s) if s == "a line"));
+        let done = rx.recv().await.unwrap();
+        assert!(
+            matches!(done.payload, EventPayload::Done),
+            "Drop must emit Done; got {:?}",
+            done.payload
+        );
+    }
+
+    #[tokio::test]
+    async fn drop_flushes_partial_stdout_line_before_done() {
+        use crate::engine::container::frontend::ContainerFrontend;
+        let bus = crate::frontend::api::event_bus::EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
+        // No trailing newline — the line lives in the buffer until flush.
+        fe.write_stdout(b"trailing partial").unwrap();
+        drop(fe);
+
+        let line = rx.recv().await.unwrap();
+        assert!(
+            matches!(line.payload, EventPayload::StdoutLine(ref s) if s == "trailing partial"),
+            "partial stdout line must be flushed by Drop; got {:?}",
+            line.payload
+        );
+        let done = rx.recv().await.unwrap();
+        assert!(matches!(done.payload, EventPayload::Done));
+    }
+
+    #[tokio::test]
+    async fn drop_flushes_partial_stderr_line_before_done() {
+        use crate::engine::container::frontend::ContainerFrontend;
+        let bus = crate::frontend::api::event_bus::EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
+        fe.write_stderr(b"err partial").unwrap();
+        drop(fe);
+
+        let line = rx.recv().await.unwrap();
+        assert!(
+            matches!(line.payload, EventPayload::StderrLine(ref s) if s == "err partial"),
+            "partial stderr line must be flushed by Drop; got {:?}",
+            line.payload
+        );
+        let done = rx.recv().await.unwrap();
+        assert!(matches!(done.payload, EventPayload::Done));
+    }
+
+    #[tokio::test]
+    async fn explicit_emit_done_then_drop_does_not_double_emit() {
+        let bus = crate::frontend::api::event_bus::EventBus::new(16);
+        let mut rx = bus.subscribe();
+        let mut fe = ApiDispatchFrontend::new("exec prompt", &[], bus.sender());
+        fe.emit_done();
+        drop(fe);
+
+        let done = rx.recv().await.unwrap();
+        assert!(matches!(done.payload, EventPayload::Done));
+        // Second recv must time out — no second Done.
+        let again = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            again.is_err(),
+            "Drop must NOT emit a second Done after explicit emit_done; got {:?}",
+            again
+        );
     }
 }

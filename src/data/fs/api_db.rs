@@ -20,6 +20,16 @@ pub struct SessionRecord {
     pub created_at: String,
     pub status: String,
     pub closed_at: Option<String>,
+    /// Async setup status, one of `initializing`, `cloning_repository`,
+    /// `setting_up_branch`, `running_ready`, `ready`, `failed`. Set on
+    /// session creation; updated by the setup task; consulted by the
+    /// job-submission guard and the server-restart cleanup.
+    pub setup_status: String,
+    /// Session type — `local` (workdir mount) or `remote` (cloned repo).
+    pub session_type: String,
+    /// For `remote` sessions, the resolved clone destination on disk so that
+    /// failure cleanup can remove the partial clone.
+    pub cloned_path: Option<String>,
 }
 
 /// Persistable command metadata.
@@ -84,6 +94,41 @@ impl SqliteSessionStore {
                 log_path    TEXT NOT NULL
             );",
         )?;
+        // Additive column migrations: sqlite ALTER TABLE ADD COLUMN is safe
+        // and idempotent when we ignore the "duplicate column" error.
+        Self::add_column_if_missing(
+            conn,
+            "sessions",
+            "setup_status",
+            "TEXT NOT NULL DEFAULT 'ready'",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "sessions",
+            "session_type",
+            "TEXT NOT NULL DEFAULT 'local'",
+        )?;
+        Self::add_column_if_missing(conn, "sessions", "cloned_path", "TEXT")?;
+        Ok(())
+    }
+
+    fn add_column_if_missing(
+        conn: &Connection,
+        table: &str,
+        column: &str,
+        decl: &str,
+    ) -> Result<(), DataError> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column {
+                return Ok(());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
         Ok(())
     }
 
@@ -99,28 +144,52 @@ impl SqliteSessionStore {
         workdir: &str,
         created_at: &str,
     ) -> Result<(), DataError> {
+        self.insert_session_full(id, workdir, created_at, "ready", "local", None)
+    }
+
+    /// Insert a session with explicit setup_status, session_type, and
+    /// optional cloned_path. Used by the async-setup pipeline so that the
+    /// row exists in `initializing` state before any setup work runs — so
+    /// that the server-restart-cleanup pass can find non-terminal sessions
+    /// even before any setup_state.json is written.
+    pub fn insert_session_full(
+        &self,
+        id: &str,
+        workdir: &str,
+        created_at: &str,
+        setup_status: &str,
+        session_type: &str,
+        cloned_path: Option<&str>,
+    ) -> Result<(), DataError> {
         let conn = self.lock();
         conn.execute(
-            "INSERT INTO sessions (id, workdir, created_at, status) VALUES (?1, ?2, ?3, 'active')",
-            params![id, workdir, created_at],
+            "INSERT INTO sessions \
+                 (id, workdir, created_at, status, setup_status, session_type, cloned_path) \
+                 VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6)",
+            params![id, workdir, created_at, setup_status, session_type, cloned_path],
         )?;
         Ok(())
+    }
+
+    /// Update the setup_status for a session. Returns true if the row was
+    /// updated (i.e. the session exists).
+    pub fn update_setup_status(&self, id: &str, setup_status: &str) -> Result<bool, DataError> {
+        let conn = self.lock();
+        let affected = conn.execute(
+            "UPDATE sessions SET setup_status = ?1 WHERE id = ?2",
+            params![setup_status, id],
+        )?;
+        Ok(affected > 0)
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<SessionRecord>, DataError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, workdir, created_at, status, closed_at FROM sessions WHERE id = ?1",
+            "SELECT id, workdir, created_at, status, closed_at, \
+                    setup_status, session_type, cloned_path \
+             FROM sessions WHERE id = ?1",
         )?;
-        let mut rows = stmt.query_map(params![id], |row| {
-            Ok(SessionRecord {
-                id: row.get(0)?,
-                workdir: row.get(1)?,
-                created_at: row.get(2)?,
-                status: row.get(3)?,
-                closed_at: row.get(4)?,
-            })
-        })?;
+        let mut rows = stmt.query_map(params![id], session_record_from_row)?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -130,17 +199,11 @@ impl SqliteSessionStore {
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>, DataError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, workdir, created_at, status, closed_at FROM sessions ORDER BY created_at",
+            "SELECT id, workdir, created_at, status, closed_at, \
+                    setup_status, session_type, cloned_path \
+             FROM sessions ORDER BY created_at",
         )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(SessionRecord {
-                id: row.get(0)?,
-                workdir: row.get(1)?,
-                created_at: row.get(2)?,
-                status: row.get(3)?,
-                closed_at: row.get(4)?,
-            })
-        })?;
+        let rows = stmt.query_map([], session_record_from_row)?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row?);
@@ -157,18 +220,33 @@ impl SqliteSessionStore {
         };
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, workdir, created_at, status, closed_at FROM sessions \
-             WHERE status = ?1 ORDER BY created_at",
+            "SELECT id, workdir, created_at, status, closed_at, \
+                    setup_status, session_type, cloned_path \
+             FROM sessions WHERE status = ?1 ORDER BY created_at",
         )?;
-        let rows = stmt.query_map(params![status], |row| {
-            Ok(SessionRecord {
-                id: row.get(0)?,
-                workdir: row.get(1)?,
-                created_at: row.get(2)?,
-                status: row.get(3)?,
-                closed_at: row.get(4)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![status], session_record_from_row)?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    /// Return every session whose `setup_status` is one of the non-terminal
+    /// values — `initializing`, `cloning_repository`, `setting_up_branch`,
+    /// `running_ready`. Used at startup to mark them as `failed` (the setup
+    /// task was killed by the restart).
+    pub fn list_sessions_with_in_progress_setup(&self) -> Result<Vec<SessionRecord>, DataError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, workdir, created_at, status, closed_at, \
+                    setup_status, session_type, cloned_path \
+             FROM sessions \
+             WHERE setup_status IN ('initializing', 'cloning_repository', \
+                                    'setting_up_branch', 'running_ready') \
+             ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], session_record_from_row)?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row?);
@@ -328,6 +406,19 @@ impl SqliteSessionStore {
         let conn = self.lock();
         f(&conn)
     }
+}
+
+fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    Ok(SessionRecord {
+        id: row.get(0)?,
+        workdir: row.get(1)?,
+        created_at: row.get(2)?,
+        status: row.get(3)?,
+        closed_at: row.get(4)?,
+        setup_status: row.get(5)?,
+        session_type: row.get(6)?,
+        cloned_path: row.get(7)?,
+    })
 }
 
 #[cfg(test)]

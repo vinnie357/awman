@@ -82,6 +82,11 @@ impl ApiPaths {
         self.command_dir(session_id, command_id).join("output.log")
     }
 
+    /// NDJSON `ExecutionEvent` log path for a single command/job.
+    pub fn command_events_log_path(&self, session_id: &str, command_id: &str) -> PathBuf {
+        self.command_dir(session_id, command_id).join("events.log")
+    }
+
     /// TLS material directory.
     pub fn tls_dir(&self) -> PathBuf {
         self.root.join(TLS_SUBDIR)

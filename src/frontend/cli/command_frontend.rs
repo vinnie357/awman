@@ -788,25 +788,29 @@ mod tests {
     }
 
     #[test]
-    fn argument_trailing_var_args_joins_multi_token_command() {
+    fn argument_remote_exec_prompt_reads_prompt() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["awman", "remote", "run", "exec", "prompt", "hello"])
+            .try_get_matches_from(["awman", "remote", "exec", "prompt", "hello world"])
             .unwrap();
         let frontend = CliFrontend::new(m);
-        let v = frontend.argument(&["remote", "run"], "command").unwrap();
-        assert_eq!(v, Some("exec prompt hello".to_string()));
+        let v = frontend
+            .argument(&["remote", "exec", "prompt"], "prompt")
+            .unwrap();
+        assert_eq!(v, Some("hello world".to_string()));
     }
 
     #[test]
-    fn argument_trailing_var_args_single_token() {
+    fn argument_remote_exec_workflow_reads_workflow() {
         let cmd = CommandCatalogue::get().build_clap_command();
         let m = cmd
-            .try_get_matches_from(["awman", "remote", "run", "status"])
+            .try_get_matches_from(["awman", "remote", "exec", "workflow", "my-wf.toml"])
             .unwrap();
         let frontend = CliFrontend::new(m);
-        let v = frontend.argument(&["remote", "run"], "command").unwrap();
-        assert_eq!(v, Some("status".to_string()));
+        let v = frontend
+            .argument(&["remote", "exec", "workflow"], "workflow")
+            .unwrap();
+        assert_eq!(v, Some("my-wf.toml".to_string()));
     }
 
     #[test]
@@ -819,24 +823,6 @@ mod tests {
     }
 
     // ─── arguments (plural) ───────────────────────────────────────────────────
-
-    #[test]
-    fn arguments_reads_trailing_var_args_as_vec() {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "remote", "run", "exec", "prompt", "hello"])
-            .unwrap();
-        let frontend = CliFrontend::new(m);
-        let v = frontend.arguments(&["remote", "run"], "command").unwrap();
-        assert_eq!(
-            v,
-            vec![
-                "exec".to_string(),
-                "prompt".to_string(),
-                "hello".to_string()
-            ]
-        );
-    }
 
     #[test]
     fn arguments_wrong_path_returns_empty_vec() {

@@ -272,6 +272,9 @@ pub(crate) fn format_error(err: &CommandError) -> String {
             crate::engine::error::EngineError::Other(msg) => msg.to_string(),
         },
         CommandError::Data(e) => format!("{e}"),
+        CommandError::NotAvailableForFrontend { command, frontend } => {
+            format!("command `{command}` is not available via the {frontend} frontend")
+        }
     };
     format!("awman: {body}")
 }
@@ -347,6 +350,7 @@ pub(crate) fn error_exit_code(err: &CommandError) -> u8 {
         | CommandError::RemoteSessionMissing
         | CommandError::RemoteSessionKillFailed { .. } => 1,
         CommandError::NotImplemented(_) => 1,
+        CommandError::NotAvailableForFrontend { .. } => 1,
         CommandError::Other(_) => 1,
     }
 }

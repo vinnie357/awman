@@ -343,7 +343,7 @@ async fn workdirs_endpoint_returns_empty_array_when_no_allowlist() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn create_session_returns_201_and_session_id() {
+async fn create_session_returns_202_and_session_id() {
     let workdir = TempDir::new().unwrap();
     let canonical = std::fs::canonicalize(workdir.path()).unwrap();
     let (_root, base) = start_test_server(vec![canonical.clone()]).await;
@@ -356,7 +356,7 @@ async fn create_session_returns_201_and_session_id() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 201);
+    assert_eq!(resp.status(), 202);
     let body: serde_json::Value = resp.json().await.unwrap();
     let session_id = body["session_id"].as_str().expect("session_id must be a string");
     assert!(!session_id.is_empty());

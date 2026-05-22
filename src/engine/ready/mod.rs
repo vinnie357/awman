@@ -288,6 +288,20 @@ impl ReadyEngine {
                 }
             }
             ReadyPhase::BuildingAgentImage => {
+                // Issue 22 (extended for WI 0078): if Docker isn't available
+                // there's no point attempting to download an agent Dockerfile
+                // from the network — the build would fail anyway. Mark as
+                // failed and continue, so the setup task exits promptly in
+                // sandboxed test environments.
+                if !self.container_runtime.is_available() {
+                    let msg = "Docker daemon is not running.".to_string();
+                    self.summary.agent_image = StepStatus::Failed(msg.clone());
+                    frontend.report_step_status("Build agent image", StepStatus::Failed(msg));
+                    return Ok({
+                        self.phase = ReadyPhase::CheckingNonDefaultAgents;
+                        self.phase.clone()
+                    });
+                }
                 let paths = RepoDockerfilePaths::new(&git_root);
                 let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
                 let tag = agent_image_tag(&git_root, self.options.agent.as_str());
@@ -1023,6 +1037,135 @@ mod tests {
         assert_ne!(
             new_content, "FROM legacy\n",
             "Dockerfile.dev must be overwritten"
+        );
+    }
+
+    // ── WI 0078: Ready idempotency ───────────────────────────────────────────
+    //
+    // `ReadyEngine::run_to_completion` may be invoked many times across the
+    // lifetime of a single API server (every `POST /v1/sessions` runs it).
+    // Re-running it for the same git root must not panic, must not produce
+    // diverging state on disk, and must produce a summary on each call. The
+    // catalogue-level idempotency tested here:
+    //   - Both invocations reach a terminal `ReadyPhase` (`Complete` or
+    //     `Failed`) — i.e. neither hangs or loops.
+    //   - The aspec and work-items scaffolding statuses are stable across
+    //     calls (the first run creates them; the second sees them in place).
+    //   - The second invocation does not mutate the Dockerfile that the
+    //     first invocation wrote.
+    #[tokio::test]
+    async fn run_to_completion_is_idempotent_across_two_invocations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        // Synthetic agent name so `CheckingLocalAgent`'s spawned `Command`
+        // returns NotFound immediately instead of invoking a real CLI.
+        let agent_str = "awman-test-idempotency-agent";
+        std::fs::write(
+            awman_dir.join(format!("Dockerfile.{agent_str}")),
+            "FROM scratch\n",
+        )
+        .unwrap();
+
+        let resolver = StaticGitRootResolver::new(tmp.path());
+
+        let build_engine = || -> (ReadyEngine, FakeReadyFrontend) {
+            let session = Arc::new(
+                crate::data::session::Session::open(
+                    tmp.path().to_path_buf(),
+                    &resolver,
+                    SessionOpenOptions::default(),
+                )
+                .unwrap(),
+            );
+            let overlay = Arc::new(OverlayEngine::with_auth_resolver(
+                crate::data::fs::auth_paths::AuthPathResolver::at_home(tmp.path()),
+            ));
+            let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
+            let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+                overlay.clone(),
+                runtime.clone(),
+            ));
+            let options = ReadyEngineOptions {
+                agent: AgentName::new(agent_str).unwrap(),
+                refresh: false,
+                build: false,
+                no_cache: false,
+                allow_docker: false,
+                non_interactive: true,
+                env_passthrough: None,
+            };
+            let engine = ReadyEngine::new(
+                session,
+                Arc::new(GitEngine::new()),
+                overlay,
+                runtime,
+                agent_engine,
+                options,
+            );
+            let frontend = FakeReadyFrontend {
+                create_dockerfile: true,
+                run_audit: false,
+                migrate_legacy: true,
+                phases: Vec::new(),
+                statuses: Vec::new(),
+            };
+            (engine, frontend)
+        };
+
+        let (mut engine_a, mut frontend_a) = build_engine();
+        let summary_a = engine_a.run_to_completion(&mut frontend_a).await.unwrap();
+        assert!(
+            matches!(
+                engine_a.phase(),
+                ReadyPhase::Complete | ReadyPhase::Failed(_)
+            ),
+            "first run must reach a terminal phase; got {:?}",
+            engine_a.phase()
+        );
+
+        // Snapshot the Dockerfile after the first invocation. If a Dockerfile
+        // was created, the second invocation must not overwrite it.
+        let dockerfile = tmp.path().join("Dockerfile.dev");
+        let snapshot_a = std::fs::read_to_string(&dockerfile).ok();
+
+        let (mut engine_b, mut frontend_b) = build_engine();
+        let summary_b = engine_b.run_to_completion(&mut frontend_b).await.unwrap();
+        assert!(
+            matches!(
+                engine_b.phase(),
+                ReadyPhase::Complete | ReadyPhase::Failed(_)
+            ),
+            "second run must also reach a terminal phase; got {:?}",
+            engine_b.phase()
+        );
+
+        let snapshot_b = std::fs::read_to_string(&dockerfile).ok();
+        assert_eq!(
+            snapshot_a, snapshot_b,
+            "Dockerfile.dev contents must be stable across idempotent runs"
+        );
+
+        // The aspec/work-items scaffolding mirrors the first run on the second
+        // run — the engine must NOT rewrite or fail on artifacts it already
+        // produced.
+        assert_eq!(
+            std::mem::discriminant(&summary_a.aspec_folder),
+            std::mem::discriminant(&summary_b.aspec_folder),
+            "aspec_folder status must be stable across idempotent runs; first={:?} second={:?}",
+            summary_a.aspec_folder,
+            summary_b.aspec_folder
+        );
+        assert_eq!(
+            std::mem::discriminant(&summary_a.work_items_config),
+            std::mem::discriminant(&summary_b.work_items_config),
+            "work_items_config status must be stable across idempotent runs; first={:?} second={:?}",
+            summary_a.work_items_config,
+            summary_b.work_items_config
+        );
+        assert_eq!(
+            summary_a.runtime_name, summary_b.runtime_name,
+            "runtime_name must be stable across idempotent runs"
         );
     }
 }

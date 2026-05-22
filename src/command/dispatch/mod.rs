@@ -34,8 +34,8 @@ use crate::command::commands::new::{
 };
 use crate::command::commands::ready::{ReadyCommand, ReadyCommandFlags, ReadyCommandFrontend};
 use crate::command::commands::remote::{
-    RemoteCommand, RemoteCommandFrontend, RemoteRunFlags, RemoteSessionKillFlags,
-    RemoteSessionStartFlags, RemoteSubcommand,
+    RemoteCommand, RemoteCommandFrontend, RemoteExecPromptFlags, RemoteExecWorkflowFlags,
+    RemoteSessionKillFlags, RemoteSessionStartFlags, RemoteSubcommand,
 };
 use crate::command::commands::specs::{
     SpecsAmendFlags, SpecsCommand, SpecsCommandFrontend, SpecsSubcommand,
@@ -438,33 +438,83 @@ impl<F: CommandFrontend> Dispatch<F> {
                 ApiServerSubcommand::Status(ApiServerStatusFlags {}),
                 self.engines.clone(),
             ))),
-            ["remote", "run"] => {
-                let command = self.frontend.arguments(&canonical_refs, "command")?;
-                let flags = RemoteRunFlags {
-                    command,
-                    remote_addr: self.frontend.flag_string(&canonical_refs, "remote-addr")?,
-                    session: self.frontend.flag_string(&canonical_refs, "session")?,
-                    follow: self
-                        .frontend
-                        .flag_bool(&canonical_refs, "follow")?
-                        .unwrap_or(false),
-                    api_key: self.frontend.flag_string(&canonical_refs, "api-key")?,
-                };
+            ["remote", "exec", "workflow"] => {
+                let workflow = self
+                    .frontend
+                    .flag_path(&canonical_refs, "workflow")?
+                    .or_else(|| {
+                        self.frontend
+                            .argument(&canonical_refs, "workflow")
+                            .ok()
+                            .flatten()
+                            .map(PathBuf::from)
+                    })
+                    .ok_or_else(|| {
+                        CommandError::missing_required_argument(&canonical_refs, "workflow")
+                    })?;
                 Ok(BuiltCommand::Remote(RemoteCommand::new(
-                    RemoteSubcommand::Run(flags),
+                    RemoteSubcommand::ExecWorkflow(RemoteExecWorkflowFlags {
+                        workflow,
+                        work_item: self.frontend.flag_string(&canonical_refs, "work-item")?,
+                        agent: self.frontend.flag_string(&canonical_refs, "agent")?,
+                        remote_addr: self
+                            .frontend
+                            .flag_string(&canonical_refs, "remote-addr")?,
+                        session: self.frontend.flag_string(&canonical_refs, "session")?,
+                        follow: self
+                            .frontend
+                            .flag_bool(&canonical_refs, "follow")?
+                            .unwrap_or(false),
+                        api_key: self.frontend.flag_string(&canonical_refs, "api-key")?,
+                    }),
+                    self.engines.clone(),
+                    session.clone(),
+                )))
+            }
+            ["remote", "exec", "prompt"] => {
+                let prompt = self
+                    .frontend
+                    .argument(&canonical_refs, "prompt")?
+                    .ok_or_else(|| {
+                        CommandError::missing_required_argument(&canonical_refs, "prompt")
+                    })?;
+                Ok(BuiltCommand::Remote(RemoteCommand::new(
+                    RemoteSubcommand::ExecPrompt(RemoteExecPromptFlags {
+                        prompt,
+                        agent: self.frontend.flag_string(&canonical_refs, "agent")?,
+                        remote_addr: self
+                            .frontend
+                            .flag_string(&canonical_refs, "remote-addr")?,
+                        session: self.frontend.flag_string(&canonical_refs, "session")?,
+                        follow: self
+                            .frontend
+                            .flag_bool(&canonical_refs, "follow")?
+                            .unwrap_or(false),
+                        api_key: self.frontend.flag_string(&canonical_refs, "api-key")?,
+                    }),
                     self.engines.clone(),
                     session.clone(),
                 )))
             }
             ["remote", "session", "start"] => {
-                let dir = self.frontend.argument(&canonical_refs, "dir")?;
-                let remote_addr = self.frontend.flag_string(&canonical_refs, "remote-addr")?;
-                let api_key = self.frontend.flag_string(&canonical_refs, "api-key")?;
+                let session_type = self
+                    .frontend
+                    .flag_enum(&canonical_refs, "type")?
+                    .unwrap_or_else(|| "local".to_string());
                 Ok(BuiltCommand::Remote(RemoteCommand::new(
                     RemoteSubcommand::SessionStart(RemoteSessionStartFlags {
-                        dir,
-                        remote_addr,
-                        api_key,
+                        session_type,
+                        workdir: self.frontend.flag_string(&canonical_refs, "workdir")?,
+                        repo_url: self.frontend.flag_string(&canonical_refs, "repo-url")?,
+                        branch: self.frontend.flag_string(&canonical_refs, "branch")?,
+                        wait: self
+                            .frontend
+                            .flag_bool(&canonical_refs, "wait")?
+                            .unwrap_or(false),
+                        remote_addr: self
+                            .frontend
+                            .flag_string(&canonical_refs, "remote-addr")?,
+                        api_key: self.frontend.flag_string(&canonical_refs, "api-key")?,
                     }),
                     self.engines.clone(),
                     session.clone(),
@@ -1033,14 +1083,26 @@ mod tests {
     }
 
     #[test]
-    fn build_remote_run_with_command_args() {
+    fn build_remote_exec_workflow_with_workflow_argument() {
         let mut frontend = FakeCommandFrontend::new();
-        frontend.args_vec.insert(
-            "command".into(),
-            vec!["exec".into(), "prompt".into(), "hello".into()],
-        );
+        frontend
+            .paths
+            .insert("workflow".into(), std::path::PathBuf::from("/tmp/wf.toml"));
         let dispatch = Dispatch::new(frontend, make_session(), make_engines());
-        let built = dispatch.build_command(&["remote", "run"]).unwrap();
+        let built = dispatch
+            .build_command(&["remote", "exec", "workflow"])
+            .unwrap();
+        assert!(matches!(built, BuiltCommand::Remote(_)));
+    }
+
+    #[test]
+    fn build_remote_exec_prompt_with_prompt_argument() {
+        let mut frontend = FakeCommandFrontend::new();
+        frontend.args.insert("prompt".into(), "hello".into());
+        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let built = dispatch
+            .build_command(&["remote", "exec", "prompt"])
+            .unwrap();
         assert!(matches!(built, BuiltCommand::Remote(_)));
     }
 
@@ -1131,20 +1193,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_command_box_input_remote_run_trailing_var_args() {
+    fn parse_command_box_input_remote_exec_workflow() {
         let parsed = Dispatch::<FakeCommandFrontend>::parse_command_box_input(
-            r#"remote run -- exec prompt "hello world""#,
+            "remote exec workflow my-workflow.toml --follow",
         )
         .unwrap();
-        assert_eq!(parsed.path, vec!["remote", "run"]);
-        match parsed.arguments.get("command") {
-            Some(parsed_input::ArgValue::Multi(items)) => {
-                assert!(items.iter().any(|i| i == "exec"));
-                assert!(items.iter().any(|i| i == "prompt"));
-                assert!(items.iter().any(|i| i == "hello world"));
+        assert_eq!(parsed.path, vec!["remote", "exec", "workflow"]);
+        match parsed.arguments.get("workflow") {
+            Some(parsed_input::ArgValue::Single(s)) => {
+                assert_eq!(s, "my-workflow.toml");
             }
-            other => panic!("expected Multi command args, got: {other:?}"),
+            other => panic!("expected Single workflow argument, got: {other:?}"),
         }
+        assert!(matches!(
+            parsed.flags.get("follow"),
+            Some(parsed_input::FlagValue::Bool(true))
+        ));
     }
 
     #[test]

@@ -110,9 +110,9 @@ fn api_has_start_kill_logs_status_subcommands() {
 }
 
 #[test]
-fn remote_has_run_and_session_subcommands() {
+fn remote_has_exec_and_session_subcommands() {
     let names = subcommand_names("remote");
-    assert!(names.contains(&"run"));
+    assert!(names.contains(&"exec"));
     assert!(names.contains(&"session"));
 }
 

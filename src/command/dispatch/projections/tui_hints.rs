@@ -137,7 +137,7 @@ mod tests {
             vec!["config", "get"],
             vec!["config", "set"],
             vec!["api", "start"],
-            vec!["remote", "run"],
+            vec!["remote", "exec", "workflow"],
             vec!["new", "spec"],
         ] {
             let hint = cat.tui_hint_for(path);

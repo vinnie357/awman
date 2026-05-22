@@ -54,19 +54,22 @@ fn api_paths_tls_dir_under_root() {
 //
 // Actual route-hit tests live in binary_smoke and are marked `real_network_*`.
 
-/// The expected route paths from `build_router` (WI 0072 + 0073).
+/// The expected route paths from `build_router`. WI 0078 retired the legacy
+/// `/v1/commands/{id}/logs` and `/v1/commands/{id}/logs/stream` endpoints in
+/// favor of `/v1/sessions/{id}/jobs/{job_id}/logs`, which carries structured
+/// `ExecutionEvent` payloads in SSE.
 const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/status"),
     ("GET", "/v1/workdirs"),
     ("GET", "/v1/sessions"),
     ("POST", "/v1/sessions"),
-    ("GET", "/v1/sessions/{id}"),
-    ("DELETE", "/v1/sessions/{id}"),
+    ("GET", "/v1/sessions/:id"),
+    ("DELETE", "/v1/sessions/:id"),
+    ("GET", "/v1/sessions/:id/status"),
+    ("GET", "/v1/sessions/:id/jobs/:job_id/logs"),
     ("POST", "/v1/commands"),
-    ("GET", "/v1/commands/{id}"),
-    ("GET", "/v1/commands/{id}/logs"),
-    ("GET", "/v1/commands/{id}/logs/stream"),
-    ("GET", "/v1/workflows/{command_id}"),
+    ("GET", "/v1/commands/:id"),
+    ("GET", "/v1/workflows/:command_id"),
 ];
 
 #[test]
@@ -91,9 +94,22 @@ fn v1_status_route_present_in_expected_table() {
 }
 
 #[test]
-fn v1_commands_stream_route_present() {
-    let has_stream = EXPECTED_ROUTES.iter().any(|(_, p)| p.contains("stream"));
-    assert!(has_stream);
+fn per_job_logs_route_present() {
+    let has_job_logs = EXPECTED_ROUTES
+        .iter()
+        .any(|(_, p)| *p == "/v1/sessions/:id/jobs/:job_id/logs");
+    assert!(has_job_logs, "per-job structured SSE endpoint must be registered");
+}
+
+#[test]
+fn legacy_command_log_routes_are_removed() {
+    let has_legacy_stream = EXPECTED_ROUTES
+        .iter()
+        .any(|(_, p)| p.contains("/v1/commands/") && p.contains("/logs"));
+    assert!(
+        !has_legacy_stream,
+        "legacy /v1/commands/{{id}}/logs(/stream) endpoints must not be present"
+    );
 }
 
 // ─── SqliteSessionStore as API persistence layer ────────────────────────

@@ -27,7 +27,7 @@ use crate::command::commands::new::{
 };
 use crate::command::commands::ready::ReadyOutcome;
 use crate::command::commands::remote::{
-    RemoteOutcome, RemoteRunOutcome, RemoteSessionKillOutcome, RemoteSessionStartOutcome,
+    RemoteExecOutcome, RemoteOutcome, RemoteSessionKillOutcome, RemoteSessionStartOutcome,
 };
 use crate::command::commands::specs::{SpecsAmendOutcome, SpecsOutcome};
 use crate::command::commands::status::{StatusContainerRow, StatusOutcome};
@@ -317,29 +317,34 @@ fn render_api_server_status(o: &ApiServerStatusOutcome) -> String {
 
 fn render_remote(o: &RemoteOutcome) -> Option<String> {
     match o {
-        RemoteOutcome::Run(r) => Some(render_remote_run(r)),
+        RemoteOutcome::ExecWorkflow(r) => Some(render_remote_exec(r)),
+        RemoteOutcome::ExecPrompt(r) => Some(render_remote_exec(r)),
         RemoteOutcome::SessionStart(s) => Some(render_remote_session_start(s)),
         RemoteOutcome::SessionKill(k) => Some(render_remote_session_kill(k)),
     }
 }
 
-fn render_remote_run(o: &RemoteRunOutcome) -> String {
-    let cmd = o.command.join(" ");
+fn render_remote_exec(o: &RemoteExecOutcome) -> String {
     let status_part = o
         .status
         .as_deref()
         .map(|s| format!(" [{s}]"))
         .unwrap_or_default();
     format!(
-        "Command {}: {cmd} (session {}) via {}{status_part}",
-        o.command_id, o.session, o.remote_addr,
+        "Command {}: {} (session {}) via {}{status_part}",
+        o.command_id, o.subcommand, o.session, o.remote_addr,
     )
 }
 
 fn render_remote_session_start(o: &RemoteSessionStartOutcome) -> String {
+    let status_part = o
+        .setup_status
+        .as_deref()
+        .map(|s| format!(" [{s}]"))
+        .unwrap_or_default();
     format!(
-        "Session {} created for {} via {}.",
-        o.session_id, o.dir, o.remote_addr,
+        "Session {} created via {}{status_part}.",
+        o.session_id, o.remote_addr,
     )
 }
 
@@ -579,16 +584,16 @@ mod tests {
     }
 
     #[test]
-    fn render_remote_run_includes_session_when_present() {
-        let s = render_remote_run(&RemoteRunOutcome {
+    fn render_remote_exec_includes_session_when_present() {
+        let s = render_remote_exec(&RemoteExecOutcome {
             command_id: "cmd-1".into(),
-            command: vec!["status".into()],
+            subcommand: "exec workflow".into(),
             session: "abc123".into(),
             remote_addr: "localhost:9876".into(),
             status: None,
             exit_code: None,
         });
-        assert!(s.contains("status"));
+        assert!(s.contains("exec workflow"));
         assert!(s.contains("abc123"));
     }
 
@@ -968,21 +973,21 @@ mod tests {
     use crate::command::commands::remote::{RemoteSessionKillOutcome, RemoteSessionStartOutcome};
 
     #[test]
-    fn render_remote_session_start_with_dir() {
+    fn render_remote_session_start_shows_session_id() {
         let s = render_remote_session_start(&RemoteSessionStartOutcome {
             session_id: "sess-1".into(),
-            dir: "/my/repo".into(),
             remote_addr: "localhost:9876".into(),
+            setup_status: Some("ready".into()),
         });
-        assert!(s.contains("/my/repo"), "dir must appear: {s}");
+        assert!(s.contains("sess-1"), "session_id must appear: {s}");
     }
 
     #[test]
     fn render_remote_session_start_shows_remote_addr() {
         let s = render_remote_session_start(&RemoteSessionStartOutcome {
             session_id: "sess-2".into(),
-            dir: "/work".into(),
             remote_addr: "localhost:9876".into(),
+            setup_status: None,
         });
         assert!(s.contains("localhost:9876"), "remote_addr must appear: {s}");
     }

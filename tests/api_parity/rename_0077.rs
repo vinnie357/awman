@@ -222,6 +222,8 @@ async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
         auth_mode: AuthMode::Disabled,
         engines,
         sessions: tokio::sync::Mutex::new(HashMap::new()),
+        event_buses: tokio::sync::Mutex::new(HashMap::new()),
+        setup_buses: tokio::sync::Mutex::new(HashMap::new()),
     });
 
     let app = build_router(state);

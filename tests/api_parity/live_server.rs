@@ -53,6 +53,8 @@ fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
         auth_mode: auth,
         engines,
         sessions: tokio::sync::Mutex::new(HashMap::new()),
+        event_buses: tokio::sync::Mutex::new(HashMap::new()),
+        setup_buses: tokio::sync::Mutex::new(HashMap::new()),
     })
 }
 

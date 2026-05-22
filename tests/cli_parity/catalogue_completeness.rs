@@ -3,7 +3,7 @@
 //! Confirms that every command documented in `aspec/uxui/cli.md` is present in
 //! `CommandCatalogue` and that flag implications / conflicts are registered.
 
-use awman::command::dispatch::catalogue::{ArgumentKind, CommandCatalogue, FlagKind};
+use awman::command::dispatch::catalogue::{CommandCatalogue, FlagKind};
 
 fn cat() -> &'static CommandCatalogue {
     CommandCatalogue::get()
@@ -82,22 +82,30 @@ fn api_start_has_workdirs_flag() {
     assert!(cmd.find_flag("workdirs").is_some());
 }
 
-// ─── remote run ──────────────────────────────────────────────────────────────
+// ─── remote exec ─────────────────────────────────────────────────────────────
 
 #[test]
-fn remote_run_has_follow_flag() {
-    let cmd = cat().lookup(&["remote", "run"]).unwrap();
+fn remote_exec_workflow_has_follow_flag() {
+    let cmd = cat().lookup(&["remote", "exec", "workflow"]).unwrap();
     assert!(cmd.find_flag("follow").is_some());
 }
 
 #[test]
-fn remote_run_has_trailing_args_argument() {
-    let cmd = cat().lookup(&["remote", "run"]).unwrap();
-    let trailing = cmd
-        .arguments
-        .iter()
-        .any(|a| matches!(a.kind, ArgumentKind::TrailingVarArgs));
-    assert!(trailing, "remote run must accept trailing var-args");
+fn remote_exec_workflow_has_workflow_argument() {
+    let cmd = cat().lookup(&["remote", "exec", "workflow"]).unwrap();
+    assert!(
+        cmd.arguments.iter().any(|a| a.name == "workflow"),
+        "remote exec workflow must accept a workflow argument"
+    );
+}
+
+#[test]
+fn remote_exec_prompt_has_prompt_argument() {
+    let cmd = cat().lookup(&["remote", "exec", "prompt"]).unwrap();
+    assert!(
+        cmd.arguments.iter().any(|a| a.name == "prompt"),
+        "remote exec prompt must accept a prompt argument"
+    );
 }
 
 // ─── new workflow format values ───────────────────────────────────────────────

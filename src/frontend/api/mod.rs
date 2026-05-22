@@ -5,7 +5,9 @@
 //! spawning a child process.
 
 pub mod command_frontend;
+pub mod event_bus;
 pub mod routes;
+pub mod session_setup;
 
 use crate::command::commands::api_server::ApiServeConfig;
 use crate::command::error::CommandError;
@@ -109,6 +111,55 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
         }
     }
 
+    // Mark sessions with in-progress setup as failed (server restarted mid-setup).
+    // Authoritative source is the DB's setup_status column; we also persist
+    // a setup_state.json for the /status endpoint's disk fallback path so
+    // that the failure reason is visible to clients.
+    {
+        use crate::data::session_setup_event::{
+            SessionSetupError, SessionSetupState, SessionSetupStatus,
+        };
+        if let Ok(records) = store.list_sessions_with_in_progress_setup() {
+            for rec in &records {
+                tracing::warn!(
+                    session_id = %rec.id,
+                    previous_status = %rec.setup_status,
+                    "Marking session as failed (server restarted during setup)"
+                );
+                let _ = store.update_setup_status(&rec.id, "failed");
+
+                // Clean up any partial clone for remote sessions.
+                if rec.session_type == "remote" {
+                    if let Some(cloned) = rec.cloned_path.as_deref() {
+                        let _ = std::fs::remove_dir_all(cloned);
+                    }
+                }
+
+                // Update or create setup_state.json so /status reflects the
+                // restart failure once the in-memory bus is gone.
+                let setup_path = api_paths.session_dir(&rec.id).join("setup_state.json");
+                let mut ss = match std::fs::read_to_string(&setup_path)
+                    .ok()
+                    .and_then(|c| serde_json::from_str::<SessionSetupState>(&c).ok())
+                {
+                    Some(s) => s,
+                    None => SessionSetupState::new(),
+                };
+                ss.status = SessionSetupStatus::Failed;
+                ss.current_stage =
+                    Some("Server restarted during session setup".to_string());
+                ss.error = Some(SessionSetupError {
+                    stage: "server_restart".to_string(),
+                    message: "Server restarted during session setup".to_string(),
+                });
+                if let Ok(json) = serde_json::to_string_pretty(&ss) {
+                    let _ = std::fs::create_dir_all(api_paths.session_dir(&rec.id));
+                    let _ = std::fs::write(&setup_path, json);
+                }
+            }
+        }
+    }
+
     let state = Arc::new(routes::AppState {
         store,
         paths: api_paths,
@@ -119,6 +170,8 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
         auth_mode,
         engines,
         sessions: tokio::sync::Mutex::new(restored_sessions),
+        event_buses: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        setup_buses: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     let app = routes::build_router(state.clone());
