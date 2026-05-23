@@ -40,9 +40,15 @@ pub struct GlobalConfig {
     pub overlays: Option<OverlaysConfig>,
     #[serde(rename = "agentStuckTimeout", skip_serializing_if = "Option::is_none")]
     pub agent_stuck_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workers: Option<u8>,
 }
 
 impl GlobalConfig {
+    pub fn workers(&self) -> u8 {
+        self.workers.unwrap_or(2)
+    }
+
     /// Resolve the global config home directory. Honours `AWMAN_CONFIG_HOME` for
     /// tests and overrides; otherwise falls back to `$HOME/.awman`.
     pub fn home_dir() -> Result<PathBuf, DataError> {
@@ -141,6 +147,7 @@ mod tests {
             }),
             overlays: None,
             agent_stuck_timeout_secs: Some(45),
+            workers: None,
         };
 
         original.save_with(&env).unwrap();

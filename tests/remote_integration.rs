@@ -3,7 +3,6 @@
 /// Tests spin up an in-process headless HTTP server (the same infrastructure
 /// used by `headless_integration.rs`) and exercise the public remote-client
 /// functions against it over real HTTP.  No Docker daemon is required.
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -229,7 +228,6 @@ async fn start_test_server(workdirs: Vec<PathBuf>) -> (TempDir, String) {
         headless_root: root_dir.path().to_path_buf(),
         started_at: Instant::now(),
         runtime: Arc::new(MockRuntime),
-        busy_sessions: Mutex::new(HashSet::new()),
         task_handles: Mutex::new(Vec::new()),
         auth_mode: AuthMode::Disabled,
     });

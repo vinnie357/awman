@@ -5,7 +5,7 @@
 //! cleanly. Tests are gated by whether we can bind a TCP port; on hosts that
 //! deny loopback binding we skip rather than hard-fail.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -44,16 +44,15 @@ fn make_app_state(root: &std::path::Path, auth: AuthMode) -> Arc<AppState> {
     };
 
     Arc::new(AppState {
-        store,
+        store: Arc::new(store),
         paths,
         workdirs: vec![],
         started_at: Instant::now(),
-        busy_sessions: tokio::sync::Mutex::new(HashSet::new()),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: auth,
         engines,
-        sessions: tokio::sync::Mutex::new(HashMap::new()),
-        event_buses: tokio::sync::Mutex::new(HashMap::new()),
+        sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         setup_buses: tokio::sync::Mutex::new(HashMap::new()),
     })
 }

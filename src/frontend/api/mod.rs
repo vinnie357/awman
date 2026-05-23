@@ -14,7 +14,6 @@ use crate::command::error::CommandError;
 
 /// Boot the API HTTP server and block until shutdown signal.
 pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
-    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -89,13 +88,43 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
     if let Ok(records) = store.list_sessions_by_status(Some("active")) {
         for rec in records {
             let workdir_path = std::path::PathBuf::from(&rec.workdir);
+
+            // For remote sessions, the workdir IS the clone directory; if the
+            // clone no longer exists on disk, close the session and skip.
+            if rec.session_type == "remote" && !workdir_path.exists() {
+                tracing::warn!(
+                    session_id = %rec.id,
+                    workdir = %rec.workdir,
+                    "Remote session clone no longer exists; closing session"
+                );
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = store.close_session_force(&rec.id, &now);
+                continue;
+            }
+
             let resolver = crate::data::session::StaticGitRootResolver::new(&workdir_path);
             match crate::data::session::Session::open_or_workdir_fallback(
-                workdir_path,
+                workdir_path.clone(),
                 &resolver,
                 crate::data::session::SessionOpenOptions::default(),
             ) {
-                Ok(s) => {
+                Ok(mut s) => {
+                    // Restore the SessionType variant for remote sessions so
+                    // that worktree suppression and other type-aware code
+                    // paths behave correctly. repo_url and branch aren't
+                    // persisted in the schema; use empty placeholders since
+                    // only the variant and cloned_path are actually consumed.
+                    if rec.session_type == "remote" {
+                        if let Some(cloned) = rec.cloned_path.as_deref() {
+                            s.set_session_type(
+                                crate::data::session::SessionType::Remote {
+                                    repo_url: String::new(),
+                                    branch: String::new(),
+                                    cloned_path: std::path::PathBuf::from(cloned),
+                                },
+                            );
+                        }
+                    }
                     restored_sessions.insert(rec.id.clone(), Arc::new(tokio::sync::RwLock::new(s)));
                     tracing::info!(session_id = %rec.id, workdir = %rec.workdir, "Restored session");
                 }
@@ -160,19 +189,64 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
         }
     }
 
+    let store = Arc::new(store);
+
+    // Stale command recovery: at startup, every command still in `running`
+    // is unequivocally stale — the worker that owned it died with the
+    // previous server process. Use a zero-second threshold so we recover all
+    // of them immediately rather than leaving recently-started ones stuck
+    // for the duration of the threshold.
+    match store.recover_stale_commands(0) {
+        Ok(recovered) if !recovered.is_empty() => {
+            tracing::info!(
+                count = recovered.len(),
+                "Recovered stale running commands back to queued"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to recover stale commands");
+        }
+        _ => {}
+    }
+
+    let sessions = Arc::new(tokio::sync::Mutex::new(restored_sessions));
+    let event_buses = Arc::new(tokio::sync::Mutex::new(
+        std::collections::HashMap::new(),
+    ));
+
     let state = Arc::new(routes::AppState {
-        store,
+        store: Arc::clone(&store),
         paths: api_paths,
         workdirs: config.workdirs,
         started_at: Instant::now(),
-        busy_sessions: tokio::sync::Mutex::new(HashSet::new()),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode,
-        engines,
-        sessions: tokio::sync::Mutex::new(restored_sessions),
-        event_buses: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        engines: engines.clone(),
+        sessions: Arc::clone(&sessions),
+        event_buses: Arc::clone(&event_buses),
         setup_buses: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
+
+    // Spawn queue workers.
+    let worker_count = crate::data::config::global::GlobalConfig::load()
+        .unwrap_or_default()
+        .workers();
+    if worker_count == 0 {
+        tracing::warn!("workers config is 0 — no queue workers will run; commands will be enqueued but never processed");
+    }
+    for i in 0..worker_count {
+        let worker = crate::command::QueueWorker::new(
+            format!("worker-{i}-{}", uuid::Uuid::new_v4()),
+            Arc::clone(&store),
+            engines.clone(),
+            Arc::clone(&sessions),
+            Arc::clone(&event_buses),
+            state.paths.clone(),
+        );
+        tokio::spawn(worker.run());
+        tracing::debug!(worker_index = i, "Spawned queue worker");
+    }
+    tracing::info!(count = worker_count, "Queue workers started");
 
     let app = routes::build_router(state.clone());
     let addr = std::net::SocketAddr::from((config.bind_ip, config.port));

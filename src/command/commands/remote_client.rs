@@ -269,9 +269,9 @@ impl RemoteClient {
             .map_err(|e| CommandError::Other(format!("invalid exec response: {e}")))
     }
 
-    /// `GET /v1/commands/{id}` — fetch a job's metadata.
+    /// `GET /v1/commands/{id}/status` — fetch a job's metadata.
     pub async fn get_job(&self, command_id: &str) -> Result<RemoteResponse, CommandError> {
-        self.get(&["commands", command_id]).await
+        self.get(&["commands", command_id, "status"]).await
     }
 
     /// `GET /v1/workflows/{id}` — fetch the workflow state JSON for a job.
@@ -287,12 +287,12 @@ impl RemoteClient {
         }
     }
 
-    /// `GET /v1/sessions/{sid}/jobs/{jid}/logs` (SSE) — stream typed
+    /// `GET /v1/commands/{id}/logs` (SSE) — stream typed
     /// `ExecutionEvent` values to the sink. Terminates when the server sends
     /// a `Done` event or the sink returns `true` from any callback.
     pub async fn stream_job_logs(
         &self,
-        session_id: &str,
+        _session_id: &str,
         job_id: &str,
         sink: &mut dyn ExecutionEventSink,
     ) -> Result<(), CommandError> {
@@ -300,7 +300,7 @@ impl RemoteClient {
         use futures_util::StreamExt;
 
         let url = format!(
-            "{}/v1/sessions/{session_id}/jobs/{job_id}/logs",
+            "{}/v1/commands/{job_id}/logs",
             self.base_url
         );
 

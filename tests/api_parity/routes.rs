@@ -54,10 +54,10 @@ fn api_paths_tls_dir_under_root() {
 //
 // Actual route-hit tests live in binary_smoke and are marked `real_network_*`.
 
-/// The expected route paths from `build_router`. WI 0078 retired the legacy
-/// `/v1/commands/{id}/logs` and `/v1/commands/{id}/logs/stream` endpoints in
-/// favor of `/v1/sessions/{id}/jobs/{job_id}/logs`, which carries structured
-/// `ExecutionEvent` payloads in SSE.
+/// The expected route paths from `build_router`. WI 0079 moved SSE log
+/// streaming from `/v1/sessions/{id}/jobs/{job_id}/logs` to
+/// `/v1/commands/{id}/logs`, and added `GET /v1/sessions/:id/queue` and
+/// `GET /v1/commands/:id/status`.
 const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/status"),
     ("GET", "/v1/workdirs"),
@@ -66,15 +66,16 @@ const EXPECTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/sessions/:id"),
     ("DELETE", "/v1/sessions/:id"),
     ("GET", "/v1/sessions/:id/status"),
-    ("GET", "/v1/sessions/:id/jobs/:job_id/logs"),
+    ("GET", "/v1/sessions/:id/queue"),
     ("POST", "/v1/commands"),
-    ("GET", "/v1/commands/:id"),
+    ("GET", "/v1/commands/:id/status"),
+    ("GET", "/v1/commands/:id/logs"),
     ("GET", "/v1/workflows/:command_id"),
 ];
 
 #[test]
 fn expected_routes_table_is_non_empty() {
-    assert_eq!(EXPECTED_ROUTES.len(), 11);
+    assert_eq!(EXPECTED_ROUTES.len(), 12);
 }
 
 #[test]
@@ -97,18 +98,18 @@ fn v1_status_route_present_in_expected_table() {
 fn per_job_logs_route_present() {
     let has_job_logs = EXPECTED_ROUTES
         .iter()
-        .any(|(_, p)| *p == "/v1/sessions/:id/jobs/:job_id/logs");
-    assert!(has_job_logs, "per-job structured SSE endpoint must be registered");
+        .any(|(_, p)| *p == "/v1/commands/:id/logs");
+    assert!(has_job_logs, "per-command structured SSE endpoint must be registered");
 }
 
 #[test]
 fn legacy_command_log_routes_are_removed() {
-    let has_legacy_stream = EXPECTED_ROUTES
+    let has_legacy = EXPECTED_ROUTES
         .iter()
-        .any(|(_, p)| p.contains("/v1/commands/") && p.contains("/logs"));
+        .any(|(_, p)| p.contains("/jobs/"));
     assert!(
-        !has_legacy_stream,
-        "legacy /v1/commands/{{id}}/logs(/stream) endpoints must not be present"
+        !has_legacy,
+        "legacy /v1/sessions/{{id}}/jobs/{{job_id}}/logs endpoints must not be present"
     );
 }
 

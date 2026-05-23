@@ -65,7 +65,8 @@ Applies to all projects on the machine unless overridden by a per-repo config.
   },
   "api": {
     "workDirs": ["/home/user/my-project"],
-    "alwaysNonInteractive": false
+    "alwaysNonInteractive": false,
+    "workers": 2
   },
   "remote": {
     "defaultAddr": "http://build-server.example.com:9876",
@@ -86,6 +87,7 @@ Applies to all projects on the machine unless overridden by a per-repo config.
 | `overlays.directories` | object array | `[]` | Host directories to mount into agent containers automatically across all projects. **Additive** with per-repo overlays — both lists are merged. See [`overlays`](#overlays) |
 | `api.workDirs` | string array | `[]` | Working directories pre-approved for API mode session creation. Merged with `--workdirs` flags at server startup. See [API Mode](08-api-mode.md#working-directory-allowlist) |
 | `api.alwaysNonInteractive` | boolean | `false` | When `true`, all dispatched commands automatically run in non-interactive mode. Useful for API servers where no TTY is available. See [API Mode](08-api-mode.md#alwaysnoninteractive) |
+| `api.workers` | integer | `2` | Number of worker tasks that process the command queue in parallel. Each worker claims one queued command at a time and executes it. Higher values allow more concurrent command execution across sessions (one command per session). See [API Mode: Job Queue](08-api-mode.md#job-queue) |
 | `remote.defaultAddr` | string | (not set) | Default address of the remote API awman server (e.g. `http://host:9876`). Overridden by `--remote-addr` or `AWMAN_REMOTE_ADDR`. See [Remote Mode](09-remote-mode.md#connecting-to-a-remote-host) |
 | `remote.defaultAPIKey` | string | (not set) | API key sent with every request to `remote.defaultAddr`. **Only sent when the target address exactly matches `remote.defaultAddr`** — never forwarded to other hosts. Overridden by `--api-key` or `AWMAN_API_KEY`. See [Remote Mode](09-remote-mode.md#api-key-authentication) |
 | `remote.savedDirs` | string array | `[]` | Absolute paths (on the remote host) shown in the TUI saved-dir picker for `remote session start`. See [Remote Mode](09-remote-mode.md#configuration) |
@@ -108,6 +110,7 @@ Applies to all projects on the machine unless overridden by a per-repo config.
 | `workItems.dir` / `workItems.template` | Per-repo only |
 | `api.workDirs` | Global only (merged with `--workdirs` flags at startup) |
 | `api.alwaysNonInteractive` | Global only |
+| `api.workers` | Global only |
 | `remote.defaultAddr` | Global only (overridden per-invocation by `--remote-addr` or `AWMAN_REMOTE_ADDR`) |
 | `remote.defaultAPIKey` | Global only (overridden per-invocation by `--api-key` or `AWMAN_API_KEY`; only sent to `remote.defaultAddr`) |
 | `remote.savedDirs` | Global only |

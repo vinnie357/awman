@@ -8,6 +8,7 @@
 pub mod commands;
 pub mod dispatch;
 pub mod error;
+pub mod queue_worker;
 
 pub use dispatch::catalogue::{CommandCatalogue, CommandSpec, FlagSpec, FrontendVisibility};
 pub use dispatch::{
@@ -15,3 +16,4 @@ pub use dispatch::{
     ParsedCommandBoxInput,
 };
 pub use error::CommandError;
+pub use queue_worker::QueueWorker;

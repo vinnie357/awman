@@ -2,7 +2,6 @@
 ///
 /// Tests spin up an in-process axum server bound to a random OS-assigned port
 /// and exercise the full HTTP API via `reqwest`. No Docker daemon is required.
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -223,7 +222,6 @@ async fn start_test_server_with_auth(workdirs: Vec<PathBuf>, auth_mode: AuthMode
         headless_root: root_dir.path().to_path_buf(),
         started_at: Instant::now(),
         runtime: Arc::new(MockRuntime),
-        busy_sessions: Mutex::new(HashSet::new()),
         task_handles: Mutex::new(Vec::new()),
         auth_mode,
     });

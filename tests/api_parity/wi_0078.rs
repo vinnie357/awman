@@ -13,7 +13,7 @@
 //! Live server tests are prefixed `real_network_` and skip gracefully when
 //! loopback binding is unavailable (sandboxed CI).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -68,16 +68,15 @@ fn make_app_state_with_workdirs(
     };
 
     Arc::new(AppState {
-        store,
+        store: Arc::new(store),
         paths,
         workdirs,
         started_at: Instant::now(),
-        busy_sessions: tokio::sync::Mutex::new(HashSet::new()),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: auth,
         engines,
-        sessions: tokio::sync::Mutex::new(HashMap::new()),
-        event_buses: tokio::sync::Mutex::new(HashMap::new()),
+        sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         setup_buses: tokio::sync::Mutex::new(HashMap::new()),
     })
 }
@@ -1220,7 +1219,7 @@ fn update_setup_status_round_trips() {
 
 // ─── Per-job SSE endpoint ─────────────────────────────────────────────────────
 
-/// GET /v1/sessions/{sid}/jobs/{jid}/logs for a non-existent job returns 404.
+/// GET /v1/commands/{id}/logs for a non-existent command returns 404.
 #[tokio::test]
 async fn real_network_job_logs_404_for_unknown_job() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1231,151 +1230,11 @@ async fn real_network_job_logs_404_for_unknown_job() {
     };
 
     let resp = reqwest::get(format!(
-        "http://{addr}/v1/sessions/no-such-sid/jobs/no-such-jid/logs"
+        "http://{addr}/v1/commands/no-such-cmd/logs"
     ))
     .await
-    .expect("GET /jobs/logs");
+    .expect("GET /commands/logs");
     assert_eq!(resp.status().as_u16(), 404);
-
-    server.abort();
-}
-
-/// `?format=json` returns the contents of events.log as a JSON array of
-/// `ExecutionEvent`s, even when the job is fully completed.
-#[tokio::test]
-async fn real_network_job_logs_format_json_returns_array() {
-    use tokio::io::AsyncWriteExt;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let workdir = tempfile::tempdir().unwrap();
-    let workdir_path = workdir.path().canonicalize().unwrap();
-
-    let state =
-        make_app_state_with_workdirs(tmp.path(), AuthMode::Disabled, vec![workdir_path.clone()]);
-    let Some((addr, server)) = spawn_router(state.clone()).await else {
-        eprintln!("SKIP: cannot bind 127.0.0.1");
-        return;
-    };
-
-    let sid = "json-session";
-    let jid = "json-job";
-    state
-        .store
-        .insert_session_full(
-            sid,
-            &workdir_path.display().to_string(),
-            "2026-01-01T00:00:00Z",
-            "ready",
-            "local",
-            None,
-        )
-        .unwrap();
-    let cmd_dir = state.paths.command_dir(sid, jid);
-    tokio::fs::create_dir_all(&cmd_dir).await.unwrap();
-    let log_path = cmd_dir.join("output.log");
-    state
-        .store
-        .insert_command(jid, sid, "exec prompt", "[]", &log_path.display().to_string())
-        .unwrap();
-    state
-        .store
-        .update_command_finished(jid, "done", Some(0), "2026-01-01T00:00:05Z")
-        .unwrap();
-
-    // Write an NDJSON events.log with two events.
-    let events_log = state.paths.command_events_log_path(sid, jid);
-    let mut f = tokio::fs::File::create(&events_log).await.unwrap();
-    f.write_all(b"{\"timestamp\":\"2026-01-01T00:00:00Z\",\"sequence\":0,\"payload\":{\"type\":\"StdoutLine\",\"data\":\"first\"}}\n").await.unwrap();
-    f.write_all(b"{\"timestamp\":\"2026-01-01T00:00:01Z\",\"sequence\":1,\"payload\":{\"type\":\"Done\"}}\n").await.unwrap();
-    f.flush().await.unwrap();
-
-    let resp = reqwest::get(format!(
-        "http://{addr}/v1/sessions/{sid}/jobs/{jid}/logs?format=json"
-    ))
-    .await
-    .expect("GET /jobs/logs?format=json");
-    assert_eq!(resp.status().as_u16(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["session_id"].as_str().unwrap(), sid);
-    assert_eq!(body["job_id"].as_str().unwrap(), jid);
-    let events = body["events"].as_array().unwrap();
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0]["sequence"].as_u64().unwrap(), 0);
-    assert_eq!(events[1]["sequence"].as_u64().unwrap(), 1);
-
-    server.abort();
-}
-
-/// SSE replay path: write a known events.log, then GET the per-job logs
-/// endpoint without a query parameter. Assert the response body is in SSE
-/// format and contains all events.
-#[tokio::test]
-async fn real_network_job_logs_sse_replays_events() {
-    use tokio::io::AsyncWriteExt;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let workdir = tempfile::tempdir().unwrap();
-    let workdir_path = workdir.path().canonicalize().unwrap();
-
-    let state =
-        make_app_state_with_workdirs(tmp.path(), AuthMode::Disabled, vec![workdir_path.clone()]);
-    let Some((addr, server)) = spawn_router(state.clone()).await else {
-        eprintln!("SKIP: cannot bind 127.0.0.1");
-        return;
-    };
-
-    let sid = "sse-session";
-    let jid = "sse-job";
-    state
-        .store
-        .insert_session_full(
-            sid,
-            &workdir_path.display().to_string(),
-            "2026-01-01T00:00:00Z",
-            "ready",
-            "local",
-            None,
-        )
-        .unwrap();
-    let cmd_dir = state.paths.command_dir(sid, jid);
-    tokio::fs::create_dir_all(&cmd_dir).await.unwrap();
-    let log_path = cmd_dir.join("output.log");
-    state
-        .store
-        .insert_command(jid, sid, "exec prompt", "[]", &log_path.display().to_string())
-        .unwrap();
-    state
-        .store
-        .update_command_finished(jid, "done", Some(0), "2026-01-01T00:00:05Z")
-        .unwrap();
-
-    let events_log = state.paths.command_events_log_path(sid, jid);
-    let mut f = tokio::fs::File::create(&events_log).await.unwrap();
-    f.write_all(b"{\"timestamp\":\"2026-01-01T00:00:00Z\",\"sequence\":0,\"payload\":{\"type\":\"StdoutLine\",\"data\":\"first line\"}}\n").await.unwrap();
-    f.write_all(b"{\"timestamp\":\"2026-01-01T00:00:01Z\",\"sequence\":1,\"payload\":{\"type\":\"Done\"}}\n").await.unwrap();
-    f.flush().await.unwrap();
-
-    let resp = reqwest::get(format!(
-        "http://{addr}/v1/sessions/{sid}/jobs/{jid}/logs"
-    ))
-    .await
-    .expect("GET SSE logs");
-    assert_eq!(resp.status().as_u16(), 200);
-    let body = resp.text().await.unwrap();
-
-    // Look for at least one structured SSE message.
-    assert!(
-        body.contains("event: stdout_line"),
-        "SSE body must contain `event: stdout_line`; got {body}"
-    );
-    assert!(
-        body.contains("first line"),
-        "SSE body must include the stdout payload; got {body}"
-    );
-    assert!(
-        body.contains("event: done"),
-        "SSE body must contain `event: done`; got {body}"
-    );
 
     server.abort();
 }

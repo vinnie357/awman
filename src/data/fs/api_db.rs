@@ -44,6 +44,37 @@ pub struct CommandRecord {
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub log_path: String,
+    pub worker_id: Option<String>,
+    pub queued_at: Option<String>,
+    pub result: Option<String>,
+}
+
+/// Identifies a running worker task.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkerId(pub String);
+
+impl WorkerId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for WorkerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Result of a completed command execution, serialized as JSON into the
+/// `result` column.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CommandResult {
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
 }
 
 /// Sqlite-backed session and command store.
@@ -109,6 +140,9 @@ impl SqliteSessionStore {
             "TEXT NOT NULL DEFAULT 'local'",
         )?;
         Self::add_column_if_missing(conn, "sessions", "cloned_path", "TEXT")?;
+        Self::add_column_if_missing(conn, "commands", "worker_id", "TEXT")?;
+        Self::add_column_if_missing(conn, "commands", "queued_at", "TEXT")?;
+        Self::add_column_if_missing(conn, "commands", "result", "TEXT")?;
         Ok(())
     }
 
@@ -331,7 +365,7 @@ impl SqliteSessionStore {
         let conn = self.lock();
         let mut stmt = conn.prepare(
             "SELECT id, session_id, subcommand, args, status, exit_code, \
-                    started_at, finished_at, log_path
+                    started_at, finished_at, log_path, worker_id, queued_at, result
              FROM commands WHERE id = ?1",
         )?;
         let mut rows = stmt.query_map(params![id], |row| {
@@ -345,6 +379,9 @@ impl SqliteSessionStore {
                 started_at: row.get(6)?,
                 finished_at: row.get(7)?,
                 log_path: row.get(8)?,
+                worker_id: row.get(9)?,
+                queued_at: row.get(10)?,
+                result: row.get(11)?,
             })
         })?;
         match rows.next() {
@@ -405,6 +442,262 @@ impl SqliteSessionStore {
     ) -> Result<R, DataError> {
         let conn = self.lock();
         f(&conn)
+    }
+
+    // ─── Queue operations ─────────────────────────────────────────────────
+
+    pub fn enqueue_command(
+        &self,
+        id: &str,
+        session_id: &str,
+        subcommand: &str,
+        args: &str,
+        log_path: &str,
+    ) -> Result<(), DataError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at)
+             VALUES (?1, ?2, ?3, ?4, 'queued', ?5, ?6)",
+            params![id, session_id, subcommand, args, log_path, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim_next_command(&self, worker_id: &str) -> Result<Option<CommandRecord>, DataError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.lock();
+        // Atomically claim the next eligible command: must be queued (or legacy pending)
+        // and no other command in the same session can be running.
+        let mut stmt = conn.prepare(
+            "UPDATE commands
+             SET status = 'running', worker_id = ?1, started_at = ?2
+             WHERE id = (
+                 SELECT c.id FROM commands c
+                 WHERE c.status IN ('queued', 'pending')
+                   AND NOT EXISTS (
+                       SELECT 1 FROM commands r
+                       WHERE r.session_id = c.session_id
+                         AND r.status = 'running'
+                   )
+                 ORDER BY c.queued_at ASC, c.rowid ASC
+                 LIMIT 1
+             )
+             RETURNING id, session_id, subcommand, args, status, exit_code,
+                       started_at, finished_at, log_path, worker_id, queued_at, result",
+        )?;
+        let mut rows = stmt.query_map(params![worker_id, now], |row| {
+            Ok(CommandRecord {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                subcommand: row.get(2)?,
+                args: row.get(3)?,
+                status: row.get(4)?,
+                exit_code: row.get(5)?,
+                started_at: row.get(6)?,
+                finished_at: row.get(7)?,
+                log_path: row.get(8)?,
+                worker_id: row.get(9)?,
+                queued_at: row.get(10)?,
+                result: row.get(11)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn complete_command(
+        &self,
+        id: &str,
+        status: &str,
+        exit_code: Option<i32>,
+        result_json: Option<&str>,
+    ) -> Result<(), DataError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE commands SET status = ?1, exit_code = ?2, finished_at = ?3, result = ?4
+             WHERE id = ?5",
+            params![status, exit_code, now, result_json, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_commands_for_session(
+        &self,
+        session_id: &str,
+        limit: i64,
+    ) -> Result<Vec<CommandRecord>, DataError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, subcommand, args, status, exit_code,
+                    started_at, finished_at, log_path, worker_id, queued_at, result
+             FROM commands
+             WHERE session_id = ?1
+             ORDER BY queued_at DESC, rowid DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit], |row| {
+            Ok(CommandRecord {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                subcommand: row.get(2)?,
+                args: row.get(3)?,
+                status: row.get(4)?,
+                exit_code: row.get(5)?,
+                started_at: row.get(6)?,
+                finished_at: row.get(7)?,
+                log_path: row.get(8)?,
+                worker_id: row.get(9)?,
+                queued_at: row.get(10)?,
+                result: row.get(11)?,
+            })
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
+    pub fn count_queued_for_session(&self, session_id: &str) -> Result<i64, DataError> {
+        let conn = self.lock();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM commands WHERE session_id = ?1 AND status = 'queued'",
+            params![session_id],
+            |r| r.get(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn running_command_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<CommandRecord>, DataError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, subcommand, args, status, exit_code,
+                    started_at, finished_at, log_path, worker_id, queued_at, result
+             FROM commands
+             WHERE session_id = ?1 AND status = 'running'
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![session_id], |row| {
+            Ok(CommandRecord {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                subcommand: row.get(2)?,
+                args: row.get(3)?,
+                status: row.get(4)?,
+                exit_code: row.get(5)?,
+                started_at: row.get(6)?,
+                finished_at: row.get(7)?,
+                log_path: row.get(8)?,
+                worker_id: row.get(9)?,
+                queued_at: row.get(10)?,
+                result: row.get(11)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn cancel_queued_for_session(&self, session_id: &str) -> Result<Vec<String>, DataError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.lock();
+        // First get the IDs
+        let ids: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM commands WHERE session_id = ?1 AND status = 'queued'",
+            )?;
+            let rows = stmt
+                .query_map(params![session_id], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        // Then update
+        conn.execute(
+            "UPDATE commands SET status = 'cancelled', finished_at = ?1
+             WHERE session_id = ?2 AND status = 'queued'",
+            params![now, session_id],
+        )?;
+        Ok(ids)
+    }
+
+    pub fn recover_stale_commands(&self, timeout_secs: u64) -> Result<Vec<String>, DataError> {
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(timeout_secs as i64);
+        let cutoff_str = cutoff.to_rfc3339();
+        let conn = self.lock();
+        let ids: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM commands
+                 WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1",
+            )?;
+            let rows = stmt
+                .query_map(params![cutoff_str], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        conn.execute(
+            "UPDATE commands SET status = 'queued', worker_id = NULL, started_at = NULL
+             WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?1",
+            params![cutoff_str],
+        )?;
+        Ok(ids)
+    }
+
+    pub fn queue_position_for_command(
+        &self,
+        command_id: &str,
+        session_id: &str,
+    ) -> Result<Option<i64>, DataError> {
+        let conn = self.lock();
+        // Get the queued_at for this command
+        let queued_at: Option<String> = conn
+            .query_row(
+                "SELECT queued_at FROM commands WHERE id = ?1 AND status = 'queued'",
+                params![command_id],
+                |r| r.get(0),
+            )
+            .ok();
+        let Some(queued_at) = queued_at else {
+            return Ok(None);
+        };
+        let position: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM commands
+             WHERE session_id = ?1 AND status = 'queued'
+               AND (queued_at < ?2 OR (queued_at = ?2 AND rowid < (SELECT rowid FROM commands WHERE id = ?3)))",
+            params![session_id, queued_at, command_id],
+            |r| r.get(0),
+        )?;
+        Ok(Some(position))
+    }
+
+    /// Update a session's status to an arbitrary value (e.g. 'closing').
+    pub fn update_session_status(&self, id: &str, status: &str) -> Result<bool, DataError> {
+        let conn = self.lock();
+        let affected = conn.execute(
+            "UPDATE sessions SET status = ?1 WHERE id = ?2",
+            params![status, id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Close a session: set status to 'closed' and closed_at timestamp.
+    /// Unlike close_session which only works on 'active' sessions, this works
+    /// from any non-closed status.
+    pub fn close_session_force(&self, id: &str, closed_at: &str) -> Result<bool, DataError> {
+        let conn = self.lock();
+        let affected = conn.execute(
+            "UPDATE sessions SET status = 'closed', closed_at = ?1
+             WHERE id = ?2 AND status != 'closed'",
+            params![closed_at, id],
+        )?;
+        Ok(affected > 0)
     }
 }
 

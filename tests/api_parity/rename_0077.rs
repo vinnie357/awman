@@ -176,7 +176,7 @@ fn api_startup_log_message_contains_awman_and_api_mode() {
 /// Skipped when loopback binding is unavailable (sandboxed CI).
 #[tokio::test]
 async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Instant;
 
@@ -213,16 +213,15 @@ async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
     };
 
     let state = Arc::new(AppState {
-        store,
+        store: Arc::new(store),
         paths,
         workdirs: vec![],
         started_at: Instant::now(),
-        busy_sessions: tokio::sync::Mutex::new(HashSet::new()),
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: AuthMode::Disabled,
         engines,
-        sessions: tokio::sync::Mutex::new(HashMap::new()),
-        event_buses: tokio::sync::Mutex::new(HashMap::new()),
+        sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         setup_buses: tokio::sync::Mutex::new(HashMap::new()),
     });
 

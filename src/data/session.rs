@@ -259,11 +259,44 @@ impl GitRootResolver for StaticGitRootResolver {
     }
 }
 
+/// Whether this session targets a local working directory or a remote
+/// repository that was cloned automatically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionType {
+    Local { workdir: PathBuf },
+    Remote {
+        repo_url: String,
+        branch: String,
+        cloned_path: PathBuf,
+    },
+}
+
+impl SessionType {
+    pub fn is_remote(&self) -> bool {
+        matches!(self, SessionType::Remote { .. })
+    }
+
+    pub fn cloned_path(&self) -> Option<&Path> {
+        match self {
+            SessionType::Remote { cloned_path, .. } => Some(cloned_path),
+            SessionType::Local { .. } => None,
+        }
+    }
+
+    pub fn working_dir(&self) -> &Path {
+        match self {
+            SessionType::Local { workdir } => workdir,
+            SessionType::Remote { cloned_path, .. } => cloned_path,
+        }
+    }
+}
+
 /// The ruling Layer 0 type that every command and workflow invocation hangs off.
 #[derive(Debug, Clone)]
 pub struct Session {
     id: SessionId,
-    working_dir: PathBuf,
+    session_type: SessionType,
     git_root: PathBuf,
     repo_config: RepoConfig,
     global_config: GlobalConfig,
@@ -338,7 +371,7 @@ impl Session {
 
         Ok(Self {
             id: SessionId::new(),
-            working_dir,
+            session_type: SessionType::Local { workdir: working_dir },
             git_root,
             repo_config,
             global_config,
@@ -358,7 +391,15 @@ impl Session {
     }
 
     pub fn working_dir(&self) -> &Path {
-        &self.working_dir
+        self.session_type.working_dir()
+    }
+
+    pub fn session_type(&self) -> &SessionType {
+        &self.session_type
+    }
+
+    pub fn set_session_type(&mut self, session_type: SessionType) {
+        self.session_type = session_type;
     }
 
     pub fn git_root(&self) -> &Path {

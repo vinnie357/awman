@@ -22,7 +22,7 @@ pub mod new;
 pub mod prompt_templates;
 pub mod ready;
 pub mod remote;
-pub(super) mod remote_client;
+pub(crate) mod remote_client;
 pub mod specs;
 pub mod status;
 pub mod status_tips;

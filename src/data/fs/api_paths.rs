@@ -153,6 +153,16 @@ impl ApiPaths {
         self.session_dir(session_id).join("agent-settings")
     }
 
+    /// Directory for a remote session's cloned repository.
+    pub fn remote_session_repo_path(&self, session_id: &str) -> PathBuf {
+        self.session_dir(session_id).join("repo")
+    }
+
+    /// Directory for a remote session (parent of repo/).
+    pub fn remote_session_dir(&self, session_id: &str) -> PathBuf {
+        self.session_dir(session_id)
+    }
+
     /// Alias for `from_root` to match the legacy `at_root` naming.
     pub fn at_root(root: impl Into<PathBuf>) -> Self {
         Self::from_root(root)

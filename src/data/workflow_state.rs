@@ -14,7 +14,7 @@ use crate::data::workflow_definition::WorkflowStep;
 
 /// Current schema version for persisted `WorkflowState`. Bumped when the
 /// on-disk shape changes incompatibly.
-pub const WORKFLOW_STATE_SCHEMA_VERSION: u32 = 1;
+pub const WORKFLOW_STATE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepState {
@@ -34,6 +34,30 @@ pub enum StepState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowStepInfo {
+    pub name: String,
+    pub depends_on: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhaseStepStatus {
+    Pending,
+    Running,
+    Succeeded,
+    Failed { error: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseStepState {
+    pub description: String,
+    pub status: PhaseStepStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowState {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -46,6 +70,12 @@ pub struct WorkflowState {
     pub current_step_index: Option<usize>,
     pub started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStepInfo>,
+    #[serde(default)]
+    pub setup_step_states: Vec<PhaseStepState>,
+    #[serde(default)]
+    pub teardown_step_states: Vec<PhaseStepState>,
 }
 
 fn default_schema_version() -> u32 {
@@ -65,6 +95,15 @@ impl WorkflowState {
         for s in steps {
             step_states.insert(s.name.clone(), StepState::Pending);
         }
+        let step_infos: Vec<WorkflowStepInfo> = steps
+            .iter()
+            .map(|s| WorkflowStepInfo {
+                name: s.name.clone(),
+                depends_on: s.depends_on.clone(),
+                agent: s.agent.clone(),
+                model: s.model.clone(),
+            })
+            .collect();
         Self {
             schema_version: WORKFLOW_STATE_SCHEMA_VERSION,
             workflow_name,
@@ -75,6 +114,9 @@ impl WorkflowState {
             current_step_index: None,
             started_at: now,
             updated_at: now,
+            steps: step_infos,
+            setup_step_states: Vec::new(),
+            teardown_step_states: Vec::new(),
         }
     }
 

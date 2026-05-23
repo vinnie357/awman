@@ -2,7 +2,7 @@
 //!
 //! Wire-identical to `oldsrc/commands/headless/server.rs::build_router`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -18,14 +18,13 @@ use tokio::sync::RwLock;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::trace::TraceLayer;
 
-use crate::command::dispatch::{Dispatch, Engines};
+use crate::command::dispatch::Engines;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
 use crate::data::execution_event::{EventPayload, ExecutionEvent};
 use crate::data::fs::api_db::SqliteSessionStore;
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
 use crate::data::session_setup_event::{SessionSetupState, SessionSetupStatus, SetupEventPayload};
-use crate::frontend::api::command_frontend::ApiDispatchFrontend;
 use crate::frontend::api::event_bus::EventBus;
 use crate::frontend::api::session_setup::SessionSetupBus;
 
@@ -40,24 +39,42 @@ pub enum AuthMode {
 // ─── Shared state ────────────────────────────────────────────────────────────
 
 pub struct AppState {
-    pub store: SqliteSessionStore,
+    pub store: Arc<SqliteSessionStore>,
     pub paths: ApiPaths,
     pub workdirs: Vec<PathBuf>,
     pub started_at: Instant,
-    pub busy_sessions: tokio::sync::Mutex<HashSet<String>>,
     pub task_handles: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pub auth_mode: AuthMode,
     pub engines: Engines,
     /// Maps HTTP session IDs → their Layer 0 Session. Opened once when the
     /// session is created via the API, reused for every command dispatch
     /// within that session, removed when the session is closed.
-    pub sessions: tokio::sync::Mutex<HashMap<String, Arc<RwLock<Session>>>>,
+    pub sessions: Arc<tokio::sync::Mutex<HashMap<String, Arc<RwLock<Session>>>>>,
     /// Per-command EventBus handles, keyed by command_id. Retained during
     /// execution plus a short grace period for late-connecting SSE clients.
-    pub event_buses: tokio::sync::Mutex<HashMap<String, Arc<EventBus>>>,
+    pub event_buses: Arc<tokio::sync::Mutex<HashMap<String, Arc<EventBus>>>>,
     /// Per-session setup bus handles, keyed by session_id. Retained during
     /// setup plus 60 seconds after reaching a terminal state.
     pub setup_buses: tokio::sync::Mutex<HashMap<String, Arc<SessionSetupBus>>>,
+}
+
+#[derive(Serialize)]
+struct QueueStatusResponse {
+    session_id: String,
+    queue_depth: i64,
+    running: Option<serde_json::Value>,
+    queued: Vec<serde_json::Value>,
+    recent_completed: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct SessionClosingResponse {
+    session_id: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    running_command_id: Option<String>,
+    cancelled_count: usize,
+    message: String,
 }
 
 // ─── Request / Response types (wire-compatible with oldsrc) ──────────────────
@@ -123,6 +140,14 @@ struct CommandResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     finished_at: Option<String>,
     log_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_position: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -164,12 +189,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handle_get_session).delete(handle_close_session),
         )
         .route("/v1/sessions/:id/status", get(handle_get_session_status))
-        .route(
-            "/v1/sessions/:id/jobs/:job_id/logs",
-            get(handle_stream_job_logs),
-        )
+        .route("/v1/sessions/:id/queue", get(handle_get_session_queue))
         .route("/v1/commands", post(handle_create_command))
-        .route("/v1/commands/:id", get(handle_get_command))
+        .route("/v1/commands/:id/status", get(handle_get_command))
+        .route("/v1/commands/:id/logs", get(handle_stream_command_logs))
         .route("/v1/workflows/:command_id", get(handle_get_workflow))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -604,6 +627,24 @@ async fn run_session_setup(
         }
     };
 
+    // For remote sessions, replace the default Local session_type so that
+    // downstream consumers (e.g. worktree suppression in ExecWorkflowCommand)
+    // see the correct variant.
+    if plan.session_type == "remote" {
+        if let Some(cloned_path) = plan.cloned_path.clone() {
+            let repo_url = plan.repo_url.clone().unwrap_or_default();
+            let branch = plan.branch.clone().unwrap_or_default();
+            session
+                .write()
+                .await
+                .set_session_type(crate::data::session::SessionType::Remote {
+                    repo_url,
+                    branch,
+                    cloned_path,
+                });
+        }
+    }
+
     state
         .sessions
         .lock()
@@ -780,9 +821,7 @@ async fn handle_close_session(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    let closed_at = chrono::Utc::now().to_rfc3339();
-
-    match state.store.get_session(&id) {
+    let session_record = match state.store.get_session(&id) {
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -808,39 +847,118 @@ async fn handle_close_session(
             })
             .into_response();
         }
-        Ok(Some(_)) => {}
+        Ok(Some(s)) if s.status == "closing" => {
+            // Already closing — return current state.
+            let running_cmd = state
+                .store
+                .running_command_for_session(&id)
+                .ok()
+                .flatten();
+            return Json(SessionClosingResponse {
+                session_id: id,
+                status: "closing".to_string(),
+                running_command_id: running_cmd.map(|c| c.id),
+                cancelled_count: 0,
+                message: "Session is already closing. Poll GET /v1/sessions/{id}/status to monitor.".to_string(),
+            })
+            .into_response();
+        }
+        Ok(Some(s)) => s,
+    };
+
+    // Step 1: Mark session as 'closing' FIRST so the POST /v1/commands guard
+    // begins rejecting new enqueues immediately. If we cancel queued commands
+    // first, a concurrent POST could observe `status = 'active'`, enqueue a
+    // new command, and have it claimed by a worker before we close the gate.
+    let _ = state.store.update_session_status(&id, "closing");
+
+    // Step 2: Cancel all queued commands. Any racing POST that slipped in
+    // before step 1 took effect will have its queued row cancelled here.
+    let cancelled_ids = state
+        .store
+        .cancel_queued_for_session(&id)
+        .unwrap_or_default();
+    let cancelled_count = cancelled_ids.len();
+
+    // Step 3: Check for a running command.
+    let running_cmd = state
+        .store
+        .running_command_for_session(&id)
+        .ok()
+        .flatten();
+
+    if let Some(running) = running_cmd {
+        // Running command exists — return 202 and let the worker handle
+        // final cleanup when the command finishes.
+        tracing::info!(
+            session_id = %id,
+            running_command_id = %running.id,
+            cancelled_count = cancelled_count,
+            "Session entering drain-and-kill (waiting for running command)"
+        );
+        return (
+            StatusCode::ACCEPTED,
+            Json(SessionClosingResponse {
+                session_id: id,
+                status: "closing".to_string(),
+                running_command_id: Some(running.id),
+                cancelled_count,
+                message: "Session is closing. Waiting for running command to complete. Poll GET /v1/sessions/{id}/status to monitor.".to_string(),
+            }),
+        )
+            .into_response();
     }
 
-    match state.store.close_session(&id, &closed_at) {
-        Ok(true) => {
-            // Remove the in-memory Session so it can be dropped.
-            state.sessions.lock().await.remove(&id);
-
-            match state.store.get_session(&id) {
-                Ok(Some(s)) => Json(SessionResponse {
-                    id: s.id,
-                    workdir: s.workdir,
-                    created_at: s.created_at,
-                    status: s.status,
-                    closed_at: s.closed_at,
-                })
-                .into_response(),
-                _ => StatusCode::NO_CONTENT.into_response(),
+    // No running command — close immediately.
+    // For remote sessions, delete the cloned directory.
+    if session_record.session_type == "remote" {
+        if let Some(ref cloned_path) = session_record.cloned_path {
+            let path = std::path::PathBuf::from(cloned_path);
+            let git = Arc::clone(&state.engines.git_engine);
+            let delete_result =
+                tokio::task::spawn_blocking(move || git.delete_directory(&path)).await;
+            match delete_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!(session_id = %id, error = %e, "Failed to delete remote clone");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        error_json("Failed to clean up remote session directory"),
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    tracing::error!(session_id = %id, error = %e, "Delete task panicked");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        error_json("Failed to clean up remote session directory"),
+                    )
+                        .into_response();
+                }
             }
         }
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            error_json(format!("Session '{}' not found or already closed", id)),
-        )
-            .into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to close session");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to close session"),
-            )
-                .into_response()
-        }
+    }
+
+    let closed_at = chrono::Utc::now().to_rfc3339();
+    let _ = state.store.close_session_force(&id, &closed_at);
+    state.sessions.lock().await.remove(&id);
+
+    tracing::info!(
+        session_id = %id,
+        cancelled_count = cancelled_count,
+        "Session closed immediately (no running commands)"
+    );
+
+    match state.store.get_session(&id) {
+        Ok(Some(s)) => Json(SessionResponse {
+            id: s.id,
+            workdir: s.workdir,
+            created_at: s.created_at,
+            status: s.status,
+            closed_at: s.closed_at,
+        })
+        .into_response(),
+        _ => StatusCode::NO_CONTENT.into_response(),
     }
 }
 
@@ -988,9 +1106,6 @@ async fn handle_create_command(
     };
 
     // Validate command is API-allowed via the typed catalogue check.
-    // `validate_for_frontend` returns `CommandError::NotAvailableForFrontend`
-    // when blocked; any other error path (e.g. unknown command) falls through
-    // to per-command dispatch where it surfaces with its own error.
     {
         let catalogue = CommandCatalogue::get();
         let path_parts: Vec<&str> = body.subcommand.split_whitespace().collect();
@@ -1010,9 +1125,20 @@ async fn handle_create_command(
         }
     }
 
-    // Validate session.
-    let workdir = match state.store.get_session(&session_id) {
-        Ok(Some(s)) if s.status == "active" => s.workdir.clone(),
+    // Validate session exists and is in a state that accepts commands.
+    match state.store.get_session(&session_id) {
+        Ok(Some(s)) if s.status == "active" => {}
+        Ok(Some(s)) if s.status == "closing" => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "session is closing",
+                    "session_id": session_id,
+                    "hint": "Session is shutting down and no longer accepts commands."
+                })),
+            )
+                .into_response();
+        }
         Ok(Some(_)) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -1059,52 +1185,12 @@ async fn handle_create_command(
         }
     }
 
-    // DB-level concurrency guard.
-    match state.store.has_running_command_for_session(&session_id) {
-        Ok(true) => {
-            return (
-                StatusCode::FORBIDDEN,
-                error_json(format!(
-                    "Session '{}' already has a running command.",
-                    session_id
-                )),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to check running commands");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to check running commands"),
-            )
-                .into_response();
-        }
-        Ok(false) => {}
-    }
-
-    // In-memory concurrency guard.
-    {
-        let mut busy = state.busy_sessions.lock().await;
-        if busy.contains(&session_id) {
-            return (
-                StatusCode::FORBIDDEN,
-                error_json(format!(
-                    "Session '{}' already has a running command.",
-                    session_id
-                )),
-            )
-                .into_response();
-        }
-        busy.insert(session_id.clone());
-    }
-
     let command_id = uuid::Uuid::new_v4().to_string();
     let args_json = serde_json::to_string(&body.args).unwrap_or_else(|_| "[]".to_string());
 
     let cmd_dir = state.paths.command_dir(&session_id, &command_id);
     if let Err(e) = tokio::fs::create_dir_all(&cmd_dir).await {
         tracing::error!(error = %e, "Failed to create command directory");
-        state.busy_sessions.lock().await.remove(&session_id);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             error_json("Failed to create command directory"),
@@ -1114,18 +1200,17 @@ async fn handle_create_command(
 
     let log_path = cmd_dir.join("output.log");
 
-    if let Err(e) = state.store.insert_command(
+    if let Err(e) = state.store.enqueue_command(
         &command_id,
         &session_id,
         &body.subcommand,
         &args_json,
         &log_path.to_string_lossy(),
     ) {
-        tracing::error!(error = %e, "Failed to insert command");
-        state.busy_sessions.lock().await.remove(&session_id);
+        tracing::error!(error = %e, "Failed to enqueue command");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            error_json("Failed to create command"),
+            error_json("Failed to enqueue command"),
         )
             .into_response();
     }
@@ -1134,31 +1219,8 @@ async fn handle_create_command(
         command_id = %command_id,
         session_id = %session_id,
         subcommand = %body.subcommand,
-        "Command dispatched"
+        "Command enqueued"
     );
-
-    // Spawn execution task via Layer 2 dispatch.
-    let state_clone = Arc::clone(&state);
-    let cmd_id = command_id.clone();
-    let sess_id = session_id.clone();
-    let subcommand = body.subcommand.clone();
-    let cmd_args = body.args.clone();
-    let log_p = log_path.clone();
-    let workdir_clone = workdir;
-
-    let handle = tokio::spawn(async move {
-        execute_command(
-            state_clone,
-            cmd_id,
-            sess_id,
-            subcommand,
-            cmd_args,
-            log_p,
-            workdir_clone,
-        )
-        .await;
-    });
-    state.task_handles.lock().await.push(handle);
 
     let flags_applied = serde_json::json!({
         "yolo": true,
@@ -1175,179 +1237,6 @@ async fn handle_create_command(
         .into_response()
 }
 
-async fn execute_command(
-    state: Arc<AppState>,
-    command_id: String,
-    session_id: String,
-    subcommand: String,
-    args: Vec<String>,
-    log_path: PathBuf,
-    workdir: String,
-) {
-    let started_at = chrono::Utc::now().to_rfc3339();
-    let _ = state.store.update_command_started(&command_id, &started_at);
-
-    // Write metadata.
-    if let Some(parent) = log_path.parent() {
-        let metadata = serde_json::json!({
-            "command_id": command_id,
-            "session_id": session_id,
-            "subcommand": subcommand,
-            "args": args,
-            "workdir": workdir,
-            "started_at": started_at,
-        });
-        let meta_path = parent.join("metadata.json");
-        let _ = tokio::fs::write(
-            &meta_path,
-            serde_json::to_string_pretty(&metadata).unwrap_or_default(),
-        )
-        .await;
-    }
-
-    // Create the EventBus for this command execution.
-    let event_bus = Arc::new(EventBus::new(4096));
-
-    // Spawn a logfile writer task that persists events to disk.
-    {
-        let mut log_rx = event_bus.subscribe();
-        let events_log_path = log_path.with_file_name("events.log");
-        let output_log_path = log_path.clone();
-        tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-            let mut events_file = match tokio::fs::File::create(&events_log_path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create events.log");
-                    return;
-                }
-            };
-            let mut output_file = match tokio::fs::File::create(&output_log_path).await {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to create output.log");
-                    return;
-                }
-            };
-            loop {
-                match log_rx.recv().await {
-                    Ok(event) => {
-                        if let Ok(json) = serde_json::to_string(&event) {
-                            let _ = events_file
-                                .write_all(format!("{json}\n").as_bytes())
-                                .await;
-                        }
-                        if let Some(text) = event.payload.to_plain_text() {
-                            let _ =
-                                output_file.write_all(format!("{text}\n").as_bytes()).await;
-                        }
-                        if matches!(event.payload, EventPayload::Done) {
-                            let _ = events_file.flush().await;
-                            let _ = output_file.flush().await;
-                            break;
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!(lagged = n, "Logfile writer lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-    }
-
-    // Store the EventBus handle for SSE subscribers.
-    state
-        .event_buses
-        .lock()
-        .await
-        .insert(command_id.clone(), Arc::clone(&event_bus));
-
-    // Construct the API frontend that emits to the EventBus. The frontend's
-    // `Drop` impl is the single source of the `Done` sentinel — it flushes
-    // any partial stdout/stderr line buffers first, then emits `Done` once.
-    let frontend = ApiDispatchFrontend::new(&subcommand, &args, event_bus.sender());
-
-    // Look up the existing Session for this HTTP session. The Session was
-    // opened when the client created the session via POST /v1/sessions and is
-    // reused for every command within it.
-    let session = match state.sessions.lock().await.get(&session_id).cloned() {
-        Some(s) => s,
-        None => {
-            tracing::error!(command_id = %command_id, session_id = %session_id, "Session not found in memory");
-            // Dropping `frontend` here emits the `Done` sentinel.
-            drop(frontend);
-            let finished_at = chrono::Utc::now().to_rfc3339();
-            let _ = state
-                .store
-                .update_command_finished(&command_id, "error", None, &finished_at);
-            state.busy_sessions.lock().await.remove(&session_id);
-            return;
-        }
-    };
-
-    // Build the command path from the subcommand string (e.g. "exec prompt" → ["exec", "prompt"]).
-    let path_parts: Vec<&str> = subcommand.split_whitespace().collect();
-
-    // Dispatch through Layer 2 — exactly like CLI and TUI do. The frontend is
-    // moved into `Dispatch`, then into the matching per-command `Box<dyn ...>`,
-    // and finally dropped when `run_with_frontend` returns — at which point
-    // its `Drop` impl flushes any partial line buffers and emits `Done`.
-    let dispatch = Dispatch::new(frontend, session, state.engines.clone());
-    let result = dispatch.run_command(&path_parts).await;
-
-    let finished_at = chrono::Utc::now().to_rfc3339();
-    let (status, exit_code) = match &result {
-        Ok(_) => ("done", Some(0)),
-        Err(_) => ("error", Some(1)),
-    };
-
-    // Clean up EventBus after a grace period.
-    {
-        let state_for_cleanup = Arc::clone(&state);
-        let cmd_id_for_cleanup = command_id.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            state_for_cleanup
-                .event_buses
-                .lock()
-                .await
-                .remove(&cmd_id_for_cleanup);
-        });
-    }
-
-    // Update metadata.
-    if let Some(parent) = log_path.parent() {
-        let metadata = serde_json::json!({
-            "command_id": command_id,
-            "session_id": session_id,
-            "subcommand": subcommand,
-            "args": args,
-            "workdir": workdir,
-            "started_at": started_at,
-            "finished_at": finished_at,
-            "exit_code": exit_code,
-            "status": status,
-        });
-        let meta_path = parent.join("metadata.json");
-        let _ = tokio::fs::write(
-            &meta_path,
-            serde_json::to_string_pretty(&metadata).unwrap_or_default(),
-        )
-        .await;
-    }
-
-    let _ = state
-        .store
-        .update_command_finished(&command_id, status, exit_code, &finished_at);
-
-    if let Err(ref e) = result {
-        tracing::error!(command_id = %command_id, error = %e, "Command failed");
-    }
-
-    state.busy_sessions.lock().await.remove(&session_id);
-}
-
 async fn handle_get_command(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -1356,6 +1245,22 @@ async fn handle_get_command(
         Ok(Some(c)) => {
             let args: serde_json::Value =
                 serde_json::from_str(&c.args).unwrap_or(serde_json::Value::Array(vec![]));
+
+            let queue_position = if c.status == "queued" {
+                state
+                    .store
+                    .queue_position_for_command(&c.id, &c.session_id)
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
+            let result: Option<serde_json::Value> = c
+                .result
+                .as_deref()
+                .and_then(|r| serde_json::from_str(r).ok());
+
             Json(CommandResponse {
                 id: c.id,
                 session_id: c.session_id,
@@ -1366,6 +1271,10 @@ async fn handle_get_command(
                 started_at: c.started_at,
                 finished_at: c.finished_at,
                 log_path: c.log_path,
+                queued_at: c.queued_at,
+                queue_position,
+                worker_id: c.worker_id,
+                result,
             })
             .into_response()
         }
@@ -1385,64 +1294,55 @@ async fn handle_get_command(
     }
 }
 
-/// Query parameters for the per-job SSE / log endpoint.
+/// Query parameters for the per-command SSE / log endpoint.
 #[derive(Deserialize, Default)]
-struct JobLogsQuery {
+struct CommandLogsQuery {
     /// When set to `"json"`, return the events.log content as a JSON array
     /// of ExecutionEvent values instead of streaming SSE.
     #[serde(default)]
     format: Option<String>,
 }
 
-/// `GET /v1/sessions/{sid}/jobs/{jid}/logs` — structured event stream.
+/// `GET /v1/commands/{id}/logs` — structured event stream.
 ///
 /// Behavior:
-/// - Validates `sid` and `jid` exist; 404 otherwise.
+/// - Validates the command exists; 404 otherwise.
 /// - When `?format=json`, returns `events.log` as a JSON array of
 ///   `ExecutionEvent` (non-streaming).
 /// - Otherwise streams SSE in `event: <type>\ndata: <json>\n\n` format.
-/// - If the job is running, first replays `events.log` from disk (capturing
+/// - If the command is running, first replays `events.log` from disk (capturing
 ///   the highest sequence number), then subscribes to the live EventBus
 ///   and filters out events with `sequence <= last_replayed_seq` to avoid
 ///   duplicates from the replay/live switchover race.
 /// - When the broadcast channel reports `Lagged(n)`, sends an SSE comment
 ///   line `: lagged: <n> events skipped` and resumes streaming.
 /// - Emits a final `event: done\ndata: ...\n\n` when the stream completes.
-async fn handle_stream_job_logs(
+async fn handle_stream_command_logs(
     State(state): State<Arc<AppState>>,
-    AxumPath((session_id, job_id)): AxumPath<(String, String)>,
-    Query(query): Query<JobLogsQuery>,
+    AxumPath(command_id): AxumPath<String>,
+    Query(query): Query<CommandLogsQuery>,
 ) -> Response {
-    // Validate job exists and belongs to session.
-    let (events_log_path, is_already_done) = match state.store.get_command(&job_id) {
-        Ok(Some(c)) if c.session_id == session_id => {
-            let done = matches!(c.status.as_str(), "done" | "error");
+    let (session_id, events_log_path, is_already_done) = match state.store.get_command(&command_id)
+    {
+        Ok(Some(c)) => {
+            let done = matches!(c.status.as_str(), "done" | "error" | "cancelled");
             let events_log = state
                 .paths
-                .command_events_log_path(&session_id, &job_id);
-            (events_log, done)
-        }
-        Ok(Some(_)) => {
-            return (
-                StatusCode::NOT_FOUND,
-                error_json(format!(
-                    "Job '{job_id}' not found in session '{session_id}'"
-                )),
-            )
-                .into_response();
+                .command_events_log_path(&c.session_id, &command_id);
+            (c.session_id, events_log, done)
         }
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
-                error_json(format!("Job '{job_id}' not found")),
+                error_json(format!("Command '{command_id}' not found")),
             )
                 .into_response();
         }
         Err(e) => {
-            tracing::error!(error = %e, "Failed to look up job");
+            tracing::error!(error = %e, "Failed to look up command");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                error_json("Failed to look up job"),
+                error_json("Failed to look up command"),
             )
                 .into_response();
         }
@@ -1468,7 +1368,7 @@ async fn handle_stream_job_logs(
         }
         return Json(serde_json::json!({
             "session_id": session_id,
-            "job_id": job_id,
+            "command_id": command_id,
             "events": events,
         }))
         .into_response();
@@ -1482,7 +1382,7 @@ async fn handle_stream_job_logs(
     let maybe_bus = if is_already_done {
         None
     } else {
-        state.event_buses.lock().await.get(&job_id).cloned()
+        state.event_buses.lock().await.get(&command_id).cloned()
     };
 
     tokio::spawn(async move {
@@ -1517,7 +1417,7 @@ async fn handle_stream_job_logs(
                     Ok(event) => {
                         if let Some(last) = last_replayed_seq {
                             if event.sequence <= last {
-                                continue; // already sent via replay
+                                continue;
                             }
                         }
                         let is_done = matches!(event.payload, EventPayload::Done);
@@ -1536,7 +1436,6 @@ async fn handle_stream_job_logs(
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        // Bus dropped — emit synthetic Done if we didn't already.
                         let done = ExecutionEvent {
                             timestamp: chrono::Utc::now(),
                             sequence: last_replayed_seq.map(|s| s + 1).unwrap_or(0),
@@ -1548,8 +1447,6 @@ async fn handle_stream_job_logs(
                 }
             }
         }
-        // No live bus and replay finished — the job is completed; emit Done if
-        // the last replayed event wasn't already a Done.
         let done = ExecutionEvent {
             timestamp: chrono::Utc::now(),
             sequence: last_replayed_seq.map(|s| s + 1).unwrap_or(0),
@@ -1568,6 +1465,109 @@ fn execution_event_to_sse(event: &ExecutionEvent) -> Event {
     Event::default()
         .event(event.payload.sse_event_type())
         .data(data)
+}
+
+async fn handle_get_session_queue(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Response {
+    // Validate session exists.
+    match state.store.get_session(&id) {
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                error_json(format!("Session '{}' not found", id)),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to get session");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error_json("Failed to get session"),
+            )
+                .into_response();
+        }
+        Ok(Some(_)) => {}
+    }
+
+    let queue_depth = state
+        .store
+        .count_queued_for_session(&id)
+        .unwrap_or(0);
+
+    let running = match state.store.running_command_for_session(&id) {
+        Ok(Some(c)) => {
+            let args: serde_json::Value =
+                serde_json::from_str(&c.args).unwrap_or(serde_json::Value::Array(vec![]));
+            Some(serde_json::json!({
+                "command_id": c.id,
+                "subcommand": c.subcommand,
+                "args": args,
+                "started_at": c.started_at,
+                "worker_id": c.worker_id,
+            }))
+        }
+        _ => None,
+    };
+
+    let session_cmds = state
+        .store
+        .list_commands_for_session(&id, 100)
+        .unwrap_or_default();
+
+    // Queued items: spec requires oldest first (position 0 = next to run).
+    // `list_commands_for_session` returns newest first, so collect queued
+    // candidates and reverse before assigning positions.
+    let mut queued_records: Vec<_> = session_cmds
+        .iter()
+        .filter(|c| c.status == "queued")
+        .collect();
+    queued_records.reverse();
+    let queued: Vec<serde_json::Value> = queued_records
+        .iter()
+        .enumerate()
+        .map(|(pos, c)| {
+            let args: serde_json::Value =
+                serde_json::from_str(&c.args).unwrap_or(serde_json::Value::Array(vec![]));
+            serde_json::json!({
+                "command_id": c.id,
+                "subcommand": c.subcommand,
+                "args": args,
+                "queued_at": c.queued_at,
+                "position": pos as i64,
+            })
+        })
+        .collect();
+
+    // Recent completed: spec requires `finished_at DESC`, capped at 10.
+    let mut completed_records: Vec<_> = session_cmds
+        .iter()
+        .filter(|c| matches!(c.status.as_str(), "done" | "error"))
+        .collect();
+    completed_records.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
+    let recent_completed: Vec<serde_json::Value> = completed_records
+        .into_iter()
+        .take(10)
+        .map(|c| {
+            serde_json::json!({
+                "command_id": c.id,
+                "subcommand": c.subcommand,
+                "status": c.status,
+                "exit_code": c.exit_code,
+                "finished_at": c.finished_at,
+            })
+        })
+        .collect();
+
+    Json(QueueStatusResponse {
+        session_id: id,
+        queue_depth,
+        running,
+        queued,
+        recent_completed,
+    })
+    .into_response()
 }
 
 async fn handle_get_workflow(
@@ -1624,12 +1624,11 @@ async fn handle_get_workflow(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
     use std::sync::Arc;
     use std::time::Instant;
 
-    // Route table from oldsrc/commands/headless/server.rs — wire-identical assertion guard.
-    // Every entry here must be registered in build_router; any divergence is a regression.
+    // Route table — assertion guard. Every entry here must be registered in
+    // build_router; any divergence is a regression.
     const EXPECTED_ROUTES: &[(&str, &str)] = &[
         ("GET", "/v1/status"),
         ("GET", "/v1/workdirs"),
@@ -1638,9 +1637,10 @@ mod tests {
         ("GET", "/v1/sessions/:id"),
         ("DELETE", "/v1/sessions/:id"),
         ("GET", "/v1/sessions/:id/status"),
-        ("GET", "/v1/sessions/:id/jobs/:job_id/logs"),
+        ("GET", "/v1/sessions/:id/queue"),
         ("POST", "/v1/commands"),
-        ("GET", "/v1/commands/:id"),
+        ("GET", "/v1/commands/:id/status"),
+        ("GET", "/v1/commands/:id/logs"),
         ("GET", "/v1/workflows/:command_id"),
     ];
 
@@ -1656,7 +1656,7 @@ mod tests {
         use crate::engine::overlay::OverlayEngine;
 
         let paths = ApiPaths::at_root(tmp);
-        let store = SqliteSessionStore::open(tmp).unwrap();
+        let store = Arc::new(SqliteSessionStore::open(tmp).unwrap());
         let runtime = Arc::new(ContainerRuntime::docker());
         let overlay = Arc::new(OverlayEngine::with_auth_resolver(
             AuthPathResolver::at_home(tmp),
@@ -1682,12 +1682,11 @@ mod tests {
             paths,
             workdirs: Vec::new(),
             started_at: Instant::now(),
-            busy_sessions: tokio::sync::Mutex::new(HashSet::new()),
             task_handles: tokio::sync::Mutex::new(Vec::new()),
             auth_mode: AuthMode::Disabled,
             engines,
-            sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            event_buses: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            sessions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            event_buses: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             setup_buses: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
@@ -1697,7 +1696,7 @@ mod tests {
         // Guard: if someone adds a route without updating this table, the count drifts.
         assert_eq!(
             EXPECTED_ROUTES.len(),
-            11,
+            12,
             "route count mismatch — update EXPECTED_ROUTES"
         );
     }
@@ -1763,8 +1762,9 @@ mod tests {
             ("GET", "/v1/sessions/test-id", 404),        // session not found
             ("DELETE", "/v1/sessions/test-id", 404),      // session not found
             ("GET", "/v1/sessions/test-id/status", 404),  // session not found
-            ("GET", "/v1/commands/test-id", 404),         // command not found
-            ("GET", "/v1/sessions/test-sid/jobs/test-jid/logs", 404), // job not found
+            ("GET", "/v1/sessions/test-id/queue", 404),   // session not found
+            ("GET", "/v1/commands/test-id/status", 404),  // command not found
+            ("GET", "/v1/commands/test-id/logs", 404),    // command not found
             ("GET", "/v1/workflows/test-cmd", 404),       // command not found
         ];
 

@@ -495,8 +495,14 @@ impl Command for ExecWorkflowCommand {
         // 4. Worktree prepare (if --worktree is set).
         // When a worktree is used, capture its path so the session below is
         // rooted at the worktree checkout rather than the main repo.
+        if self.flags.worktree && self.session.session_type().is_remote() {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "Skipping worktree creation for remote session — repo is already isolated.".into(),
+            });
+        }
         let mut worktree_path: Option<PathBuf> = None;
-        let worktree_lifecycle = if self.flags.worktree {
+        let worktree_lifecycle = if self.flags.worktree && !self.session.session_type().is_remote() {
             let git_root = match self.engines.git_engine.resolve_root(&cwd) {
                 Ok(r) => r,
                 Err(e) => {

@@ -338,6 +338,32 @@ curl http://localhost:9876/v1/workdirs
 
 ---
 
+## Job Queue
+
+The API server uses a per-session FIFO queue to serialize command execution. When you submit a command via `POST /v1/commands`, it is enqueued immediately and returns with a `command_id`. A pool of worker tasks processes the queue: each worker claims one queued command at a time and executes it, then claims the next one.
+
+**Key properties:**
+
+- **One command per session at a time**: Within a single session, only one command runs at any moment. Commands are processed in strict FIFO order (ordered by submission time). This ensures workflows don't interfere with each other.
+
+- **Concurrent execution across sessions**: With N worker tasks and M sessions with queued commands, up to min(N, M) commands can run *concurrently* — one per session. For example, with 2 workers and 3 sessions, 2 sessions can execute in parallel while the 3rd waits.
+
+- **Never blocks submission**: Unlike the old behavior, submitting a command never blocks or returns "session busy". The command is enqueued and the request returns immediately with HTTP 202 (if successful) or 409 (if the session is closing). The caller polls `GET /v1/commands/{id}/status` or `GET /v1/sessions/{id}/queue` to check progress.
+
+**Monitoring queue status:**
+
+Use `GET /v1/sessions/{id}/queue` to inspect the queue depth, which command is currently running, and recently completed commands. This is useful for:
+
+- Checking how long commands will take to run (based on queue depth)
+- Diagnosing stalls or stuck commands
+- Capacity planning (how many workers to run)
+
+**Configuration:**
+
+The number of worker tasks is configurable via the `workers` global config option. The default is 2 workers. See [Configuration](#configuration) below.
+
+---
+
 ## HTTP API
 
 All endpoints speak JSON. All requests and responses are logged at `INFO` level or above.
@@ -358,8 +384,9 @@ http://localhost:<port>/v1
 | `POST` | `/v1/sessions` | Create a new session |
 | `GET` | `/v1/sessions` | List sessions; accepts optional `?status=active` filter |
 | `GET` | `/v1/sessions/:id` | Get session detail |
+| `GET` | `/v1/sessions/:id/queue` | Get queue status for a session (queued, running, recent completed) |
 | `DELETE` | `/v1/sessions/:id` | Close a session |
-| `POST` | `/v1/commands` | Submit a subcommand to a session |
+| `POST` | `/v1/commands` | Submit a subcommand to a session (enqueued) |
 | `GET` | `/v1/commands/:id` | Get command status and metadata |
 | `GET` | `/v1/commands/:id/logs` | Get captured command output (snapshot) |
 | `GET` | `/v1/commands/:id/logs/stream` | Stream live command output via Server-Sent Events |
@@ -372,25 +399,44 @@ http://localhost:<port>/v1
 
 #### Create a session
 
+There are two types of sessions:
+
+**Local session** — bound to a working directory on the server's filesystem:
+
 ```sh
 curl -s -X POST http://localhost:9876/v1/sessions \
   -H 'Authorization: Bearer <api-key>' \
   -H 'Content-Type: application/json' \
-  -d '{"workdir":"/home/user/my-project"}'
+  -d '{"type":"local","workdir":"/home/user/my-project"}'
 ```
 
-Creates a new session bound to the given working directory. The directory must be in the allowlist. Returns immediately with a session UUID:
+**Remote session** — clones a git repository on the server and operates within the clone:
+
+```sh
+curl -s -X POST http://localhost:9876/v1/sessions \
+  -H 'Authorization: Bearer <api-key>' \
+  -H 'Content-Type: application/json' \
+  -d '{"type":"remote","repo_url":"https://github.com/org/repo","branch":"main"}'
+```
+
+Both types return immediately with a session UUID:
 
 ```json
 { "session_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890" }
 ```
 
+**Local sessions** bind to an existing directory on the server. The directory must be in the allowlist (configured via `api.workDirs` in global config or `--workdirs` at startup). Workflows run directly in that directory.
+
+**Remote sessions** clone a git repository into an isolated directory on the server (`~/.awman/sessions/{session_id}/repo/`). Workflows run inside the clone. When the session is closed, the cloned directory is deleted, leaving no artifacts on the server. This is useful for running ephemeral CI jobs where you want to operate on a remote repo without setting up a local copy.
+
 Error responses:
 
 | Situation | HTTP status |
 |-----------|-------------|
-| `workdir` not in allowlist | 403 — includes `allowed_workdirs` list |
-| `workdir` field missing | 400 |
+| `workdir` not in allowlist (local) | 403 — includes `allowed_workdirs` list |
+| Invalid `type` field | 400 |
+| Missing required fields | 400 |
+| Network error cloning repo (remote) | 500 |
 
 #### List sessions
 
@@ -443,7 +489,24 @@ curl -s -X DELETE http://localhost:9876/v1/sessions/<session-id> \
   -H 'Authorization: Bearer <api-key>'
 ```
 
-Marks the session `closed`. Closed sessions cannot receive new commands. All existing command records and output files are preserved — no data is deleted. Returns HTTP 204 on success, HTTP 404 if the session does not exist.
+Gracefully closes a session. All queued commands are cancelled immediately, but any currently running command is allowed to finish before the session is marked closed.
+
+**Behavior:**
+- **No queued commands:** Session transitions immediately to `closed` status. Returns HTTP 200.
+- **Queued commands, no running command:** All queued commands are cancelled. Session transitions immediately to `closed` status. Returns HTTP 200.
+- **Running command:** The session transitions to `closing` status, rejecting new submissions. The running command is allowed to finish. Returns HTTP 202 with details:
+  ```json
+  {
+    "session_id": "a1b2c3d4-...",
+    "status": "closing",
+    "running_command_id": "cmd-456",
+    "cancelled_count": 3,
+    "message": "Session is closing. Waiting for running command to complete. Poll GET /v1/sessions/{id}/status to monitor."
+  }
+  ```
+  Poll `GET /v1/sessions/{id}/status` to observe the transition to `closed`.
+
+Closed sessions cannot receive new commands. All command records and output files are preserved — no data is deleted. Returns HTTP 404 if the session does not exist.
 
 ---
 
@@ -481,29 +544,22 @@ curl -s -X POST http://localhost:9876/v1/commands \
   -d '{"subcommand":"exec","args":["workflow","./aspec/workflows/implement-feature.md","--work-item","0053"]}'
 ```
 
-Returns immediately with a command UUID — execution is asynchronous:
+**Workflow files:** For `exec workflow`, the workflow file path is specified as a positional argument relative to the session's working directory (same format as the CLI). The file must exist within the session's working directory and be a valid TOML or YAML workflow definition. Workflow files are never passed as inline JSON — always use file paths.
+
+Returns immediately with a command UUID — the command is **enqueued** and execution is asynchronous:
 
 ```json
 { "command_id": "e5f6a7b8-..." }
 ```
 
-**One command at a time per session.** If a command is already running in the session, the request returns HTTP 403:
-
-```json
-{
-  "error": "session busy",
-  "running_command_id": "e5f6a7b8-..."
-}
-```
-
-Once the running command completes, the session accepts new commands.
+The command begins executing as soon as a worker claims it from the queue. **At most one command per session runs at any given time** — commands within a session are processed sequentially in FIFO order. If a command is already running, subsequent commands are queued and wait their turn (they do not block the API request).
 
 Error responses:
 
 | Situation | HTTP status | `error` field |
 |-----------|-------------|---------------|
 | Session not found or closed | 404 | `"session not found"` (includes session UUID) |
-| Another command is running | 403 | `"session busy"` |
+| Session is closing (graceful shutdown) | 409 | `"session is closing"` |
 | Unknown subcommand | 400 | `"unknown subcommand"` (includes list of valid subcommands) |
 | `x-awman-session` header missing | 400 | `"missing x-awman-session header"` |
 
@@ -520,11 +576,13 @@ Returns the current status and metadata for a command:
 {
   "id": "e5f6a7b8-...",
   "session_id": "a1b2c3d4-...",
-  "subcommand": "implement",
-  "args": ["0057"],
-  "status": "running",
+  "subcommand": "exec",
+  "args": ["workflow", "deploy.toml"],
+  "status": "queued",
+  "queued_at": "2026-04-20T12:00:30Z",
+  "queue_position": 2,
   "exit_code": null,
-  "started_at": "2026-04-20T12:01:00Z",
+  "started_at": null,
   "finished_at": null,
   "log_path": "~/.awman/api/sessions/a1b2c3d4-.../commands/e5f6a7b8-.../output.log"
 }
@@ -532,10 +590,28 @@ Returns the current status and metadata for a command:
 
 | `status` value | Meaning |
 |----------------|---------|
-| `pending` | Accepted; not yet started |
-| `running` | Container is executing |
+| `queued` | Enqueued; waiting for a worker to claim it |
+| `running` | Claimed by a worker; container is executing |
 | `done` | Completed with exit code 0 |
 | `error` | Completed with a non-zero exit code |
+| `cancelled` | Cancelled before execution (e.g. session kill) |
+
+**Queue-related response fields** (present when `status = 'queued'`):
+
+| Field | Description |
+|-------|-------------|
+| `queued_at` | ISO 8601 timestamp when the command was enqueued |
+| `queue_position` | 0-indexed position in the session's queue (0 = next to run). `null` when the command is running, done, or cancelled |
+| `worker_id` | UUID of the worker task that claimed this command. Only present when `status = 'running'` |
+
+**Result field** (present when `status = 'done'` or `'error'`):
+
+```json
+{
+  "exit_code": 0,
+  "error": null
+}
+```
 
 #### Get command logs
 
@@ -598,6 +674,67 @@ curl -s http://localhost:9876/v1/commands/<command-id>/logs/stream \
 - **Read timeout:** `awman remote run --follow` uses a 10-minute read timeout per SSE event. Any output from the server resets the timer, so long-running commands that produce incremental output can stream for hours. If the server is completely silent for 10 minutes, the client disconnects with a timeout message; the command continues running on the server. When using cURL directly with `--no-buffer`, consider adding `--max-time 0` to disable cURL's own timeout for very long-running commands.
 
 `awman remote run --follow` uses this endpoint internally. The cURL form above is equivalent and is useful in scripts where the awman binary is unavailable on the client.
+
+#### Get session queue status
+
+```sh
+curl -s http://localhost:9876/v1/sessions/<session-id>/queue \
+  -H 'Authorization: Bearer <api-key>'
+```
+
+Returns the current queue state for a session — how many commands are queued, which one is running, and recently completed commands.
+
+```json
+{
+  "session_id": "a1b2c3d4-...",
+  "queue_depth": 3,
+  "running": {
+    "command_id": "cmd-456",
+    "subcommand": "exec",
+    "args": ["workflow", "deploy.toml"],
+    "started_at": "2026-04-20T12:05:00Z",
+    "worker_id": "worker-789"
+  },
+  "queued": [
+    {
+      "command_id": "cmd-457",
+      "subcommand": "exec",
+      "args": ["workflow", "test.toml"],
+      "queued_at": "2026-04-20T12:01:00Z",
+      "position": 0
+    },
+    {
+      "command_id": "cmd-458",
+      "subcommand": "exec",
+      "args": ["prompt", "review the code"],
+      "queued_at": "2026-04-20T12:02:00Z",
+      "position": 1
+    }
+  ],
+  "recent_completed": [
+    {
+      "command_id": "cmd-455",
+      "subcommand": "exec",
+      "args": ["workflow", "setup.toml"],
+      "status": "done",
+      "exit_code": 0,
+      "finished_at": "2026-04-20T12:00:00Z"
+    }
+  ]
+}
+```
+
+**Response fields:**
+
+| Field | Description |
+|-------|-------------|
+| `session_id` | The session UUID |
+| `queue_depth` | Total number of enqueued (not yet running) commands |
+| `running` | The currently executing command, or `null` if none |
+| `queued` | Array of enqueued commands, in FIFO order, with 0-indexed position |
+| `recent_completed` | Array of the 10 most recent completed commands (status `done` or `error`), newest first |
+
+This endpoint is useful for monitoring queue depth and diagnosing stalls in multi-command workflows.
 
 ---
 
@@ -708,10 +845,14 @@ CMD=$(curl -s -X POST "$SERVER/v1/commands" \
 echo "Command: $CMD"
 
 # 3. Poll until done
+# Note: The command will first be in 'queued' status while waiting for a worker.
+# When a worker claims it, status transitions to 'running', then finally 'done' or 'error'.
 while true; do
-  STATUS=$(curl -s "$SERVER/v1/commands/$CMD" \
-    -H "Authorization: Bearer $KEY" | jq -r .status)
-  echo "Status: $STATUS"
+  RESP=$(curl -s "$SERVER/v1/commands/$CMD" \
+    -H "Authorization: Bearer $KEY")
+  STATUS=$(echo "$RESP" | jq -r .status)
+  POSITION=$(echo "$RESP" | jq -r '.queue_position // "N/A"')
+  echo "Status: $STATUS (queue position: $POSITION)"
   [ "$STATUS" = "done" ] || [ "$STATUS" = "error" ] && break
   sleep 10
 done
@@ -784,7 +925,7 @@ Everything API mode writes lives under `~/.awman/api/`:
 
 **`sessions`** — one row per session: `id` (UUID), `workdir`, `status` (`active`/`closed`), `created_at`, `closed_at`.
 
-**`commands`** — one row per command: `id` (UUID), `session_id`, `subcommand`, `args` (JSON array), `status` (`pending`/`running`/`done`/`error`), `exit_code`, `started_at`, `finished_at`, `log_path`.
+**`commands`** — one row per command: `id` (UUID), `session_id`, `subcommand`, `args` (JSON array), `status` (`queued`/`running`/`done`/`error`/`cancelled`), `exit_code`, `started_at`, `finished_at`, `log_path`, `queued_at` (when enqueued), `worker_id` (UUID of the worker that claimed it), and `result` (JSON object with exit code and error message).
 
 The database is the authoritative record of all activity. The per-command log files hold raw output. Neither is deleted when a session is closed.
 
@@ -886,7 +1027,8 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 |-----------|-----------|
 | `workdir` not in allowlist on `POST /v1/sessions` | HTTP 403; response includes the list of allowed directories |
 | Session not found or already closed on `POST /v1/commands` | HTTP 404; response includes the session UUID |
-| Second `POST /v1/commands` while one is running | HTTP 403 `"session busy"`; includes running command ID |
+| Multiple `POST /v1/commands` in quick succession | All commands are enqueued; first returns immediately, subsequent requests also return immediately with different command IDs; all are processed in FIFO order (one per session at a time) |
+| Session is `closing` on `POST /v1/commands` | HTTP 409 `"session is closing"`; command is rejected to prevent new work during graceful shutdown |
 | Server already running when `api start` is invoked | Error printed; exits non-zero |
 | Port already bound (EADDRINUSE) | Error includes the port number and PID holding it |
 | `--workdirs` path doesn't exist at startup | Warning logged; path remains on allowlist |
@@ -915,6 +1057,13 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 | `GET /v1/workflows/:command_id` — workflow is paused | HTTP 200; `WorkflowState.status` is `"paused"`; the paused step is identified in the body; polling may continue since the workflow can resume |
 | `GET /v1/workflows/:command_id` — workflow is complete | HTTP 200; `WorkflowState.status` is `"complete"`; all steps present with terminal statuses; clients should stop polling |
 | Concurrent reads of `workflow.state.json` during a write | File is written atomically via rename; clients never observe a partial JSON document |
+| `DELETE /v1/sessions/:id` — no queued commands, no running command | HTTP 200; session immediately transitions to `closed` status |
+| `DELETE /v1/sessions/:id` — queued commands present, no running command | HTTP 200; all queued commands are cancelled; session immediately transitions to `closed` status |
+| `DELETE /v1/sessions/:id` — running command present | HTTP 202; session transitions to `closing` status; running command is allowed to finish; client must poll `GET /v1/sessions/:id/status` to observe the transition to `closed` |
+| `DELETE /v1/sessions/:id` — called again while `closing` | HTTP 200; returns the current session state (still `closing` if command hasn't finished, or `closed` if it has) |
+| `GET /v1/sessions/:id/queue` — session has no commands | HTTP 200; returns `queue_depth: 0`, `running: null`, empty arrays for `queued` and `recent_completed` |
+| `GET /v1/sessions/:id/queue` — command is `pending` (queued but not yet claimed) | Appears in the `queued` array with a `position` indicating its place in the queue (0-indexed) |
+| `POST /v1/commands` with workflow file that doesn't exist | Command is enqueued; when the worker executes it, it fails with an error in the `result` field and status becomes `error` |
 
 ---
 

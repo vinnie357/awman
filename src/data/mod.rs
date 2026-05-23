@@ -30,12 +30,16 @@ pub use image_tags::{agent_image_tag, project_image_tag, repo_hash};
 pub use repo_dockerfile_paths::RepoDockerfilePaths;
 pub use session::{
     AgentName, CommandInvocation, CommandStatus, ContainerHandle, GitRootResolver, Session,
-    SessionId, SessionLogEntry, SessionLogKind, SessionState, StepStatus, WorkflowInvocation,
-    WorkflowStepRecord,
+    SessionId, SessionLogEntry, SessionLogKind, SessionState, SessionType, StepStatus,
+    WorkflowInvocation, WorkflowStepRecord,
 };
 pub use session_manager::{InMemorySessionStore, SessionManager, SessionStore};
 pub use workflow_dag::{detect_cycle, validate_references, WorkflowDag};
 pub use workflow_definition::{detect_format, Workflow, WorkflowFormat, WorkflowStep};
-pub use workflow_state::{StepState, WorkflowState, WORKFLOW_STATE_SCHEMA_VERSION};
+pub use workflow_state::{
+    PhaseStepState, PhaseStepStatus, StepState, WorkflowState, WorkflowStepInfo,
+    WORKFLOW_STATE_SCHEMA_VERSION,
+};
 pub use workflow_state_store::WorkflowStateStore as EngineWorkflowStateStore;
 pub use worktree_paths::{worktree_branch_name, worktree_branch_name_for_workflow, WorktreePaths};
+pub use fs::api_db::{CommandResult, WorkerId};
