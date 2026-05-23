@@ -213,6 +213,14 @@ impl EffectiveConfig {
     pub fn runtime(&self) -> Option<String> {
         self.global.runtime.clone()
     }
+
+    /// Effective base image tag for setup/teardown containers (repo > global > None).
+    pub fn base_image(&self) -> Option<String> {
+        if let Some(v) = self.repo.base_image.as_deref() {
+            return Some(v.to_string());
+        }
+        self.global.base_image.clone()
+    }
 }
 
 #[cfg(test)]

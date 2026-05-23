@@ -265,6 +265,48 @@ impl WorkflowFrontend for CliFrontend {
         eprintln!();
     }
 
+    fn on_setup_step_started(&mut self, description: &str) {
+        eprintln!("awman: setup: {description}");
+    }
+
+    fn on_setup_step_output(&mut self, line: &str) {
+        eprintln!("  {line}");
+    }
+
+    fn on_setup_step_completed(&mut self, description: &str) {
+        eprintln!("awman: setup: {description} [ok]");
+    }
+
+    fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        eprintln!("awman: setup: {description} [failed exit={exit_code}]");
+        if !stderr.is_empty() {
+            for line in stderr.lines() {
+                eprintln!("  {line}");
+            }
+        }
+    }
+
+    fn on_teardown_step_started(&mut self, description: &str) {
+        eprintln!("awman: teardown: {description}");
+    }
+
+    fn on_teardown_step_output(&mut self, line: &str) {
+        eprintln!("  {line}");
+    }
+
+    fn on_teardown_step_completed(&mut self, description: &str) {
+        eprintln!("awman: teardown: {description} [ok]");
+    }
+
+    fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        eprintln!("awman: teardown: {description} [failed exit={exit_code}]");
+        if !stderr.is_empty() {
+            for line in stderr.lines() {
+                eprintln!("  {line}");
+            }
+        }
+    }
+
     fn report_step_interactive_launch(
         &mut self,
         _step: &WorkflowStep,

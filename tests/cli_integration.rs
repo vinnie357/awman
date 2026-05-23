@@ -691,7 +691,7 @@ fn exec_workflow_without_git_repo_exits_with_git_error_not_unknown_subcommand() 
     let not_a_repo = TempDir::new().unwrap();
     let output = amux()
         .current_dir(not_a_repo.path())
-        .args(["exec", "workflow", "./wf.md"])
+        .args(["exec", "workflow", "./wf.toml"])
         .output()
         .expect("failed to run amux exec workflow");
     assert!(
@@ -952,9 +952,9 @@ fn new_workflow_format_yaml_writes_yaml_file() {
     assert!(content.contains("YAML Workflow"));
 }
 
-// 7. `amux new workflow --format md` writes a .md file.
+// 7. `amux new workflow --format md` is rejected (markdown no longer supported).
 #[test]
-fn new_workflow_format_md_writes_md_file() {
+fn new_workflow_format_md_is_rejected() {
     let home = TempDir::new().unwrap();
     let repo = make_git_repo();
 
@@ -968,15 +968,10 @@ fn new_workflow_format_md_writes_md_file() {
     );
 
     assert!(
-        output.status.success(),
-        "amux new workflow --format md must succeed; stderr: {}",
+        !output.status.success(),
+        "amux new workflow --format md must fail; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-
-    let dest = repo.path().join("aspec").join("workflows").join("md-wf.md");
-    assert!(dest.exists(), ".md file must be created");
-    let content = std::fs::read_to_string(&dest).unwrap();
-    assert!(content.starts_with("# MD Workflow"), "MD file must start with title heading");
 }
 
 // 8. `amux new workflow --global` writes to ~/.awman/workflows/.

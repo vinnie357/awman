@@ -35,6 +35,7 @@ This file is created by `awman init` and should be committed to source control. 
 |-------|------|---------|-------------|
 | `agent` | string | `"claude"` | Agent to use for this repository: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, or `cline` |
 | `terminal_scrollback_lines` | integer | `10000` | Number of scrollback lines in the container terminal emulator. Overrides the global value |
+| `base_image` | string | (from global or `make build` default) | Container image tag for workflow setup/teardown phases. Overrides the global value if set. Only override if you have a repo-specific custom base image. See [Workflows — Setup and Teardown](04-workflows.md#setup-and-teardown-phases) |
 | `yoloDisallowedTools` | string array | `[]` | Tools the agent cannot use when `--yolo` is active. Overrides the global list entirely |
 | `envPassthrough` | string array | `[]` | Host environment variable names to inject into agent containers at launch. Overrides the global list entirely. See [`envPassthrough`](#envpassthrough) |
 | `overlays.skills` | boolean | false | When `true`, mount your global awman skills directory (`~/.awman/skills/`) into the agent container as its native slash commands. **Additive** with the global config; either scope setting it to `true` enables the mount. See [`overlays`](#overlays) |
@@ -81,6 +82,7 @@ Applies to all projects on the machine unless overridden by a per-repo config.
 | `default_agent` | string | `"claude"` | Default agent when no per-repo agent is configured: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, or `cline` |
 | `terminal_scrollback_lines` | integer | `10000` | Default scrollback lines for all repos unless overridden |
 | `runtime` | string | `"docker"` | Container runtime: `"docker"` or `"apple-containers"` (macOS 26+ only) |
+| `base_image` | string | (from `make build`) | Default container image tag for workflow setup/teardown phases. Overridden by per-repo `base_image` if set. Only override if you have a custom base image. See [Workflows — Setup and Teardown](04-workflows.md#setup-and-teardown-phases) |
 | `yoloDisallowedTools` | string array | `[]` | Global fallback list of tools forbidden when `--yolo` is active |
 | `envPassthrough` | string array | `[]` | Host environment variable names to inject into agent containers at launch. See [`envPassthrough`](#envpassthrough) |
 | `overlays.skills` | boolean | false | When `true`, mount your global awman skills directory (`~/.awman/skills/`) into every agent container as its native slash commands. **Additive** — enable it here, per-repo config, `AWMAN_OVERLAYS`, or `--overlay` flags. See [`overlays`](#overlays) |
@@ -102,6 +104,7 @@ Applies to all projects on the machine unless overridden by a per-repo config.
 |-------|-----------|
 | `agent` / `default_agent` | Per-repo → Global → Built-in default (`claude`) |
 | `terminal_scrollback_lines` | Per-repo → Global → Built-in default (10,000) |
+| `base_image` | Per-repo → Global → Built-in default (from `make build`) |
 | `yoloDisallowedTools` | Per-repo → Global → Empty list (no restriction) |
 | `envPassthrough` | Per-repo → Global → Empty list (no passthrough) |
 | `overlays.skills` | **Additive OR**: if true in global, per-repo, `AWMAN_OVERLAYS`, or `--overlay` flags, the mount is enabled |

@@ -205,6 +205,9 @@ pub(crate) fn format_error(err: &CommandError) -> String {
             crate::engine::error::EngineError::Container(msg) => format!(
                 "container backend error: {msg}\n  awman requires Docker; install Docker Desktop / docker-engine and retry"
             ),
+            crate::engine::error::EngineError::ContainerImageNotFound { image } => format!(
+                "image not found: '{image}'. Run `make build` or build the base image manually."
+            ),
             crate::engine::error::EngineError::Network(msg) => {
                 format!("network error: {msg}")
             }

@@ -7,6 +7,7 @@
 
 mod apple;
 mod backend;
+pub mod background;
 pub mod display;
 mod docker;
 pub mod frontend;
@@ -25,4 +26,5 @@ pub use options::{
     EnvVar, ImageRef, MemoryLimit, ModelFlagForm, OverlayPermission, OverlaySpec, PlanMode,
     YoloMode,
 };
+pub use background::{BackgroundContainer, ContainerExec, ExecOutput};
 pub use runtime::ContainerRuntime;

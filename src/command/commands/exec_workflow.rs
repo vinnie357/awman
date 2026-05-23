@@ -210,6 +210,41 @@ impl WorkflowFrontend for WorkflowProxy {
     fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
         self.0.lock().unwrap().set_engine_sender(tx);
     }
+
+    fn on_setup_step_started(&mut self, description: &str) {
+        self.0.lock().unwrap().on_setup_step_started(description);
+    }
+    fn on_setup_step_output(&mut self, line: &str) {
+        self.0.lock().unwrap().on_setup_step_output(line);
+    }
+    fn on_setup_step_completed(&mut self, description: &str) {
+        self.0.lock().unwrap().on_setup_step_completed(description);
+    }
+    fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .on_setup_step_failed(description, exit_code, stderr);
+    }
+
+    fn on_teardown_step_started(&mut self, description: &str) {
+        self.0.lock().unwrap().on_teardown_step_started(description);
+    }
+    fn on_teardown_step_output(&mut self, line: &str) {
+        self.0.lock().unwrap().on_teardown_step_output(line);
+    }
+    fn on_teardown_step_completed(&mut self, description: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .on_teardown_step_completed(description);
+    }
+    fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .on_teardown_step_failed(description, exit_code, stderr);
+    }
 }
 
 // ─── ContainerFrontendProxy ──────────────────────────────────────────────────
@@ -445,7 +480,7 @@ impl Command for ExecWorkflowCommand {
         // 2. Resolve mount scope — confirm with the user when cwd differs from git root.
         let cwd = self.session.working_dir().to_path_buf();
         let git_root_for_scope = self.session.git_root().to_path_buf();
-        let _mount_path = match MountScope::resolve(&cwd, &git_root_for_scope, frontend.as_mut()) {
+        let mount_path = match MountScope::resolve(&cwd, &git_root_for_scope, frontend.as_mut()) {
             Ok(p) => p,
             Err(e) => {
                 frontend.write_message(UserMessage {
@@ -708,10 +743,14 @@ impl Command for ExecWorkflowCommand {
         // Merge CLI overlays with config/env sources now that session is available.
         let (directory_overlays, skills_enabled) = collect_all_overlay_specs(&session, cli_typed);
 
-        // 9. Run the engine. The engine block is scoped so proxy + factory are
-        //    dropped before we reclaim the frontend via Arc::try_unwrap.
+        // 9. Run the engine with three-phase coordination.
+        // The engine block is scoped so proxy + factory are dropped before we
+        // reclaim the frontend via Arc::try_unwrap.
         let yolo = self.flags.yolo;
         let work_item_number = work_item_context.as_ref().map(|ctx| ctx.number);
+        let setup_steps = workflow.setup.clone();
+        let teardown_steps = workflow.teardown.clone();
+        let teardown_on_failure = workflow.teardown_on_failure;
         let (engine_result, step_counts) = {
             let proxy = WorkflowProxy(Arc::clone(&shared));
             let factory = CommandLayerFactory {
@@ -745,7 +784,155 @@ impl Command for ExecWorkflowCommand {
                 }
             };
             engine.set_yolo(yolo);
-            let result = engine.run_to_completion().await;
+
+            // === SETUP PHASE ===
+            let mut setup_failed = false;
+            if !setup_steps.is_empty() && !engine.state().setup_completed {
+                let base_image = resolve_base_image(&session, &git_root_for_scope);
+                let env = collect_passthrough_env(&session);
+                let overlay_specs = match collect_overlay_specs_for_phase(
+                    &self.engines,
+                    &session,
+                ) {
+                    Ok(specs) => specs,
+                    Err(e) => {
+                        shared.lock().unwrap().write_message(UserMessage {
+                            level: MessageLevel::Error,
+                            text: format!("exec workflow: {e}"),
+                        });
+                        setup_failed = true;
+                        Vec::new()
+                    }
+                };
+
+                if !setup_failed {
+                    // The setup container exec calls are blocking; keep the
+                    // tokio worker free by routing them through block_in_place.
+                    tokio::task::block_in_place(|| {
+                        match self.engines.runtime.start_background(
+                            &base_image,
+                            &mount_path,
+                            &env,
+                            &overlay_specs,
+                        ) {
+                            Ok(setup_container) => {
+                                let setup_result =
+                                    engine.run_setup(&setup_steps, &setup_container);
+                                if let Err(e) = setup_container.kill() {
+                                    shared.lock().unwrap().write_message(UserMessage {
+                                        level: MessageLevel::Warning,
+                                        text: format!(
+                                            "exec workflow: failed to kill setup container: {e}"
+                                        ),
+                                    });
+                                }
+                                if let Err(e) = setup_result {
+                                    shared.lock().unwrap().write_message(UserMessage {
+                                        level: MessageLevel::Error,
+                                        text: format!("exec workflow: setup phase failed: {e}"),
+                                    });
+                                    setup_failed = true;
+                                }
+                            }
+                            Err(e) => {
+                                shared.lock().unwrap().write_message(UserMessage {
+                                    level: MessageLevel::Error,
+                                    text: format!(
+                                        "exec workflow: failed to start setup container: {e}"
+                                    ),
+                                });
+                                setup_failed = true;
+                            }
+                        }
+                    });
+                }
+            }
+
+            // === MAIN PHASE ===
+            let result = if setup_failed {
+                Err(crate::engine::error::EngineError::Container(
+                    "setup phase failed; main workflow not started".into(),
+                ))
+            } else {
+                engine.run_to_completion().await
+            };
+
+            let workflow_succeeded = matches!(result, Ok(WorkflowOutcome::Completed { .. }));
+
+            // === TEARDOWN PHASE ===
+            if !teardown_steps.is_empty() {
+                let should_run = teardown_on_failure || workflow_succeeded;
+                if should_run {
+                    let base_image = resolve_base_image(&session, &git_root_for_scope);
+                    let env = collect_passthrough_env(&session);
+                    // Overlay resolution failure is fatal for teardown too —
+                    // running with no overlays would silently drop secrets and
+                    // env vars (e.g. GH_TOKEN) that `create_pull_request`
+                    // requires. Surface the error and skip teardown.
+                    let overlay_specs = match collect_overlay_specs_for_phase(
+                        &self.engines,
+                        &session,
+                    ) {
+                        Ok(specs) => Some(specs),
+                        Err(e) => {
+                            shared.lock().unwrap().write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!(
+                                    "exec workflow: teardown overlay resolution failed; teardown skipped: {e}"
+                                ),
+                            });
+                            None
+                        }
+                    };
+
+                    if let Some(overlay_specs) = overlay_specs {
+                        tokio::task::block_in_place(|| {
+                            match self.engines.runtime.start_background(
+                                &base_image,
+                                &mount_path,
+                                &env,
+                                &overlay_specs,
+                            ) {
+                                Ok(teardown_container) => {
+                                    let _ = engine.run_teardown(
+                                        &teardown_steps,
+                                        workflow_succeeded,
+                                        teardown_on_failure,
+                                        &teardown_container,
+                                    );
+                                    if let Err(e) = teardown_container.kill() {
+                                        shared.lock().unwrap().write_message(UserMessage {
+                                            level: MessageLevel::Warning,
+                                            text: format!(
+                                                "exec workflow: failed to kill teardown container: {e}"
+                                            ),
+                                        });
+                                    }
+                                }
+                                Err(e) => {
+                                    shared.lock().unwrap().write_message(UserMessage {
+                                        level: MessageLevel::Warning,
+                                        text: format!(
+                                            "exec workflow: failed to start teardown container: {e}"
+                                        ),
+                                    });
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+
+            // If teardown didn't run (no teardown steps, or skipped on failure)
+            // the engine's current_phase still reads Main — promote it to Done
+            // so persisted state reflects completion.
+            if !matches!(
+                engine.state().current_phase,
+                crate::data::workflow_state::WorkflowPhase::Done
+            ) {
+                let _ = engine.mark_done();
+            }
+
             let mut completed = 0usize;
             let mut failed = 0usize;
             for state in engine.state().step_states.values() {
@@ -813,6 +1000,55 @@ impl Command for ExecWorkflowCommand {
             worktree_used: self.flags.worktree,
         })
     }
+}
+
+/// Resolve the base image tag for setup/teardown containers.
+/// Checks effective config, falls back to the project image tag convention.
+fn resolve_base_image(session: &Session, git_root: &std::path::Path) -> String {
+    if let Some(configured) = session.effective_config().base_image() {
+        return configured;
+    }
+    crate::data::image_tags::project_image_tag(git_root)
+}
+
+/// Resolve overlays for a setup/teardown container.
+///
+/// Contract for the setup/teardown phase code: on `Err`, the caller MUST NOT
+/// call `start_background` for that phase. For setup this surfaces as a hard
+/// failure that also blocks the main phase; for teardown the phase is skipped
+/// (running with no overlays would silently drop env vars like `GH_TOKEN`
+/// that `create_pull_request` requires).
+fn collect_overlay_specs_for_phase(
+    engines: &Engines,
+    session: &Session,
+) -> Result<Vec<crate::engine::container::options::OverlaySpec>, crate::engine::error::EngineError> {
+    let request = crate::engine::overlay::OverlayRequest {
+        directories: Vec::new(),
+        include_skills: false,
+        agent: None,
+        yolo: false,
+        container_home: None,
+    };
+    engines
+        .overlay_engine
+        .build_overlays(session, &request)
+        .map_err(|e| crate::engine::error::EngineError::Other(
+            format!("failed to resolve overlays for setup/teardown container: {e}")
+        ))
+}
+
+/// Collect the env-passthrough variables (from flag/repo/global config) that
+/// are set on the host, so setup/teardown containers see the same env as
+/// agent containers. Crucially this carries `GH_TOKEN`/`GITHUB_TOKEN` for the
+/// `create_pull_request` teardown step.
+fn collect_passthrough_env(session: &Session) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    for key in session.effective_config().env_passthrough() {
+        if let Ok(value) = std::env::var(&key) {
+            env.insert(key, value);
+        }
+    }
+    env
 }
 
 /// Extract a numeric work item number from strings like "0069", "69", "WI-69",

@@ -111,13 +111,13 @@ fn remote_exec_prompt_has_prompt_argument() {
 // ─── new workflow format values ───────────────────────────────────────────────
 
 #[test]
-fn new_workflow_format_accepts_toml_yaml_md() {
+fn new_workflow_format_accepts_toml_yaml() {
     let cmd = cat().lookup(&["new", "workflow"]).unwrap();
     let flag = cmd.find_flag("format").expect("--format flag");
     if let FlagKind::Enum(values) = flag.kind {
         assert!(values.contains(&"toml"));
         assert!(values.contains(&"yaml"));
-        assert!(values.contains(&"md"));
+        assert!(!values.contains(&"md"), "md format no longer supported");
     } else {
         panic!("--format should be Enum kind");
     }

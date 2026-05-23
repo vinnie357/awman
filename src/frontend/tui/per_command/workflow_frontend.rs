@@ -280,6 +280,52 @@ impl WorkflowFrontend for TuiCommandFrontend {
         })
     }
 
+    fn on_setup_step_started(&mut self, description: &str) {
+        self.messages
+            .info(format!("setup: {description}"));
+    }
+
+    fn on_setup_step_output(&mut self, line: &str) {
+        self.messages.info(format!("  {line}"));
+    }
+
+    fn on_setup_step_completed(&mut self, description: &str) {
+        self.messages
+            .success(format!("setup: {description}"));
+    }
+
+    fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        let msg = if stderr.is_empty() {
+            format!("setup failed: {description} (exit {exit_code})")
+        } else {
+            format!("setup failed: {description} (exit {exit_code}): {stderr}")
+        };
+        self.messages.error_msg(msg);
+    }
+
+    fn on_teardown_step_started(&mut self, description: &str) {
+        self.messages
+            .info(format!("teardown: {description}"));
+    }
+
+    fn on_teardown_step_output(&mut self, line: &str) {
+        self.messages.info(format!("  {line}"));
+    }
+
+    fn on_teardown_step_completed(&mut self, description: &str) {
+        self.messages
+            .success(format!("teardown: {description}"));
+    }
+
+    fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        let msg = if stderr.is_empty() {
+            format!("teardown failed: {description} (exit {exit_code})")
+        } else {
+            format!("teardown failed: {description} (exit {exit_code}): {stderr}")
+        };
+        self.messages.error_msg(msg);
+    }
+
     fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
         if let Ok(mut guard) = self.engine_tx_shared.lock() {
             *guard = Some(tx);

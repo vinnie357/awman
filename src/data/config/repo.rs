@@ -97,6 +97,8 @@ pub struct RepoConfig {
     pub overlays: Option<OverlaysConfig>,
     #[serde(rename = "agentStuckTimeout", skip_serializing_if = "Option::is_none")]
     pub agent_stuck_timeout_secs: Option<u64>,
+    #[serde(rename = "baseImage", skip_serializing_if = "Option::is_none")]
+    pub base_image: Option<String>,
 }
 
 impl RepoConfig {

@@ -14,7 +14,7 @@ use crate::data::workflow_definition::WorkflowStep;
 
 /// Current schema version for persisted `WorkflowState`. Bumped when the
 /// on-disk shape changes incompatibly.
-pub const WORKFLOW_STATE_SCHEMA_VERSION: u32 = 2;
+pub const WORKFLOW_STATE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepState {
@@ -41,6 +41,15 @@ pub struct WorkflowStepInfo {
     pub agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WorkflowPhase {
+    Setup,
+    #[default]
+    Main,
+    Teardown,
+    Done,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +81,12 @@ pub struct WorkflowState {
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub steps: Vec<WorkflowStepInfo>,
+    #[serde(default)]
+    pub current_phase: WorkflowPhase,
+    #[serde(default)]
+    pub setup_completed: bool,
+    #[serde(default)]
+    pub teardown_completed: bool,
     #[serde(default)]
     pub setup_step_states: Vec<PhaseStepState>,
     #[serde(default)]
@@ -115,6 +130,9 @@ impl WorkflowState {
             started_at: now,
             updated_at: now,
             steps: step_infos,
+            current_phase: WorkflowPhase::Main,
+            setup_completed: false,
+            teardown_completed: false,
             setup_step_states: Vec::new(),
             teardown_step_states: Vec::new(),
         }

@@ -42,6 +42,8 @@ pub struct GlobalConfig {
     pub agent_stuck_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workers: Option<u8>,
+    #[serde(rename = "baseImage", skip_serializing_if = "Option::is_none")]
+    pub base_image: Option<String>,
 }
 
 impl GlobalConfig {
@@ -148,6 +150,7 @@ mod tests {
             overlays: None,
             agent_stuck_timeout_secs: Some(45),
             workers: None,
+            base_image: None,
         };
 
         original.save_with(&env).unwrap();

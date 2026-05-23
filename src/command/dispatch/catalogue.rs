@@ -1166,7 +1166,7 @@ const NEW_SPEC: CommandSpec = CommandSpec {
     subcommands: &[],
 };
 
-const WORKFLOW_FORMAT_VALUES: &[&str] = &["toml", "yaml", "md"];
+const WORKFLOW_FORMAT_VALUES: &[&str] = &["toml", "yaml"];
 
 const NEW_WORKFLOW: CommandSpec = CommandSpec {
     name: "workflow",

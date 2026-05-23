@@ -662,6 +662,62 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         Ok(StepFailureChoice::Abort)
     }
 
+    fn on_setup_step_started(&mut self, description: &str) {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "setup".to_string(),
+            message: format!("started: {description}"),
+        });
+    }
+
+    fn on_setup_step_output(&mut self, line: &str) {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "setup".to_string(),
+            message: line.to_string(),
+        });
+    }
+
+    fn on_setup_step_completed(&mut self, description: &str) {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "setup".to_string(),
+            message: format!("completed: {description}"),
+        });
+    }
+
+    fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "setup".to_string(),
+            message: format!("failed: {description} (exit {exit_code}): {stderr}"),
+        });
+    }
+
+    fn on_teardown_step_started(&mut self, description: &str) {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "teardown".to_string(),
+            message: format!("started: {description}"),
+        });
+    }
+
+    fn on_teardown_step_output(&mut self, line: &str) {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "teardown".to_string(),
+            message: line.to_string(),
+        });
+    }
+
+    fn on_teardown_step_completed(&mut self, description: &str) {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "teardown".to_string(),
+            message: format!("completed: {description}"),
+        });
+    }
+
+    fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "teardown".to_string(),
+            message: format!("failed: {description} (exit {exit_code}): {stderr}"),
+        });
+    }
+
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
         let (status, exit_code, error, phase_status, step_desc) = match outcome {
             WorkflowOutcome::Completed => (

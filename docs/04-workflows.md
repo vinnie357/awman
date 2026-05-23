@@ -2,7 +2,9 @@
 
 A workflow breaks a large implementation task into discrete phases — for example: plan → implement → review → docs. Each phase runs as its own agent session. You review the output between phases and decide whether to advance, retry, or redirect.
 
-Workflows are files you write and commit to your repo — in Markdown, TOML, or YAML. awman parses them into an execution plan and runs them inside Docker containers, pausing between steps for your input.
+Workflows are files you write and commit to your repo — in TOML or YAML format. awman parses them into an execution plan and runs them inside Docker containers, pausing between steps for your input. Optional `setup` and `teardown` sections allow you to prepare the environment before the first step (e.g., installing dependencies, checking out branches) and perform post-workflow actions (e.g., running tests, creating pull requests).
+
+**Migration from Markdown:** Markdown workflow files (`.md`) are no longer supported as of this release. If you have existing Markdown workflows, convert them to TOML or YAML using the format examples below. The conversion is straightforward — all step definitions map directly to TOML/YAML syntax.
 
 ---
 
@@ -105,7 +107,7 @@ Writes to `~/.awman/workflows/<name>.<ext>` instead of the current repo. Use thi
 |------|-------------|
 | `--interview` | Let a code agent complete the workflow from a short summary |
 | `--global` | Write to `~/.awman/workflows/` instead of the current repo |
-| `--format <fmt>` | Output format: `toml` (default), `yaml`, or `md` |
+| `--format <fmt>` | Output format: `toml` (default) or `yaml` |
 
 ### Edge cases
 
@@ -119,26 +121,28 @@ Writes to `~/.awman/workflows/<name>.<ext>` instead of the current repo. Use thi
 | No steps added before Ctrl-Enter (TUI) | Inline error: "At least one step is required" |
 | Step prompt is empty (CLI) | Warning logged; empty prompt written to file |
 | `depends_on` names non-existent steps | Warning logged; file is still written (steps may be added later) |
+| Load a `.md` workflow file | Error: "Markdown workflow files are no longer supported. Convert to TOML (.toml) or YAML (.yaml/.yml). See docs/04-workflows.md for the current format." |
 
 ---
 
 ## Workflow file formats
 
-awman supports three workflow file formats: **Markdown** (`.md`), **TOML** (`.toml`), and **YAML** (`.yml` / `.yaml`). The format is detected automatically from the file extension. All three formats produce identical execution behaviour — you can pass any of them to `--workflow` interchangeably.
+awman supports two workflow file formats: **TOML** (`.toml`) and **YAML** (`.yml` / `.yaml`). The format is detected automatically from the file extension. Both formats produce identical execution behaviour — you can pass either to `--workflow` interchangeably.
 
 | Extension | Format |
 |-----------|--------|
-| `.md` | Markdown |
 | `.toml` | TOML |
 | `.yml` or `.yaml` | YAML |
 
 Any other extension is rejected with:
 
 ```
-unsupported workflow format: expected .md, .toml, .yml, or .yaml
+unsupported workflow format: expected .toml, .yml, or .yaml
 ```
 
-All three formats support the same step fields:
+### Step fields
+
+All steps support the same fields:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
@@ -148,45 +152,7 @@ All three formats support the same step fields:
 | `agent` | string | no | Run this step with a specific agent instead of the default. Valid values: `claude`, `codex`, `opencode`, `maki`, `gemini` |
 | `model` | string | no | Run this step with a specific model. Overrides any `--model` flag |
 
-Field names in TOML and YAML are **lowercase only** (`name`, `depends_on`, `agent`, `model`, `prompt`). Uppercase variants are not accepted. Unknown fields (e.g. `dependson`, `Prompt`) are rejected as errors so that typos do not silently take effect.
-
-### Markdown (`.md`)
-
-The original format. awman looks for:
-
-| Element | Description |
-|---------|-------------|
-| `# Title` | Optional heading used for display only |
-| `## Step: <name>` | Defines a step; names must be unique within the file |
-| `Depends-on: <step>[, <step>…]` | Declares upstream dependencies (omit for root steps) |
-| `Agent: <name>` | Optional. Run this step with a specific agent instead of the default |
-| `Model: <name>` | Optional. Run this step with a specific model |
-| `Prompt:` | Everything after this keyword (until the next heading) is the step's prompt template |
-
-```markdown
-# Implement Feature Workflow
-
-## Step: plan
-Prompt: Read the following work item and produce an implementation plan.
-
-{{work_item_content}}
-
-## Step: implement
-Depends-on: plan
-Prompt: Implement work item {{work_item_number}} according to the plan.
-
-Follow the spec: {{work_item_section:[Implementation Details]}}
-
-## Step: review
-Depends-on: implement
-Prompt: Review the changes from the implement step for correctness and style.
-
-## Step: docs
-Depends-on: implement
-Prompt: Write documentation for work item {{work_item_number}}.
-```
-
-In this example, `review` and `docs` both depend on `implement` — they form a **parallel group** and are executed sequentially in file order. In the TUI they are rendered stacked vertically with slight indentation.
+Field names are **lowercase only** (`name`, `depends_on`, `agent`, `model`, `prompt`). Uppercase variants are not accepted. Unknown fields (e.g. `dependson`, `Prompt`) are rejected as errors so that typos do not silently take effect.
 
 ### TOML (`.toml`)
 
@@ -262,6 +228,162 @@ steps:
 ```
 
 Use YAML literal blocks (`|`) for multiline prompts. `depends_on` must be a YAML sequence — not a bare string. Newlines and `{{template_vars}}` are preserved exactly.
+
+---
+
+## Setup and teardown phases
+
+Workflows can include optional `setup` and `teardown` sections to prepare the environment before the main steps and perform post-workflow actions.
+
+**Setup phase** runs before the first main step and is intended for:
+- Checking out or creating a Git branch
+- Pulling latest changes
+- Installing dependencies
+- Running build or configuration scripts
+- Cloning additional repositories needed by the workflow
+
+**Teardown phase** runs after all main steps complete (or on failure, if `teardown_on_failure` is enabled) and is intended for:
+- Running tests
+- Committing changes
+- Creating pull requests
+- Pushing branches to a remote
+- Cleanup operations
+
+All setup and teardown steps execute inside the project's **base container image** — the same isolated Docker container used for agent steps. No shell commands are ever executed directly on the host. Each phase uses its own container instance: a setup container runs all setup steps, then is killed; later, a teardown container is started for all teardown steps.
+
+### Setup step types
+
+Setup steps are defined in a `[[setup]]` (TOML) or `setup:` (YAML) array. Each step has a `type` field and type-specific fields:
+
+| Type | Fields | Description |
+|------|--------|-------------|
+| `clone_repo` | `url` (string, required), `branch` (string, optional), `into` (string, optional) | Clone a repository. `branch` checks out a specific branch. `into` specifies the target directory (relative to workdir); omit to use the repo name. Useful for cloning additional repos needed by the workflow (for the primary repo, use the session's `repo_url` and `branch` fields instead). |
+| `checkout_create_branch` | `branch` (string, required), `base` (string, optional) | Check out an existing branch or create a new one. If `base` is specified, the branch is created from that ref. Attempts to fetch from the remote first; if unavailable or not configured, falls back to local creation. |
+| `pull_branch` | `remote` (string, optional), `branch` (string, optional) | Pull the latest changes from a remote branch. Equivalent to `git pull <remote> <branch>`. Omit both to use `git pull` with defaults. |
+| `run_shell` | `command` (string, required), `env` (object, optional) | Execute a shell command. `env` is an optional object of environment variables to inject (`{"KEY": "value"}`). |
+| `run_script` | `path` (string, required), `env` (object, optional) | Execute a shell script file (relative to the workdir). `env` is an optional object of environment variables. |
+
+Example TOML setup:
+
+```toml
+[[setup]]
+type = "checkout_create_branch"
+branch = "feature/my-feature"
+base = "main"
+
+[[setup]]
+type = "run_shell"
+command = "npm install"
+
+[[setup]]
+type = "run_shell"
+command = "npm run build"
+```
+
+Example YAML setup:
+
+```yaml
+setup:
+  - type: checkout_create_branch
+    branch: feature/my-feature
+    base: main
+  - type: run_shell
+    command: npm install
+  - type: run_shell
+    command: npm run build
+```
+
+### Teardown step types
+
+Teardown steps are defined in a `[[teardown]]` (TOML) or `teardown:` (YAML) array. Each step has a `type` field and type-specific fields:
+
+| Type | Fields | Description |
+|------|--------|-------------|
+| `run_shell` | `command` (string, required), `env` (object, optional) | Execute a shell command. |
+| `run_script` | `path` (string, required), `env` (object, optional) | Execute a shell script file. |
+| `commit_changes` | `message` (string, required), `add_all` (boolean, optional) | Commit staged changes. If `add_all` is `true`, runs `git add -A` first. |
+| `push_branch` | `remote` (string, optional), `branch` (string, optional) | Push the current branch to a remote. Omit both to use `git push` with defaults. |
+| `create_pull_request` | `title` (string, required), `body` (string, optional), `base` (string, optional) | Create a pull request using the GitHub CLI. Requires `gh` to be available in the base container image. |
+
+Example TOML teardown:
+
+```toml
+[[teardown]]
+type = "run_shell"
+command = "npm test"
+
+[[teardown]]
+type = "commit_changes"
+message = "automated changes"
+add_all = true
+
+[[teardown]]
+type = "create_pull_request"
+title = "feat: automated implementation"
+body = "This PR was created automatically by an awman workflow."
+base = "main"
+```
+
+Example YAML teardown:
+
+```yaml
+teardown:
+  - type: run_shell
+    command: npm test
+  - type: commit_changes
+    message: "automated changes"
+    add_all: true
+  - type: create_pull_request
+    title: "feat: automated implementation"
+    body: "This PR was created automatically by an awman workflow."
+    base: main
+```
+
+### Teardown on failure
+
+By default, teardown steps are skipped if the workflow fails. To run teardown even on failure (e.g., to clean up partial artifacts), set `teardown_on_failure = true` at the top level:
+
+```toml
+name = "implement-feature"
+teardown_on_failure = true
+
+# steps, setup, teardown defined below...
+```
+
+If any teardown step fails, the error is logged and execution continues to the next teardown step (best-effort cleanup). Teardown failure does not retroactively change the workflow's success/failure status.
+
+### Container execution model
+
+**Setup container lifecycle:**
+1. Before setup runs, awman starts a background container from the base image with the session workdir mounted
+2. Each setup step is executed via `exec` into the running container
+3. After all setup steps complete (or if any step fails), the setup container is killed
+4. If setup fails, the main workflow steps do not run
+
+**Teardown container lifecycle:**
+1. After all main steps complete, awman starts a fresh teardown container (separate from the setup container)
+2. Each teardown step is executed via `exec` into the teardown container
+3. After all teardown steps complete, the teardown container is killed
+4. If `teardown_on_failure = false` and the workflow failed, teardown is skipped entirely
+
+All environment variables configured for the project (via overlays, config, or per-step `env` fields) are inherited by both setup and teardown containers, just as they are for main workflow steps.
+
+### Remote sessions and setup/teardown
+
+For `type: remote` API sessions, the repository is already cloned and the branch is checked out by awman at session creation time — the session's working directory points to a fresh clone before any setup steps begin. A `clone_repo` setup step is therefore redundant for provisioning the primary repo and should not be used for that purpose. It remains valid for cloning *additional* repositories needed by the workflow into subdirectories.
+
+### Idempotency
+
+If a workflow is interrupted mid-setup or mid-teardown and then resumed, the full setup or teardown phase is re-run from the beginning. Setup steps should be written to be idempotent — i.e., they should succeed whether or not they have been run before:
+
+- Use `git clone <url> || true` if the directory might already exist
+- Use `checkout_create_branch` instead of raw `git checkout -b` (it handles existing branches automatically)
+- Ensure package manager commands (`npm install`, `pip install`) are idempotent
+- For custom scripts, make them idempotent by checking preconditions
+
+### Base image and `gh` CLI
+
+If your teardown includes a `create_pull_request` step, the base container image **must have the GitHub CLI (`gh`) installed**. By default, the base image is the project's `Dockerfile.dev`. If `gh` is not available, the step will fail with a clear error. Update your `Dockerfile.dev` to include `gh` if you intend to use `create_pull_request` steps.
 
 ### Prompt template variables
 
@@ -642,15 +764,14 @@ Steps that share the same `Depends-on` set form a **parallel group**. awman exec
 
 ## Bundled examples
 
-`aspec/workflows/` contains ready-to-use example workflows in all three supported formats:
+`aspec/workflows/` contains ready-to-use example workflows:
 
 | File | Format | Description |
 |------|--------|-------------|
-| `implement-preplanned.md` | Markdown | Four-step implement → tests + docs → review workflow |
-| `implement-preplanned.toml` | TOML | Identical workflow in TOML format |
+| `implement-preplanned.toml` | TOML | Four-step implement → tests + docs → review workflow |
 | `implement-preplanned.yaml` | YAML | Identical workflow in YAML format |
 
-All three files define the same four steps (`implement`, `tests`, `docs`, `review`) with the same prompts, dependencies, and agent assignments. Use whichever format best fits your tooling — for example, TOML or YAML if you generate or lint workflow files programmatically.
+Both files define the same four steps (`implement`, `tests`, `docs`, `review`) with the same prompts, dependencies, and agent assignments. Use TOML or YAML based on your preference — both are equally supported.
 
 ---
 
@@ -678,13 +799,22 @@ All three files define the same four steps (`implement`, `tests`, `docs`, `revie
 | Current step and next step use the same agent | "Same container" (**↓**) option available as usual |
 | Current step and next step use different agents | "Same container" option greyed out (TUI) or skipped (CLI) with explanation |
 | Empty workflow file | Rejected with a helpful message |
-| Unsupported file extension (e.g. `.json`) | Error: `unsupported workflow format: expected .md, .toml, .yml, or .yaml` |
+| Unsupported file extension (e.g. `.json`) | Error: `unsupported workflow format: expected .toml, .yml, or .yaml` |
+| Markdown workflow file (`.md`) | Error: `Markdown workflow files are no longer supported. Convert to TOML (.toml) or YAML (.yaml/.yml).` |
 | TOML/YAML step missing `name` field | Parse error including the step index |
 | TOML/YAML step missing `prompt` field | Parse error including the step name (or index if unnamed) |
-| Empty `[[step]]` / `steps:` array | Error matching the Markdown `"workflow file contains no steps"` behaviour |
+| Empty `[[step]]` / `steps:` array | Error: `"workflow file contains no steps"` |
 | `depends_on` as bare YAML string instead of sequence | Parse error; must be a YAML sequence |
 | Unknown field in TOML/YAML step (e.g. `dependson`) | Parse error; typos are not silently dropped |
 | Uppercase field name in TOML/YAML (e.g. `Name:`) | Parse error; field names must be lowercase |
+| Setup step with invalid type | Parse error; type must be one of the supported step types |
+| Teardown step with invalid type | Parse error; type must be one of the supported step types |
+| `create_pull_request` step but `gh` not in base image | Step fails at execution time with "command not found: gh" |
+| Setup failure | Main workflow steps do not run; go directly to teardown (if `teardown_on_failure = true`) or exit |
+| Teardown step failure (non-zero exit) | Error is logged; execution continues to next teardown step (best-effort) |
+| `checkout_create_branch` with no remote configured | Falls back to local branch creation from HEAD or specified `base` |
+| `run_script` step with non-existent path | Step fails with file-not-found error |
+| Setup interrupted and resumed | Full setup phase re-runs from the beginning; steps should be idempotent |
 | Work item file not found | Error before loading the workflow |
 | Workflow file not found / unreadable | Clear error with the file path |
 | Agent failure mid-workflow | Step marked Error; user prompted to retry or abort |

@@ -18,6 +18,7 @@ use crate::data::workflow_definition::{Workflow, WorkflowStep};
 use crate::data::workflow_state::{StepState, WorkflowState, WORKFLOW_STATE_SCHEMA_VERSION};
 use crate::data::workflow_state_store::WorkflowStateStore;
 use crate::engine::container::instance::{ContainerExecution, ContainerExitInfo};
+use crate::engine::container::ContainerExec;
 use crate::engine::error::EngineError;
 use crate::engine::git::GitEngine;
 use crate::engine::overlay::OverlayEngine;
@@ -31,6 +32,7 @@ use crate::engine::workflow::frontend::WorkflowFrontend;
 pub mod actions;
 pub mod factory;
 pub mod frontend;
+pub mod step_commands;
 pub mod timing;
 
 /// Result of a mid-step yolo countdown (step is still running while
@@ -1214,6 +1216,147 @@ impl WorkflowEngine {
             .map_err(EngineError::Data)?;
         Ok(())
     }
+
+    /// Run setup phase steps inside the provided background container.
+    /// Returns `Ok(())` on success, `Err` if any step fails (remaining steps
+    /// are skipped).
+    pub fn run_setup(
+        &mut self,
+        steps: &[crate::data::workflow_definition::SetupStep],
+        container: &impl ContainerExec,
+    ) -> Result<(), EngineError> {
+        use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowPhase};
+        use crate::engine::workflow::step_commands::{setup_step_description, setup_step_to_shell};
+
+        self.state.current_phase = WorkflowPhase::Setup;
+        self.state.setup_step_states = steps
+            .iter()
+            .map(|s| PhaseStepState {
+                description: setup_step_description(s),
+                status: PhaseStepStatus::Pending,
+            })
+            .collect();
+        self.persist()?;
+
+        for (idx, step) in steps.iter().enumerate() {
+            let desc = setup_step_description(step);
+            let (command, env) = setup_step_to_shell(step);
+
+            self.state.setup_step_states[idx].status = PhaseStepStatus::Running;
+            self.persist()?;
+
+            self.frontend.on_setup_step_started(&desc);
+
+            let result = container.exec(&command, env.as_ref())?;
+
+            for line in result.stdout.lines() {
+                self.frontend.on_setup_step_output(line);
+            }
+            for line in result.stderr.lines() {
+                self.frontend.on_setup_step_output(line);
+            }
+
+            if result.exit_code != 0 {
+                self.state.setup_step_states[idx].status = PhaseStepStatus::Failed {
+                    error: result.stderr.clone(),
+                };
+                self.persist()?;
+                self.frontend
+                    .on_setup_step_failed(&desc, result.exit_code, &result.stderr);
+                return Err(EngineError::Container(format!(
+                    "setup step '{}' failed with exit code {}",
+                    desc, result.exit_code
+                )));
+            }
+
+            self.state.setup_step_states[idx].status = PhaseStepStatus::Succeeded;
+            self.persist()?;
+            self.frontend.on_setup_step_completed(&desc);
+        }
+
+        self.state.setup_completed = true;
+        self.state.current_phase = WorkflowPhase::Main;
+        self.persist()?;
+        Ok(())
+    }
+
+    /// Run teardown phase steps inside the provided background container.
+    /// Skips all steps and returns `Ok(())` if `!teardown_on_failure && !workflow_succeeded`.
+    /// Failing teardown steps are logged but do not abort the remaining steps (best-effort).
+    pub fn run_teardown(
+        &mut self,
+        steps: &[crate::data::workflow_definition::TeardownStep],
+        workflow_succeeded: bool,
+        teardown_on_failure: bool,
+        container: &impl ContainerExec,
+    ) -> Result<(), EngineError> {
+        use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowPhase};
+        use crate::engine::workflow::step_commands::{
+            teardown_step_description, teardown_step_to_shell,
+        };
+
+        if !teardown_on_failure && !workflow_succeeded {
+            return Ok(());
+        }
+
+        self.state.current_phase = WorkflowPhase::Teardown;
+        self.state.teardown_step_states = steps
+            .iter()
+            .map(|s| PhaseStepState {
+                description: teardown_step_description(s),
+                status: PhaseStepStatus::Pending,
+            })
+            .collect();
+        self.persist()?;
+
+        for (idx, step) in steps.iter().enumerate() {
+            let desc = teardown_step_description(step);
+            let (command, env) = teardown_step_to_shell(step);
+
+            self.state.teardown_step_states[idx].status = PhaseStepStatus::Running;
+            self.persist()?;
+
+            self.frontend.on_teardown_step_started(&desc);
+
+            let result = container.exec(&command, env.as_ref())?;
+
+            for line in result.stdout.lines() {
+                self.frontend.on_teardown_step_output(line);
+            }
+            for line in result.stderr.lines() {
+                self.frontend.on_teardown_step_output(line);
+            }
+
+            if result.exit_code != 0 {
+                self.state.teardown_step_states[idx].status = PhaseStepStatus::Failed {
+                    error: result.stderr.clone(),
+                };
+                self.persist()?;
+                self.frontend
+                    .on_teardown_step_failed(&desc, result.exit_code, &result.stderr);
+                // Best-effort: continue to next step.
+            } else {
+                self.state.teardown_step_states[idx].status = PhaseStepStatus::Succeeded;
+                self.persist()?;
+                self.frontend.on_teardown_step_completed(&desc);
+            }
+        }
+
+        self.state.teardown_completed = true;
+        self.state.current_phase = WorkflowPhase::Done;
+        self.persist()?;
+        Ok(())
+    }
+
+    /// Mark the workflow as fully finished. Called by the orchestrator after
+    /// the main phase completes when no teardown phase will run (so the state
+    /// reflects completion rather than lingering in `Main`).
+    pub fn mark_done(&mut self) -> Result<(), EngineError> {
+        use crate::data::workflow_state::WorkflowPhase;
+        self.state.current_phase = WorkflowPhase::Done;
+        self.persist()?;
+        Ok(())
+    }
 }
 
 /// Hash a workflow's steps + title to detect drift.
@@ -1435,6 +1578,9 @@ mod tests {
             steps,
             agent: wf_agent.map(|s| s.to_string()),
             model: None,
+            setup: Vec::new(),
+            teardown: Vec::new(),
+            teardown_on_failure: false,
         }
     }
 
@@ -2446,5 +2592,327 @@ mod tests {
         signal_completion(&completion, 0);
         let result = engine_task.await.unwrap().unwrap();
         assert_eq!(result, WorkflowOutcome::Completed);
+    }
+
+    // ── MockBackgroundContainer ───────────────────────────────────────────────
+
+    struct MockBackgroundContainer {
+        /// Pre-programmed results: (stdout, stderr, exit_code).
+        results: Mutex<VecDeque<(String, String, i32)>>,
+        /// Recorded commands (in call order).
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl MockBackgroundContainer {
+        /// All execs succeed with empty output.
+        fn always_success() -> Self {
+            Self {
+                results: Mutex::new(VecDeque::new()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Provide an explicit sequence of (stdout, stderr, exit_code) results.
+        fn with_results(results: impl IntoIterator<Item = (String, String, i32)>) -> Self {
+            Self {
+                results: Mutex::new(results.into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::engine::container::ContainerExec for MockBackgroundContainer {
+        fn exec(
+            &self,
+            command: &str,
+            _env: Option<&std::collections::HashMap<String, String>>,
+        ) -> Result<crate::engine::container::ExecOutput, crate::engine::error::EngineError>
+        {
+            self.calls.lock().unwrap().push(command.to_string());
+            let (stdout, stderr, exit_code) = self
+                .results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| ("".into(), "".into(), 0));
+            Ok(crate::engine::container::ExecOutput {
+                stdout,
+                stderr,
+                exit_code,
+            })
+        }
+    }
+
+    // ── run_setup / run_teardown unit tests ──────────────────────────────────
+
+    fn setup_steps_sample() -> Vec<crate::data::workflow_definition::SetupStep> {
+        use crate::data::workflow_definition::SetupStep;
+        vec![
+            SetupStep::CloneRepo {
+                url: "https://example.com/repo".into(),
+                branch: None,
+                into: None,
+            },
+            SetupStep::PullBranch {
+                remote: None,
+                branch: None,
+            },
+            SetupStep::RunShell {
+                command: "cargo build".into(),
+                env: None,
+            },
+        ]
+    }
+
+    fn teardown_steps_sample() -> Vec<crate::data::workflow_definition::TeardownStep> {
+        use crate::data::workflow_definition::TeardownStep;
+        vec![
+            TeardownStep::RunShell {
+                command: "cargo test".into(),
+                env: None,
+            },
+            TeardownStep::CommitChanges {
+                message: "auto: results".into(),
+                add_all: true,
+            },
+        ]
+    }
+
+    fn make_minimal_engine(tmp: &tempfile::TempDir) -> WorkflowEngine {
+        let session = make_session(tmp);
+        let workflow = make_workflow(
+            Some("test-wf"),
+            Some("claude"),
+            vec![make_step("step-a", &[], None)],
+        );
+        make_engine(&session, workflow, FakeContainerExecutionFactory::always_success(), [])
+    }
+
+    #[test]
+    fn run_setup_executes_steps_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = setup_steps_sample();
+        let mock = MockBackgroundContainer::always_success();
+
+        engine.run_setup(&steps, &mock).unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 3);
+        assert!(calls[0].contains("git clone"));
+        assert_eq!(calls[1], "git pull");
+        assert_eq!(calls[2], "cargo build");
+    }
+
+    #[test]
+    fn run_setup_aborts_on_second_step_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = setup_steps_sample(); // 3 steps
+        let mock = MockBackgroundContainer::with_results([
+            ("".into(), "".into(), 0),                 // step 1 succeeds
+            ("".into(), "build error".into(), 1),      // step 2 fails
+            ("".into(), "".into(), 0),                 // step 3 (never reached)
+        ]);
+
+        let result = engine.run_setup(&steps, &mock);
+
+        assert!(result.is_err(), "run_setup must return Err on step failure");
+        assert_eq!(mock.calls().len(), 2, "third step must not be exec'd");
+    }
+
+    #[test]
+    fn run_teardown_skips_when_not_on_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = teardown_steps_sample();
+        let mock = MockBackgroundContainer::always_success();
+
+        // teardown_on_failure = false, workflow_succeeded = false → skip all
+        engine
+            .run_teardown(&steps, false, false, &mock)
+            .unwrap();
+
+        assert_eq!(mock.calls().len(), 0, "no exec calls should be made");
+    }
+
+    #[test]
+    fn run_teardown_runs_when_succeeded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = teardown_steps_sample();
+        let mock = MockBackgroundContainer::always_success();
+
+        engine
+            .run_teardown(&steps, true, false, &mock)
+            .unwrap();
+
+        assert_eq!(mock.calls().len(), 2, "both teardown steps must exec");
+    }
+
+    #[test]
+    fn run_teardown_continues_after_step_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = teardown_steps_sample();
+        let mock = MockBackgroundContainer::with_results([
+            ("".into(), "test failure".into(), 1), // step 1 fails
+            ("".into(), "".into(), 0),             // step 2 succeeds
+        ]);
+
+        // Teardown is best-effort: returns Ok even if a step fails.
+        let result = engine.run_teardown(&steps, true, false, &mock);
+        assert!(result.is_ok(), "run_teardown must return Ok despite step failure");
+        assert_eq!(mock.calls().len(), 2, "both steps must be exec'd");
+    }
+
+    #[test]
+    fn run_setup_transitions_phase_to_main_on_success() {
+        use crate::data::workflow_state::WorkflowPhase;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = setup_steps_sample();
+        let mock = MockBackgroundContainer::always_success();
+
+        engine.run_setup(&steps, &mock).unwrap();
+
+        assert_eq!(
+            engine.state().current_phase,
+            WorkflowPhase::Main,
+            "phase must be Main after successful setup"
+        );
+        assert!(
+            engine.state().setup_completed,
+            "setup_completed must be true after successful setup"
+        );
+    }
+
+    #[test]
+    fn run_setup_state_tracking() {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+
+        use crate::data::workflow_definition::SetupStep;
+        let steps = vec![
+            SetupStep::RunShell { command: "step1".into(), env: None },
+            SetupStep::RunShell { command: "step2".into(), env: None },
+        ];
+        let mock = MockBackgroundContainer::always_success();
+
+        engine.run_setup(&steps, &mock).unwrap();
+
+        let states = &engine.state().setup_step_states;
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].status, PhaseStepStatus::Succeeded);
+        assert_eq!(states[1].status, PhaseStepStatus::Succeeded);
+    }
+
+    #[test]
+    fn run_teardown_state_tracking() {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+
+        use crate::data::workflow_definition::TeardownStep;
+        let steps = vec![
+            TeardownStep::RunShell { command: "td1".into(), env: None },
+            TeardownStep::RunShell { command: "td2".into(), env: None },
+        ];
+        let mock = MockBackgroundContainer::always_success();
+
+        engine.run_teardown(&steps, true, false, &mock).unwrap();
+
+        let states = &engine.state().teardown_step_states;
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].status, PhaseStepStatus::Succeeded);
+        assert_eq!(states[1].status, PhaseStepStatus::Succeeded);
+    }
+
+    #[test]
+    fn run_setup_failure_records_failed_state() {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+
+        use crate::data::workflow_definition::SetupStep;
+        let steps = vec![
+            SetupStep::RunShell { command: "ok-step".into(), env: None },
+            SetupStep::RunShell { command: "bad-step".into(), env: None },
+        ];
+        let mock = MockBackgroundContainer::with_results([
+            ("".into(), "".into(), 0),
+            ("".into(), "stderr content".into(), 1),
+        ]);
+
+        let result = engine.run_setup(&steps, &mock);
+        assert!(result.is_err());
+
+        let states = &engine.state().setup_step_states;
+        assert_eq!(states[0].status, PhaseStepStatus::Succeeded);
+        assert!(
+            matches!(&states[1].status, PhaseStepStatus::Failed { error } if error == "stderr content"),
+            "failed state must capture stderr: {:?}",
+            states[1].status
+        );
+    }
+
+    #[test]
+    fn run_teardown_transitions_phase_to_done() {
+        use crate::data::workflow_state::WorkflowPhase;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = teardown_steps_sample();
+        let mock = MockBackgroundContainer::always_success();
+
+        engine.run_teardown(&steps, true, false, &mock).unwrap();
+
+        assert_eq!(
+            engine.state().current_phase,
+            WorkflowPhase::Done,
+            "phase must be Done after teardown completes"
+        );
+        assert!(engine.state().teardown_completed);
+    }
+
+    #[test]
+    fn mark_done_sets_phase_to_done() {
+        use crate::data::workflow_state::WorkflowPhase;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        assert_eq!(engine.state().current_phase, WorkflowPhase::Main);
+
+        engine.mark_done().unwrap();
+        assert_eq!(engine.state().current_phase, WorkflowPhase::Done);
+    }
+
+    #[test]
+    fn run_setup_phase_persistence_verified_from_store() {
+        use crate::data::workflow_state::WorkflowPhase;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+
+        use crate::data::workflow_definition::SetupStep;
+        let steps = vec![SetupStep::RunShell { command: "go".into(), env: None }];
+        let mock = MockBackgroundContainer::always_success();
+
+        engine.run_setup(&steps, &mock).unwrap();
+
+        // Verify the on-disk state was persisted with the correct phase fields.
+        let store = WorkflowStateStore::at_git_root(tmp.path());
+        let saved = store.load(None, "test-wf").unwrap().unwrap();
+        assert_eq!(saved.current_phase, WorkflowPhase::Main);
+        assert!(saved.setup_completed);
     }
 }

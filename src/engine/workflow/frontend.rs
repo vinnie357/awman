@@ -91,4 +91,16 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// The frontend stores the sender so the TUI event loop can route
     /// Ctrl-W and stuck notifications to this specific engine instance.
     fn set_engine_sender(&mut self, _tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {}
+
+    // === Setup/Teardown phase output (fire-and-forget, default no-ops) ===
+
+    fn on_setup_step_started(&mut self, _description: &str) {}
+    fn on_setup_step_output(&mut self, _line: &str) {}
+    fn on_setup_step_completed(&mut self, _description: &str) {}
+    fn on_setup_step_failed(&mut self, _description: &str, _exit_code: i32, _stderr: &str) {}
+
+    fn on_teardown_step_started(&mut self, _description: &str) {}
+    fn on_teardown_step_output(&mut self, _line: &str) {}
+    fn on_teardown_step_completed(&mut self, _description: &str) {}
+    fn on_teardown_step_failed(&mut self, _description: &str, _exit_code: i32, _stderr: &str) {}
 }
