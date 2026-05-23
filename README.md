@@ -2,7 +2,7 @@
   <strong>Run and coordinate AI code agents from your terminal.</strong> <br>
   Parallel sessions, multi-step workflows, full container isolation.<br>
   <br>
-  <img src="./docs/awman_logo.svg" width="320" alt="awman">
+  <img src="./docs/awman_logo.svg" width="620" alt="awman">
 </p>
 
 <p align="center">

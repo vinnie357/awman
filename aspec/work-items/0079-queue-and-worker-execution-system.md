@@ -5,18 +5,30 @@ Issue: issuelink
 
 ## Summary
 
-The awman API frontend is moving from a synchronous request-response model to an async queue-and-worker execution system. API clients submit "exec jobs" (for `exec workflow` or `exec prompt`) which are enqueued in a SQLite-backed job queue. Worker tasks self-assign jobs from the queue and execute them. Clients poll per-session job status asynchronously. This is single-node only.
+The awman API frontend's command execution path is reworked from a synchronous one-command-at-a-time model to an async per-session queue-and-worker system. The **existing HTTP API route structure** is preserved — clients continue to submit commands via `POST /v1/commands`, check status via `GET /v1/commands/{id}/status`, stream logs via `GET /v1/commands/{id}/logs`, and read workflow state via `GET /v1/workflows/{command_id}`. What changes is the execution backend: instead of immediately spawning a tokio task and blocking the session, commands are enqueued into a per-session SQLite-backed FIFO queue and processed by worker tasks. A new `GET /v1/sessions/{id}/queue` endpoint lets clients inspect the queue depth and state for a given session.
 
-Sessions in this model have an explicit **type** that governs how the working directory is provisioned:
+Key changes from the current implementation:
 
-- **`local`**: The session is bound to an existing directory already present on the host (e.g. a repo the operator has already cloned). The client supplies an absolute `workdir` path when creating the session. awman does not manage the directory lifecycle.
-- **`remote`**: The session is bound to a remote git repository. When the session is created, `GitEngine` clones the repository into an isolated directory under `~/.awman/sessions/{session_id}/repo/`. When the session is killed, `GitEngine` deletes that directory. The client supplies a `repo_url` and optionally a `branch` when creating the session.
+1. **Per-session job queues**: Each session has its own independent FIFO queue. When a client submits a command via `POST /v1/commands`, the command is enqueued with `status = 'queued'` and the response returns immediately with the `command_id`. **At most one command per session may be running at any time** — this is enforced at the queue claim level, not by the caller. The current per-session concurrency guard (`busy_sessions`) is removed — the queue replaces it.
 
-For `remote` sessions, because the cloned repository already occupies its own isolated directory, **no git worktree is created** when running `exec workflow` or `exec prompt`. The command layer (`ExecWorkflowCommand`) is responsible for detecting the session type and skipping worktree creation accordingly.
+2. **Worker tasks**: At server startup, N worker tasks are spawned (configurable via `workers` in global config, default 2). Each worker loops: claim the next queued command from **any** session, execute it, mark complete. Workers use atomic SQLite transactions to claim commands, preventing double-execution.
 
-Both session types use the same job queue and worker system.
+3. **Workflow file references**: When submitting `exec workflow` via the API, the workflow is specified as a **file path relative to the session's workdir** — exactly as on the CLI or TUI. The workflow file (TOML or YAML) must exist within the workdir. Workflows are never passed as inline JSON to the API.
 
-Before implementing, read and internalize `aspec/architecture/2026-grand-architecture.md` in full. The session types, job queue schema, and all persistence types live in Layer 0. `GitEngine` methods for clone/checkout/delete live in Layer 1. Session creation lifecycle coordination (clone on create, delete on kill, worktree suppression) lives in Layer 2. The API frontend (Layer 3) only starts workers, exposes HTTP routes, and delegates all logic to lower layers.
+4. **Existing route semantics are preserved**: `POST /v1/commands` continues to accept `{ "subcommand": "exec workflow", "args": ["my-workflow.toml"] }` (the workflow file path is a positional argument, not a flag). The `GET /v1/commands/{id}/status` response gains a `queue_position` field when the command is queued. The SSE log streaming endpoint moves to `GET /v1/commands/{id}/logs`. The workflow state endpoint is unchanged.
+
+5. **Queue status endpoint**: `GET /v1/sessions/{id}/queue` returns the current queue state for a session — pending commands, the currently running command, and recently completed commands.
+
+Sessions have an explicit **type** that governs working directory provisioning:
+
+- **`local`**: Bound to an existing host directory. The client supplies an absolute `workdir` path.
+- **`remote`**: Bound to a remote git repository. `GitEngine` clones the repo into `~/.awman/sessions/{session_id}/repo/` on session creation. The clone directory is deleted on session kill.
+
+For `remote` sessions, no git worktree is created — the cloned repo is already isolated. `ExecWorkflowCommand` in Layer 2 detects the session type and skips worktree creation.
+
+Both session types use the same queue-and-worker system. The WI 0078 infrastructure — async session creation, `SessionSetupBus`, `EventBus`, SSE log streaming, always-yolo enforcement — is fully leveraged and not duplicated.
+
+Before implementing, read and internalize `aspec/architecture/2026-grand-architecture.md` in full. Session types, queue schema, and path helpers live in Layer 0. `GitEngine` clone/checkout/delete methods live in Layer 1. `QueueWorker`, worktree suppression, and `QueueWorkerFrontend` live in Layer 2. Layer 3 only exposes HTTP routes and spawns worker tasks at startup.
 
 ## User Stories
 
@@ -24,28 +36,37 @@ Before implementing, read and internalize `aspec/architecture/2026-grand-archite
 As a: API client
 
 I want to:
-submit an exec job via `POST /sessions/{id}/jobs` and immediately receive a job ID, then poll `GET /sessions/{id}/jobs/{job_id}` to check status (pending, running, completed, failed)
+submit exec commands via `POST /v1/commands` and receive a `command_id` immediately, then poll `GET /v1/commands/{command_id}/status` to check whether the command is queued, running, completed, or failed
 
 So I can:
 submit multiple long-running workflows without blocking and check results when ready, without holding open an HTTP connection
 
 ### User Story 2:
-As a: platform operator using the API to run workflows against a remote git repository
+As a: platform operator managing multiple sessions
 
 I want to:
-create a `type: remote` session by supplying a `repo_url` and `branch`, and have awman clone the repo and check out (or create) the branch automatically
+submit commands to different sessions and have them execute concurrently (one per session), while commands within a single session are serialized via the queue
 
 So I can:
-run workflows against a fresh, isolated copy of a remote repository without needing to pre-clone it on the host machine
+run workflows against multiple repos in parallel while ensuring that commands within a given session don't interfere with each other
 
 ### User Story 3:
 As a: platform operator
 
 I want to:
-have worker tasks self-assign jobs atomically from the SQLite queue so that if multiple worker tasks are running, no job is executed twice
+check `GET /v1/sessions/{id}/queue` to see how many commands are queued, which one is running, and which have completed
 
 So I can:
-scale the number of workers within a single awman process without risking duplicate job execution
+monitor throughput, diagnose stalls, and plan capacity without parsing log files
+
+### User Story 4:
+As a: API client submitting a workflow
+
+I want to:
+reference a workflow file by its path within the workdir (e.g. `workflows/deploy.toml` as a positional argument), exactly as I would on the CLI
+
+So I can:
+use the same workflow files across CLI, TUI, and API without converting them to JSON or any other format
 
 
 ## Implementation Details
@@ -53,76 +74,95 @@ scale the number of workers within a single awman process without risking duplic
 ### Layer 0: Data (`src/data/`)
 
 #### SessionType
-- Add a new enum in `src/data/session.rs`:
-  ```rust
-  pub enum SessionType {
-      Local { workdir: PathBuf },
-      Remote { repo_url: String, branch: String, cloned_path: PathBuf },
-  }
-  ```
+Add a new enum in `src/data/session.rs`:
+```rust
+pub enum SessionType {
+    Local { workdir: PathBuf },
+    Remote { repo_url: String, branch: String, cloned_path: PathBuf },
+}
+```
 - `Session` gains a `session_type: SessionType` field, replacing any prior ad-hoc workdir field. `Session::working_dir()` becomes a method that returns the appropriate path: for `Local`, it returns `workdir`; for `Remote`, it returns `cloned_path`.
 - `SessionType` derives `serde::Serialize` and `serde::Deserialize` — persisted as a JSON column in the `sessions` table.
-- For `Remote` sessions, `cloned_path` is deterministic: `~/.awman/sessions/{session_id}/repo/`. This path is computed by Layer 0 path helpers in `api_paths.rs` — not hardcoded in Layer 2.
+- For `Remote` sessions, `cloned_path` is deterministic: `~/.awman/sessions/{session_id}/repo/`. Computed by Layer 0 path helpers in `api_paths.rs`.
 - Add `SessionType::is_remote(&self) -> bool` and `SessionType::cloned_path(&self) -> Option<&Path>` helpers.
 
-#### Job Queue Schema
-- New module `src/data/fs/api_job_queue.rs` (consistent with the renamed `api_db.rs` from WI 0077)
-- SQLite schema additions (new tables, added to the existing API database managed by `ApiDb`):
+#### Queue Schema — Extending the Existing `commands` Table
+
+Rather than introducing a separate `jobs` table, the existing `commands` table in `ApiDb` is extended to support queue semantics. This preserves backward compatibility with the existing `GET /v1/commands/{id}/status` endpoint and avoids a parallel ID namespace.
+
+SQLite schema additions (idempotent `ALTER TABLE ADD COLUMN` migrations, same pattern as the `setup_status` column):
 
 ```sql
-CREATE TABLE sessions (
-    session_id   TEXT PRIMARY KEY,
-    session_type TEXT NOT NULL,  -- JSON-serialized SessionType
-    status       TEXT NOT NULL DEFAULT 'active',  -- 'active' | 'closed'
-    created_at   TEXT NOT NULL,
-    closed_at    TEXT
-);
+-- Column: worker_id
+-- The UUID of the worker task that claimed this command. NULL while queued.
+ALTER TABLE commands ADD COLUMN worker_id TEXT;
 
-CREATE TABLE jobs (
-    job_id       TEXT PRIMARY KEY,       -- UUID
-    session_id   TEXT NOT NULL,
-    job_type     TEXT NOT NULL,          -- "exec_workflow" | "exec_prompt"
-    payload      TEXT NOT NULL,          -- JSON: workflow name/path, model, agent, etc.
-    status       TEXT NOT NULL           -- "pending" | "running" | "completed" | "failed"
-                 DEFAULT 'pending',
-    worker_id    TEXT,                   -- NULL until claimed
-    created_at   TEXT NOT NULL,
-    claimed_at   TEXT,
-    completed_at TEXT,
-    result       TEXT                    -- JSON: exit code, error message, output summary
-);
+-- Column: queued_at
+-- Timestamp when the command was enqueued. Set on INSERT.
+ALTER TABLE commands ADD COLUMN queued_at TEXT;
 
-CREATE INDEX idx_jobs_session ON jobs(session_id);
-CREATE INDEX idx_jobs_status  ON jobs(status, created_at);
+-- Column: result
+-- JSON: exit code, error message, output summary. Written on completion.
+ALTER TABLE commands ADD COLUMN result TEXT;
 ```
 
-- New types in Layer 0:
-  - `JobId` (newtype over UUID, serializable)
-  - `WorkerId` (newtype over UUID, identifies a running worker task)
-  - `JobType` enum: `ExecWorkflow`, `ExecPrompt`
-  - `JobStatus` enum: `Pending`, `Running`, `Completed`, `Failed`
-  - `JobPayload` struct: `workflow_or_prompt: String`, `agent: Option<AgentName>`, `model: Option<String>` — serialized as JSON into `payload` column
-  - `JobResult` struct: `exit_code: Option<i32>`, `error: Option<String>` — serialized as JSON into `result` column
-  - `JobRecord` struct: mirrors the jobs table row exactly, derives `serde::Serialize` and `serde::Deserialize`
+The existing `status` column gains new values (in addition to `'pending'`, `'running'`, `'done'`, `'error'`). The semantics:
+- `'queued'` — enqueued, waiting for a worker to claim it. This replaces the old `'pending'` for API-submitted commands. (Non-API commands that were inserted as `'pending'` in legacy code remain readable.)
+- `'running'` — claimed by a worker, execution in progress
+- `'done'` — completed successfully
+- `'error'` — completed with failure
+- `'cancelled'` — removed from the queue before execution (e.g. by a session kill request)
 
-- New `JobQueue` struct (thin wrapper over the `ApiDb` connection pool):
-  - `JobQueue::enqueue(session_id, job_type, payload) -> Result<JobId>` — inserts a new job with `status = 'pending'`
-  - `JobQueue::claim_next(worker_id) -> Result<Option<JobRecord>>` — atomically claims the next pending job using a SQLite transaction: `UPDATE jobs SET status='running', worker_id=?, claimed_at=? WHERE job_id = (SELECT job_id FROM jobs WHERE status='pending' ORDER BY created_at ASC LIMIT 1)`. Returns the claimed record or `None` if queue is empty.
-  - `JobQueue::complete_job(job_id, result) -> Result<()>` — sets status to `completed`, writes result JSON
-  - `JobQueue::fail_job(job_id, error) -> Result<()>` — sets status to `failed`, writes error to result
-  - `JobQueue::list_by_session(session_id) -> Result<Vec<JobRecord>>` — returns all jobs for a session, ordered by `created_at`
-  - `JobQueue::get_job(job_id) -> Result<Option<JobRecord>>`
+New `SqliteSessionStore` methods for queue operations:
+
+- `enqueue_command(id, session_id, subcommand, args, log_path) -> Result<()>` — inserts with `status = 'queued'`, `queued_at = now()`.
+
+- `claim_next_command(worker_id: &str) -> Result<Option<CommandRecord>>` — atomically claims the next queued command, enforcing **at most one running command per session**:
+  ```sql
+  UPDATE commands
+  SET status = 'running', worker_id = ?1, started_at = ?2
+  WHERE id = (
+      SELECT c.id FROM commands c
+      WHERE c.status = 'queued'
+        AND NOT EXISTS (
+            SELECT 1 FROM commands r
+            WHERE r.session_id = c.session_id
+              AND r.status = 'running'
+        )
+      ORDER BY c.queued_at ASC
+      LIMIT 1
+  )
+  RETURNING *
+  ```
+  The `NOT EXISTS` subquery ensures a session's next queued command is not claimed until its current running command completes. This is the **sole enforcement point** for per-session serial execution — callers do not need their own concurrency guards. Returns the claimed record or `None` if no eligible command exists. Workers compete on this; SQLite serializes the transactions.
+
+- `complete_command(id, status, exit_code, result_json) -> Result<()>` — sets `status` to `'done'` or `'error'`, writes `result` JSON, sets `finished_at`.
+
+- `list_commands_for_session(session_id, limit) -> Result<Vec<CommandRecord>>` — returns all commands for a session ordered by `queued_at`, most recent first. Used by the queue status endpoint.
+
+- `count_queued_for_session(session_id) -> Result<i64>` — counts commands with `status = 'queued'` for the given session.
+
+- `running_command_for_session(session_id) -> Result<Option<CommandRecord>>` — returns the currently running command for the session, if any.
+
+- `cancel_queued_for_session(session_id) -> Result<Vec<String>>` — atomically sets `status = 'cancelled'` and `finished_at = now()` for all commands in the session with `status = 'queued'`. Returns the list of cancelled command IDs. Used by the graceful session kill path.
+
+- `recover_stale_commands(timeout_secs: u64) -> Result<Vec<String>>` — finds commands with `status = 'running'` and `started_at` older than the timeout, resets them to `'queued'` (clearing `worker_id` and `started_at`). Returns the list of recovered command IDs. Called at server startup.
+
+New types in Layer 0:
+- `WorkerId` (newtype over UUID, serializable) — identifies a running worker task.
+- `CommandResult` struct: `exit_code: Option<i32>`, `error: Option<String>` — serialized as JSON into the `result` column.
+
+The existing `CommandRecord` struct gains the new fields (`worker_id`, `queued_at`, `result`).
 
 #### Remote Session Path Helpers
-- Add to `api_paths.rs`:
-  - `fn remote_session_repo_path(session_id: &SessionId) -> PathBuf` → `~/.awman/sessions/{session_id}/repo/`
-  - `fn remote_session_dir(session_id: &SessionId) -> PathBuf` → `~/.awman/sessions/{session_id}/`
-  - `fn job_state_dir(session_id: &SessionId, job_id: &JobId) -> PathBuf` → `~/.awman/sessions/{session_id}/jobs/{job_id}/`
-  - `fn job_workflow_state_path(session_id: &SessionId, job_id: &JobId) -> PathBuf` → `~/.awman/sessions/{session_id}/jobs/{job_id}/workflow_state.json`
-- These are pure path functions — no I/O, no side effects. They are called by Layer 2 when constructing sessions and by Layer 1 when cleaning up.
+Add to `api_paths.rs`:
+- `fn remote_session_repo_path(session_id: &str) -> PathBuf` → `sessions_dir/{session_id}/repo/`
+- `fn remote_session_dir(session_id: &str) -> PathBuf` → `sessions_dir/{session_id}/`
+
+These are pure path functions — no I/O, no side effects.
 
 #### WorkflowState Step Metadata (Layer 0 — coordinate with WI 0080)
-WI 0080 extends `WorkflowState` with phase tracking fields. This work item additionally requires that `WorkflowState` be **self-describing** for remote rendering — i.e. it must carry enough information for a TUI or CLI client to reconstruct the full step list with dependency topology without separately fetching the `WorkflowDefinition`.
+WI 0080 extends `WorkflowState` with phase tracking fields. This work item additionally requires that `WorkflowState` be **self-describing** for remote rendering — it must carry enough information for a TUI or CLI client to reconstruct the full step list with dependency topology without separately fetching the `WorkflowDefinition`.
 
 Add to `WorkflowState` in `src/data/workflow_state.rs`:
 ```rust
@@ -137,7 +177,7 @@ pub struct WorkflowStepInfo {
     pub model: Option<String>,
 }
 ```
-`WorkflowEngine` populates `steps` from the `WorkflowDefinition` when the workflow is first created (during `WorkflowEngine::new`). This field does not change after initialization. It enables a polling client to render the full topological workflow strip without access to the definition file.
+`WorkflowEngine` populates `steps` from the `WorkflowDefinition` when the workflow is first created. This field does not change after initialization. It enables a polling client to render the full topological workflow strip without access to the definition file.
 
 Also add (coordinate with WI 0080's phase step tracking):
 ```rust
@@ -147,213 +187,372 @@ pub teardown_step_states: Vec<PhaseStepState>,
 where:
 ```rust
 pub struct PhaseStepState {
-    pub description: String,  // human-readable (e.g. "clone_repo: https://github.com/org/repo")
+    pub description: String,
     pub status: PhaseStepStatus,  // Pending | Running | Succeeded | Failed { error: String }
 }
 ```
-`WorkflowEngine::run_setup` and `run_teardown` update these vecs (via the `WorkflowFrontend` trait callbacks) after each step transitions. This makes setup/teardown step progress visible via the workflow status API endpoint.
+`WorkflowEngine::run_setup` and `run_teardown` update these vecs after each step transitions.
 
-Bump `WORKFLOW_STATE_SCHEMA_VERSION` once for both this and WI 0080's changes — coordinate to avoid double-bumping.
+Bump `WORKFLOW_STATE_SCHEMA_VERSION` once for both this and WI 0080's changes.
 
 ### Layer 1: Engine (`src/engine/`)
 
-#### GitEngine — New Methods for Remote Session Lifecycle
-- `GitEngine::clone_repo(url: &str, branch: &str, into_path: &Path) -> Result<()>` — clones the remote repo at `url` into `into_path`, checking out `branch`. If the target directory already exists and is non-empty, return `GitError::CloneTargetExists`. Creates parent directories as needed.
-- `GitEngine::checkout_or_create_branch(repo_path: &Path, branch: &str) -> Result<BranchDisposition>` — inspects the repository at `repo_path` for the given `branch`:
-  - If the branch exists on the remote (i.e. is in `git branch -r`): checkout with `git checkout <branch>`
-  - If the branch does not exist remotely: create it locally with `git checkout -b <branch>`
-  - Returns `BranchDisposition::CheckedOut` or `BranchDisposition::Created` so the caller can log the appropriate message
-- `GitEngine::delete_directory(path: &Path) -> Result<()>` — removes the directory and all contents. Returns `GitError::DirectoryNotFound` if the path does not exist. This is a destructive filesystem operation — callers must only use it for awman-managed directories (remote session repos under `~/.awman/`).
+#### GitEngine — Methods for Remote Session Lifecycle
+These methods were specified in WI 0078 and should already be implemented:
+- `GitEngine::clone_repo(url, branch, into_path) -> Result<()>`
+- `GitEngine::checkout_or_create_branch(repo_path, branch) -> Result<BranchDisposition>`
+- `GitEngine::delete_directory(path) -> Result<()>`
 
-  > Note: `delete_directory` uses `std::fs::remove_dir_all`. It lives in Layer 1 (`GitEngine`) rather than Layer 0 because it is explicitly a git-lifecycle operation (cleaning up a cloned repo), not generic file I/O. Layer 0 path helpers provide the path; Layer 1 performs the deletion.
+No new engine methods are needed for the queue system. The queue is a persistence and coordination concern (Layer 0 + Layer 2), not an engine concern.
 
-- `BranchDisposition` enum: `CheckedOut`, `Created` — Layer 1 type, returned by `checkout_or_create_branch`.
-
-#### WorkflowEngine — No New Methods
-- No changes required to `WorkflowEngine` for session type handling. The worktree suppression decision is made in Layer 2 before `WorkflowEngine` is invoked.
+#### WorkflowEngine — No Changes
+No changes to `WorkflowEngine` for session type handling. The worktree suppression decision is made in Layer 2 before `WorkflowEngine` is invoked.
 
 ### Layer 2: Command (`src/command/`)
 
-#### Session Creation Command (`CreateSessionCommand`)
-- New type `CreateSessionCommand` in `src/command/commands/create_session.rs`. This command is invoked by the API frontend when `POST /sessions` is received. It is NOT available from the CLI or TUI (visibility: `ApiOnly` in the `CommandCatalogue`).
-- `CreateSessionCommand::run(session_type: SessionType, engines: &Engines, session_manager: &SessionManager) -> Result<Session>`:
-  1. If `session_type` is `Remote`:
-     a. Compute `cloned_path = api_paths::remote_session_repo_path(&new_session_id)`
-     b. Call `engines.git_engine.clone_repo(&repo_url, &branch, &cloned_path)`
-     c. Call `engines.git_engine.checkout_or_create_branch(&cloned_path, &branch)` — log the `BranchDisposition` result
-     d. If clone or checkout fails, abort — do NOT create a session record
-  2. Create a `Session` with the resolved `session_type` and `working_dir`
-  3. Persist the session to `ApiDb` via `SessionManager`
-  4. Trigger `ReadyCommand` (see WI 0078 — auto-ready on session creation)
-  5. Return the created `Session`
-
-#### Session Kill Command (`KillSessionCommand`)
-- `KillSessionCommand::run(session_id, engines, session_manager) -> Result<()>`:
-  1. Refuse if any jobs for the session are in `running` status (return `SessionError::JobsStillRunning`)
-  2. If `session.session_type` is `Remote`:
-     a. Call `engines.git_engine.delete_directory(&session.session_type.cloned_path())`
-  3. Mark the session as `closed` in `ApiDb`
-  4. Remove from in-memory `SessionManager`
-
 #### ExecWorkflowCommand — Worktree Suppression for Remote Sessions
-- In `ExecWorkflowCommand::run_with_frontend(session, ...)`, before the worktree creation step, check `session.session_type.is_remote()`. If `true`, skip worktree creation entirely. The workflow runs directly in `session.working_dir()` (which is already the isolated `cloned_path`). Log a debug note: "Skipping worktree creation for remote session — repo is already isolated."
-- This check must live in `ExecWorkflowCommand` at Layer 2, not in `WorkflowEngine` at Layer 1. `WorkflowEngine` must not be aware of session types.
+In `ExecWorkflowCommand::run_with_frontend(session, ...)`, before the worktree creation step, check `session.session_type.is_remote()`. If `true`, skip worktree creation entirely. The workflow runs directly in `session.working_dir()` (the isolated `cloned_path`). Log a debug note: "Skipping worktree creation for remote session — repo is already isolated."
+
+This check lives in `ExecWorkflowCommand` at Layer 2, not in `WorkflowEngine` at Layer 1.
 
 #### QueueWorker
-- New type: `QueueWorker` in `src/command/queue_worker.rs`
-- `QueueWorker` holds a `JobQueue` (Layer 0) reference, a `WorkerId`, and access to `Dispatch` and `Engines` (same bundle as other command execution paths)
-- `QueueWorker::new(job_queue, worker_id, engines, session_manager) -> QueueWorker`
-- `QueueWorker::run(self) -> !` — async loop: calls `job_queue.claim_next(worker_id)` in a loop. If a job is returned, execute it. If no job, sleep briefly (e.g. 250ms) and retry. This loop runs indefinitely as a `tokio::task`.
-- Job execution within `QueueWorker::run`:
-  1. Look up the session from `SessionManager` using `job.session_id`
-  2. Compute the job state directory: `api_paths::job_state_dir(&job.session_id, &job.job_id)`. Create this directory on disk (`std::fs::create_dir_all`).
-  3. Construct a per-job `WorkflowStateStore::at_path(job_state_dir)` and inject it into a **per-job copy of `Engines`** with this store replacing the default store. This ensures `WorkflowEngine` writes state to `~/.awman/sessions/{session_id}/jobs/{job_id}/workflow_state.json` for this job, not to the session's git root.
-  4. Construct a `DispatchFrontend` implementation (`QueueWorkerFrontend`) that reads flags from the job payload, always returns `true` for `yolo` and `non_interactive`, and sends all output to a log sink associated with the job record
-  5. Call `Dispatch::run_command(job_type, ...)` using the resolved command, `QueueWorkerFrontend`, and the per-job `Engines` copy
-  6. On completion, call `job_queue.complete_job(job_id, result)` or `job_queue.fail_job(job_id, error)`
-- `QueueWorkerFrontend` is a Layer 2 struct (lives in `src/command/`) that implements `DispatchFrontend`. It reads all flag values from the `JobPayload` and always enforces yolo/non-interactive.
-- The number of concurrent workers is configurable via global config (`awman.workers: u8`, default 2). The `QueueWorker` tasks are spawned by Layer 3 at server startup.
+New type: `QueueWorker` in `src/command/queue_worker.rs`
+
+`QueueWorker` holds a reference to the `SqliteSessionStore` (which now includes queue operations), a `WorkerId`, and access to `Engines` and the `AppState` sessions map.
+
+```rust
+pub struct QueueWorker {
+    worker_id: String,
+    store: SqliteSessionStore,  // shared via Arc in practice
+    engines: Engines,
+    sessions: /* shared handle to AppState.sessions */,
+    event_buses: /* shared handle to AppState.event_buses */,
+    paths: ApiPaths,
+}
+```
+
+- `QueueWorker::new(worker_id, store, engines, sessions, event_buses, paths) -> QueueWorker`
+- `QueueWorker::run(self) -> !` — async loop:
+  1. Call `store.claim_next_command(worker_id)`.
+  2. If a command is returned, execute it (see below).
+  3. If no command, sleep 250ms and retry.
+  4. This loop runs indefinitely as a `tokio::task`.
+
+**Command execution within `QueueWorker::run`**:
+1. Look up the in-memory `Session` from the sessions map using `command.session_id`.
+2. Compute the command state directory via `paths.command_dir(&command.session_id, &command.id)`. Create this directory on disk.
+3. Create an `EventBus` for this command execution. Spawn the logfile writer task (same pattern as current `execute_command`). Store the bus in `event_buses`.
+4. Construct an `ApiDispatchFrontend` with the `EventBusSender` — the same frontend type used by the current execution path.
+5. Build `Dispatch` with the frontend, session, and engines.
+6. Call `dispatch.run_command(&path_parts)`.
+7. On completion, call `store.complete_command(id, status, exit_code, result_json)`.
+8. Clean up the `EventBus` after a 5-second grace period (same as current behavior).
+9. Write metadata.json with the command's final state.
+
+The `QueueWorker` reuses `ApiDispatchFrontend` directly — it does NOT need a separate `QueueWorkerFrontend`. The always-yolo enforcement already lives in `ApiDispatchFrontend`'s trait implementation (per WI 0078), so it applies automatically.
 
 #### Worker Spawn Count
-- `GlobalConfig` in Layer 0 gains a `workers: Option<u8>` field (defaults to 2 if not set)
-- Layer 3 reads this value at server startup and spawns that many `QueueWorker::run()` tokio tasks
+`GlobalConfig` in Layer 0 gains a `workers: Option<u8>` field (defaults to 2 if not set). Layer 3 reads this value at server startup and spawns that many `QueueWorker::run()` tokio tasks.
 
 ### Layer 3: Frontend (`src/frontend/api/`)
 
 #### Server Startup
-- After session restore (existing logic), spawn N worker tasks: `for _ in 0..global_config.workers() { tokio::spawn(QueueWorker::new(...).run()); }`
-- Workers are fire-and-forget tasks; the server does not await them.
+After session restore (existing logic), run stale command recovery (`store.recover_stale_commands()`), then spawn N worker tasks:
+```rust
+for i in 0..global_config.workers() {
+    let worker = QueueWorker::new(
+        Uuid::new_v4().to_string(),
+        store.clone(),
+        engines.clone(),
+        sessions.clone(),
+        event_buses.clone(),
+        paths.clone(),
+    );
+    tokio::spawn(worker.run());
+}
+```
+Workers are fire-and-forget tasks; the server does not await them.
 
-#### New HTTP Routes
-All routes follow the pattern: translate request → call Layer 2 → return response. No business logic in handlers.
+#### Route Changes
 
-- `POST /sessions` — create a session. Request body is one of:
-  ```json
-  { "type": "local", "workdir": "/absolute/path/to/repo" }
-  ```
-  or
-  ```json
-  { "type": "remote", "repo_url": "https://github.com/org/repo", "branch": "my-feature" }
-  ```
-  The handler calls `CreateSessionCommand::run(session_type, engines, session_manager)`. Response:
-  ```json
-  {
-    "session_id": "...",
-    "type": "remote",
-    "workdir": "~/.awman/sessions/.../repo",
-    "branch": "my-feature",
-    "branch_disposition": "created"
-  }
-  ```
-- `DELETE /sessions/{id}` — kill a session. Calls `KillSessionCommand::run(...)`. Returns HTTP 409 if jobs are still running.
-- `POST /sessions/{id}/jobs` — enqueue a job. Request body: `{ "type": "exec_workflow", "workflow": "my-workflow", "agent": "claude", "model": "..." }`. Response: `{ "job_id": "...", "status": "pending" }`.
-- `GET /sessions/{id}/jobs` — list all jobs for the session.
-- `GET /sessions/{id}/jobs/{job_id}` — get a specific job's full record including result.
-- `GET /sessions/{id}/jobs/{job_id}/workflow` — get the current `WorkflowState` for an `exec_workflow` job. The handler:
-  1. Calls `api_paths::job_workflow_state_path(&session_id, &job_id)` to resolve the file path (Layer 0 path helper — no direct path construction in Layer 3)
-  2. If the file does not exist (job still pending, or job type is `exec_prompt`): return HTTP 404 with `{ "error": "no workflow state for this job" }`
-  3. If the file exists: read and deserialize as `WorkflowState`, return HTTP 200 with the full JSON body
-  4. On deserialization failure: return HTTP 500 with an error message
-  - This endpoint is polled by CLI `--follow` mode and by the TUI's remote workflow strip. It is read-only — the file is written exclusively by `WorkflowEngine` via `WorkflowStateStore`.
+All existing routes are preserved. The changes are to the execution backend, not the HTTP surface.
 
-All route handlers call into Layer 2 types or Layer 0 path/file helpers — no direct SQLite calls in Layer 3.
+**`POST /v1/commands` — now enqueues instead of direct execution**
+
+The handler's existing responsibilities are preserved:
+1. Extract `session_id` from `x-awman-session` header
+2. Validate command is API-allowed via `CommandCatalogue`
+3. Validate session exists, is active, and setup is ready (job submission guard from WI 0078)
+4. **Changed**: Remove the per-session concurrency guard (`busy_sessions` / `has_running_command_for_session`). The queue handles serialization.
+5. Generate `command_id`, create the command directory
+6. **Changed**: Call `store.enqueue_command(...)` instead of `store.insert_command(...)`. This sets `status = 'queued'`.
+7. **Changed**: Do NOT spawn a tokio task to execute the command. The worker will pick it up.
+8. Return `202 Accepted` with the existing `CreateCommandResponse` body: `{ "command_id": "...", "flags_applied": { "yolo": true, "non_interactive": true } }`
+
+The request body is unchanged:
+```json
+{
+  "subcommand": "exec workflow",
+  "args": ["workflows/deploy.toml", "--agent", "claude"]
+}
+```
+
+Workflow files are referenced by path relative to the session's workdir, just as on the CLI. The positional workflow path argument is a file path (TOML or YAML). The workflow file must exist within the session's working directory. `ExecWorkflowCommand` in Layer 2 resolves the path and loads the file — no special handling needed in the API layer.
+
+**`GET /v1/commands/{id}/status` — extended response**
+
+The existing `CommandResponse` struct gains new fields:
+```rust
+struct CommandResponse {
+    // ... existing fields ...
+    id: String,
+    session_id: String,
+    subcommand: String,
+    args: serde_json::Value,
+    status: String,           // now includes "queued" as a possible value
+    exit_code: Option<i32>,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    log_path: String,
+    // New fields:
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queued_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_position: Option<i64>,  // 0 = next to run, None when running/done
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
+}
+```
+
+When the command has `status = 'queued'`, the handler computes `queue_position` by counting how many commands in the same session are queued with an earlier `queued_at` timestamp.
+
+**`GET /v1/sessions/{id}/queue` — new endpoint (queue status)**
+
+New route added to the router. Returns the current queue state for a session.
+
+Response schema:
+```json
+{
+  "session_id": "abc-123",
+  "queue_depth": 3,
+  "running": {
+    "command_id": "cmd-456",
+    "subcommand": "exec workflow",
+    "args": ["deploy.toml"],
+    "started_at": "2026-05-23T10:00:00Z",
+    "worker_id": "worker-789"
+  },
+  "queued": [
+    {
+      "command_id": "cmd-457",
+      "subcommand": "exec workflow",
+      "args": ["test.toml"],
+      "queued_at": "2026-05-23T10:01:00Z",
+      "position": 0
+    },
+    {
+      "command_id": "cmd-458",
+      "subcommand": "exec prompt",
+      "args": ["--prompt", "review the code"],
+      "queued_at": "2026-05-23T10:02:00Z",
+      "position": 1
+    }
+  ],
+  "recent_completed": [
+    {
+      "command_id": "cmd-455",
+      "subcommand": "exec workflow",
+      "status": "done",
+      "exit_code": 0,
+      "finished_at": "2026-05-23T09:59:00Z"
+    }
+  ]
+}
+```
+
+Implementation:
+- `queue_depth`: count of commands with `status = 'queued'` for this session.
+- `running`: the command with `status = 'running'` for this session (at most one), or `null`.
+- `queued`: list of commands with `status = 'queued'`, ordered by `queued_at ASC`, with 0-indexed position.
+- `recent_completed`: the last 10 commands with `status IN ('done', 'error')`, ordered by `finished_at DESC`. Provides quick visibility into recent history without needing to list all commands.
+
+If the session does not exist, return HTTP 404. If the session has no commands, return the response with `queue_depth: 0`, `running: null`, empty arrays.
+
+**All other routes are unchanged**:
+- `POST /v1/sessions` — async session creation (WI 0078), unchanged
+- `GET /v1/sessions` — list sessions, unchanged
+- `GET /v1/sessions/{id}` — get session, unchanged
+- `DELETE /v1/sessions/{id}` — graceful session kill (see dedicated section below). Cancels all queued commands immediately, waits for any running command to finish, then closes the session.
+- `GET /v1/sessions/{id}/status` — setup status (WI 0078), unchanged
+- `GET /v1/commands/{id}/status` — extended (see above)
+- `GET /v1/commands/{id}/logs` — SSE streaming (WI 0078 event bus), moved from the old `/v1/sessions/{id}/jobs/{job_id}/logs` path. The command ID is the only identifier needed — the session is looked up from the command record.
+- `GET /v1/workflows/{command_id}` — workflow state, unchanged
+- `GET /v1/status` — server status, unchanged
+- `GET /v1/workdirs` — workdir list, unchanged
 
 #### TUI Workflow Strip for Remote Sessions
-When the TUI submits a `remote exec workflow` job (via `Dispatch`), it must display the workflow strip and update it in real time from the API. Follow mode is always active in the TUI.
+When the TUI submits a `remote exec workflow` command, it displays the workflow strip and updates it in real time from the API. Follow mode is always active in the TUI.
 
-**RemoteWorkflowPoller** (new type in `src/frontend/tui/`, Layer 3 TUI):
+**RemoteWorkflowPoller** (Layer 3 TUI):
 ```rust
 struct RemoteWorkflowPoller {
     client: Arc<RemoteClient>,
-    session_id: SessionId,
-    job_id: JobId,
+    session_id: String,
+    command_id: String,
     workflow_view: Arc<Mutex<Option<WorkflowViewState>>>,
 }
 ```
 - `RemoteWorkflowPoller::start(self) -> JoinHandle<()>` — spawns a `tokio::task` that:
-  1. Every 500ms: call `client.get_job(session_id, job_id)` for overall status
-  2. Every 500ms (same tick): call `client.get_workflow_state(session_id, job_id)`
-  3. On a new `WorkflowState` response: convert it to `WorkflowViewState` via `workflow_state_to_view_state(&state)`
-  4. Lock `workflow_view`, replace the current value, release
-  5. The TUI render loop picks up the updated `WorkflowViewState` and redraws the workflow strip on the next tick — identical rendering path to local workflows
-  6. When job status is `completed` or `failed`: do one final state poll, update the view, then stop polling
-- `RemoteWorkflowPoller` is created in the TUI command handling path immediately after a `remote exec workflow` job is submitted. The `workflow_view` Arc is the **same one already used by the tab for local workflow rendering** — no special remote strip path is needed; the strip renders identically regardless of whether data comes from local `WorkflowEngine` callbacks or remote polling.
+  1. Every 500ms: call `client.get_command_status(command_id)` for overall status
+  2. Every 500ms (same tick): call `client.get_workflow_state(command_id)`
+  3. On a new `WorkflowState` response: convert to `WorkflowViewState` via `workflow_state_to_view_state(&state)`
+  4. Lock `workflow_view`, replace, release
+  5. The TUI render loop picks up the updated `WorkflowViewState` on the next tick
+  6. When command status is `done` or `error`: do one final state poll, update the view, stop polling
 
-**`workflow_state_to_view_state` conversion function** (Layer 3 TUI — may be promoted to Layer 2 if CLI reuse is needed):
-- Input: `&WorkflowState` (Layer 0 type — see Layer 0 section above for `WorkflowStepInfo`, `PhaseStepState` additions)
+The `workflow_view` Arc is the **same one already used by the tab for local workflow rendering** — no special remote strip path; the strip renders identically.
+
+**`workflow_state_to_view_state` conversion function** (Layer 3 TUI):
+- Input: `&WorkflowState`
 - Output: `WorkflowViewState` (TUI type containing `Vec<WorkflowStepView>`)
 - Conversion:
-  1. Prepend a pseudo-step for each entry in `state.setup_step_states` (if non-empty): `WorkflowStepView { name: phase_step.description, status: mapped_from(phase_step.status), depends_on: [] }`. These represent setup container exec steps and appear at the top of the strip labeled with their description.
-  2. For each step in `state.steps` (in order): look up `StepState` in `state.step_states`, map to status string, build `WorkflowStepView { name, status, agent, model, depends_on }`.
-  3. Append a pseudo-step for each entry in `state.teardown_step_states` (if non-empty): `depends_on: [name_of_last_step_in_state.steps]`.
-  4. Return `WorkflowViewState { steps, current_step: state.current_step_index }`.
-- `StepState` → status string mapping: `Pending` → "pending", `Running { .. }` → "running", `Succeeded` → "done", `Failed { .. }` → "error", `Cancelled` → "cancelled", `Skipped` → "skipped"
-- `PhaseStepStatus` → status string: same mapping as above
+  1. Prepend pseudo-steps from `state.setup_step_states`
+  2. Map main steps from `state.steps` + `state.step_states`
+  3. Append pseudo-steps from `state.teardown_step_states`
+  4. Return `WorkflowViewState { steps, current_step: state.current_step_index }`
 
-**CLI `--follow` step output** (in Layer 2 `RemoteCommand` or Layer 3 CLI frontend):
-- Track last-seen `HashMap<String, StepState>` (and `Vec<PhaseStepState>` for setup/teardown)
-- On each poll that returns a changed `WorkflowState`, print only lines where status changed, in the format shown in WI 0078's "Remote Follow Mode" section
-- Setup steps prefixed with `[setup]`, main steps with `[step N]`, teardown steps with `[teardown]`
+**CLI `--follow` step output** (Layer 2 `RemoteCommand`):
+- Track last-seen step states
+- On each poll that returns a changed `WorkflowState`, print status changes:
+  ```
+  [setup]      clone_repo: https://github.com/org/repo   → succeeded
+  [step 1]     analyze                                    → running
+  [step 2]     implement                                  → pending
+  [teardown]   commit_changes                             → pending
+  ```
+
+**TUI strip for prompt commands**: When a `remote exec prompt` command is submitted, do NOT start `RemoteWorkflowPoller` — there is no workflow state. Show a simple "running" indicator.
+
+#### `DELETE /v1/sessions/{id}` — Graceful Drain-and-Kill
+
+Session kill is a graceful operation: queued commands are cancelled immediately, but any currently running command is allowed to finish before the session is closed. This avoids aborting mid-execution while still preventing new work from starting.
+
+**Behavior:**
+1. Validate the session exists and is active. Return 404 if not found, 200 if already closed.
+2. Call `store.cancel_queued_for_session(session_id)` — atomically sets all queued commands to `'cancelled'`. This prevents workers from claiming any new work for this session.
+3. Mark the session's status as `'closing'` in `ApiDb` (new status value). A `'closing'` session rejects new command submissions (`POST /v1/commands` returns HTTP 409).
+4. Check if the session has a command with `status = 'running'`:
+   - **No running command**: proceed to step 5 immediately.
+   - **Running command exists**: return HTTP 202 Accepted with:
+     ```json
+     {
+       "session_id": "abc-123",
+       "status": "closing",
+       "running_command_id": "cmd-456",
+       "cancelled_count": 2,
+       "message": "Session is closing. Waiting for running command to complete. Poll GET /v1/sessions/{id}/status to monitor."
+     }
+     ```
+     The session remains in `'closing'` state. When the running command finishes (detected by the worker's post-execution path), the worker checks if the session is `'closing'` and triggers final cleanup (step 5).
+5. **Final cleanup** (runs either inline or deferred after the running command completes):
+   a. If `session.session_type` is `Remote`, call `git_engine.delete_directory(cloned_path)`.
+   b. Mark the session as `'closed'` in `ApiDb`, set `closed_at`.
+   c. Remove from in-memory `sessions` map.
+   d. Return HTTP 200 (if inline) with the final session state.
+
+**Worker integration**: After a worker completes a command, it checks whether the session's status is `'closing'`. If so, the worker triggers step 5 (final cleanup) instead of claiming the next command for that session. This is a simple check added to the worker's post-execution path — no separate background task is needed.
+
+**`GET /v1/sessions/{id}/status` during closing**: The existing status endpoint already returns the session's current state. When a session is in `'closing'` status, the response reflects this, allowing clients to poll until the session reaches `'closed'`.
+
+**`POST /v1/commands` guard**: The handler checks the session's status before enqueuing. If the session status is `'closing'` or `'closed'`, return HTTP 409 Conflict:
+```json
+{
+  "error": "session is closing",
+  "session_id": "abc-123",
+  "hint": "Session is shutting down and no longer accepts commands."
+}
+```
 
 
 ## Edge Case Considerations
 
-- **Clone failure**: If `GitEngine::clone_repo` fails (network error, invalid URL, authentication failure), `CreateSessionCommand` must return an error. No session record is written to the database. The Layer 3 handler returns HTTP 422 with the git error message.
-- **Branch checkout failure**: If `checkout_or_create_branch` fails after a successful clone (e.g. the branch name is invalid), the session creation fails. The partially-cloned repo directory must be cleaned up (call `git_engine.delete_directory(cloned_path)` in the error path of `CreateSessionCommand`). Do not leave orphaned directories under `~/.awman/sessions/`.
-- **Session kill with running jobs**: `DELETE /sessions/{id}` returns HTTP 409 Conflict. The response body includes the list of running job IDs. The client is responsible for waiting or cancelling jobs.
-- **Remote session kill — partial cleanup**: If `delete_directory` fails (e.g. permissions issue), log the error and return HTTP 500. The session is NOT marked as closed — the operator must resolve the filesystem issue and retry.
-- **`local` session with non-existent workdir**: When creating a `local` session, validate that the supplied `workdir` path exists and is a directory. Return HTTP 400 if not. This check happens in `CreateSessionCommand`, not in the Layer 3 handler.
-- **Session restore on server restart**: On startup, sessions in `active` status are restored from `ApiDb`. For `remote` sessions, verify that `cloned_path` still exists on disk. If the path is missing (e.g. host rebooted and temp storage was lost), mark the session as `closed` with an error note rather than leaving it in an invalid state.
-- **Concurrent `clone_repo` calls**: Each remote session has a unique UUID-based `cloned_path`, so concurrent clone operations target different directories and do not interfere with each other.
-- **`remote session start` command**: The CLI `awman remote session start` (defined in WI 0078) must expose `--type`, `--workdir` (for `local`), `--repo-url`, and `--branch` (for `remote`) flags. These are registered in the `CommandCatalogue` for the `remote session start` subcommand.
-- **Worktree suppression — audit**: All existing callers in `ExecWorkflowCommand` that create git worktrees must check `session.session_type.is_remote()`. There must be no code path that creates a worktree for a remote session.
-- **API vs CLI/TUI sessions**: `JobQueue`, `SessionType`, and the `CreateSessionCommand` / `KillSessionCommand` are API-specific concerns. CLI and TUI create `Session` objects directly without going through `CreateSessionCommand`. The `SessionType` enum lives in Layer 0 but CLI/TUI sessions should always be `Local` — enforce this with a constructor that requires a `workdir` for non-API sessions.
-- **Workflow state file written before visible in API**: `WorkflowEngine` writes state after each step transition. The first write happens when the first step enters `Running` status. A client polling `GET /sessions/{id}/jobs/{job_id}/workflow` immediately after job submission may receive HTTP 404 even though the job is `running` — this is expected. Clients must tolerate 404 during the initial lag.
-- **Workflow state file for completed jobs**: After the workflow completes and the job is marked `completed`, the workflow state file persists in `job_state_dir`. It is NOT deleted on session kill (only the remote session's `repo/` directory is deleted). Operators can inspect historical workflow state for completed jobs.
-- **Workflow state schema version mismatch in API response**: If the `WorkflowState` JSON was written by an older version of awman with a different schema version, the deserialization may fail. Return HTTP 500 with the schema mismatch message. Do not silently return a partially-deserialized state.
-- **Per-job `Engines` copy**: `Engines` is cloned per-job by `QueueWorker` with only the `WorkflowStateStore` replaced. All other engine references (ContainerRuntime, GitEngine, etc.) are `Arc`-shared and do not incur extra cost. Ensure `Engines` derives or manually implements `Clone` to support this pattern cleanly.
-- **TUI strip for prompt jobs**: When a `remote exec prompt` job is submitted, the TUI should NOT start `RemoteWorkflowPoller` — there is no workflow state to show. Instead, show a simple "running" indicator in the tab and update to "done" or "failed" when job status resolves.
+- **Queue ordering**: Commands within a session are processed in strict FIFO order by `queued_at`. If two commands are enqueued at the same millisecond, SQLite's `ORDER BY queued_at, rowid` breaks the tie deterministically.
+- **Worker starvation**: With N workers and M active sessions, if one session queues many commands, workers may spend most of their time on that session. This is acceptable for single-node — workers claim globally, so all sessions are served fairly (next-in-queue regardless of session). If session-level fairness is needed later, `claim_next_command` can be changed to round-robin across sessions, but this is out of scope.
+- **Atomic claim**: `claim_next_command` uses `UPDATE ... WHERE id = (SELECT ... LIMIT 1)` in a single statement. SQLite's write serialization ensures exactly one worker claims each command. No explicit transaction wrapper is needed beyond SQLite's implicit one.
+- **Clone failure**: If `GitEngine::clone_repo` fails (network error, invalid URL), session creation fails (per WI 0078). No session record is created. The Layer 3 handler returns the error.
+- **Branch checkout failure**: If `checkout_or_create_branch` fails after clone, the cloned directory is cleaned up (per WI 0078). No session created.
+- **Session kill with queued commands**: `DELETE /sessions/{id}` immediately cancels all queued commands and transitions the session to `'closing'`. If a command is running, the session remains in `'closing'` until it completes, then the worker triggers final cleanup. Clients poll `GET /sessions/{id}/status` to observe the transition to `'closed'`.
+- **Session kill with no in-flight commands**: `DELETE /sessions/{id}` transitions directly to `'closed'` and returns HTTP 200 synchronously.
+- **Remote session kill — partial cleanup**: If `delete_directory` fails during final cleanup, log the error and return HTTP 500. The session is NOT marked as closed — the operator must resolve the filesystem issue and retry.
+- **Double delete**: If `DELETE /sessions/{id}` is called while the session is already `'closing'`, return HTTP 200 with the current state (including `running_command_id` if still draining). If already `'closed'`, return HTTP 200 with the closed session record.
+- **`local` session with non-existent workdir**: Return HTTP 400 at session creation. This check happens during async setup (per WI 0078).
+- **Session restore on server restart**: On startup, sessions in `active` status are restored from `ApiDb`. For `remote` sessions, verify `cloned_path` exists. If missing, mark as `closed`. Commands with `status = 'running'` are recovered to `'queued'` via `recover_stale_commands()`.
+- **Single active command per session**: This is enforced by the `NOT EXISTS` subquery in `claim_next_command`. Workers naturally skip sessions that have a running command and pick work from other sessions instead. With N workers and M sessions with queued work, up to min(N, M) commands run concurrently — one per session. This is not a performance optimization but a correctness requirement: workflows hold locks on the workdir and containers, so concurrent execution within a session would fail.
+- **Worker efficiency**: Because `claim_next_command` skips busy sessions, workers never waste cycles attempting and failing a claim. If all sessions with queued work already have a running command, `claim_next_command` returns `None` and the worker sleeps.
+- **Worktree suppression — audit**: All existing callers in `ExecWorkflowCommand` that create git worktrees must check `session.session_type.is_remote()`. No code path should create a worktree for a remote session.
+- **API vs CLI/TUI sessions**: The queue system is API-only. CLI and TUI create `Session` objects directly without the queue. `SessionType` lives in Layer 0 but CLI/TUI sessions are always `Local`.
+- **Workflow file resolution**: When `args` contains `["deploy.toml"]` (positional argument), `ExecWorkflowCommand` resolves `deploy.toml` relative to the session's `working_dir()`. For local sessions this is the user's repo; for remote sessions it's the `cloned_path`. The file must exist and be TOML or YAML. Markdown workflows are rejected per WI 0080.
+- **Workflow state file timing**: `WorkflowEngine` writes state after each step transition. The first write happens when the first step enters `Running`. A client polling `GET /v1/workflows/{command_id}` immediately after submission may receive HTTP 404 — this is expected. Clients must tolerate 404 while the command is queued or during initial execution lag.
+- **Workflow state for completed commands**: After workflow completion, the state file persists in the command directory. It is NOT deleted on session kill (only the remote session's `repo/` directory is deleted).
+- **`status` field backward compatibility**: Legacy commands inserted with `status = 'pending'` (by pre-queue code) are treated as `'queued'` by workers. The `claim_next_command` query matches `status IN ('queued', 'pending')`.
+- **Worker count zero**: If `workers: 0` is configured, no workers spawn. Commands will be enqueued but never processed. Emit a startup warning.
+- **EventBus per command**: Each command execution creates its own `EventBus` (unchanged from current behavior). The `EventBus` is created by the worker when it starts executing the command, not at enqueue time. SSE clients connecting while the command is queued will get HTTP 404 from the log endpoint (no events yet).
+- **Per-command `Engines` customization**: For workflow commands, `QueueWorker` may need to adjust the `WorkflowStateStore` path to point to the command's directory. This is done by creating a per-command copy of `Engines` with the store replaced, same pattern as the current `execute_command` function.
 
 
 ## Test Considerations
 
-- **Local session creation test**: `POST /sessions` with `type: local, workdir: /tmp/test-repo`; assert session record created with `session_type: Local`, `working_dir == /tmp/test-repo`.
-- **Remote session creation test** (requires network or mock `GitEngine`): `POST /sessions` with `type: remote, repo_url: ..., branch: main`; assert `cloned_path` exists on disk and session record is created.
-- **Remote session — branch exists test**: If the specified branch exists in the remote, assert `BranchDisposition::CheckedOut` is returned and the branch is checked out in the clone.
-- **Remote session — branch not found test**: If the branch does not exist remotely, assert `BranchDisposition::Created` and the branch is created locally.
-- **Remote session kill test**: Kill a `remote` session; assert `cloned_path` directory is deleted from disk and session is marked `closed`.
-- **Clone failure cleanup test**: If `clone_repo` succeeds but `checkout_or_create_branch` fails, assert that `cloned_path` is cleaned up and no session record exists in the database.
-- **409 on session delete with running job test**: While a job is in `running` status, attempt `DELETE /sessions/{id}`; assert HTTP 409 is returned with the running job ID in the body.
-- **Server restart — remote session missing dir test**: Insert a `remote` session in `active` status with a nonexistent `cloned_path`; simulate server startup; assert the session is moved to `closed` with an error note.
-- **ExecWorkflowCommand no-worktree test**: Execute a workflow against a `remote` session; assert `GitEngine::create_worktree` is never called (use a mock `GitEngine`).
-- **Atomic claim test**: Spawn 4 worker tasks against a queue with 4 pending jobs; assert each job is claimed by exactly one worker.
-- **Stale job recovery test**: Insert a job with `status = 'running'` and `claimed_at` older than the timeout; run `JobQueue::recover_stale_jobs()`; assert status reset to `pending`.
-- **Worker count config test**: Set `workers: 0`; assert no workers are spawned and startup emits a warning.
-- **Layer 0 unit tests**: `JobQueue::enqueue`, `claim_next`, `complete_job`, `fail_job`, `list_by_session`, `get_job` — tested in isolation against an in-memory SQLite database.
-- **Workflow state file path test**: `api_paths::job_workflow_state_path(session_id, job_id)` returns the expected path. Unit test — no filesystem I/O.
-- **QueueWorker writes workflow state test**: Execute a mock `exec_workflow` job via a `QueueWorker` backed by a mock `WorkflowEngine`. Assert that `workflow_state.json` exists at `job_state_dir` after execution.
-- **Workflow status endpoint — file not yet written test**: Call `GET /sessions/{id}/jobs/{job_id}/workflow` on a freshly-enqueued job (no workflow state file yet); assert HTTP 404.
-- **Workflow status endpoint — file present test**: Write a fixture `WorkflowState` JSON to `job_state_dir`, then call the endpoint; assert HTTP 200 and the body deserializes correctly.
-- **Workflow status endpoint — prompt job test**: Submit an `exec_prompt` job; assert `GET /sessions/{id}/jobs/{job_id}/workflow` returns HTTP 404 with the expected error message.
-- **`workflow_state_to_view_state` unit test**: Construct a `WorkflowState` with 3 main steps (one running, one done, one pending), 2 setup steps (both done), 1 teardown step (pending); call the conversion; assert output has 6 `WorkflowStepView` entries in order (2 setup + 3 main + 1 teardown) with correct status strings.
-- **TUI strip poller integration test**: Submit a remote exec workflow job from a mock TUI session; assert `RemoteWorkflowPoller` is started, polls the workflow endpoint, and updates `workflow_view` with the correct `WorkflowViewState`.
-- **TUI strip final state test**: When job transitions to `completed`, assert the poller does one final poll, updates the view to reflect all steps as "done", then stops.
+- **Enqueue and claim test**: Insert 3 commands via `enqueue_command`; call `claim_next_command` 3 times; assert each returns a different command in FIFO order; 4th call returns `None`.
+- **Atomic claim test**: Spawn 4 workers claiming from a queue of 4 commands simultaneously; assert each command is claimed by exactly one worker (no duplicates).
+- **Session-exclusive execution test**: Enqueue 2 commands for the same session; spawn 2 workers; assert only one command enters `'running'` at a time — the second worker gets `None` from `claim_next_command` and does not execute concurrently.
+- **Cross-session concurrency test**: Enqueue 1 command each for 2 different sessions; assert both can be claimed and run concurrently by different workers.
+- **Queue position test**: Enqueue 3 commands for a session; call `GET /v1/commands/{id}/status` for each; assert `queue_position` is 0, 1, 2 respectively.
+- **Queue status endpoint test**: Enqueue 3 commands, let 1 run and 1 complete; call `GET /v1/sessions/{id}/queue`; assert `queue_depth` is 1, `running` is the active command, `queued` has 1 entry, `recent_completed` has 1 entry.
+- **Stale command recovery test**: Insert a command with `status = 'running'` and `started_at` older than timeout; call `recover_stale_commands()`; assert status reset to `'queued'`.
+- **Worker count config test**: Set `workers: 0`; assert no workers spawned and startup emits a warning.
+- **POST /v1/commands enqueues test**: Submit a command via `POST /v1/commands`; assert the DB has it with `status = 'queued'`, NOT `'pending'` or `'running'`.
+- **POST /v1/commands no longer blocks session test**: Submit 2 commands to the same session in quick succession; assert both return 202 (not 403). The second is queued behind the first.
+- **DELETE /sessions/{id} with queued commands test**: Enqueue 3 commands, attempt `DELETE /sessions/{id}`; assert all 3 are cancelled, session status is `'closed'` (no running command to wait for), HTTP 200.
+- **DELETE /sessions/{id} with running command test**: Enqueue 2 commands, let 1 start running, call `DELETE`; assert queued command is cancelled, session status is `'closing'`, HTTP 202 with `running_command_id`. When the running command completes, assert session transitions to `'closed'`.
+- **DELETE /sessions/{id} with empty queue test**: Close a session with no commands; assert immediate `'closed'`, HTTP 200.
+- **POST /v1/commands rejected on closing session test**: Set session to `'closing'`, attempt `POST /v1/commands`; assert HTTP 409.
+- **Double delete test**: Call `DELETE` on an already-closing session; assert HTTP 200 with current state, no error.
+- **Workflow file reference test**: Submit `POST /v1/commands` with `args: ["test.toml"]` (positional argument); assert the worker resolves `test.toml` relative to the session workdir and loads the workflow file.
+- **Workflow file not found test**: Submit with a nonexistent workflow file path; assert the command fails with a clear error in the `result` field.
+- **Remote session worktree suppression test**: Execute a workflow against a remote session; assert `GitEngine::create_worktree` is never called.
+- **Local session creation test**: `POST /sessions` with `type: local, workdir: /tmp/test-repo`; assert session created.
+- **Remote session creation test**: `POST /sessions` with `type: remote, repo_url: ..., branch: main`; assert `cloned_path` exists.
+- **Remote session kill cleanup test**: Kill a remote session; assert `cloned_path` deleted.
+- **Server restart recovery test**: Insert a session with a running command; simulate restart; assert command recovered to `'queued'`.
+- **GET /v1/commands/{id}/status response shape test**: Verify the response includes `queued_at`, `queue_position`, `worker_id`, and `result` fields with correct types.
+- **SSE log streaming still works test**: Enqueue a command, let worker execute it, connect to SSE endpoint; assert events stream correctly.
+- **Backward compat — legacy pending commands test**: Insert a command with `status = 'pending'` (old code path); assert `claim_next_command` picks it up.
+- **Workflow state endpoint unchanged test**: After workflow execution, `GET /v1/workflows/{command_id}` returns the correct state JSON.
+- **Queue depth under load test**: Enqueue 100 commands across 10 sessions; assert queue status is accurate and workers drain all commands without deadlock or duplicate execution.
+- **`workflow_state_to_view_state` unit test**: Construct a `WorkflowState` with setup/main/teardown steps; assert correct conversion to `WorkflowViewState`.
+- **TUI strip poller integration test**: Submit a remote workflow via mock TUI; assert `RemoteWorkflowPoller` polls and updates the view.
 
 
 ## Codebase Integration
 
-- Strictly follow `aspec/architecture/2026-grand-architecture.md`. `SessionType`, job queue types (`JobRecord`, `JobQueue`, `JobId`, etc.), and path helpers for remote session directories all live in Layer 0. `GitEngine` clone/checkout/delete methods live in Layer 1. `CreateSessionCommand`, `KillSessionCommand`, `QueueWorker`, and `QueueWorkerFrontend` live in Layer 2. Layer 3 only exposes HTTP routes and spawns worker tasks.
-- `SessionType` is a Layer 0 type. The decision to skip worktree creation based on `SessionType::is_remote()` is made in Layer 2 (`ExecWorkflowCommand`). `WorkflowEngine` in Layer 1 must NOT be aware of session types — it must not receive session type information or branch on it.
-- `JobQueue` is passed to `QueueWorker` as a shared handle (`Arc<JobQueue>`) so multiple worker tasks share the same connection pool.
-- `QueueWorker` must implement the `DispatchFrontend` supertrait pattern via `QueueWorkerFrontend` — no special code path in `Dispatch` for workers.
-- New SQLite tables must be added as proper migrations in the `ApiDb` schema versioning system.
+- Strictly follow `aspec/architecture/2026-grand-architecture.md`. Queue schema and types (`CommandRecord` extensions, `WorkerId`, `CommandResult`) live in Layer 0. `GitEngine` methods live in Layer 1. `QueueWorker` lives in Layer 2. Layer 3 only exposes HTTP routes and spawns workers.
+- `SessionType` is a Layer 0 type. Worktree suppression based on `SessionType::is_remote()` is decided in Layer 2 (`ExecWorkflowCommand`). `WorkflowEngine` in Layer 1 must NOT be aware of session types.
+- `QueueWorker` reuses `ApiDispatchFrontend` for its frontend — the same type used by the current `execute_command` function. No separate `QueueWorkerFrontend` is needed. Always-yolo enforcement comes from `ApiDispatchFrontend` automatically.
+- The `EventBus` lifecycle is unchanged: created per command execution by the worker, retained for 5 seconds after completion, then dropped. SSE clients connect to the `/v1/commands/{id}/logs` endpoint.
+- The existing `busy_sessions` mutex in `AppState` is removed. Per-session serial execution is enforced by `claim_next_command`'s `NOT EXISTS` subquery — this is the single enforcement point.
+- After completing a command, the worker checks if the session's status is `'closing'`. If so, the worker runs the session's final cleanup (remote dir deletion, status → `'closed'`) instead of returning to the claim loop. This keeps the drain-and-kill logic in the worker's post-execution path, not in a separate background task.
+- New SQLite columns must be added as idempotent `ALTER TABLE ADD COLUMN` migrations, consistent with the existing pattern in `SqliteSessionStore::migrate`.
 - `workers` config field lives in `GlobalConfig` (Layer 0). Spawning worker tasks is a Layer 3 server startup concern.
+- The `POST /v1/commands` handler no longer spawns execution tasks. It only validates, enqueues, and returns. Execution is the worker's responsibility.
+- Route table tests must be updated: add `GET /v1/sessions/:id/queue`, replace `GET /v1/commands/:id` with `GET /v1/commands/:id/status`, replace `GET /v1/sessions/:id/jobs/:job_id/logs` with `GET /v1/commands/:id/logs`.
 
 
 ## Documentation
 
 After implementation:
-- `docs/08-api-mode.md` — add a "Sessions" section explaining `local` vs `remote` session types, creation request bodies, `branch_disposition` in the response, and session lifecycle (clone on create, delete on kill)
-- `docs/08-api-mode.md` — add a "Job Queue" section: how to submit jobs, poll status, worker configuration
+- `docs/08-api-mode.md` — add a "Job Queue" section: explain that commands are enqueued and processed by workers; document the `GET /v1/sessions/{id}/queue` endpoint; document the `queue_position` field in command responses; document the `workers` config option; explain that workflows are specified as file paths in `args`, not inline JSON
 - `docs/07-configuration.md` — document the `workers` global config option
-- Create `docs/11-api-sessions-and-jobs.md` as a user guide: end-to-end example for both session types, submitting jobs, polling results
+- Update `docs/08-api-mode.md` session lifecycle section to explain `local` vs `remote` session types (if not already covered by WI 0078 docs)
+- Update the API endpoint reference table to include `GET /v1/sessions/{id}/queue`
