@@ -747,10 +747,10 @@ impl Command for ExecWorkflowCommand {
         // The engine block is scoped so proxy + factory are dropped before we
         // reclaim the frontend via Arc::try_unwrap.
         let yolo = self.flags.yolo;
-        let work_item_number = work_item_context.as_ref().map(|ctx| ctx.number);
         let setup_steps = workflow.setup.clone();
         let teardown_steps = workflow.teardown.clone();
         let teardown_on_failure = workflow.teardown_on_failure;
+        let engine_work_item_context = work_item_context.clone();
         let (engine_result, step_counts) = {
             let proxy = WorkflowProxy(Arc::clone(&shared));
             let factory = CommandLayerFactory {
@@ -765,7 +765,7 @@ impl Command for ExecWorkflowCommand {
             let mut engine = match WorkflowEngine::resume(
                 &session,
                 workflow,
-                work_item_number,
+                engine_work_item_context,
                 Box::new(proxy),
                 Box::new(factory),
                 Arc::clone(&self.engines.git_engine),

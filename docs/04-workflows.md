@@ -23,13 +23,13 @@ Workflows are useful when:
 
 ```sh
 # Run a workflow file
-awman exec workflow aspec/workflows/implement-feature.md
+awman exec workflow aspec/workflows/implement-hard.toml
 
 # Run a workflow and associate a work item for template variable substitution
-awman exec workflow aspec/workflows/implement-feature.md --work-item 0027
+awman exec workflow aspec/workflows/implement-hard.toml --work-item 0027
 
 # Run a workflow without a work item
-awman exec workflow aspec/workflows/review.md
+awman exec workflow aspec/workflows/dependency-upgrade.toml
 ```
 
 Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution. See [API Mode](08-api-mode.md#awman-exec-workflow-path--awman-exec-wf-path) for usage in CI and scripting contexts.
@@ -78,7 +78,6 @@ By default awman writes to `aspec/workflows/<name>.toml` inside the current repo
 
 ```sh
 awman new workflow --format yaml   # writes aspec/workflows/<name>.yaml
-awman new workflow --format md     # writes aspec/workflows/<name>.md
 ```
 
 ### Interview mode
@@ -107,7 +106,7 @@ Writes to `~/.awman/workflows/<name>.<ext>` instead of the current repo. Use thi
 |------|-------------|
 | `--interview` | Let a code agent complete the workflow from a short summary |
 | `--global` | Write to `~/.awman/workflows/` instead of the current repo |
-| `--format <fmt>` | Output format: `toml` (default) or `yaml` |
+| `--format <fmt>` | Output format: `toml` (default) or `yaml`. Markdown is not supported |
 
 ### Edge cases
 
@@ -385,40 +384,171 @@ If a workflow is interrupted mid-setup or mid-teardown and then resumed, the ful
 
 If your teardown includes a `create_pull_request` step, the base container image **must have the GitHub CLI (`gh`) installed**. By default, the base image is the project's `Dockerfile.dev`. If `gh` is not available, the step will fail with a clear error. Update your `Dockerfile.dev` to include `gh` if you intend to use `create_pull_request` steps.
 
-### Prompt template variables
+### Complete example: setup + steps + teardown
 
-All three formats support the same template variables in the `prompt` field:
+This example shows a full workflow that creates a branch, installs dependencies, runs implementation and review steps, then commits, pushes, and opens a PR:
+
+```toml
+title = "Implement and Ship"
+teardown_on_failure = false
+
+[[setup]]
+type = "checkout_create_branch"
+branch = "feature/{{work_item_number}}"
+base = "main"
+
+[[setup]]
+type = "run_shell"
+command = "cargo fetch"
+
+[[step]]
+name = "implement"
+model = "claude-opus-4-6"
+prompt = """
+Implement work item {{work_item_number}} according to the spec.
+"""
+
+[[step]]
+name = "review"
+depends_on = ["implement"]
+prompt = """
+Review the changes for correctness and style.
+"""
+
+[[teardown]]
+type = "run_shell"
+command = "make test"
+
+[[teardown]]
+type = "commit_changes"
+message = "Implement {{work_item_number}}"
+add_all = true
+
+[[teardown]]
+type = "push_branch"
+
+[[teardown]]
+type = "create_pull_request"
+title = "Implement {{work_item_number}}"
+body = "Automated PR from awman workflow."
+base = "main"
+```
+
+The equivalent YAML:
+
+```yaml
+title: Implement and Ship
+teardown_on_failure: false
+
+setup:
+  - type: checkout_create_branch
+    branch: "feature/{{work_item_number}}"
+    base: main
+  - type: run_shell
+    command: cargo fetch
+
+steps:
+  - name: implement
+    model: claude-opus-4-6
+    prompt: |
+      Implement work item {{work_item_number}} according to the spec.
+  - name: review
+    depends_on: [implement]
+    prompt: |
+      Review the changes for correctness and style.
+
+teardown:
+  - type: run_shell
+    command: make test
+  - type: commit_changes
+    message: "Implement {{work_item_number}}"
+    add_all: true
+  - type: push_branch
+  - type: create_pull_request
+    title: "Implement {{work_item_number}}"
+    body: Automated PR from awman workflow.
+    base: main
+```
+
+### Template variables
+
+Template variables are available in **all workflow fields** — step `prompt` values, setup step fields, and teardown step fields. The only field that does not support substitution is `type` (which selects the step kind).
 
 | Variable | Replaced with |
 |----------|--------------|
 | `{{work_item_number}}` | Zero-padded four-digit work item number (e.g. `0027`) |
+| `{{work_item}}` | Bare numeric work item number (e.g. `27`) |
 | `{{work_item_content}}` | Full text of the work item Markdown file |
-| `{{work_item_section:[Name]}}` | Content of the named section from the work item file (case-insensitive) |
+| `{{work_item_section:[Name]}}` | Content of the named `## Name` section from the work item file (case-insensitive heading match, trailing colons stripped) |
+
+All variables require `--work-item` to be passed when running the workflow. If `--work-item` is omitted, `{{work_item_*}}` placeholders are replaced with empty strings and a warning is emitted.
 
 Unknown variables or missing sections are left in place with a warning.
+
+**Examples across workflow phases:**
+
+```toml
+# Setup — branch name derived from work item
+[[setup]]
+type = "checkout_create_branch"
+branch = "feature/{{work_item_number}}"
+
+# Step — prompt references work item content
+[[step]]
+name = "implement"
+prompt = "Implement {{work_item_number}}: {{work_item_section:[Summary]}}"
+
+# Teardown — commit message and PR title include work item number
+[[teardown]]
+type = "commit_changes"
+message = "Implement {{work_item_number}}"
+add_all = true
+
+[[teardown]]
+type = "create_pull_request"
+title = "feat: {{work_item_number}}"
+body = "{{work_item_section:[Summary]}}"
+```
 
 ---
 
 ## Multi-agent workflows
 
-Each step in a workflow can run in a different agent's container. In Markdown, add an `Agent:` line to the step header block — between `Depends-on:` and `Prompt:`. In TOML and YAML, add an `agent` key to the step object.
+Each step in a workflow can run in a different agent's container by adding an `agent` key to the step.
 
-```markdown
-## Step: plan
-Prompt: Produce an implementation plan.
+```toml
+[[step]]
+name = "plan"
+prompt = "Produce an implementation plan."
 
-## Step: implement
-Depends-on: plan
-Agent: codex
-Prompt: Implement the plan from the previous step.
+[[step]]
+name = "implement"
+depends_on = ["plan"]
+agent = "codex"
+prompt = "Implement the plan from the previous step."
 
-## Step: review
-Depends-on: implement
-Agent: claude
-Prompt: Review the implementation for correctness and style.
+[[step]]
+name = "review"
+depends_on = ["implement"]
+agent = "claude"
+prompt = "Review the implementation for correctness and style."
 ```
 
-Steps without an `Agent:` field use the workflow default agent — the value from repo config (or global config), overridden by the `--agent` flag if one was passed at the command line. The `--agent` flag sets the **default** for steps that do not name an agent; it does **not** override steps that explicitly specify one.
+```yaml
+steps:
+  - name: plan
+    prompt: Produce an implementation plan.
+  - name: implement
+    depends_on: [plan]
+    agent: codex
+    prompt: Implement the plan from the previous step.
+  - name: review
+    depends_on: [implement]
+    agent: claude
+    prompt: Review the implementation for correctness and style.
+```
+
+Steps without an `agent` field use the workflow default agent — the value from repo config (or global config), overridden by the `--agent` flag if one was passed at the command line. The `--agent` flag sets the **default** for steps that do not name an agent; it does **not** override steps that explicitly specify one.
 
 ### Agent pre-flight check
 
@@ -441,11 +571,9 @@ Use the default agent (claude) for steps that specify 'codex'? [y/N]:
 
 If all required images are already available, the pre-flight check completes silently and the first step launches immediately.
 
-### Field placement
+### Unknown agents
 
-`Agent:` must appear in the step header block — after any `Depends-on:` line and before the `Prompt:` line. An `Agent:` that appears after `Prompt:` is treated as prompt text, not as a directive.
-
-An unknown agent name in an `Agent:` field is caught at parse time, before any container runs, and exits with a list of valid options.
+An unknown agent name in an `agent` field is caught at parse time, before any container runs, and exits with a list of valid options.
 
 ### Resuming workflows with per-step agents
 
@@ -455,23 +583,42 @@ When resuming a saved workflow, the per-step agent assignments from the original
 
 ## Per-step model overrides
 
-Each step in a workflow can run against a different model. In Markdown, add a `Model:` line to the step header block — between any `Agent:` line and the `Prompt:` line. In TOML and YAML, add a `model` key to the step object.
+Each step in a workflow can run against a different model by adding a `model` key to the step.
 
-```markdown
-## Step: plan
-Agent: claude
-Model: claude-opus-4-6
-Prompt: Produce a detailed implementation plan.
+```toml
+[[step]]
+name = "plan"
+agent = "claude"
+model = "claude-opus-4-6"
+prompt = "Produce a detailed implementation plan."
 
-## Step: implement
-Depends-on: plan
-Agent: claude
-Model: claude-haiku-4-5
-Prompt: Implement the plan from the previous step.
+[[step]]
+name = "implement"
+depends_on = ["plan"]
+agent = "claude"
+model = "claude-haiku-4-5"
+prompt = "Implement the plan from the previous step."
 
-## Step: review
-Depends-on: implement
-Prompt: Review the implementation for correctness and style.
+[[step]]
+name = "review"
+depends_on = ["implement"]
+prompt = "Review the implementation for correctness and style."
+```
+
+```yaml
+steps:
+  - name: plan
+    agent: claude
+    model: claude-opus-4-6
+    prompt: Produce a detailed implementation plan.
+  - name: implement
+    depends_on: [plan]
+    agent: claude
+    model: claude-haiku-4-5
+    prompt: Implement the plan from the previous step.
+  - name: review
+    depends_on: [implement]
+    prompt: Review the implementation for correctness and style.
 ```
 
 In this example, `plan` uses a large model for deep reasoning, `implement` uses a smaller model for routine code generation, and `review` inherits whatever model is in effect from the `--model` flag (or the agent's built-in default if no flag was passed).
@@ -482,21 +629,17 @@ For each step, awman resolves the effective model using this priority:
 
 | Priority | Source | Applies when |
 |----------|--------|-------------|
-| 1 (highest) | Step's `Model:` field | The step explicitly declares a model |
-| 2 | `--model` flag on the command line | The step has no `Model:` field |
+| 1 (highest) | Step's `model` field | The step explicitly declares a model |
+| 2 | `--model` flag on the command line | The step has no `model` field |
 | 3 (lowest) | Agent built-in default | Neither a step field nor a flag was provided |
 
-The `--model` flag acts as the **default** for all steps without a `Model:` field; it does **not** override steps that declare their own model.
+The `--model` flag acts as the **default** for all steps without a `model` field; it does **not** override steps that declare their own model.
 
-### Field placement
-
-`Model:` must appear in the step header block — after any `Depends-on:` and `Agent:` lines and before the `Prompt:` line. A `Model:` that appears after `Prompt:` is treated as prompt text, not as a directive. A `Model:` line with no value is treated as absent — it does not pass an empty string to the agent.
-
-`Agent:` and `Model:` are independent overrides. A step can specify one, both, or neither. When both are present, awman resolves the agent first (using the same logic as without `Model:`), then resolves the model.
+`agent` and `model` are independent overrides. A step can specify one, both, or neither. When both are present, awman resolves the agent first, then resolves the model.
 
 ### Workflow resume and model persistence
 
-Per-step model values from `Model:` fields are persisted in the workflow state file. On resume, the persisted model is used, not any `--model` flag passed on the resumed invocation. This matches the existing behaviour for `Agent:` fields and ensures the resumed run is identical to the original.
+Per-step `model` values are persisted in the workflow state file. On resume, the persisted model is used, not any `--model` flag passed on the resumed invocation. This matches the existing behaviour for `agent` fields and ensures the resumed run is identical to the original.
 
 ---
 
@@ -505,7 +648,7 @@ Per-step model values from `Model:` fields are persisted in the workflow state f
 ### In the TUI
 
 ```
-exec workflow aspec/workflows/implement-feature.md --work-item 0027
+exec workflow aspec/workflows/implement-hard.toml --work-item 0027
 ```
 
 A **workflow status strip** appears, showing each step as a coloured box:
@@ -523,7 +666,7 @@ When a step completes, a confirmation dialog appears. Press **Enter** or **y** t
 ### In command mode
 
 ```sh
-awman exec workflow aspec/workflows/implement-feature.md --work-item 0027
+awman exec workflow aspec/workflows/implement-hard.toml --work-item 0027
 ```
 
 Between steps, awman prints the step summary and prompts:
@@ -547,8 +690,8 @@ Press [r] to retry, or any other key to abort:
 
 | Flag | Description |
 |------|-------------|
-| `--agent=<name>` | Default agent for steps that do not specify an `Agent:` field. Does not override steps with an explicit `Agent:` directive |
-| `--model=<NAME>` | Default model for steps that do not specify a `Model:` field. Does not override steps with an explicit `Model:` directive |
+| `--agent=<name>` | Default agent for steps that do not specify an `agent` field. Does not override steps with an explicit `agent` value |
+| `--model=<NAME>` | Default model for steps that do not specify a `model` field. Does not override steps with an explicit `model` value |
 | `--non-interactive` | Run each step's agent in print/batch mode |
 | `--plan` | Run each step in read-only mode |
 | `--allow-docker` | Mount Docker socket into each step's container |
@@ -621,27 +764,6 @@ When you open the control board **while a step is actively running**, the same a
 | **↑**, **←** | (same as between-step) | ✓ Yes | (same as between-step) |
 
 The dialog title shows `Workflow Control (step running)` when opened mid-step. Actions that kill the container display a sub-note in gray: `↳ kills running container`. The dismiss action shows: `↳ step keeps running`.
-
-### Next step: same container
-
-The **↓** action reuses the already-running container — the next step's prompt is written directly to its PTY stdin. Useful when the container has already installed dependencies or built artifacts that the next step needs. If the PTY session has closed, awman falls back to a new container and shows a status message.
-
-If the next step requires a **different agent** than the current step, the **↓** option is unavailable. In the TUI it renders greyed out with the message:
-
-```
-Next step uses agent 'codex'; cannot reuse current 'claude' container.
-```
-
-In command mode, the "same container" prompt is skipped entirely and the explanation is printed instead. Use **→** (new container) to advance, which always works regardless of agent.
-
-### Manual vs. automatic opening
-
-Ctrl+W works:
-- Between steps (always available)
-- **During a running step** (new) — does not kill the container unless you select a destructive action
-- When no other dialog is open
-
----
 
 ### Next step: same container
 
@@ -764,14 +886,14 @@ Steps that share the same `Depends-on` set form a **parallel group**. awman exec
 
 ## Bundled examples
 
-`aspec/workflows/` contains ready-to-use example workflows:
+`aspec/workflows/` contains ready-to-use workflow files:
 
-| File | Format | Description |
-|------|--------|-------------|
-| `implement-preplanned.toml` | TOML | Four-step implement → tests + docs → review workflow |
-| `implement-preplanned.yaml` | YAML | Identical workflow in YAML format |
-
-Both files define the same four steps (`implement`, `tests`, `docs`, `review`) with the same prompts, dependencies, and agent assignments. Use TOML or YAML based on your preference — both are equally supported.
+| File | Description |
+|------|-------------|
+| `implement-hard.toml` | Four-step workflow: implement → tests + docs (parallel) → review. Uses Opus for implementation, Haiku for docs, and a final interactive review step |
+| `implement-pr.toml` | Same four steps as `implement-hard.toml`, plus teardown steps that run tests, commit changes, push the branch, and create a pull request |
+| `hard-parity-local.toml` | Five-step workflow: implement → parity check → tests + docs (parallel) → review. Uses a local model via OpenCode for parity checking, tests, and docs |
+| `dependency-upgrade.toml` | Two-step workflow: security audit → version audit. Upgrades vulnerable dependencies first, then reviews available version updates |
 
 ---
 
@@ -779,19 +901,17 @@ Both files define the same four steps (`implement`, `tests`, `docs`, `review`) w
 
 | Situation | Behaviour |
 |-----------|-----------|
-| Cycle in `Depends-on` graph | Error before any agent runs |
-| Unknown `Depends-on` step name | Error at parse time |
-| Unknown agent name in `Agent:` field | Error at parse time, before any containers run |
-| `Agent:` field placed after `Prompt:` | Treated as prompt text, not a directive |
+| Cycle in `depends_on` graph | Error before any agent runs |
+| Unknown `depends_on` step name | Error at parse time |
+| Unknown agent name in `agent` field | Error at parse time, before any containers run |
 | Missing agent image at workflow start | Pre-flight prompt: build it, fall back to default, or abort |
 | Agent Dockerfile download fails during pre-flight | Error surfaced; workflow does not start |
 | Agent image build fails during pre-flight | Error surfaced; partial Dockerfile removed; workflow does not start |
-| `--agent` flag + step with explicit `Agent:` field | Step's `Agent:` directive wins; `--agent` is only the default for unspecified steps |
-| `--model` flag + step with explicit `Model:` field | Step's `Model:` directive wins; `--model` is only the default for steps without a `Model:` field |
-| `Model:` combined with `Agent:` in the same step | Independent overrides; agent resolved first, then model |
-| `Model:` field with no value | Treated as absent; agent launches with its built-in default or `--model` flag value |
-| `Model:` appearing after `Prompt:` | Treated as prompt text, not a directive |
-| Invalid model name in `Model:` field | Passed verbatim to the agent; the agent surfaces its own error |
+| `--agent` flag + step with explicit `agent` field | Step's `agent` value wins; `--agent` is only the default for unspecified steps |
+| `--model` flag + step with explicit `model` field | Step's `model` value wins; `--model` is only the default for steps without a `model` field |
+| `model` combined with `agent` in the same step | Independent overrides; agent resolved first, then model |
+| `model` field with no value | Treated as absent; agent launches with its built-in default or `--model` flag value |
+| Invalid model name in `model` field | Passed verbatim to the agent; the agent surfaces its own error |
 | Resume with a different `--model` flag | Persisted per-step model values take precedence; `--model` applies only to steps with no persisted model |
 | All steps specify non-default agents | Pre-flight still runs for each; default fallback offered only if setup is declined |
 | Parallel steps with different agents | Each step runs in its own container — no cross-step sharing |

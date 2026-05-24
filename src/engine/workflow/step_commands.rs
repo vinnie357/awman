@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use crate::data::workflow_definition::{SetupStep, TeardownStep};
+use crate::data::workflow_prompt_template::{substitute_prompt, WorkItemContext};
 
 /// Quote `s` as a single POSIX shell word so embedded whitespace, quotes, and
 /// metacharacters cannot break out of the argument. Workflow files are
@@ -131,6 +132,72 @@ pub fn teardown_step_description(step: &TeardownStep) -> String {
         TeardownStep::PushBranch { remote, branch } => match (remote, branch) {
             (Some(r), Some(b)) => format!("push_branch: {r} {b}"),
             _ => "push_branch".to_string(),
+        },
+    }
+}
+
+fn sub(s: &str, ctx: Option<&WorkItemContext>) -> String {
+    substitute_prompt(s, ctx).rendered
+}
+
+fn sub_opt(s: &Option<String>, ctx: Option<&WorkItemContext>) -> Option<String> {
+    s.as_ref().map(|v| sub(v, ctx))
+}
+
+/// Apply work-item template substitution to all string fields of a setup step.
+pub fn substitute_setup_step(step: &SetupStep, ctx: Option<&WorkItemContext>) -> SetupStep {
+    match step {
+        SetupStep::CloneRepo { url, branch, into } => SetupStep::CloneRepo {
+            url: sub(url, ctx),
+            branch: sub_opt(branch, ctx),
+            into: sub_opt(into, ctx),
+        },
+        SetupStep::CheckoutCreateBranch { branch, base } => SetupStep::CheckoutCreateBranch {
+            branch: sub(branch, ctx),
+            base: sub_opt(base, ctx),
+        },
+        SetupStep::PullBranch { remote, branch } => SetupStep::PullBranch {
+            remote: sub_opt(remote, ctx),
+            branch: sub_opt(branch, ctx),
+        },
+        SetupStep::RunShell { command, env } => SetupStep::RunShell {
+            command: sub(command, ctx),
+            env: env.clone(),
+        },
+        SetupStep::RunScript { path, env } => SetupStep::RunScript {
+            path: sub(path, ctx),
+            env: env.clone(),
+        },
+    }
+}
+
+/// Apply work-item template substitution to all string fields of a teardown step.
+pub fn substitute_teardown_step(
+    step: &TeardownStep,
+    ctx: Option<&WorkItemContext>,
+) -> TeardownStep {
+    match step {
+        TeardownStep::RunShell { command, env } => TeardownStep::RunShell {
+            command: sub(command, ctx),
+            env: env.clone(),
+        },
+        TeardownStep::RunScript { path } => TeardownStep::RunScript {
+            path: sub(path, ctx),
+        },
+        TeardownStep::CommitChanges { message, add_all } => TeardownStep::CommitChanges {
+            message: sub(message, ctx),
+            add_all: *add_all,
+        },
+        TeardownStep::CreatePullRequest { title, body, base } => {
+            TeardownStep::CreatePullRequest {
+                title: sub(title, ctx),
+                body: sub_opt(body, ctx),
+                base: sub_opt(base, ctx),
+            }
+        }
+        TeardownStep::PushBranch { remote, branch } => TeardownStep::PushBranch {
+            remote: sub_opt(remote, ctx),
+            branch: sub_opt(branch, ctx),
         },
     }
 }
@@ -445,5 +512,88 @@ mod tests {
             }),
             "push_branch"
         );
+    }
+
+    fn wi() -> WorkItemContext {
+        WorkItemContext {
+            number: 42,
+            content: "# Title\n\n## Summary\nDo the thing\n".to_string(),
+        }
+    }
+
+    #[test]
+    fn substitute_teardown_commit_message() {
+        let step = TeardownStep::CommitChanges {
+            message: "Implement {{work_item_number}}".to_string(),
+            add_all: true,
+        };
+        let result = substitute_teardown_step(&step, Some(&wi()));
+        assert_eq!(
+            result,
+            TeardownStep::CommitChanges {
+                message: "Implement 0042".to_string(),
+                add_all: true,
+            }
+        );
+    }
+
+    #[test]
+    fn substitute_teardown_create_pr() {
+        let step = TeardownStep::CreatePullRequest {
+            title: "feat: WI {{work_item_number}}".to_string(),
+            body: Some("Content: {{work_item_section:[Summary]}}".to_string()),
+            base: Some("main".to_string()),
+        };
+        let result = substitute_teardown_step(&step, Some(&wi()));
+        match result {
+            TeardownStep::CreatePullRequest { title, body, base } => {
+                assert_eq!(title, "feat: WI 0042");
+                assert_eq!(body.unwrap(), "Content: Do the thing");
+                assert_eq!(base.unwrap(), "main");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn substitute_setup_checkout_branch() {
+        let step = SetupStep::CheckoutCreateBranch {
+            branch: "feature/{{work_item_number}}".to_string(),
+            base: Some("main".to_string()),
+        };
+        let result = substitute_setup_step(&step, Some(&wi()));
+        match result {
+            SetupStep::CheckoutCreateBranch { branch, base } => {
+                assert_eq!(branch, "feature/0042");
+                assert_eq!(base.unwrap(), "main");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn substitute_noop_without_context() {
+        let step = TeardownStep::CommitChanges {
+            message: "Implement {{work_item_number}}".to_string(),
+            add_all: false,
+        };
+        let result = substitute_teardown_step(&step, None);
+        assert_eq!(
+            result,
+            TeardownStep::CommitChanges {
+                message: "Implement ".to_string(),
+                add_all: false,
+            }
+        );
+    }
+
+    #[test]
+    fn substitute_leaves_non_template_strings_intact() {
+        let step = TeardownStep::PushBranch {
+            remote: Some("origin".to_string()),
+            branch: Some("feature/x".to_string()),
+        };
+        let result = substitute_teardown_step(&step, Some(&wi()));
+        assert_eq!(result, step);
     }
 }

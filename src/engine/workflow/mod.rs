@@ -110,7 +110,7 @@ pub struct WorkflowEngine {
     current_step_name: Option<String>,
     current_step_agent: Option<AgentName>,
     current_step_model: Option<String>,
-    work_item: Option<u32>,
+    work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
     yolo: bool,
     last_exit_info: Option<ContainerExitInfo>,
     engine_rx: Option<tokio::sync::mpsc::UnboundedReceiver<EngineRequest>>,
@@ -142,7 +142,7 @@ impl WorkflowEngine {
     pub fn new(
         session: &Session,
         workflow: Workflow,
-        work_item: Option<u32>,
+        work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
         container_factory: Box<dyn ContainerExecutionFactory>,
         git_engine: Arc<GitEngine>,
@@ -150,11 +150,12 @@ impl WorkflowEngine {
     ) -> Result<Self, EngineError> {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
         let workflow_hash = compute_workflow_hash(&workflow);
+        let work_item_number = work_item_context.as_ref().map(|c| c.number);
         let state = WorkflowState::new(
             workflow_name_for(&workflow),
             &workflow.steps,
             workflow_hash,
-            work_item,
+            work_item_number,
         );
         let state_store = WorkflowStateStore::new(session);
         let effective_config = session.effective_config();
@@ -175,7 +176,7 @@ impl WorkflowEngine {
             current_step_name: None,
             current_step_agent: None,
             current_step_model: None,
-            work_item,
+            work_item_context,
             yolo: false,
             last_exit_info: None,
             engine_rx: Some(rx),
@@ -191,7 +192,7 @@ impl WorkflowEngine {
     pub async fn resume(
         session: &Session,
         workflow: Workflow,
-        work_item: Option<u32>,
+        work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
         container_factory: Box<dyn ContainerExecutionFactory>,
         git_engine: Arc<GitEngine>,
@@ -200,7 +201,8 @@ impl WorkflowEngine {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
         let store = WorkflowStateStore::new(session);
         let workflow_name = workflow_name_for(&workflow);
-        let saved = store.load(work_item, &workflow_name)?;
+        let work_item_number = work_item_context.as_ref().map(|c| c.number);
+        let saved = store.load(work_item_number, &workflow_name)?;
 
         let workflow_hash = compute_workflow_hash(&workflow);
         let mut state = match saved {
@@ -226,7 +228,7 @@ impl WorkflowEngine {
                 }
                 saved
             }
-            None => WorkflowState::new(workflow_name, &workflow.steps, workflow_hash, work_item),
+            None => WorkflowState::new(workflow_name, &workflow.steps, workflow_hash, work_item_number),
         };
 
         let interrupted = state.interrupted_running_steps();
@@ -261,7 +263,7 @@ impl WorkflowEngine {
             current_step_name: None,
             current_step_agent: None,
             current_step_model: None,
-            work_item,
+            work_item_context,
             yolo: false,
             last_exit_info: None,
             engine_rx: Some(rx),
@@ -1226,7 +1228,12 @@ impl WorkflowEngine {
         container: &impl ContainerExec,
     ) -> Result<(), EngineError> {
         use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowPhase};
-        use crate::engine::workflow::step_commands::{setup_step_description, setup_step_to_shell};
+        use crate::engine::workflow::step_commands::{
+            setup_step_description, setup_step_to_shell, substitute_setup_step,
+        };
+
+        let wi_ctx = self.work_item_context.as_ref();
+        let steps: Vec<_> = steps.iter().map(|s| substitute_setup_step(s, wi_ctx)).collect();
 
         self.state.current_phase = WorkflowPhase::Setup;
         self.state.setup_step_states = steps
@@ -1292,12 +1299,15 @@ impl WorkflowEngine {
     ) -> Result<(), EngineError> {
         use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowPhase};
         use crate::engine::workflow::step_commands::{
-            teardown_step_description, teardown_step_to_shell,
+            substitute_teardown_step, teardown_step_description, teardown_step_to_shell,
         };
 
         if !teardown_on_failure && !workflow_succeeded {
             return Ok(());
         }
+
+        let wi_ctx = self.work_item_context.as_ref();
+        let steps: Vec<_> = steps.iter().map(|s| substitute_teardown_step(s, wi_ctx)).collect();
 
         self.state.current_phase = WorkflowPhase::Teardown;
         self.state.teardown_step_states = steps
