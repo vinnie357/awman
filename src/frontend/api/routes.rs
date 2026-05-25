@@ -185,15 +185,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(handle_list_sessions).post(handle_create_session),
         )
         .route(
-            "/v1/sessions/:id",
+            "/v1/sessions/{id}",
             get(handle_get_session).delete(handle_close_session),
         )
-        .route("/v1/sessions/:id/status", get(handle_get_session_status))
-        .route("/v1/sessions/:id/queue", get(handle_get_session_queue))
+        .route("/v1/sessions/{id}/status", get(handle_get_session_status))
+        .route("/v1/sessions/{id}/queue", get(handle_get_session_queue))
         .route("/v1/commands", post(handle_create_command))
-        .route("/v1/commands/:id/status", get(handle_get_command))
-        .route("/v1/commands/:id/logs", get(handle_stream_command_logs))
-        .route("/v1/workflows/:command_id", get(handle_get_workflow))
+        .route("/v1/commands/{id}/status", get(handle_get_command))
+        .route("/v1/commands/{id}/logs", get(handle_stream_command_logs))
+        .route("/v1/workflows/{command_id}", get(handle_get_workflow))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -1634,14 +1634,14 @@ mod tests {
         ("GET", "/v1/workdirs"),
         ("GET", "/v1/sessions"),
         ("POST", "/v1/sessions"),
-        ("GET", "/v1/sessions/:id"),
-        ("DELETE", "/v1/sessions/:id"),
-        ("GET", "/v1/sessions/:id/status"),
-        ("GET", "/v1/sessions/:id/queue"),
+        ("GET", "/v1/sessions/{id}"),
+        ("DELETE", "/v1/sessions/{id}"),
+        ("GET", "/v1/sessions/{id}/status"),
+        ("GET", "/v1/sessions/{id}/queue"),
         ("POST", "/v1/commands"),
-        ("GET", "/v1/commands/:id/status"),
-        ("GET", "/v1/commands/:id/logs"),
-        ("GET", "/v1/workflows/:command_id"),
+        ("GET", "/v1/commands/{id}/status"),
+        ("GET", "/v1/commands/{id}/logs"),
+        ("GET", "/v1/workflows/{command_id}"),
     ];
 
     fn make_test_state(tmp: &std::path::Path) -> Arc<AppState> {

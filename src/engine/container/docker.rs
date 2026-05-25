@@ -775,20 +775,18 @@ fn host_docker_group_gid() -> Option<u32> {
 #[cfg(unix)]
 fn clear_stdio_nonblocking() {
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
-    use std::os::unix::io::AsRawFd;
-    for fd in [
-        std::io::stdin().as_raw_fd(),
-        std::io::stdout().as_raw_fd(),
-        std::io::stderr().as_raw_fd(),
-    ] {
-        if let Ok(flags) = fcntl(fd, FcntlArg::F_GETFL) {
+    fn clear_fd(fd: impl std::os::fd::AsFd) {
+        if let Ok(flags) = fcntl(&fd, FcntlArg::F_GETFL) {
             let mut o = OFlag::from_bits_truncate(flags);
             if o.contains(OFlag::O_NONBLOCK) {
                 o.remove(OFlag::O_NONBLOCK);
-                let _ = fcntl(fd, FcntlArg::F_SETFL(o));
+                let _ = fcntl(&fd, FcntlArg::F_SETFL(o));
             }
         }
     }
+    clear_fd(std::io::stdin());
+    clear_fd(std::io::stdout());
+    clear_fd(std::io::stderr());
 }
 
 #[cfg(test)]
