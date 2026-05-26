@@ -1244,17 +1244,15 @@ Duplicating `ensure_available` or `build_options` logic in any other module is a
 
 ### Ready Engine (`src/engine/ready/`)
 
-`ReadyEngine` owns all multi-phase logic for `awman ready`: preflight checks, legacy-layout detection and migration, Dockerfile.dev creation, Docker image builds, local agent check, audit container run, and post-audit rebuild. The legacy code (`oldsrc/commands/ready.rs`: 2239 lines, `oldsrc/commands/ready_flow.rs`: 726 lines) is replaced entirely.
+`ReadyEngine` owns all multi-phase logic for `awman ready`: preflight checks, Dockerfile.dev creation, Docker image builds, local agent check, audit container run, and post-audit rebuild. The legacy code (`oldsrc/commands/ready.rs`: 2239 lines, `oldsrc/commands/ready_flow.rs`: 726 lines) is replaced entirely.
 
 #### Phase state machine
 
 ```rust
 pub enum ReadyPhase {
-    Preflight,                    // runtime detection, git root, config, env vars, legacy detection
+    Preflight,                    // runtime detection, git root, config, env vars
     AwaitingDockerfileDecision,   // Dockerfile.dev absent or unmodified template
     CreatingDockerfile,           // write Dockerfile.dev from project template
-    AwaitingLegacyMigrationDecision,  // legacy single-file layout detected
-    MigratingLegacyLayout,        // migrate to modular layout
     BuildingBaseImage,            // build/rebuild project Docker image
     BuildingAgentImage,           // build/rebuild agent Docker image
     CheckingLocalAgent,           // send random greeting to local agent
@@ -1300,7 +1298,6 @@ impl ReadyEngine {
 pub trait ReadyFrontend: UserMessageSink + Send + Sync {
     fn ask_create_dockerfile(&mut self) -> Result<bool, EngineError>;
     fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError>;
-    fn ask_migrate_legacy_layout(&mut self, agent_name: &AgentName) -> Result<bool, EngineError>;
     fn report_phase(&mut self, phase: &ReadyPhase);
     fn report_step_status(&mut self, step: &str, status: StepStatus);
     fn container_frontend(&mut self) -> Box<dyn ContainerFrontend>;
@@ -1317,7 +1314,6 @@ pub struct ReadySummary {
     pub agent_image: StepStatus,
     pub local_agent: StepStatus,
     pub audit: StepStatus,
-    pub legacy_migration: StepStatus,
 }
 ```
 

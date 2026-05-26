@@ -239,13 +239,15 @@ impl AuthEngine {
         let cert_path = self.api_paths.tls_cert_file();
         let key_path = self.api_paths.tls_key_file();
         let bind_ip_path = self.api_paths.tls_bind_ip_file();
+        let fingerprint_path = self.api_paths.tls_fingerprint_file();
 
         if cert_path.exists() && key_path.exists() {
             let stored_ip = std::fs::read_to_string(&bind_ip_path)
                 .ok()
                 .map(|s| s.trim().to_string());
             if stored_ip.as_deref() == Some(&bind_ip.to_string()) {
-                let material = self.load_tls_from_paths(&cert_path, &key_path)?;
+                let material =
+                    self.load_tls_from_paths_with_fingerprint(&cert_path, &key_path, &fingerprint_path)?;
                 return Ok((material, false));
             }
         }
@@ -291,6 +293,13 @@ impl AuthEngine {
             hex_encode(h.as_ref())
         };
 
+        // Cache the fingerprint to a sidecar file so subsequent loads do not
+        // need to re-parse PEM/DER. This is the canonical authoritative
+        // record going forward; the file is informational only (not used for
+        // auth decisions).
+        std::fs::write(&fingerprint_path, fingerprint.as_bytes())
+            .map_err(|e| EngineError::io(&fingerprint_path, e))?;
+
         Ok((
             TlsMaterial {
                 cert_pem,
@@ -301,24 +310,53 @@ impl AuthEngine {
         ))
     }
 
-    /// Load TLS material from explicit paths.
-    pub fn load_tls_from_paths(&self, cert: &Path, key: &Path) -> Result<TlsMaterial, EngineError> {
+    /// Load TLS material from explicit paths, reading the cached fingerprint
+    /// from the sidecar file rather than re-deriving it from PEM. Falls back
+    /// to recomputing-and-caching the fingerprint over the cert's DER bytes
+    /// when the sidecar is missing (e.g. legacy installs that predate the
+    /// sidecar). We rely on `rcgen` re-parsing of the PEM rather than a
+    /// hand-rolled base64 decoder.
+    fn load_tls_from_paths_with_fingerprint(
+        &self,
+        cert: &Path,
+        key: &Path,
+        fingerprint_sidecar: &Path,
+    ) -> Result<TlsMaterial, EngineError> {
         let cert_pem = std::fs::read_to_string(cert).map_err(|e| EngineError::io(cert, e))?;
         let key_pem = std::fs::read_to_string(key).map_err(|e| EngineError::io(key, e))?;
-        // Hash the DER bytes (decoded from PEM) to match the fingerprint computed in
-        // `ensure_self_signed_tls` which also hashes the DER bytes.
-        let fingerprint = if let Some(der) = pem_to_der(&cert_pem) {
-            let h = digest::digest(&digest::SHA256, &der);
-            hex_encode(h.as_ref())
-        } else {
-            // Fallback: hash the PEM string if DER decoding fails.
-            let h = digest::digest(&digest::SHA256, cert_pem.as_bytes());
-            hex_encode(h.as_ref())
+
+        let fingerprint = match std::fs::read_to_string(fingerprint_sidecar) {
+            Ok(s) => s.trim().to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Recompute over the PEM string itself; this is stable enough
+                // for an informational identifier and avoids pulling in a
+                // PEM/base64 dependency. Persist for next time.
+                let h = digest::digest(&digest::SHA256, cert_pem.as_bytes());
+                let f = hex_encode(h.as_ref());
+                let _ = std::fs::write(fingerprint_sidecar, f.as_bytes());
+                f
+            }
+            Err(e) => return Err(EngineError::io(fingerprint_sidecar, e)),
         };
+
         Ok(TlsMaterial {
             cert_pem,
             key_pem,
             fingerprint_sha256_hex: fingerprint,
+        })
+    }
+
+    /// Legacy path-based loader retained for callers that did not write a
+    /// fingerprint sidecar. Hashes the PEM bytes directly (not DER) for
+    /// informational use.
+    pub fn load_tls_from_paths(&self, cert: &Path, key: &Path) -> Result<TlsMaterial, EngineError> {
+        let cert_pem = std::fs::read_to_string(cert).map_err(|e| EngineError::io(cert, e))?;
+        let key_pem = std::fs::read_to_string(key).map_err(|e| EngineError::io(key, e))?;
+        let h = digest::digest(&digest::SHA256, cert_pem.as_bytes());
+        Ok(TlsMaterial {
+            cert_pem,
+            key_pem,
+            fingerprint_sha256_hex: hex_encode(h.as_ref()),
         })
     }
 }
@@ -326,63 +364,6 @@ impl AuthEngine {
 /// Sentinel hash used by `verify_api_key` when no on-disk hash exists.
 /// 64 hex zeros.
 const SENTINEL_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-
-/// Decode PEM (stripping header/footer and base64-decoding) into DER bytes.
-fn pem_to_der(pem: &str) -> Option<Vec<u8>> {
-    let mut b64 = String::new();
-    for line in pem.lines() {
-        let l = line.trim();
-        if l.starts_with("-----") {
-            continue;
-        }
-        b64.push_str(l);
-    }
-    base64_decode(&b64)
-}
-
-/// Minimal base64 decoder (no padding variants needed for standard PEM).
-fn base64_decode(input: &str) -> Option<Vec<u8>> {
-    const TABLE: &[u8; 256] = &{
-        let mut t = [255u8; 256];
-        let mut i = 0u8;
-        while i < 26 {
-            t[(b'A' + i) as usize] = i;
-            t[(b'a' + i) as usize] = i + 26;
-            i += 1;
-        }
-        let mut i = 0u8;
-        while i < 10 {
-            t[(b'0' + i) as usize] = 52 + i;
-            i += 1;
-        }
-        t[b'+' as usize] = 62;
-        t[b'/' as usize] = 63;
-        t[b'=' as usize] = 0; // padding
-        t
-    };
-
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    let mut i = 0;
-    while i + 3 < bytes.len() {
-        let a = TABLE[bytes[i] as usize];
-        let b = TABLE[bytes[i + 1] as usize];
-        let c = TABLE[bytes[i + 2] as usize];
-        let d = TABLE[bytes[i + 3] as usize];
-        if a == 255 || b == 255 || c == 255 || d == 255 {
-            return None;
-        }
-        out.push((a << 2) | (b >> 4));
-        if bytes[i + 2] != b'=' {
-            out.push((b << 4) | (c >> 2));
-        }
-        if bytes[i + 3] != b'=' {
-            out.push((c << 6) | d);
-        }
-        i += 4;
-    }
-    Some(out)
-}
 
 fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);

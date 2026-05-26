@@ -734,6 +734,17 @@ const API_SERVER_START: CommandSpec = CommandSpec {
             implies: &[],
             optional: true,
         },
+        FlagSpec {
+            long: "dangerously-skip-tls",
+            short: None,
+            help: "Serve plain HTTP instead of HTTPS. Intended for localhost/test only.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliOnly,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
     ],
     api_allowed: false,
     subcommands: &[],
@@ -998,7 +1009,7 @@ const REMOTE_SESSION_START: CommandSpec = CommandSpec {
     subcommands: &[],
 };
 
-const REMOTE_SESSION_START_FLAGS: [FlagSpec; 7] = [
+const REMOTE_SESSION_START_FLAGS: [FlagSpec; 6] = [
     FlagSpec {
         long: "remote-addr",
         short: None,
@@ -1060,17 +1071,6 @@ const REMOTE_SESSION_START_FLAGS: [FlagSpec; 7] = [
         help: "Branch name (optional, for --type remote).",
         kind: FlagKind::OptionalString,
         default: FlagDefault::None,
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "wait",
-        short: None,
-        help: "Poll session status until setup completes.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::All,
         conflicts_with: &[],
         implies: &[],
@@ -1793,6 +1793,12 @@ mod tests {
         FlagCheck {
             path: &["api", "start"],
             flag: "dangerously-skip-auth",
+            is_bool: true,
+            is_optional: true,
+        },
+        FlagCheck {
+            path: &["api", "start"],
+            flag: "dangerously-skip-tls",
             is_bool: true,
             is_optional: true,
         },

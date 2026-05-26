@@ -31,6 +31,8 @@ async fn main() -> Result<ExitCode> {
     let clap_cmd = CommandCatalogue::get().build_clap_command();
     let matches = clap_cmd.get_matches();
 
+    init_tracing();
+
     // One-time migration from legacy amux paths and env vars.
     if let Some(msg) = migration::migrate_global_dir() {
         eprintln!("{msg}");
@@ -92,6 +94,44 @@ async fn main() -> Result<ExitCode> {
     } else {
         Ok(tui::run(matches, ctx).await)
     }
+}
+
+/// Initialize the global tracing subscriber once at process start.
+///
+/// Without this, every `tracing::info!`/`warn!`/`error!` call in the
+/// codebase (notably the API-server startup messages in `frontend::api`)
+/// is silently dropped, which made `awman api start` look like it was
+/// hanging until Ctrl-C. We write to stderr (so stdout stays clean for
+/// `--json` callers), default to `info`-level for awman code, and honor
+/// `RUST_LOG` for overrides. ANSI colors are auto-enabled by the `fmt`
+/// layer when stderr is a TTY.
+///
+/// The TUI initializes its own renderer on a separate path; tracing
+/// records still go to stderr but are not visible behind the alt-screen
+/// until the TUI exits, which is the same trade-off any tracing-enabled
+/// TUI accepts.
+fn init_tracing() {
+    use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    /// Compact wall-clock timer: `HH:MM:SS.mmm`. The default `SystemTime`
+    /// timer prints a full ISO-8601 string per line which dominates short
+    /// API log records like `info: Restored session`.
+    struct ShortLocalTime;
+    impl FormatTime for ShortLocalTime {
+        fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+            write!(w, "{}", chrono::Local::now().format("%H:%M:%S%.3f"))
+        }
+    }
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .with_timer(ShortLocalTime)
+        .compact()
+        .try_init();
 }
 
 // ─── Layer 4 routing tests ────────────────────────────────────────────────────

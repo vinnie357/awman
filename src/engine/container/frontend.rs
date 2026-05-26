@@ -1,7 +1,10 @@
 //! `ContainerFrontend` trait — defined by Layer 1, implemented by Layer 3.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 
+use crate::engine::container::timing::{DEFAULT_GRACE_TIMEOUT, DEFAULT_STUCK_TIMEOUT};
 use crate::engine::message::UserMessageSink;
 
 /// What stage a container execution is in.
@@ -80,4 +83,24 @@ pub trait ContainerFrontend: UserMessageSink + Send {
     /// The engine takes ownership of these channels in `run_with_frontend`
     /// and spawns reader/writer tasks. Every frontend must implement this.
     fn take_container_io(&mut self) -> ContainerIo;
+
+    /// Startup-grace timeout: how long the container has to emit its first
+    /// byte of output before it is considered failed-to-start and killed.
+    /// The regular stuck timer does not begin until the first byte is seen
+    /// and the grace timer has been discarded.
+    ///
+    /// CLI/TUI keep the default (30s). API overrides to 15 minutes so an
+    /// agent that needs to pull a large image or warm up a model isn't
+    /// killed before it has a chance to produce output.
+    fn grace_timeout(&self) -> Duration {
+        DEFAULT_GRACE_TIMEOUT
+    }
+
+    /// Stuck timeout: how long the container can go without producing any
+    /// further output (after its first byte) before the engine publishes
+    /// `StuckEvent::Stuck`. CLI, TUI, and API all use 30s; only the
+    /// grace timeout differs between modes.
+    fn stuck_timeout(&self) -> Duration {
+        DEFAULT_STUCK_TIMEOUT
+    }
 }

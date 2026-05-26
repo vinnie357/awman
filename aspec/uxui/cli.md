@@ -114,7 +114,7 @@ Initialize the current Git repo for use with awman.
 
 | Subcommand | Flags |
 |---|---|
-| `start` | `--port <n>` (default `9876`), `--workdirs <path>` (repeatable), `--background`, `--refresh-key`, `--dangerously-skip-auth`. |
+| `start` | `--port <n>` (default `9876`), `--workdirs <path>` (repeatable), `--background`, `--refresh-key`, `--dangerously-skip-auth`, `--dangerously-skip-tls`. |
 | `kill` | — |
 | `logs` | — |
 | `status` | — |

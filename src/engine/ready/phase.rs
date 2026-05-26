@@ -7,8 +7,6 @@ pub enum ReadyPhase {
     Preflight,
     AwaitingDockerfileDecision,
     CreatingDockerfile,
-    AwaitingLegacyMigrationDecision,
-    MigratingLegacyLayout,
     BuildingBaseImage,
     BuildingAgentImage,
     CheckingNonDefaultAgents,

@@ -109,6 +109,13 @@ impl ApiPaths {
         self.tls_dir().join("bind_ip")
     }
 
+    /// Sidecar file recording the SHA-256 fingerprint of the cert's DER
+    /// bytes (hex). Cached at cert-generation time so we never need to
+    /// re-parse PEM to recompute it on subsequent loads.
+    pub fn tls_fingerprint_file(&self) -> PathBuf {
+        self.tls_dir().join("fingerprint.sha256")
+    }
+
     /// API server PID file.
     pub fn pid_file(&self) -> PathBuf {
         self.root.join("awman.pid")

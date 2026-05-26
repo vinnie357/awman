@@ -54,7 +54,6 @@ pub struct RemoteSessionStartFlags {
     pub workdir: Option<String>,
     pub repo_url: Option<String>,
     pub branch: Option<String>,
-    pub wait: bool,
     pub remote_addr: Option<String>,
     pub api_key: Option<String>,
 }
@@ -544,14 +543,6 @@ async fn run_session_start(
         text: format!("Session created: {session_id}"),
     });
 
-    if !flags.wait {
-        return Ok(RemoteOutcome::SessionStart(RemoteSessionStartOutcome {
-            session_id,
-            remote_addr: addr,
-            setup_status: None,
-        }));
-    }
-
     frontend.write_message(UserMessage {
         level: MessageLevel::Info,
         text: format!("Waiting for session {session_id} setup to complete..."),
@@ -693,7 +684,6 @@ fn render_ready_summary(summary: &crate::engine::ready::summary::ReadySummary) -
         ("Local agent", &summary.local_agent),
         ("Audit", &summary.audit),
         ("Image rebuild", &summary.image_rebuild),
-        ("Legacy migration", &summary.legacy_migration),
         ("aspec/", &summary.aspec_folder),
         ("Work items config", &summary.work_items_config),
     ];

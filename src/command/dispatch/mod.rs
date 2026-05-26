@@ -415,6 +415,10 @@ impl<F: CommandFrontend> Dispatch<F> {
                     .frontend
                     .flag_bool(&canonical_refs, "dangerously-skip-auth")?
                     .unwrap_or(false);
+                let dangerously_skip_tls = self
+                    .frontend
+                    .flag_bool(&canonical_refs, "dangerously-skip-tls")?
+                    .unwrap_or(false);
                 Ok(BuiltCommand::ApiServer(ApiServerCommand::new(
                     ApiServerSubcommand::Start(ApiServerStartFlags {
                         port,
@@ -422,6 +426,7 @@ impl<F: CommandFrontend> Dispatch<F> {
                         background,
                         refresh_key,
                         dangerously_skip_auth,
+                        dangerously_skip_tls,
                     }),
                     self.engines.clone(),
                 )))
@@ -507,10 +512,6 @@ impl<F: CommandFrontend> Dispatch<F> {
                         workdir: self.frontend.flag_string(&canonical_refs, "workdir")?,
                         repo_url: self.frontend.flag_string(&canonical_refs, "repo-url")?,
                         branch: self.frontend.flag_string(&canonical_refs, "branch")?,
-                        wait: self
-                            .frontend
-                            .flag_bool(&canonical_refs, "wait")?
-                            .unwrap_or(false),
                         remote_addr: self
                             .frontend
                             .flag_string(&canonical_refs, "remote-addr")?,

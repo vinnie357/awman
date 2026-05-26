@@ -706,33 +706,6 @@ Each image build — project base or agent — is framed with prominent start an
 
 This applies whenever `ready` starts a build — `--build`, `--refresh`, or the initial `awman init` sequence.
 
-### Migration from single-file layout
-
-If you have an existing `Dockerfile.dev` that bundles agent tooling (the layout used before awman 0.6), `awman ready` detects this and offers a guided migration:
-
-```
-Detected legacy single-file Dockerfile.dev layout.
-Would you like to migrate to the modular layout? (agent tools move to .awman/Dockerfile.{agent})
-
-Migrating will:
-  1. Recreate Dockerfile.dev with a minimal debian:bookworm-slim base
-  2. Write .awman/Dockerfile.{agent} using the agent template
-  3. Build both images
-  4. Run the audit agent to restore project dependencies in Dockerfile.dev
-
-[y/N]:
-```
-
-If you accept, awman handles the entire migration automatically. Commit the resulting `Dockerfile.dev` and `.awman/Dockerfile.{agent}` to source control.
-
-If you decline, your existing image continues to work for the current session with a deprecation warning printed each time.
-
-When `awman chat` encounters the legacy layout (before you run `awman ready` to migrate), it exits with a short message:
-
-```
-Run `awman ready` to migrate to the modular Dockerfile layout, or pass `--no-migrate` to use the existing image.
-```
-
 `awman ready` also checks whether work item paths are configured. If neither `aspec/work-items/` exists nor `work_items.dir` is set, the summary shows a `⚠ not configured` warning (not a failure) for the `work items config` row, and prints a tip to run `awman config set work_items.dir <path>`.
 
 ### `ready --json`

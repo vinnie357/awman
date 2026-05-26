@@ -145,7 +145,6 @@ impl SessionSetupBusSender {
 use async_trait::async_trait;
 
 use crate::data::execution_event::EventPayload;
-use crate::data::session::AgentName;
 use crate::engine::container::frontend::{ContainerFrontend, ContainerProgress, ContainerStatus};
 use crate::engine::error::EngineError;
 use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
@@ -156,14 +155,28 @@ use crate::frontend::api::event_bus::EventBusSender;
 
 /// Bridges the `ReadyFrontend` trait (from the ready engine) to the
 /// `SessionSetupBus` during async session setup.
+///
+/// Every event observed here is also mirrored to the tracing log with the
+/// session-id prefix so operators can grep the API server log file for a
+/// single session's full setup output (including container build lines).
 pub struct SetupReadyFrontend {
     bus: SessionSetupBusSender,
     event_bus: EventBusSender,
+    /// Short session-id prefix used as the line tag in the API log file.
+    session_prefix: String,
 }
 
 impl SetupReadyFrontend {
-    pub fn new(bus: SessionSetupBusSender, event_bus: EventBusSender) -> Self {
-        Self { bus, event_bus }
+    pub fn new(
+        session_id: &str,
+        bus: SessionSetupBusSender,
+        event_bus: EventBusSender,
+    ) -> Self {
+        Self {
+            bus,
+            event_bus,
+            session_prefix: session_log_prefix(session_id),
+        }
     }
 }
 
@@ -175,6 +188,7 @@ impl UserMessageSink for SetupReadyFrontend {
             MessageLevel::Error => "error",
             MessageLevel::Success => "ok",
         };
+        log_setup_line(&self.session_prefix, &format!("[{phase}] {}", msg.text));
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: phase.to_string(),
             message: msg.text,
@@ -193,12 +207,12 @@ impl ReadyFrontend for SetupReadyFrontend {
         Ok(false)
     }
 
-    fn ask_migrate_legacy_layout(&mut self, _agent_name: &AgentName) -> Result<bool, EngineError> {
-        Ok(true)
-    }
-
     fn report_phase(&mut self, phase: &ReadyPhase) {
         let message = ready_phase_display(phase);
+        log_setup_line(
+            &self.session_prefix,
+            &format!("phase: {phase:?} — {message}"),
+        );
         {
             let mut state = self
                 .bus
@@ -216,6 +230,10 @@ impl ReadyFrontend for SetupReadyFrontend {
     }
 
     fn report_step_status(&mut self, step: &str, status: StepStatus) {
+        log_setup_line(
+            &self.session_prefix,
+            &format!("step: {step} → {}", format_step_status(&status)),
+        );
         {
             let mut state = self
                 .bus
@@ -242,6 +260,10 @@ impl ReadyFrontend for SetupReadyFrontend {
     }
 
     fn report_summary(&mut self, summary: &ReadySummary) {
+        log_setup_line(
+            &self.session_prefix,
+            &format!("ready summary: {summary:?}"),
+        );
         {
             let mut state = self
                 .bus
@@ -260,6 +282,7 @@ impl ReadyFrontend for SetupReadyFrontend {
     fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
         Box::new(SetupContainerSink {
             event_bus: self.event_bus.clone(),
+            session_prefix: self.session_prefix.clone(),
             line_buffer_stdout: String::new(),
             line_buffer_stderr: String::new(),
         })
@@ -271,8 +294,6 @@ fn ready_phase_display(phase: &ReadyPhase) -> String {
         ReadyPhase::Preflight => "Running preflight checks...".into(),
         ReadyPhase::AwaitingDockerfileDecision => "Checking Dockerfile...".into(),
         ReadyPhase::CreatingDockerfile => "Creating Dockerfile.dev...".into(),
-        ReadyPhase::AwaitingLegacyMigrationDecision => "Checking for legacy layout...".into(),
-        ReadyPhase::MigratingLegacyLayout => "Migrating legacy layout...".into(),
         ReadyPhase::BuildingBaseImage => "Building base image...".into(),
         ReadyPhase::BuildingAgentImage => "Building agent image...".into(),
         ReadyPhase::CheckingNonDefaultAgents => "Checking non-default agent images...".into(),
@@ -292,6 +313,7 @@ fn ready_phase_display(phase: &ReadyPhase) -> String {
 /// `command_frontend.rs`.
 struct SetupContainerSink {
     event_bus: EventBusSender,
+    session_prefix: String,
     line_buffer_stdout: String,
     line_buffer_stderr: String,
 }
@@ -304,6 +326,10 @@ impl UserMessageSink for SetupContainerSink {
             MessageLevel::Error => "error",
             MessageLevel::Success => "ok",
         };
+        log_setup_line(
+            &self.session_prefix,
+            &format!("container [{phase}] {}", msg.text),
+        );
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: phase.to_string(),
             message: msg.text,
@@ -327,6 +353,7 @@ impl ContainerFrontend for SetupContainerSink {
             ContainerStatus::Exited(code) => format!("Container exited with code {code}"),
             ContainerStatus::Failed(reason) => format!("Container failed: {reason}"),
         };
+        log_setup_line(&self.session_prefix, &format!("container: {message}"));
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "container".to_string(),
             message,
@@ -334,6 +361,10 @@ impl ContainerFrontend for SetupContainerSink {
     }
 
     fn report_progress(&mut self, progress: ContainerProgress) {
+        log_setup_line(
+            &self.session_prefix,
+            &format!("container [{}] {}", progress.stage, progress.message),
+        );
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: progress.stage,
             message: progress.message,
@@ -341,9 +372,24 @@ impl ContainerFrontend for SetupContainerSink {
     }
 
     fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
-        let (stdout_tx, _) = tokio::sync::mpsc::unbounded_channel();
-        let (stderr_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        // Drain stdout/stderr into the tracing log so the API log file mirrors
+        // the byte-stream output the CLI/TUI would see for the ready container.
+        // Lines are tagged with the session prefix; partial lines are buffered
+        // by `forward_container_stream_to_tracing` and emitted at line breaks
+        // (plus a final flush when the channel closes).
+        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stderr_tx, stderr_rx) = tokio::sync::mpsc::unbounded_channel();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+        forward_container_stream_to_tracing(
+            self.session_prefix.clone(),
+            "stdout".into(),
+            stdout_rx,
+        );
+        forward_container_stream_to_tracing(
+            self.session_prefix.clone(),
+            "stderr".into(),
+            stderr_rx,
+        );
         crate::engine::container::frontend::ContainerIo {
             stdout: stdout_tx,
             stderr: stderr_tx,
@@ -352,5 +398,129 @@ impl ContainerFrontend for SetupContainerSink {
             resize: None,
             initial_size: None,
         }
+    }
+
+    fn grace_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(15 * 60)
+    }
+}
+
+/// Spawn a task that buffers bytes by line and writes each line to the
+/// tracing log with the session prefix.
+fn forward_container_stream_to_tracing(
+    session_prefix: String,
+    stream_name: String,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        let mut buf: Vec<u8> = Vec::with_capacity(256);
+        while let Some(chunk) = rx.recv().await {
+            buf.extend_from_slice(&chunk);
+            while let Some(nl) = buf.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=nl).collect();
+                let s = String::from_utf8_lossy(&line[..line.len() - 1]);
+                let trimmed = s.trim_end_matches('\r');
+                if !trimmed.is_empty() {
+                    log_setup_line(
+                        &session_prefix,
+                        &format!("container.{stream_name}: {trimmed}"),
+                    );
+                }
+            }
+        }
+        if !buf.is_empty() {
+            let s = String::from_utf8_lossy(&buf);
+            let trimmed = s.trim_end_matches(['\r', '\n']);
+            if !trimmed.is_empty() {
+                log_setup_line(
+                    &session_prefix,
+                    &format!("container.{stream_name}: {trimmed}"),
+                );
+            }
+        }
+    });
+}
+
+// ─── Logging helpers ───────────────────────────────────────────────────────
+
+/// First 8 characters of the session id. Short enough to grep, long enough to
+/// disambiguate when multiple sessions run concurrently.
+pub(crate) fn session_log_prefix(session_id: &str) -> String {
+    let end = session_id.len().min(8);
+    session_id[..end].to_string()
+}
+
+/// Write a line to the tracing log tagged with the session prefix. Level is
+/// `info` by default (so it ends up in the API server log file) and `debug`
+/// when `AWMAN_API_VERBOSE_SETUP` is set to a falsy value, letting operators
+/// silence per-session chatter while keeping it available via `RUST_LOG`.
+pub(crate) fn log_setup_line(session_prefix: &str, line: &str) {
+    if verbose_setup_enabled() {
+        tracing::info!(target: "awman::api::session_setup", "[{session_prefix}] {line}");
+    } else {
+        tracing::debug!(target: "awman::api::session_setup", "[{session_prefix}] {line}");
+    }
+}
+
+/// Returns `true` when verbose setup logging is enabled (the default).
+/// Disabled when `AWMAN_API_VERBOSE_SETUP` is one of `0`, `false`, `no`, `off`.
+pub(crate) fn verbose_setup_enabled() -> bool {
+    match std::env::var("AWMAN_API_VERBOSE_SETUP") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// `UserMessageSink` that mirrors every message to the API setup tracing log.
+/// Used by the session-setup task to capture the full output of git commands
+/// (clone, branch checkout, etc.) into the API server's log file with the
+/// session-id prefix that downstream tooling greps for.
+pub struct TracingSetupSink {
+    session_prefix: String,
+}
+
+impl TracingSetupSink {
+    pub fn new(session_id: &str) -> Self {
+        Self {
+            session_prefix: session_log_prefix(session_id),
+        }
+    }
+}
+
+impl UserMessageSink for TracingSetupSink {
+    fn write_message(&mut self, msg: UserMessage) {
+        let level = match msg.level {
+            MessageLevel::Info => "info",
+            MessageLevel::Warning => "warn",
+            MessageLevel::Error => "error",
+            MessageLevel::Success => "ok",
+        };
+        log_setup_line(
+            &self.session_prefix,
+            &format!("git [{level}] {}", msg.text),
+        );
+    }
+
+    fn replay_queued(&mut self) {}
+}
+
+/// Public re-export so route handlers can write a setup-context line to the
+/// API log file using the same prefix and gating as the rest of session
+/// setup (state transitions, ready output, etc.).
+pub fn log_session_setup(session_id: &str, line: &str) {
+    log_setup_line(&session_log_prefix(session_id), line);
+}
+
+fn format_step_status(status: &StepStatus) -> String {
+    match status {
+        StepStatus::Pending => "pending".into(),
+        StepStatus::Running => "running".into(),
+        StepStatus::Done => "done".into(),
+        StepStatus::Skipped => "skipped".into(),
+        StepStatus::Warn(s) => format!("warn({s})"),
+        StepStatus::Failed(s) => format!("failed({s})"),
     }
 }

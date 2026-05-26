@@ -326,43 +326,43 @@ impl GitEngine {
         Ok(())
     }
 
-    /// Check out `branch` if it already exists; otherwise create it from HEAD.
-    /// Returns the disposition: `"checked-out"` for an existing branch or
+    /// Check out `branch` if it already exists locally or on a remote;
+    /// otherwise create it from HEAD. Returns the disposition:
+    /// `"checked-out"` for an existing branch (local or remote-tracking) or
     /// `"created"` for a new one. Errors propagate as `EngineError::Git`.
     pub fn checkout_or_create_branch(
         &self,
         path: &Path,
         branch: &str,
     ) -> Result<&'static str, EngineError> {
-        if self.branch_exists(path, branch) {
-            let output = Command::new("git")
-                .args(["checkout", branch])
-                .current_dir(path)
-                .output()
-                .map_err(|e| EngineError::Git(format!("invoke `git checkout`: {e}")))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(EngineError::Git(format!(
-                    "git checkout {branch} failed: {}",
-                    stderr.trim()
-                )));
-            }
-            Ok("checked-out")
-        } else {
-            let output = Command::new("git")
-                .args(["checkout", "-b", branch])
-                .current_dir(path)
-                .output()
-                .map_err(|e| EngineError::Git(format!("invoke `git checkout -b`: {e}")))?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(EngineError::Git(format!(
-                    "git checkout -b {branch} failed: {}",
-                    stderr.trim()
-                )));
-            }
-            Ok("created")
+        // Plain `git checkout <branch>` succeeds when (a) the local branch
+        // exists or (b) exactly one remote has the branch (git auto-creates
+        // a tracking branch). Try this first so we don't need a separate
+        // remote-branch probe.
+        let output = Command::new("git")
+            .args(["checkout", branch])
+            .current_dir(path)
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git checkout`: {e}")))?;
+        if output.status.success() {
+            return Ok("checked-out");
         }
+
+        // Fall back: branch exists neither locally nor on any remote — create
+        // it from the current HEAD.
+        let output = Command::new("git")
+            .args(["checkout", "-b", branch])
+            .current_dir(path)
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git checkout -b`: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git checkout -b {branch} failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok("created")
     }
 
     /// Recursively delete a directory, ignoring missing paths. Used to clean up
@@ -570,6 +570,72 @@ impl GitEngine {
             )));
         }
         Ok(())
+    }
+
+    /// Logged variant of [`clone_repo`]. Streams the command line and combined
+    /// stdout/stderr through `sink`. Used by the API server's session-setup
+    /// path so a remote-clone failure is captured in the server log file.
+    pub fn clone_repo_logged(
+        &self,
+        url: &str,
+        branch: Option<&str>,
+        dest: &Path,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<(), EngineError> {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| EngineError::io(parent, e))?;
+        }
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| EngineError::Git("clone dest path not UTF-8".into()))?;
+        let mut args: Vec<&str> = vec!["clone"];
+        if let Some(b) = branch {
+            args.push("-b");
+            args.push(b);
+        }
+        args.push(url);
+        args.push(dest_str);
+        // `git clone` doesn't care about cwd (dest is absolute); pick a path
+        // that's guaranteed to exist so `Command::current_dir` doesn't fail.
+        let cwd = dest
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| std::env::temp_dir());
+        let output = run_git_logged(&args, &cwd, sink)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git clone failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Logged variant of [`checkout_or_create_branch`]. Forwards every git
+    /// invocation and its output to `sink`. The first `git checkout <branch>`
+    /// failure is expected (it's how we detect "branch doesn't exist yet") so
+    /// its noise is downgraded by [`run_git_logged`] to a warning rather than
+    /// surfacing as an error.
+    pub fn checkout_or_create_branch_logged(
+        &self,
+        path: &Path,
+        branch: &str,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<&'static str, EngineError> {
+        let output = run_git_logged(&["checkout", branch], path, sink)?;
+        if output.status.success() {
+            return Ok("checked-out");
+        }
+        let output = run_git_logged(&["checkout", "-b", branch], path, sink)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git checkout -b {branch} failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok("created")
     }
 }
 

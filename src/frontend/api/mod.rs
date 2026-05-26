@@ -23,6 +23,7 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
     let api_paths = ApiPaths::from_process_env().map_err(CommandError::Data)?;
     api_paths.ensure_root().map_err(CommandError::Data)?;
 
+    tracing::info!(root = %api_paths.root().display(), "Opening session store");
     let store = SqliteSessionStore::open(api_paths.root()).map_err(CommandError::Data)?;
 
     // Startup cleanup: remove closed sessions older than 24 hours.
@@ -46,16 +47,27 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
     } else {
         let hash = auth_engine.read_api_key_hash()?.ok_or_else(|| {
             CommandError::Other(
-                "No API key hash on disk. Run `awman auth --refresh-key` first.".into(),
+                "No API key hash on disk. Run `awman api start --refresh-key` to generate one."
+                    .into(),
             )
         })?;
         routes::AuthMode::Enabled {
             key_hash: hash.as_str().to_string(),
         }
     };
+    let auth_enabled = matches!(auth_mode, routes::AuthMode::Enabled { .. });
 
-    // Construct Layer 1 engines for dispatch.
-    let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
+    // Construct Layer 1 engines for dispatch. The container runtime is
+    // resolved via the same `detect` path the CLI/TUI use so that per-user
+    // `~/.awman/config.json` settings (e.g. `runtime: "apple-containers"`)
+    // are honored in API mode. Per-repo `.awman/config.json` is loaded later
+    // per session via `Session::open_or_workdir_fallback`.
+    let global_config = crate::data::config::global::GlobalConfig::load().unwrap_or_default();
+    let runtime = Arc::new(
+        crate::engine::container::ContainerRuntime::detect(&global_config)
+            .map_err(|e| CommandError::Other(format!("container runtime detect: {e}")))?,
+    );
+    tracing::info!(runtime = runtime.runtime_name(), "Container runtime resolved");
     let git_engine = Arc::new(crate::engine::git::GitEngine::new());
     let overlay_engine = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
         auth_paths,
@@ -84,6 +96,7 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
     // Restore in-memory sessions for any active sessions persisted in SQLite
     // from a previous server lifetime. This ensures session continuity across
     // server restarts.
+    tracing::info!("Restoring active sessions from previous server lifetime");
     let mut restored_sessions = std::collections::HashMap::new();
     if let Ok(records) = store.list_sessions_by_status(Some("active")) {
         for rec in records {
@@ -228,9 +241,7 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
     });
 
     // Spawn queue workers.
-    let worker_count = crate::data::config::global::GlobalConfig::load()
-        .unwrap_or_default()
-        .workers();
+    let worker_count = global_config.workers();
     if worker_count == 0 {
         tracing::warn!("workers config is 0 — no queue workers will run; commands will be enqueued but never processed");
     }
@@ -251,11 +262,25 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
     let app = routes::build_router(state.clone());
     let addr = std::net::SocketAddr::from((config.bind_ip, config.port));
 
+    let scheme = if config.tls_material.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     tracing::info!(
         port = config.port,
         bind_ip = %config.bind_ip,
         tls = config.tls_material.is_some(),
+        auth = auth_enabled,
         "awman API mode starting"
+    );
+    // Pre-bind announce so the user sees the endpoint BEFORE the server
+    // blocks on the accept loop. The matching post-bind "listening" log
+    // below previously sat after `.await` and never fired in the success
+    // path (the future only resolves on shutdown).
+    tracing::info!(
+        endpoint = %format!("{scheme}://{}:{}", config.bind_ip, config.port),
+        "awman API mode listening — binding HTTP listener"
     );
 
     // Spawn the shutdown signal as a background task — we trigger
@@ -327,7 +352,10 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
         CommandError::Other(format!("Server error: {e}"))
     })?;
 
-    tracing::info!(port = config.port, "awman API mode listening");
+    tracing::info!(
+        port = config.port,
+        "awman API mode stopped accepting new connections"
+    );
 
     // Grace period for running commands (30s).
     const GRACE_SECS: u64 = 30;

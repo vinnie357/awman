@@ -323,6 +323,9 @@ impl Tab {
                 match event {
                     StuckEvent::Stuck => self.stuck = true,
                     StuckEvent::Unstuck => self.stuck = false,
+                    // Bridge already killed the container; clear the stuck
+                    // flag because the step is failing rather than blocked.
+                    StuckEvent::StartupGraceExpired => self.stuck = false,
                 }
             }
         }

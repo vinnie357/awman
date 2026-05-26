@@ -22,6 +22,125 @@ For single interactive sessions, use `awman chat` instead.
 
 ---
 
+## Quickstart — copy-pastable examples
+
+These examples assume a server running on `127.0.0.1:9876`. The server speaks HTTPS by default with a self-signed cert, so curl needs `-k` (or `--cacert ~/.awman/api/tls/cert.pem`) to skip verification. Pass `--dangerously-skip-tls` at server start if you'd rather use plain HTTP.
+
+```sh
+# 0. Start the server (one-time; stores its api_key.hash under ~/.awman/api).
+#    The plaintext key is shown ONCE in the startup banner; copy it now.
+awman api start --port 9876 --workdirs "$HOME/my-project" --background
+
+# Stash the key the banner just printed:
+KEY=<paste-key-from-banner>
+SERVER=https://127.0.0.1:9876
+```
+
+### Local session
+
+A local session binds to a directory that's already on the server's allowlist (configured via `--workdirs` or `api.workDirs`).
+
+**Using `curl`:**
+
+```sh
+# 1. Create a session bound to a workdir
+SESSION=$(curl -sk -X POST "$SERVER/v1/sessions" \
+  -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d "{\"type\":\"local\",\"workdir\":\"$HOME/my-project\"}" | jq -r .session_id)
+
+# 2. Dispatch a one-shot prompt; the response carries the command_id
+CMD=$(curl -sk -X POST "$SERVER/v1/commands" \
+  -H "Authorization: Bearer $KEY" \
+  -H "x-awman-session: $SESSION" \
+  -H 'Content-Type: application/json' \
+  -d '{"subcommand":"exec","args":["prompt","Summarise recent changes","--non-interactive"]}' \
+  | jq -r .command_id)
+
+# 3. Stream the output until the command finishes
+curl -Nsk "$SERVER/v1/commands/$CMD/logs/stream" \
+  -H "Authorization: Bearer $KEY" \
+  | while IFS= read -r line; do
+      case "$line" in
+        "data: [awman:done]") break ;;
+        data:\ *)              printf '%s\n' "${line#data: }" ;;
+      esac
+    done
+
+# 4. Close the session
+curl -sk -X DELETE "$SERVER/v1/sessions/$SESSION" \
+  -H "Authorization: Bearer $KEY"
+```
+
+**Using `awman` itself** (no manual session handling — `awman remote` handles it):
+
+```sh
+# One-time setup so subsequent commands don't need flags
+awman config set --global remote.defaultAddr "$SERVER"
+awman config set --global remote.defaultAPIKey "$KEY"
+
+# Start a session bound to the local directory and capture its ID
+SESSION=$(awman remote session start "$HOME/my-project" \
+  | awk '/Session started:/ {print $NF}')
+
+# Dispatch the same prompt and stream its output live
+awman remote run exec prompt "Summarise recent changes" --non-interactive \
+  --session "$SESSION" --follow
+
+# Close the session
+awman remote session kill "$SESSION"
+```
+
+### Remote session (server clones a Git repo)
+
+A remote session asks the server to clone a Git repo into an ephemeral directory under `~/.awman/sessions/<session-id>/`. The clone is deleted when the session is closed.
+
+**Using `curl`:**
+
+```sh
+# 1. Create a remote session — the server does the clone for you
+SESSION=$(curl -sk -X POST "$SERVER/v1/sessions" \
+  -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "type": "remote",
+    "repo_url": "https://github.com/org/my-project",
+    "branch": "main"
+  }' | jq -r .session_id)
+
+# 2. Run a workflow against the clone
+CMD=$(curl -sk -X POST "$SERVER/v1/commands" \
+  -H "Authorization: Bearer $KEY" \
+  -H "x-awman-session: $SESSION" \
+  -H 'Content-Type: application/json' \
+  -d '{"subcommand":"exec","args":["workflow","aspec/workflows/implement-feature.toml","--work-item","0053"]}' \
+  | jq -r .command_id)
+
+# 3. Poll status until terminal
+while true; do
+  STATUS=$(curl -sk "$SERVER/v1/commands/$CMD" \
+    -H "Authorization: Bearer $KEY" | jq -r .status)
+  echo "status=$STATUS"
+  [ "$STATUS" = "done" ] || [ "$STATUS" = "error" ] && break
+  sleep 5
+done
+
+# 4. Closing deletes the on-server clone
+curl -sk -X DELETE "$SERVER/v1/sessions/$SESSION" \
+  -H "Authorization: Bearer $KEY"
+```
+
+**Using `awman` itself:** the `awman remote session start` command currently expects a path that already exists on the server, so for remote (clone-on-server) sessions create the session via curl as shown above, then drive it with `awman remote run --session <id>`:
+
+```sh
+# Drive the just-created remote-clone session with awman
+awman remote run exec workflow aspec/workflows/implement-feature.toml \
+  --work-item 0053 \
+  --session "$SESSION" --follow
+```
+
+---
+
 ## One-shot scripted execution (`exec`)
 
 The `exec` subcommand group provides two commands for running agent tasks non-interactively from scripts, CI pipelines, or the API server — without a persistent session or TUI.
@@ -134,7 +253,7 @@ All workflow flags are described in [Workflows](04-workflows.md#flags).
 awman api start --port 9876 --workdirs /path/to/repo
 ```
 
-The server starts on the specified port (default `9876`) and accepts HTTP requests for the life of the process. Logs are emitted to stdout in human-readable format. Press `Ctrl+C` to stop.
+The server starts on the specified port (default `9876`) and accepts requests for the life of the process. The first start auto-generates an API key and prints it in a banner — copy it then; it isn't shown again. Subsequent starts reuse the same hash silently. By default the server speaks HTTPS on a self-signed cert; pass `--dangerously-skip-tls` to fall back to plain HTTP for trusted-local use. Logs are emitted to stderr (color-coded when stderr is a TTY); press `Ctrl+C` to stop.
 
 ```sh
 # Multiple working directories
@@ -143,21 +262,25 @@ awman api start --workdirs /repo-a --workdirs /repo-b
 # Custom port
 awman api start --port 8080 --workdirs /repo
 
-# Rotate the API key and print the new one to stdout
+# Rotate the API key and print the new one to stdout (does not start the server)
 awman api start --refresh-key --port 9876 --workdirs /repo
 
-# Disable authentication for this run (WARNING: anyone can reach the server)
+# Plain HTTP on loopback for tests/dev (WARNING: no TLS)
+awman api start --dangerously-skip-tls --port 9876 --workdirs /repo
+
+# Disable authentication for this run (WARNING: anyone reachable can drive the server)
 awman api start --dangerously-skip-auth --port 9876 --workdirs /repo
 ```
 
 `--workdirs` accepts one or more absolute paths (repeat the flag for multiple values). Only working directories on the allowlist can be used to create sessions — requests with any other path are rejected with HTTP 403. See [Working directory allowlist](#working-directory-allowlist).
 
-**Start flags related to authentication:**
+**Start flags related to authentication and transport:**
 
 | Flag | Description |
 |------|-------------|
-| `--refresh-key` | Generate a new API key, write its hash to disk, and print the plaintext key to stdout. The old key is invalidated immediately. |
+| `--refresh-key` | Generate a new API key, write its hash to disk, and print the plaintext key. The old key is invalidated immediately. The command exits after printing — it does not start the server. |
 | `--dangerously-skip-auth` | Disable authentication for this process lifetime only. The `api_key.hash` file is left untouched; the next normal start re-enables auth using the stored hash. |
+| `--dangerously-skip-tls` | Serve plain HTTP on the loopback interface instead of HTTPS. Intended for tests and trusted-local environments only; the server logs a loud warning at startup. Clients must connect with `http://` (not `https://`). |
 
 ### Background
 
@@ -223,6 +346,16 @@ If no log file exists:
 error: no log file found at ~/.awman/api/awman.log
        start the server with --background to enable file logging
 ```
+
+#### Session-setup verbosity
+
+While a session is being prepared (`cloning_repository`, `setting_up_branch`, `running_ready`), the server writes the full ready output — including container build lines, git command output, and state transitions — to the API log file. Each line is prefixed with the first 8 characters of the session id so you can grep one session out of a busy log:
+
+```sh
+grep '\[a1b2c3d4\]' ~/.awman/api/awman.log
+```
+
+To silence this verbose stream, set `AWMAN_API_VERBOSE_SETUP=0` before starting the server. The lines are then emitted at `debug` level and dropped by the default `info` filter; they remain available via `RUST_LOG=debug`.
 
 ### Kill
 
@@ -373,8 +506,22 @@ When authentication is enabled (the default), every request must include the API
 ### Base URL
 
 ```
-http://localhost:<port>/v1
+https://localhost:<port>/v1        # default (self-signed TLS)
+http://localhost:<port>/v1         # only if started with --dangerously-skip-tls
 ```
+
+The default TLS cert is self-signed (stored at `~/.awman/api/tls/cert.pem`), so HTTP clients will reject it unless you tell them not to. With curl:
+
+```sh
+# Easiest: skip verification (acceptable for loopback)
+curl -k https://localhost:9876/v1/status -H "Authorization: Bearer $KEY"
+
+# Stricter: pin the self-signed cert as the only trusted CA
+curl --cacert ~/.awman/api/tls/cert.pem https://localhost:9876/v1/status \
+  -H "Authorization: Bearer $KEY"
+```
+
+Every `curl` example in the rest of this document elides `-k`/`--cacert` for brevity; add one of the two flags above to any of them when running against the default HTTPS server.
 
 ### Endpoint reference
 

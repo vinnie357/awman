@@ -246,6 +246,12 @@ fn render_config_set(o: &ConfigSetOutcome) -> String {
 
 fn render_api_server(o: &ApiServerOutcome) -> Option<String> {
     match o {
+        // In foreground mode the "started" message is printed at server
+        // boot (before the accept loop blocks). When that future finally
+        // returns it's because the server has *shut down* — printing
+        // "API server started …" at that point is misleading and looked
+        // like noise dumped after Ctrl-C.
+        ApiServerOutcome::Start(s) if !s.background => None,
         ApiServerOutcome::Start(s) => Some(render_api_server_start(s)),
         ApiServerOutcome::Kill(k) => Some(render_api_server_kill(k)),
         ApiServerOutcome::Logs(l) => Some(render_api_server_logs(l)),
@@ -520,7 +526,6 @@ mod tests {
             local_agent: StepStatus::Done,
             audit: StepStatus::Skipped,
             image_rebuild: StepStatus::Skipped,
-            legacy_migration: StepStatus::Skipped,
             non_default_agent_images: Vec::new(),
             json_requested: false,
             refresh_requested: false,
@@ -625,7 +630,6 @@ mod tests {
             local_agent: StepStatus::Done,
             audit: StepStatus::Skipped,
             image_rebuild: StepStatus::Skipped,
-            legacy_migration: StepStatus::Skipped,
             non_default_agent_images: Vec::new(),
             json_requested: true,
             refresh_requested: false,
@@ -672,7 +676,6 @@ mod tests {
             local_agent: StepStatus::Pending,
             audit: StepStatus::Pending,
             image_rebuild: StepStatus::Pending,
-            legacy_migration: StepStatus::Skipped,
             non_default_agent_images: Vec::new(),
             json_requested: true,
             refresh_requested: true,

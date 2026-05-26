@@ -5,10 +5,9 @@ use serde::Serialize;
 
 use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
-use crate::command::commands::chat::resolve_agent;
 use crate::command::commands::mount_scope::MountScopeFrontend;
 use crate::command::commands::prompt_templates::{render_amend_prompt, render_interview_prompt};
-use crate::command::commands::Command;
+use crate::command::commands::{resolve_agent, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::engine::agent::AgentRunOptions;

@@ -587,6 +587,17 @@ impl WorkflowEngine {
                         StuckEvent::Unstuck => {
                             // Not inside a yolo countdown — nothing to cancel.
                         }
+                        StuckEvent::StartupGraceExpired => {
+                            // Container produced no output during its grace
+                            // window. The bridge already invoked the cancel
+                            // callback to kill it; surface a warning and let
+                            // wait_rx resolve naturally so finalize_step
+                            // records the failure.
+                            self.msg_warning(format!(
+                                "Step '{}' produced no output before its startup grace expired; killing container",
+                                step_name,
+                            ));
+                        }
                     }
                 }
                 Some(req) = Self::recv_engine(&mut self.engine_rx) => {
@@ -901,6 +912,42 @@ impl WorkflowEngine {
         let start = std::time::Instant::now();
 
         loop {
+            // Drain any pending stuck events first. Without this, an `Unstuck`
+            // event that lands at almost the same instant as countdown expiry
+            // can be passed over by the `remaining.is_zero()` check below —
+            // the loop would return `Advanced` (and mark the step Succeeded)
+            // even though the container just produced fresh output. Draining
+            // here guarantees Unstuck wins the race.
+            if let Some(rx) = stuck_rx.as_mut() {
+                loop {
+                    match rx.try_recv() {
+                        Ok(StuckEvent::Unstuck) => {
+                            self.msg_info(format!(
+                                "Step '{}' recovered, cancelling countdown (timers reset)",
+                                step_name,
+                            ));
+                            self.frontend.yolo_countdown_finished(step_name);
+                            return Ok(MidStepYoloResult::Recovered);
+                        }
+                        Ok(StuckEvent::StartupGraceExpired) => {
+                            self.msg_warning(format!(
+                                "Step '{}' produced no output before its startup grace expired; cancelling countdown",
+                                step_name,
+                            ));
+                            self.frontend.yolo_countdown_finished(step_name);
+                            return Ok(MidStepYoloResult::Recovered);
+                        }
+                        Ok(StuckEvent::Stuck) => continue,
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                        // Lagged: a message was dropped because the channel
+                        // buffer (16) was exceeded. Loop again so we keep
+                        // draining whatever's still in the queue.
+                        Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                    }
+                }
+            }
+
             let elapsed = start.elapsed();
             let remaining = if elapsed >= total {
                 std::time::Duration::ZERO
@@ -944,7 +991,7 @@ impl WorkflowEngine {
                     match event {
                         StuckEvent::Unstuck => {
                             self.msg_info(format!(
-                                "Step '{}' recovered, cancelling countdown",
+                                "Step '{}' recovered, cancelling countdown (timers reset)",
                                 step_name,
                             ));
                             self.frontend.yolo_countdown_finished(step_name);
@@ -952,6 +999,19 @@ impl WorkflowEngine {
                         }
                         StuckEvent::Stuck => {
                             // Already counting down; ignore duplicate.
+                        }
+                        StuckEvent::StartupGraceExpired => {
+                            // The container never produced its first byte
+                            // before grace ran out, so the bridge already
+                            // killed it. Tear down the countdown; wait_rx
+                            // will resolve and finalize_step records the
+                            // failure.
+                            self.msg_warning(format!(
+                                "Step '{}' produced no output before its startup grace expired; cancelling countdown",
+                                step_name,
+                            ));
+                            self.frontend.yolo_countdown_finished(step_name);
+                            return Ok(MidStepYoloResult::Recovered);
                         }
                     }
                 }
@@ -2646,6 +2706,136 @@ mod tests {
         assert!(!cancel_flag.load(Ordering::Relaxed));
 
         signal_completion(&completion, 0);
+        let result = engine_task.await.unwrap().unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+    }
+
+    /// Sending `StepUnstuck` during an active yolo countdown must cancel the
+    /// countdown and leave the step running — it must NOT mark the step
+    /// Succeeded or advance to the next step. The container keeps running
+    /// until it actually exits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn step_unstuck_during_yolo_countdown_keeps_step_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-unstuck-mid-countdown"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+
+        let (cancel_flag_a, completion_a) = make_blocking_entry();
+        let (_cancel_flag_b, completion_b) = make_blocking_entry();
+        let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+
+        // Frontend whose tick returns Continue so the countdown actually runs
+        // (lets us send StepUnstuck mid-countdown). Captures step transitions
+        // so the test can assert "a" was never marked Succeeded prematurely.
+        struct UnstuckTestFrontend {
+            actions: Mutex<VecDeque<NextAction>>,
+            engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
+            step_statuses: Mutex<Vec<(String, WorkflowStepStatus)>>,
+        }
+        impl crate::engine::message::UserMessageSink for UnstuckTestFrontend {
+            fn write_message(&mut self, _: crate::engine::message::UserMessage) {}
+            fn replay_queued(&mut self) {}
+        }
+        impl WorkflowFrontend for UnstuckTestFrontend {
+            fn show_workflow_control_board(
+                &mut self,
+                _: &WorkflowState,
+                _: &AvailableActions,
+            ) -> Result<NextAction, EngineError> {
+                Ok(self
+                    .actions
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(NextAction::Pause))
+            }
+            fn yolo_countdown_tick(
+                &mut self,
+                _: &str,
+                _: Duration,
+                _: Duration,
+            ) -> Result<YoloTickOutcome, EngineError> {
+                Ok(YoloTickOutcome::Continue)
+            }
+            fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
+                Ok(true)
+            }
+            fn user_choose_after_step_failure(
+                &mut self,
+                _: &WorkflowStep,
+                _: &ContainerExitInfo,
+            ) -> Result<StepFailureChoice, EngineError> {
+                Ok(StepFailureChoice::Abort)
+            }
+            fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
+                self.step_statuses
+                    .lock()
+                    .unwrap()
+                    .push((step.name.clone(), status));
+            }
+            fn report_workflow_completed(&mut self, _: &WorkflowOutcome) {}
+            fn set_engine_sender(
+                &mut self,
+                tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>,
+            ) {
+                *self.engine_tx.lock().unwrap() = Some(tx);
+            }
+        }
+        let frontend = UnstuckTestFrontend {
+            actions: Mutex::new(VecDeque::from([NextAction::FinishWorkflow])),
+            engine_tx: engine_tx.clone(),
+            step_statuses: Mutex::new(Vec::new()),
+        };
+
+        let factory = BlockingFactory::new([
+            (cancel_flag_a.clone(), completion_a.clone()),
+            (_cancel_flag_b.clone(), completion_b.clone()),
+        ]);
+        let overlay = OverlayEngine::with_auth_resolver(
+            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
+        );
+        let mut engine = WorkflowEngine::new(
+            &session,
+            workflow,
+            None,
+            Box::new(frontend),
+            Box::new(factory),
+            Arc::new(GitEngine::new()),
+            Arc::new(overlay),
+        )
+        .unwrap();
+        engine.set_yolo(true);
+
+        let tx = engine_tx.lock().unwrap().clone().unwrap();
+
+        let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+
+        // Let the step launch.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Kick off the yolo countdown.
+        tx.send(EngineRequest::StepStuck).unwrap();
+        // Let the countdown run a tick or two without expiring.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Container produced output again — recovery signal.
+        tx.send(EngineRequest::StepUnstuck).unwrap();
+        // Wait long enough that, if the engine were mistakenly advancing the
+        // step on Unstuck, step "b" would have launched. Cancel-flag-a must
+        // still be false (step "a" still running, NOT cancelled by Advanced).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !cancel_flag_a.load(Ordering::Relaxed),
+            "StepUnstuck during countdown must NOT cancel step 'a' — it must keep running"
+        );
+
+        // Now complete step "a" normally; workflow proceeds.
+        signal_completion(&completion_a, 0);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        signal_completion(&completion_b, 0);
+
         let result = engine_task.await.unwrap().unwrap();
         assert_eq!(result, WorkflowOutcome::Completed);
     }

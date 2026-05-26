@@ -26,7 +26,9 @@ use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
 use crate::data::session_setup_event::{SessionSetupState, SessionSetupStatus, SetupEventPayload};
 use crate::frontend::api::event_bus::EventBus;
-use crate::frontend::api::session_setup::SessionSetupBus;
+use crate::frontend::api::session_setup::{
+    log_session_setup, SessionSetupBus, TracingSetupSink,
+};
 
 // ─── Auth mode ───────────────────────────────────────────────────────────────
 
@@ -367,7 +369,8 @@ async fn handle_create_session(
                 )
                     .into_response();
             }
-            let cloned = session_dir.join("repo");
+            let folder = repo_folder_from_url(&repo_url);
+            let cloned = session_dir.join(&folder);
             (
                 cloned.clone(),
                 Some(cloned),
@@ -462,13 +465,91 @@ struct SessionSetupPlan {
     branch: Option<String>,
 }
 
+/// Derive a safe folder name for the clone target from a repo URL.
+///
+/// The folder is used as the on-disk repo name under `<session>/`, which in
+/// turn drives the `awman-<repo>:latest` image tag (see `data::image_tags`).
+/// Returning a per-repo name avoids cross-session image collisions when the
+/// API server hosts multiple remote sessions.
+fn repo_folder_from_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let last = trimmed.rsplit(['/', ':']).next().unwrap_or("");
+    let safe: String = last
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    if safe.is_empty() || safe == "." || safe == ".." {
+        "repo".to_string()
+    } else {
+        safe
+    }
+}
+
+#[cfg(test)]
+mod repo_folder_tests {
+    use super::repo_folder_from_url;
+
+    #[test]
+    fn https_url_with_dot_git() {
+        assert_eq!(
+            repo_folder_from_url("https://github.com/cohix/somerepo.git"),
+            "somerepo"
+        );
+    }
+
+    #[test]
+    fn https_url_without_dot_git() {
+        assert_eq!(
+            repo_folder_from_url("https://github.com/cohix/somerepo"),
+            "somerepo"
+        );
+    }
+
+    #[test]
+    fn scp_style_ssh_url() {
+        assert_eq!(
+            repo_folder_from_url("git@github.com:cohix/somerepo.git"),
+            "somerepo"
+        );
+    }
+
+    #[test]
+    fn ssh_url() {
+        assert_eq!(
+            repo_folder_from_url("ssh://git@github.com/cohix/somerepo.git"),
+            "somerepo"
+        );
+    }
+
+    #[test]
+    fn trailing_slash_stripped() {
+        assert_eq!(
+            repo_folder_from_url("https://github.com/cohix/somerepo/"),
+            "somerepo"
+        );
+    }
+
+    #[test]
+    fn empty_falls_back_to_repo() {
+        assert_eq!(repo_folder_from_url(""), "repo");
+    }
+
+    #[test]
+    fn unsafe_chars_filtered() {
+        assert_eq!(
+            repo_folder_from_url("https://example.com/group/my repo!.git"),
+            "myrepo"
+        );
+    }
+}
+
 async fn run_session_setup(
     state: Arc<AppState>,
     session_id: String,
     plan: SessionSetupPlan,
     setup_bus: Arc<SessionSetupBus>,
 ) {
-    use crate::data::session::AgentName;
     use crate::engine::ready::ReadyEngine;
     use crate::engine::ready::ReadyEngineOptions;
     use crate::frontend::api::session_setup::SetupReadyFrontend;
@@ -478,7 +559,25 @@ async fn run_session_setup(
     // tokio runtime is single-threaded (e.g. `#[tokio::test]`).
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+    tracing::info!(
+        session_id = %session_id,
+        session_type = %plan.session_type,
+        workdir = %plan.resolved_workdir.display(),
+        repo_url = plan.repo_url.as_deref().unwrap_or(""),
+        branch = plan.branch.as_deref().unwrap_or(""),
+        "Beginning session setup"
+    );
+
     let bus_sender = setup_bus.sender();
+    log_session_setup(
+        &session_id,
+        &format!(
+            "state → {:?}: starting setup (type={}, workdir={})",
+            SessionSetupStatus::Initializing,
+            plan.session_type,
+            plan.resolved_workdir.display()
+        ),
+    );
 
     // ── [remote only] Stage 1: clone repository ──────────────────────────────
     if plan.session_type == "remote" {
@@ -495,14 +594,27 @@ async fn run_session_setup(
             stage: "cloning_repository".into(),
             message: msg,
         });
+        log_session_setup(
+            &session_id,
+            &format!("state → {:?}: clone stage", SessionSetupStatus::CloningRepository),
+        );
 
         let url = plan.repo_url.clone().unwrap_or_default();
         let dest = plan.cloned_path.clone().expect("remote sessions have cloned_path");
+        tracing::info!(
+            session_id = %session_id,
+            repo_url = %url,
+            dest = %dest.display(),
+            "Cloning remote repository (default branch)"
+        );
         let git = Arc::clone(&state.engines.git_engine);
         let dest_for_clone = dest.clone();
-        let branch_arg = plan.branch.clone();
+        let mut clone_sink = TracingSetupSink::new(&session_id);
+        // Clone the repository's default branch regardless of `plan.branch`.
+        // The requested branch (which may not exist on the remote) is created
+        // or checked out in the dedicated branch-setup stage below.
         let clone_result = tokio::task::spawn_blocking(move || {
-            git.clone_repo(&url, branch_arg.as_deref(), &dest_for_clone)
+            git.clone_repo_logged(&url, None, &dest_for_clone, &mut clone_sink)
         })
         .await
         .unwrap_or_else(|join_err| {
@@ -511,7 +623,7 @@ async fn run_session_setup(
             )))
         });
         if let Err(e) = clone_result {
-            tracing::error!(session_id = %session_id, error = %e, "clone failed");
+            tracing::error!(session_id = %session_id, error = %e, "Clone failed");
             bus_sender.mark_failed("clone", &e.to_string());
             bus_sender.emit(SetupEventPayload::SetupFailed {
                 stage: "clone".into(),
@@ -527,6 +639,7 @@ async fn run_session_setup(
             cleanup_setup_bus(state, session_id, setup_bus).await;
             return;
         }
+        tracing::info!(session_id = %session_id, "Repository cloned");
         bus_sender.emit(SetupEventPayload::StageChanged {
             stage: "cloning_repository_done".into(),
             message: "Repository cloned".into(),
@@ -544,12 +657,29 @@ async fn run_session_setup(
                 stage: "setting_up_branch".into(),
                 message: msg,
             });
+            log_session_setup(
+                &session_id,
+                &format!(
+                    "state → {:?}: branch={branch}",
+                    SessionSetupStatus::SettingUpBranch
+                ),
+            );
+            tracing::info!(
+                session_id = %session_id,
+                branch = %branch,
+                "Setting up branch"
+            );
 
             let git = Arc::clone(&state.engines.git_engine);
             let dest_for_branch = dest.clone();
             let branch_owned = branch.to_string();
+            let mut branch_sink = TracingSetupSink::new(&session_id);
             let branch_result = tokio::task::spawn_blocking(move || {
-                git.checkout_or_create_branch(&dest_for_branch, &branch_owned)
+                git.checkout_or_create_branch_logged(
+                    &dest_for_branch,
+                    &branch_owned,
+                    &mut branch_sink,
+                )
             })
             .await
             .unwrap_or_else(|join_err| {
@@ -559,13 +689,19 @@ async fn run_session_setup(
             });
             match branch_result {
                 Ok(disposition) => {
+                    tracing::info!(
+                        session_id = %session_id,
+                        branch = %branch,
+                        disposition = disposition,
+                        "Branch ready"
+                    );
                     bus_sender.emit(SetupEventPayload::StageChanged {
                         stage: "branch_ready".into(),
                         message: format!("Branch '{branch}' {disposition}"),
                     });
                 }
                 Err(e) => {
-                    tracing::error!(session_id = %session_id, error = %e, "branch setup failed");
+                    tracing::error!(session_id = %session_id, error = %e, "Branch setup failed");
                     bus_sender.mark_failed("branch", &e.to_string());
                     bus_sender.emit(SetupEventPayload::SetupFailed {
                         stage: "branch".into(),
@@ -594,6 +730,19 @@ async fn run_session_setup(
         stage: "running_ready".into(),
         message: "Opening session and running ready checks...".into(),
     });
+    log_session_setup(
+        &session_id,
+        &format!(
+            "state → {:?}: opening session at {}",
+            SessionSetupStatus::RunningReady,
+            plan.resolved_workdir.display()
+        ),
+    );
+    tracing::info!(
+        session_id = %session_id,
+        workdir = %plan.resolved_workdir.display(),
+        "Opening session"
+    );
 
     let resolver = StaticGitRootResolver::new(&plan.resolved_workdir);
     let session = match Session::open_or_workdir_fallback(
@@ -650,13 +799,38 @@ async fn run_session_setup(
         .lock()
         .await
         .insert(session_id.clone(), Arc::clone(&session));
+    tracing::info!(session_id = %session_id, "Session opened, running ReadyEngine");
 
     // ── Stage 4 (all): run ReadyEngine ───────────────────────────────────────
+    // Use the same agent name and idempotency semantics as the CLI/TUI
+    // `awman ready` (no `--build`, no `--refresh`): the engine checks
+    // `image_exists` and `Dockerfile.<agent>` on disk and skips re-building
+    // / re-downloading when they're already present. The agent is read from
+    // the cloned repo's `.awman/config.json` (with global-config and
+    // hard-coded "claude" fallbacks), matching the CLI/TUI path — anything
+    // else mis-targets the per-agent Dockerfile lookup and re-downloads the
+    // template every session.
     let session_guard = session.read().await;
+    let agent = match crate::command::commands::resolve_agent(&None, &session_guard) {
+        Ok(a) => a,
+        Err(e) => {
+            drop(session_guard);
+            tracing::error!(session_id = %session_id, error = %e, "Failed to resolve agent");
+            bus_sender.mark_failed("resolve_agent", &e.to_string());
+            bus_sender.emit(SetupEventPayload::SetupFailed {
+                stage: "resolve_agent".into(),
+                error: e.to_string(),
+            });
+            let _ = state.store.update_setup_status(&session_id, "failed");
+            persist_setup_state(&state, &session_id, &setup_bus).await;
+            cleanup_setup_bus(state, session_id, setup_bus).await;
+            return;
+        }
+    };
     let ready_options = ReadyEngineOptions {
-        agent: AgentName::new("default").expect("valid agent name"),
+        agent,
         refresh: false,
-        build: true,
+        build: false,
         no_cache: false,
         allow_docker: true,
         non_interactive: true,
@@ -674,7 +848,8 @@ async fn run_session_setup(
 
     let event_bus = EventBus::new(4096);
     let event_sender = event_bus.sender();
-    let mut setup_frontend = SetupReadyFrontend::new(setup_bus.sender(), event_sender);
+    let mut setup_frontend =
+        SetupReadyFrontend::new(&session_id, setup_bus.sender(), event_sender);
 
     // Cap ReadyEngine at 10 minutes — any legitimate run, including a clean
     // base-image build, completes well within this. If the wall-clock exceeds
@@ -1385,6 +1560,10 @@ async fn handle_stream_command_logs(
         state.event_buses.lock().await.get(&command_id).cloned()
     };
 
+    let state_for_task = Arc::clone(&state);
+    let command_id_for_task = command_id.clone();
+    let events_log_for_replay = events_log_path.clone();
+
     tokio::spawn(async move {
         // 1. Replay events.log from disk, recording the highest sequence.
         let mut last_replayed_seq: Option<u64> = None;
@@ -1409,8 +1588,101 @@ async fn handle_stream_command_logs(
             }
         }
 
-        // 2. If a live EventBus exists, subscribe and forward post-replay events.
-        if let Some(bus) = maybe_bus {
+        // 2. If no live bus was found AND the command is not yet terminal, the
+        //    worker hasn't claimed it yet (status='queued') or it's between
+        //    claim and bus registration. Poll for the bus to appear, with a
+        //    short keepalive comment every iteration so the SSE connection
+        //    doesn't look dead to the client. Bail out if the command
+        //    transitions to a terminal state while we're waiting.
+        let mut live_bus = maybe_bus;
+        if live_bus.is_none() && !is_already_done {
+            const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+            const POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+            // Emit a visible status event so `--follow` clients see *something*
+            // while they wait for a worker to claim the command. Without this
+            // the client looks frozen for up to POLL_TIMEOUT.
+            let waiting_event = ExecutionEvent {
+                timestamp: chrono::Utc::now(),
+                sequence: last_replayed_seq.map(|s| s + 1).unwrap_or(0),
+                payload: EventPayload::StatusMessage {
+                    phase: "queue".into(),
+                    message: "Waiting for a worker to claim this command...".into(),
+                },
+            };
+            if tx.send(Ok(execution_event_to_sse(&waiting_event))).is_err() {
+                return;
+            }
+            let started = std::time::Instant::now();
+            loop {
+                // Check command status — if it reached a terminal state while
+                // we were waiting, replay any newly-flushed events.log lines
+                // and exit the wait loop so the Done event is emitted below.
+                let cmd_terminal = match state_for_task.store.get_command(&command_id_for_task) {
+                    Ok(Some(c)) => matches!(c.status.as_str(), "done" | "error" | "cancelled"),
+                    _ => false,
+                };
+                if cmd_terminal {
+                    if let Ok(content) =
+                        tokio::fs::read_to_string(&events_log_for_replay).await
+                    {
+                        for line in content.lines() {
+                            let line = line.trim();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            let event: ExecutionEvent = match serde_json::from_str(line) {
+                                Ok(e) => e,
+                                Err(_) => continue,
+                            };
+                            if let Some(last) = last_replayed_seq {
+                                if event.sequence <= last {
+                                    continue;
+                                }
+                            }
+                            last_replayed_seq = Some(
+                                last_replayed_seq
+                                    .map(|s| s.max(event.sequence))
+                                    .unwrap_or(event.sequence),
+                            );
+                            if tx.send(Ok(execution_event_to_sse(&event))).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    break;
+                }
+                // Has the worker registered the bus yet?
+                if let Some(bus) = state_for_task
+                    .event_buses
+                    .lock()
+                    .await
+                    .get(&command_id_for_task)
+                    .cloned()
+                {
+                    live_bus = Some(bus);
+                    break;
+                }
+                if started.elapsed() >= POLL_TIMEOUT {
+                    tracing::warn!(
+                        command_id = %command_id_for_task,
+                        "SSE wait for worker timed out — emitting Done"
+                    );
+                    break;
+                }
+                // Keepalive comment so the SSE connection stays alive on
+                // intermediaries and the client knows we're still here.
+                if tx
+                    .send(Ok(Event::default().comment("waiting for worker to claim job")))
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        }
+
+        // 3. If a live EventBus exists, subscribe and forward post-replay events.
+        if let Some(bus) = live_bus {
             let mut rx = bus.subscribe();
             loop {
                 match rx.recv().await {

@@ -42,10 +42,21 @@ pub struct ContainerExitInfo {
 
 /// Stuck/unstuck transition published by the container engine's stuck
 /// detector task.
+///
+/// Lifecycle: the detector first runs in *grace* mode — it watches for the
+/// container's first byte of output. If grace expires before that byte
+/// arrives, `StartupGraceExpired` is published once and the detector
+/// kills the container via its cancel callback, exiting. After the first
+/// byte arrives, grace is discarded and the detector switches to the
+/// regular `Stuck`/`Unstuck` loop driven by `stuck_timeout`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StuckEvent {
     Stuck,
     Unstuck,
+    /// The container never produced output before its grace window
+    /// elapsed. The detector has invoked the cancel callback; subscribers
+    /// should treat the step / prompt as failed.
+    StartupGraceExpired,
 }
 
 /// Fully-built but not-yet-running container handle. Trait so `Box<dyn>` keeps

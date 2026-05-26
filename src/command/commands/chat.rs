@@ -7,7 +7,7 @@ use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
 use crate::command::commands::Command;
-use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list};
+use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list, resolve_agent};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::{AgentName, Session};
@@ -281,20 +281,6 @@ pub(crate) async fn ensure_agent_setup(
         })
         .await
         .map_err(CommandError::from)
-}
-
-/// Resolve the agent: explicit flag → session default → fall back to "claude".
-pub(crate) fn resolve_agent(
-    flag: &Option<String>,
-    session: &Session,
-) -> Result<AgentName, CommandError> {
-    if let Some(name) = flag.as_deref() {
-        return AgentName::new(name).map_err(CommandError::from);
-    }
-    if let Some(name) = session.default_agent() {
-        return Ok(name.clone());
-    }
-    AgentName::new("claude").map_err(CommandError::from)
 }
 
 #[cfg(test)]

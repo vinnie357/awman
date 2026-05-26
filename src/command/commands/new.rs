@@ -3,11 +3,10 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
-use crate::command::commands::chat::resolve_agent;
 use crate::command::commands::prompt_templates::{
     render_skill_interview_prompt, render_workflow_interview_prompt,
 };
-use crate::command::commands::Command;
+use crate::command::commands::{resolve_agent, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::fs::{SkillDirs, WorkflowDirs};

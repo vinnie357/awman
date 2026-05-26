@@ -292,7 +292,7 @@ The background task runs the full setup pipeline, emitting `SessionSetupEvent` v
 
 **`ReadyCommand` is NOT added to the API `CommandCatalogue`** as a directly-invocable command. It is never exposed as an API endpoint. Its execution during session setup is an internal Layer 2 concern coordinated by `CreateSessionCommand`.
 
-**`ReadyCommand` runs non-interactively**: All interactive prompts (`ask_create_dockerfile`, `ask_run_audit_on_template`, `ask_migrate_legacy_layout`) return safe non-interactive defaults — the `SetupReadyFrontend` always returns `true` for dockerfile creation and legacy migration, `false` for audit. Add a `run_non_interactive` method or `non_interactive: bool` parameter to `ReadyCommand` if not already present.
+**`ReadyCommand` runs non-interactively**: All interactive prompts (`ask_create_dockerfile`, `ask_run_audit_on_template`) return safe non-interactive defaults — the `SetupReadyFrontend` always returns `true` for dockerfile creation and `false` for audit. Add a `run_non_interactive` method or `non_interactive: bool` parameter to `ReadyCommand` if not already present.
 
 **Ready idempotency**: `ReadyEngine::run_to_completion` may be called across multiple session creations within a single server process lifetime. It must be idempotent — if the base image is already built and agents are already configured, it completes quickly without rebuilding.
 
@@ -440,7 +440,6 @@ pub struct SetupReadyFrontend {
 impl ReadyFrontend for SetupReadyFrontend {
     fn ask_create_dockerfile(&mut self) -> Result<bool, EngineError> { Ok(true) }
     fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError> { Ok(false) }
-    fn ask_migrate_legacy_layout(&mut self, _: &AgentName) -> Result<bool, EngineError> { Ok(true) }
 
     fn report_phase(&mut self, phase: &ReadyPhase) {
         let message = ready_phase_display(phase);
@@ -500,8 +499,6 @@ fn ready_phase_display(phase: &ReadyPhase) -> String {
         ReadyPhase::Preflight => "Running preflight checks...".into(),
         ReadyPhase::AwaitingDockerfileDecision => "Checking Dockerfile...".into(),
         ReadyPhase::CreatingDockerfile => "Creating Dockerfile.dev...".into(),
-        ReadyPhase::AwaitingLegacyMigrationDecision => "Checking for legacy layout...".into(),
-        ReadyPhase::MigratingLegacyLayout => "Migrating legacy layout...".into(),
         ReadyPhase::BuildingBaseImage => "Building base image...".into(),
         ReadyPhase::BuildingAgentImage => "Building agent image...".into(),
         ReadyPhase::CheckingNonDefaultAgents => "Checking non-default agent images...".into(),
@@ -557,7 +554,6 @@ When `status` is `"ready"`:
     "local_agent": "Done",
     "audit": "Skipped",
     "image_rebuild": "Skipped",
-    "legacy_migration": "Skipped",
     "aspec_folder": "Done",
     "work_items_config": "Done",
     "non_default_agent_images": []

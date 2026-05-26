@@ -16,7 +16,6 @@ pub struct ReadySummary {
     /// Result of rebuilding the base + agent images after the audit modified
     /// `Dockerfile.dev`. `Skipped` when no rebuild was needed.
     pub image_rebuild: StepStatus,
-    pub legacy_migration: StepStatus,
     /// Whether the `aspec/` folder exists.
     pub aspec_folder: StepStatus,
     /// Whether `.awman/config.json` (per-repo config) exists.
@@ -36,7 +35,6 @@ impl ReadySummary {
             local_agent: StepStatus::Pending,
             audit: StepStatus::Pending,
             image_rebuild: StepStatus::Pending,
-            legacy_migration: StepStatus::Pending,
             aspec_folder: StepStatus::Pending,
             work_items_config: StepStatus::Pending,
             non_default_agent_images: Vec::new(),

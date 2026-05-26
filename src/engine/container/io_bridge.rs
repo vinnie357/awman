@@ -6,17 +6,42 @@
 //! - Activity tracking (shared timestamp for stuck detection)
 //! - Stuck detector task (broadcast `StuckEvent`)
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::engine::container::frontend::ContainerIo;
 use crate::engine::container::instance::StuckEvent;
-use crate::engine::container::timing::STUCK_TIMEOUT;
 use crate::engine::error::EngineError;
 
 /// Shared last-activity timestamp. Updated by reader threads on every byte
 /// chunk from stdout or stderr. Read by the stuck detector task.
 pub(crate) type SharedActivity = Arc<Mutex<Option<Instant>>>;
+
+/// Best-effort cancel callback the detector invokes when the startup grace
+/// window expires. Implemented by the backend (a closure that calls
+/// `docker stop <name>` / `container stop <name>`). Optional because tests
+/// and the inert backend don't need it.
+pub(crate) type CancelFn = Arc<dyn Fn() + Send + Sync>;
+
+/// Per-bridge configuration. Bundled into one struct so the bridge functions
+/// don't grow an unwieldy parameter list as more knobs land.
+pub(crate) struct BridgeConfig {
+    pub grace_timeout: Duration,
+    pub stuck_timeout: Duration,
+    /// Window after container launch during which the detector ignores
+    /// activity / first_byte updates. Some runtimes (notably Apple's
+    /// `container` binary) print their own startup chatter on stdout before
+    /// the real workload starts, which would otherwise prematurely satisfy
+    /// the grace-phase "first byte" check. Default `Duration::ZERO` keeps
+    /// the existing behaviour for backends that don't need it.
+    pub container_start_delay: Duration,
+    /// Invoked once when the startup grace window expires. The reader
+    /// threads have not seen a byte from the container; the detector calls
+    /// this to force the container to exit so callers' `wait()` futures
+    /// resolve with a failure status.
+    pub cancel_on_grace_expired: Option<CancelFn>,
+}
 
 /// Bundle returned by `bridge_pty` / `bridge_piped` containing the artifacts
 /// the backend needs to store for the execution lifetime.
@@ -27,10 +52,11 @@ pub(crate) struct BridgeResult {
     pub stuck_tx: Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
 }
 
-fn update_activity(activity: &SharedActivity) {
+fn update_activity(activity: &SharedActivity, first_byte: &Arc<AtomicBool>) {
     if let Ok(mut guard) = activity.lock() {
         *guard = Some(Instant::now());
     }
+    first_byte.store(true, Ordering::Release);
 }
 
 /// Spawn the stuck detector task. Returns the broadcast sender (caller
@@ -42,19 +68,72 @@ fn update_activity(activity: &SharedActivity) {
 /// lifetime of the process. Transient `SendError` (no subscribers right
 /// now) is ignored — broadcast semantics allow a subscriber to appear
 /// later as long as the sender Arc is still alive.
-fn spawn_stuck_detector(activity: SharedActivity) -> Arc<tokio::sync::broadcast::Sender<StuckEvent>> {
+///
+/// Three phases:
+///   0. *Start delay* (optional, when `container_start_delay` is non-zero)
+///      — the detector sleeps without emitting events and ignores any
+///      first-byte / activity updates from the reader threads. After the
+///      delay it resets `first_byte` and `activity` to clear out any
+///      bytes the container runtime itself produced (e.g. Apple's
+///      `container` binary prints "creating container…" / "starting
+///      container…" before the real workload runs). This prevents the
+///      runtime's startup chatter from satisfying the grace check.
+///   1. *Grace* — until the first byte of (real) output arrives, the
+///      detector watches its grace clock. If it crosses `grace_timeout`,
+///      the detector publishes `StartupGraceExpired`, invokes the cancel
+///      callback (so the container dies and `wait()` resolves), and exits.
+///   2. *Stuck* — once `first_byte` flips to `true`, the detector
+///      switches to the regular Stuck/Unstuck loop driven by the last
+///      activity timestamp and `stuck_timeout`. Grace is discarded.
+fn spawn_stuck_detector(
+    activity: SharedActivity,
+    first_byte: Arc<AtomicBool>,
+    grace_timeout: Duration,
+    stuck_timeout: Duration,
+    container_start_delay: Duration,
+    cancel_on_grace_expired: Option<CancelFn>,
+) -> Arc<tokio::sync::broadcast::Sender<StuckEvent>> {
     let (stuck_tx, _) = tokio::sync::broadcast::channel(16);
     let stuck_tx = Arc::new(stuck_tx);
     let weak = Arc::downgrade(&stuck_tx);
     tokio::spawn(async move {
+        // Phase 0: optional start-delay window. The reader threads keep
+        // updating activity / first_byte during this sleep; we discard
+        // those updates at the end of the window so only post-delay bytes
+        // count.
+        if !container_start_delay.is_zero() {
+            tokio::time::sleep(container_start_delay).await;
+            if weak.upgrade().is_none() {
+                return;
+            }
+            first_byte.store(false, Ordering::Release);
+            if let Ok(mut guard) = activity.lock() {
+                *guard = None;
+            }
+        }
+
         let mut is_stuck = false;
-        let start = Instant::now();
+        let grace_start = Instant::now();
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let tx = match weak.upgrade() {
                 Some(tx) => tx,
                 None => break,
             };
+
+            if !first_byte.load(Ordering::Acquire) {
+                // Grace phase — measure from end of the start-delay window.
+                if grace_start.elapsed() >= grace_timeout {
+                    let _ = tx.send(StuckEvent::StartupGraceExpired);
+                    if let Some(cb) = &cancel_on_grace_expired {
+                        cb();
+                    }
+                    break;
+                }
+                continue;
+            }
+
+            // Stuck phase — measure from the most recent byte.
             let elapsed = {
                 let guard = match activity.lock() {
                     Ok(g) => g,
@@ -62,10 +141,10 @@ fn spawn_stuck_detector(activity: SharedActivity) -> Arc<tokio::sync::broadcast:
                 };
                 match *guard {
                     Some(t) => t.elapsed(),
-                    None => start.elapsed(),
+                    None => grace_start.elapsed(),
                 }
             };
-            let now_stuck = elapsed >= STUCK_TIMEOUT;
+            let now_stuck = elapsed >= stuck_timeout;
             if now_stuck && !is_stuck {
                 is_stuck = true;
                 let _ = tx.send(StuckEvent::Stuck);
@@ -90,6 +169,7 @@ fn spawn_stuck_detector(activity: SharedActivity) -> Arc<tokio::sync::broadcast:
 pub(crate) fn bridge_pty(
     io: ContainerIo,
     pair: portable_pty::PtyPair,
+    config: BridgeConfig,
 ) -> Result<(Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>, BridgeResult), EngineError> {
     let mut reader = pair
         .master
@@ -101,6 +181,7 @@ pub(crate) fn bridge_pty(
         .map_err(|e| EngineError::Container(format!("take pty writer: {e}")))?;
 
     let activity: SharedActivity = Arc::new(Mutex::new(None));
+    let first_byte = Arc::new(AtomicBool::new(false));
 
     // Reader thread: PTY → stdout channel (activity tracked).
     //
@@ -110,6 +191,7 @@ pub(crate) fn bridge_pty(
     // detection reflects what the container is actually emitting.
     let stdout_tx = io.stdout;
     let act = Arc::clone(&activity);
+    let fb = Arc::clone(&first_byte);
     std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = [0u8; 4096];
@@ -118,7 +200,7 @@ pub(crate) fn bridge_pty(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    update_activity(&act);
+                    update_activity(&act, &fb);
                     if sink_open && stdout_tx.send(buf[..n].to_vec()).is_err() {
                         sink_open = false;
                     }
@@ -161,7 +243,14 @@ pub(crate) fn bridge_pty(
         });
     }
 
-    let stuck_tx = spawn_stuck_detector(activity);
+    let stuck_tx = spawn_stuck_detector(
+        activity,
+        first_byte,
+        config.grace_timeout,
+        config.stuck_timeout,
+        config.container_start_delay,
+        config.cancel_on_grace_expired,
+    );
 
     Ok((
         master_arc,
@@ -183,8 +272,10 @@ pub(crate) fn bridge_pty(
 pub(crate) fn bridge_piped(
     io: ContainerIo,
     child: &mut std::process::Child,
+    config: BridgeConfig,
 ) -> BridgeResult {
     let activity: SharedActivity = Arc::new(Mutex::new(None));
+    let first_byte = Arc::new(AtomicBool::new(false));
 
     // stdout reader thread.
     //
@@ -195,6 +286,7 @@ pub(crate) fn bridge_piped(
     if let Some(child_stdout) = child.stdout.take() {
         let stdout_tx = io.stdout;
         let act = Arc::clone(&activity);
+        let fb = Arc::clone(&first_byte);
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stdout;
@@ -204,7 +296,7 @@ pub(crate) fn bridge_piped(
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        update_activity(&act);
+                        update_activity(&act, &fb);
                         if sink_open && stdout_tx.send(buf[..n].to_vec()).is_err() {
                             sink_open = false;
                         }
@@ -218,6 +310,7 @@ pub(crate) fn bridge_piped(
     if let Some(child_stderr) = child.stderr.take() {
         let stderr_tx = io.stderr;
         let act = Arc::clone(&activity);
+        let fb = Arc::clone(&first_byte);
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stderr;
@@ -227,7 +320,7 @@ pub(crate) fn bridge_piped(
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        update_activity(&act);
+                        update_activity(&act, &fb);
                         if sink_open && stderr_tx.send(buf[..n].to_vec()).is_err() {
                             sink_open = false;
                         }
@@ -255,7 +348,14 @@ pub(crate) fn bridge_piped(
         });
     }
 
-    let stuck_tx = spawn_stuck_detector(activity);
+    let stuck_tx = spawn_stuck_detector(
+        activity,
+        first_byte,
+        config.grace_timeout,
+        config.stuck_timeout,
+        config.container_start_delay,
+        config.cancel_on_grace_expired,
+    );
 
     BridgeResult {
         stdin_injector: stdin_tx,
@@ -397,18 +497,25 @@ mod tests {
     }
 
     /// Production `spawn_stuck_detector` must terminate once its only
-    /// `Arc<Sender>` is dropped, even if `STUCK_TIMEOUT` hasn't elapsed.
+    /// `Arc<Sender>` is dropped, even if the timeout hasn't elapsed.
     /// Without this the task leaks for the lifetime of the process.
     #[tokio::test]
     async fn spawn_stuck_detector_exits_when_arc_dropped() {
         let activity: SharedActivity = Arc::new(Mutex::new(Some(Instant::now())));
-        let tx = spawn_stuck_detector(activity);
+        let first_byte = Arc::new(AtomicBool::new(true));
+        let tx = spawn_stuck_detector(
+            activity,
+            first_byte,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::ZERO,
+            None,
+        );
         // Hold a weak reference so we can observe the task dropping the Arc.
         let weak = Arc::downgrade(&tx);
         drop(tx);
 
         // Detector polls every 1s; give it 2.5s to notice the Arc is gone.
-        // (We can't speed this up because STUCK_TIMEOUT is hard-coded.)
         for _ in 0..25 {
             if weak.upgrade().is_none() {
                 return; // task dropped its Arc clone → exited
@@ -416,6 +523,107 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("spawn_stuck_detector did not exit within 2.5s of its Arc being dropped");
+    }
+
+    /// Grace phase: when no byte ever arrives and `grace_timeout` elapses,
+    /// the detector publishes `StartupGraceExpired` and invokes the cancel
+    /// callback.
+    #[tokio::test]
+    async fn spawn_stuck_detector_emits_startup_grace_expired() {
+        let activity: SharedActivity = Arc::new(Mutex::new(None));
+        let first_byte = Arc::new(AtomicBool::new(false));
+        let cancel_called = Arc::new(AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel_called);
+        let cancel: CancelFn = Arc::new(move || {
+            cancel_clone.store(true, Ordering::Release);
+        });
+
+        let tx = spawn_stuck_detector(
+            activity,
+            first_byte,
+            Duration::from_millis(50),
+            Duration::from_secs(30),
+            Duration::ZERO,
+            Some(cancel),
+        );
+        let mut rx = tx.subscribe();
+
+        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("timed out waiting for StartupGraceExpired")
+            .expect("channel closed");
+        assert_eq!(event, StuckEvent::StartupGraceExpired);
+
+        // Give the detector a tick to invoke the callback.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            cancel_called.load(Ordering::Acquire),
+            "grace expiry must invoke the cancel callback"
+        );
+    }
+
+    /// Stuck phase: once `first_byte` flips true, the detector ignores grace
+    /// and emits `Stuck` based on `stuck_timeout` measured from last activity.
+    #[tokio::test]
+    async fn spawn_stuck_detector_switches_to_stuck_phase_after_first_byte() {
+        let activity: SharedActivity = Arc::new(Mutex::new(Some(Instant::now())));
+        let first_byte = Arc::new(AtomicBool::new(true));
+
+        // Set grace to something we'd notice if it incorrectly fired
+        // (anything > stuck_timeout would work).
+        let tx = spawn_stuck_detector(
+            activity,
+            first_byte,
+            Duration::from_secs(30),
+            Duration::from_millis(50),
+            Duration::ZERO,
+            None,
+        );
+        let mut rx = tx.subscribe();
+
+        // We must receive Stuck (not StartupGraceExpired) — grace must be
+        // skipped because `first_byte` was already true.
+        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("timed out waiting for Stuck")
+            .expect("channel closed");
+        assert_eq!(event, StuckEvent::Stuck);
+    }
+
+    /// `container_start_delay`: bytes that "arrive" during the delay window
+    /// must not satisfy the first_byte check. Simulates Apple's `container`
+    /// runtime printing startup chatter before the workload begins — those
+    /// bytes flip `first_byte` to true, but the detector must wipe it at
+    /// the end of the delay window and re-enter the grace phase.
+    #[tokio::test]
+    async fn spawn_stuck_detector_start_delay_discards_pre_delay_first_byte() {
+        let activity: SharedActivity = Arc::new(Mutex::new(Some(Instant::now())));
+        // Pretend the runtime already printed something during the delay.
+        let first_byte = Arc::new(AtomicBool::new(true));
+
+        // Start delay 150ms, grace 100ms. If the delay correctly discarded
+        // the pre-delay first_byte, the detector should re-enter grace and
+        // (since no real first byte ever arrives) publish
+        // StartupGraceExpired roughly 150ms + ~grace later.
+        let tx = spawn_stuck_detector(
+            activity,
+            Arc::clone(&first_byte),
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+            Duration::from_millis(150),
+            None,
+        );
+        let mut rx = tx.subscribe();
+
+        let event = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("timed out waiting for StartupGraceExpired")
+            .expect("channel closed");
+        assert_eq!(
+            event,
+            StuckEvent::StartupGraceExpired,
+            "start-delay must wipe pre-delay first_byte so grace runs from end of delay"
+        );
     }
 
     // ── stdin EOF ─────────────────────────────────────────────────────────────
@@ -479,7 +687,7 @@ mod tests {
             .spawn()
             .expect("spawn sh");
 
-        let bridge = bridge_piped(io, &mut child);
+        let bridge = bridge_piped(io, &mut child, BridgeConfig { grace_timeout: Duration::from_secs(30), stuck_timeout: Duration::from_secs(30), container_start_delay: Duration::ZERO, cancel_on_grace_expired: None });
         // Non-interactive flow: drop the engine's stdin handle so the writer
         // task exits and child stdin closes (mirrors `spawn_piped_docker`).
         drop(bridge.stdin_injector);
@@ -523,7 +731,7 @@ mod tests {
             .spawn()
             .expect("spawn sh");
 
-        let bridge = bridge_piped(io, &mut child);
+        let bridge = bridge_piped(io, &mut child, BridgeConfig { grace_timeout: Duration::from_secs(30), stuck_timeout: Duration::from_secs(30), container_start_delay: Duration::ZERO, cancel_on_grace_expired: None });
         drop(bridge.stdin_injector);
 
         let _ = tokio::task::spawn_blocking(move || child.wait()).await;
@@ -569,7 +777,7 @@ mod tests {
             .spawn()
             .expect("spawn cat");
 
-        let bridge = bridge_piped(io, &mut child);
+        let bridge = bridge_piped(io, &mut child, BridgeConfig { grace_timeout: Duration::from_secs(30), stuck_timeout: Duration::from_secs(30), container_start_delay: Duration::ZERO, cancel_on_grace_expired: None });
         // Drop the engine's stdin sender so `cat` sees EOF after the payload.
         drop(bridge.stdin_injector);
 
@@ -635,7 +843,7 @@ mod tests {
             .spawn()
             .expect("spawn sh");
 
-        let bridge = bridge_piped(io, &mut child);
+        let bridge = bridge_piped(io, &mut child, BridgeConfig { grace_timeout: Duration::from_secs(30), stuck_timeout: Duration::from_secs(30), container_start_delay: Duration::ZERO, cancel_on_grace_expired: None });
         drop(bridge.stdin_injector);
 
         // Child must exit promptly — if the reader stopped draining, this

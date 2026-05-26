@@ -281,15 +281,50 @@ impl ContainerInstance for DockerContainerInstance {
             },
         );
 
+        // Read per-frontend timeouts before draining `take_container_io`,
+        // which leaves the frontend in a state where any further calls are
+        // implementation-defined.
+        let grace_timeout = frontend.grace_timeout();
+        let stuck_timeout = frontend.stuck_timeout();
         let io = frontend.take_container_io();
+
+        let bridge_cfg = bridge_config_for(&self.name, grace_timeout, stuck_timeout);
 
         // PTY path: frontend requested interactive PTY bridging.
         if io.initial_size.is_some() {
-            return spawn_pty_bridged_docker(self, io, argv, seeded, started_at, handle);
+            return spawn_pty_bridged_docker(
+                self, io, argv, seeded, started_at, handle, bridge_cfg,
+            );
         }
 
         // Piped path: non-interactive or no PTY.
-        spawn_piped_docker(self, io, argv, seeded, started_at, handle)
+        spawn_piped_docker(self, io, argv, seeded, started_at, handle, bridge_cfg)
+    }
+}
+
+/// Build a `BridgeConfig` for this container, including a cancel callback
+/// that runs `docker stop <name>` so the startup-grace detector can kill a
+/// container that never produced output. We construct the same `docker stop`
+/// invocation the backend's `cancel_handle` would issue.
+fn bridge_config_for(
+    name: &ContainerName,
+    grace_timeout: std::time::Duration,
+    stuck_timeout: std::time::Duration,
+) -> crate::engine::container::io_bridge::BridgeConfig {
+    let container_name = name.0.clone();
+    let cancel: crate::engine::container::io_bridge::CancelFn =
+        std::sync::Arc::new(move || {
+            let _ = Command::new("docker")
+                .args(["stop", &container_name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        });
+    crate::engine::container::io_bridge::BridgeConfig {
+        grace_timeout,
+        stuck_timeout,
+        container_start_delay: std::time::Duration::ZERO,
+        cancel_on_grace_expired: Some(cancel),
     }
 }
 
@@ -302,6 +337,7 @@ fn spawn_pty_bridged_docker(
     seeded: Option<String>,
     started_at: chrono::DateTime<chrono::Utc>,
     handle: crate::data::session::ContainerHandle,
+    bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
 ) -> Result<ContainerExecution, EngineError> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
@@ -334,7 +370,7 @@ fn spawn_pty_bridged_docker(
     }
 
     let (master_arc, bridge) =
-        crate::engine::container::io_bridge::bridge_pty(io, pair)?;
+        crate::engine::container::io_bridge::bridge_pty(io, pair, bridge_cfg)?;
 
     let backend = DockerExecution {
         child: None,
@@ -355,6 +391,7 @@ fn spawn_piped_docker(
     seeded: Option<String>,
     started_at: chrono::DateTime<chrono::Utc>,
     handle: crate::data::session::ContainerHandle,
+    bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
 ) -> Result<ContainerExecution, EngineError> {
     let mut cmd = Command::new("docker");
     cmd.args(&argv);
@@ -378,7 +415,7 @@ fn spawn_piped_docker(
         let _ = io.stdin_tx.send(b"\n".to_vec());
     }
 
-    let bridge = crate::engine::container::io_bridge::bridge_piped(io, &mut child);
+    let bridge = crate::engine::container::io_bridge::bridge_piped(io, &mut child, bridge_cfg);
 
     // Non-interactive (piped) path: drop the engine's stdin_injector so the
     // writer task sees EOF after draining the seeded prompt and closes the

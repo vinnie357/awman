@@ -97,6 +97,25 @@ pub async fn run(_matches: clap::ArgMatches, ctx: RuntimeContext) -> ExitCode {
     }
 }
 
+/// Restore the terminal to a clean state. Idempotent and best-effort: each
+/// step is attempted independently so a failure in one doesn't leave later
+/// steps un-run. Called from both the normal teardown path and the panic
+/// hook so an unexpected panic doesn't leave the shell in raw mode with the
+/// kitty keyboard protocol still active.
+fn restore_terminal(keyboard_enhanced: bool) {
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    if keyboard_enhanced {
+        let _ = execute!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(
+        stdout,
+        LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture,
+        crossterm::cursor::Show,
+    );
+}
+
 /// Set up the terminal, run the main loop, and restore on exit.
 fn run_event_loop(app: &mut App) -> io::Result<()> {
     enable_raw_mode()?;
@@ -121,24 +140,24 @@ fn run_event_loop(app: &mut App) -> io::Result<()> {
         crossterm::event::EnableMouseCapture
     )?;
 
+    // Install a panic hook that restores the terminal before the default
+    // hook prints the panic message — without this, a panic inside the
+    // event loop would leave the shell in raw mode with the kitty
+    // keyboard protocol pushed, so every keystroke (arrows, Ctrl-C, …)
+    // would appear as a literal escape sequence in the user's prompt.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal(keyboard_enhanced);
+        original_hook(info);
+    }));
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = main_loop(&mut terminal, app);
 
-    disable_raw_mode()?;
-    if keyboard_enhanced {
-        execute!(
-            terminal.backend_mut(),
-            crossterm::event::PopKeyboardEnhancementFlags
-        )?;
-    }
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    restore_terminal(keyboard_enhanced);
+    let _ = std::panic::take_hook();
 
     result
 }

@@ -999,7 +999,8 @@ fn remote_command_catalogue_has_exactly_four_paths() {
 }
 
 /// `remote session start` must have `--type`, `--workdir`, `--repo-url`,
-/// `--branch`, and `--wait` flags.
+/// and `--branch` flags. (The legacy `--wait` flag was removed when polling
+/// became unconditional.)
 #[test]
 fn remote_session_start_has_required_flags() {
     let cat = CommandCatalogue::get();
@@ -1007,7 +1008,7 @@ fn remote_session_start_has_required_flags() {
         .lookup(&["remote", "session", "start"])
         .expect("remote session start must exist");
 
-    for flag_name in &["type", "workdir", "repo-url", "branch", "wait"] {
+    for flag_name in &["type", "workdir", "repo-url", "branch"] {
         assert!(
             start.find_flag(flag_name).is_some(),
             "remote session start must have --{flag_name} flag"
@@ -1466,12 +1467,13 @@ async fn sse_lagged_branch_uses_expected_event_count_format() {
     }
 }
 
-// ─── `remote session start --wait` runtime behavior ───────────────────────────
+// ─── `remote session start` poll-loop runtime behavior ──────────────────────
 //
 // These tests drive the public `RemoteCommand::run_with_frontend` entry point
-// against a wiremock HTTP server, exercising the wait poll loop. They avoid
-// the 5-second sleep entirely because the poll-then-sleep order returns
-// before the sleep when the mock answers with a terminal state on first poll.
+// against a wiremock HTTP server, exercising the status poll loop that runs
+// unconditionally after session creation. They avoid the 5-second sleep
+// entirely because the poll-then-sleep order returns before the sleep when
+// the mock answers with a terminal state on first poll.
 
 mod remote_session_start_wait_tests {
     use std::sync::{Arc, Mutex};
@@ -1550,71 +1552,12 @@ mod remote_session_start_wait_tests {
         messages.lock().unwrap().iter().map(|m| m.level).collect()
     }
 
-    /// `wait=false` returns the session id immediately and never polls the
-    /// status endpoint. We assert no GET to /status arrived by simply not
-    /// registering a handler for it — wiremock would surface unmatched
-    /// requests at shutdown via its panic-on-drop policy.
+    /// The poll loop runs unconditionally; it polls `/status`, sees `ready`,
+    /// renders the summary, and exits with `setup_status: Some("ready")`.
+    /// Because the loop polls first then sleeps, this test returns without
+    /// hitting the 5-second inter-poll sleep.
     #[tokio::test]
-    async fn wait_false_returns_immediately_and_does_not_poll_status() {
-        let mock = MockServer::start().await;
-        let root = tempfile::tempdir().unwrap();
-        let workdir = tempfile::tempdir().unwrap();
-
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/v1/sessions"))
-            .respond_with(
-                ResponseTemplate::new(202)
-                    .set_body_json(serde_json::json!({ "session_id": "sid-no-wait" })),
-            )
-            .expect(1)
-            .mount(&mock)
-            .await;
-
-        let messages = Arc::new(Mutex::new(Vec::new()));
-        let engines = build_engines(root.path());
-        let session = build_session(workdir.path());
-        let flags = RemoteSessionStartFlags {
-            session_type: "local".into(),
-            workdir: Some(workdir.path().display().to_string()),
-            repo_url: None,
-            branch: None,
-            wait: false,
-            remote_addr: Some(mock.uri()),
-            api_key: None,
-        };
-        let cmd = RemoteCommand::new(
-            RemoteSubcommand::SessionStart(flags),
-            engines,
-            session,
-        );
-        let outcome = cmd
-            .run_with_frontend(Box::new(CapturingSink {
-                messages: messages.clone(),
-            }))
-            .await
-            .expect("run_with_frontend");
-
-        match outcome {
-            RemoteOutcome::SessionStart(o) => {
-                assert_eq!(o.session_id, "sid-no-wait");
-                assert!(
-                    o.setup_status.is_none(),
-                    "wait=false must not poll status; got setup_status={:?}",
-                    o.setup_status
-                );
-            }
-            other => panic!("expected SessionStart outcome; got {other:?}"),
-        }
-        // wiremock's Drop verifies the expect(1) on /v1/sessions and panics
-        // if /status was hit despite never being registered.
-    }
-
-    /// `wait=true` polls `/status`, sees `ready`, renders the summary, and
-    /// exits with `setup_status: Some("ready")`. Because the loop polls
-    /// first then sleeps, this test returns without hitting the 5-second
-    /// inter-poll sleep.
-    #[tokio::test]
-    async fn wait_true_terminates_on_ready_status_and_renders_summary() {
+    async fn poll_loop_terminates_on_ready_status_and_renders_summary() {
         let mock = MockServer::start().await;
         let root = tempfile::tempdir().unwrap();
         let workdir = tempfile::tempdir().unwrap();
@@ -1636,7 +1579,6 @@ mod remote_session_start_wait_tests {
             "local_agent": "Done",
             "audit": "Skipped",
             "image_rebuild": "Skipped",
-            "legacy_migration": "Skipped",
             "aspec_folder": "Done",
             "work_items_config": "Done",
             "non_default_agent_images": [],
@@ -1667,7 +1609,6 @@ mod remote_session_start_wait_tests {
             workdir: Some(workdir.path().display().to_string()),
             repo_url: None,
             branch: None,
-            wait: true,
             remote_addr: Some(mock.uri()),
             api_key: None,
         };
@@ -1694,27 +1635,27 @@ mod remote_session_start_wait_tests {
         let all_text = texts(&messages).join("\n");
         assert!(
             all_text.contains("ready"),
-            "wait should emit a status line containing 'ready'; got:\n{all_text}"
+            "poll loop should emit a status line containing 'ready'; got:\n{all_text}"
         );
         assert!(
             all_text.contains("is ready"),
-            "wait should print 'Session ... is ready.'; got:\n{all_text}"
+            "poll loop should print 'Session ... is ready.'; got:\n{all_text}"
         );
         // The rendered summary box uses the runtime name in its title.
         assert!(
             all_text.contains("docker"),
-            "wait must render the ready summary (which contains the runtime name); got:\n{all_text}"
+            "poll loop must render the ready summary (which contains the runtime name); got:\n{all_text}"
         );
         assert!(
             levels(&messages).contains(&MessageLevel::Success),
-            "wait success must include a Success-level message"
+            "success path must include a Success-level message"
         );
     }
 
-    /// `wait=true` with a `failed` terminal status returns an error and
+    /// A `failed` terminal status from the poll loop returns an error and
     /// prints the partial step table plus the error message.
     #[tokio::test]
-    async fn wait_true_terminates_on_failed_status_and_returns_error() {
+    async fn poll_loop_terminates_on_failed_status_and_returns_error() {
         let mock = MockServer::start().await;
         let root = tempfile::tempdir().unwrap();
         let workdir = tempfile::tempdir().unwrap();
@@ -1754,7 +1695,6 @@ mod remote_session_start_wait_tests {
             workdir: Some(workdir.path().display().to_string()),
             repo_url: None,
             branch: None,
-            wait: true,
             remote_addr: Some(mock.uri()),
             api_key: None,
         };
@@ -1770,7 +1710,7 @@ mod remote_session_start_wait_tests {
             .await;
         assert!(
             result.is_err(),
-            "wait must surface the failed status as a CommandError; got Ok({:?})",
+            "poll loop must surface the failed status as a CommandError; got Ok({:?})",
             result.ok()
         );
 

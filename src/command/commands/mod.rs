@@ -30,6 +30,30 @@ pub mod worktree_lifecycle;
 
 pub use command_trait::Command;
 
+/// Resolve the agent name to use for a command, in precedence order:
+///   1. explicit CLI flag (`flag`)
+///   2. `session.default_agent()` (which itself resolves flag > repo > global)
+///   3. fallback to `"claude"` so a fresh repo with no config still works.
+///
+/// Frontends (CLI / TUI / API session-setup) must funnel through this helper
+/// so the agent choice is uniformly driven by `.awman/config.json`, with the
+/// hard-coded fallback only used as a last resort.
+pub fn resolve_agent(
+    flag: &Option<String>,
+    session: &crate::data::session::Session,
+) -> Result<crate::data::session::AgentName, crate::command::error::CommandError> {
+    use crate::command::error::CommandError;
+    use crate::data::session::AgentName;
+
+    if let Some(name) = flag.as_deref() {
+        return AgentName::new(name).map_err(CommandError::from);
+    }
+    if let Some(name) = session.default_agent() {
+        return Ok(name.clone());
+    }
+    AgentName::new("claude").map_err(CommandError::from)
+}
+
 /// A parsed overlay expression: either a directory mount or a skills overlay.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedOverlay {

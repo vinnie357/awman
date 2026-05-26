@@ -5,10 +5,8 @@ use serde::Serialize;
 
 use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
-use crate::command::commands::chat::resolve_agent;
 use crate::command::commands::mount_scope::MountScopeFrontend;
-use crate::command::commands::Command;
-use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list};
+use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list, resolve_agent, Command};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::{AgentName, Session};

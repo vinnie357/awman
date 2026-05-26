@@ -1,6 +1,5 @@
 //! `ReadyFrontend` impl for the TUI.
 
-use crate::data::session::AgentName;
 use crate::engine::container::frontend::ContainerFrontend;
 use crate::engine::error::EngineError;
 use crate::engine::message::UserMessageSink;
@@ -38,22 +37,6 @@ impl ReadyFrontend for TuiCommandFrontend {
         ))
     }
 
-    fn ask_migrate_legacy_layout(&mut self, agent_name: &AgentName) -> Result<bool, EngineError> {
-        let response = self
-            .ask_dialog(DialogRequest::YesNo {
-                title: "Migrate layout?".into(),
-                body: format!(
-                    "Legacy layout detected for agent '{}'. Migrate to the new layout?",
-                    agent_name.as_str()
-                ),
-            })
-            .map_err(|e| EngineError::Other(e.to_string()))?;
-        Ok(matches!(
-            response,
-            DialogResponse::Yes | DialogResponse::Char('y')
-        ))
-    }
-
     fn report_phase(&mut self, phase: &ReadyPhase) {
         self.messages.info(format!("ready: {phase:?}"));
     }
@@ -74,19 +57,15 @@ impl ReadyFrontend for TuiCommandFrontend {
             ("Agent image", &summary.agent_image),
             ("Local agent", &summary.local_agent),
             ("Audit", &summary.audit),
-            ("Legacy migration", &summary.legacy_migration),
             ("aspec folder", &summary.aspec_folder),
             ("Config", &summary.work_items_config),
         ];
 
-        // Owned strings for non-default agent labels.
-        let agent_labels: Vec<String> = summary
-            .non_default_agent_images
-            .iter()
-            .map(|(name, _)| format!("Agent: {name}"))
-            .collect();
-        for (i, (_, status)) in summary.non_default_agent_images.iter().enumerate() {
-            rows.push((&agent_labels[i], status));
+        // Ready engine reports a single consolidated row — either
+        // "Other agents" (all OK) or "Missing images" (warn). Render the
+        // engine-provided label verbatim.
+        for (label, status) in summary.non_default_agent_images.iter() {
+            rows.push((label.as_str(), status));
         }
 
         let box_str =

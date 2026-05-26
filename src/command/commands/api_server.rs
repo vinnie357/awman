@@ -22,6 +22,8 @@ pub struct ApiServeConfig {
     pub bind_ip: IpAddr,
     pub workdirs: Vec<PathBuf>,
     pub dangerously_skip_auth: bool,
+    /// `None` means TLS is disabled (plain HTTP); only set when the user
+    /// explicitly passed `--dangerously-skip-tls`.
     pub tls_material: Option<TlsMaterial>,
 }
 
@@ -34,6 +36,7 @@ pub struct ApiServerStartFlags {
     pub background: bool,
     pub refresh_key: bool,
     pub dangerously_skip_auth: bool,
+    pub dangerously_skip_tls: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -194,9 +197,28 @@ async fn run_start(
         }));
     }
 
-    // Auth check: when not skipping auth, ensure an API key hash exists.
+    // First-run convenience: if auth is required but no key hash exists on
+    // disk, generate one now and display the banner instead of forcing the
+    // user to re-run with `--refresh-key`.
+    let mut auto_generated_key = false;
     if !flags.dangerously_skip_auth && engines.auth_engine.read_api_key_hash()?.is_none() {
-        return Err(CommandError::ApiServerAuthMissing);
+        let key = engines.auth_engine.refresh_api_key()?;
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: "No API key configured — generating one now (store it; it will not be shown again):".to_string(),
+        });
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: banner::render_api_key_banner(key.as_str()),
+        });
+        auto_generated_key = true;
+    }
+
+    if flags.dangerously_skip_auth {
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Warning,
+            text: "--dangerously-skip-auth set — API endpoints will accept unauthenticated requests.".to_string(),
+        });
     }
 
     let workdir_strings: Vec<String> = workdirs.iter().map(|p| p.display().to_string()).collect();
@@ -213,6 +235,9 @@ async fn run_start(
         ];
         if flags.dangerously_skip_auth {
             args.push("--dangerously-skip-auth".to_string());
+        }
+        if flags.dangerously_skip_tls {
+            args.push("--dangerously-skip-tls".to_string());
         }
         for w in &flags.workdirs {
             args.push("--workdirs".to_string());
@@ -267,22 +292,40 @@ async fn run_start(
         api_process::write_pid(&pid_path, std::process::id())?;
     }
 
-    // TLS material: generate or load now so the bind_ip warning surfaces
-    // BEFORE we hand off to serve_until_shutdown.
+    // TLS material: generate or load now (unless explicitly skipped) so the
+    // bind_ip warning surfaces BEFORE we hand off to serve_until_shutdown.
     let bind_ip: std::net::IpAddr = "127.0.0.1".parse().expect("static loopback ip");
-    let (tls_material, regenerated) = engines.auth_engine.ensure_self_signed_tls(bind_ip)?;
-    if regenerated && api_paths.tls_bind_ip_file().exists() {
-        // Existing sidecar file means a previous cert was here — emit the
-        // re-pin warning. (We can't reliably distinguish "first ever cert"
-        // from "regenerated for new IP" without extra state, but the sidecar
-        // existing post-write is good enough as a proxy.)
+    let tls_material = if flags.dangerously_skip_tls {
         frontend.write_message(UserMessage {
             level: MessageLevel::Warning,
-            text:
-                "TLS cert regenerated for new bind IP — pinned remote clients will need to re-pin"
-                    .into(),
+            text: "--dangerously-skip-tls set — serving plain HTTP on the loopback interface. Use only in trusted local environments.".to_string(),
         });
-    }
+        None
+    } else {
+        let (mat, regenerated) = engines.auth_engine.ensure_self_signed_tls(bind_ip)?;
+        if regenerated && api_paths.tls_bind_ip_file().exists() {
+            // Existing sidecar file means a previous cert was here — emit the
+            // re-pin warning. (We can't reliably distinguish "first ever cert"
+            // from "regenerated for new IP" without extra state, but the sidecar
+            // existing post-write is good enough as a proxy.)
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text:
+                    "TLS cert regenerated for new bind IP — pinned remote clients will need to re-pin"
+                        .into(),
+            });
+        }
+        frontend.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!(
+                "TLS ready (self-signed; cert fingerprint sha256:{}…)",
+                &mat.fingerprint_sha256_hex[..16]
+            ),
+        });
+        Some(mat)
+    };
+
+    let scheme = if tls_material.is_some() { "https" } else { "http" };
 
     // Persist server metadata so `api status` and remote clients can
     // probe the right endpoint.
@@ -292,16 +335,29 @@ async fn run_start(
         &api_process::ServerMeta {
             port: flags.port,
             bind_ip: bind_ip.to_string(),
-            scheme: "https".into(),
+            scheme: scheme.to_string(),
         },
     );
+
+    frontend.write_message(UserMessage {
+        level: MessageLevel::Info,
+        text: format!(
+            "Starting {} API server on {}://{}:{} (Ctrl-C to stop).",
+            if scheme == "https" { "HTTPS" } else { "HTTP" },
+            scheme,
+            bind_ip,
+            flags.port,
+        ),
+    });
+
+    let _ = auto_generated_key; // currently informational only; outcome already covers it via downstream signals
 
     let config = ApiServeConfig {
         port: flags.port,
         bind_ip,
         workdirs,
         dangerously_skip_auth: flags.dangerously_skip_auth,
-        tls_material: Some(tls_material),
+        tls_material,
     };
 
     let serve_result = frontend.serve_until_shutdown(config).await;
@@ -584,6 +640,7 @@ mod tests {
             background: false,
             refresh_key: true,
             dangerously_skip_auth: false, // no auth configured, but refresh_key skips check
+            dangerously_skip_tls: false,
         };
 
         let mut frontend = NullFrontend {
@@ -597,7 +654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_without_auth_configured_returns_error() {
+    async fn start_without_auth_configured_auto_generates_key_and_proceeds() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let engines = make_engines(tmp.path());
@@ -610,6 +667,7 @@ mod tests {
             background: false,
             refresh_key: false,
             dangerously_skip_auth: false,
+            dangerously_skip_tls: false,
         };
 
         let mut frontend = NullFrontend {
@@ -617,8 +675,29 @@ mod tests {
         };
         let result = run_start(flags, &engines, &mut frontend, &api_paths).await;
         assert!(
-            matches!(result, Err(CommandError::ApiServerAuthMissing)),
-            "missing auth hash must error with ApiServerAuthMissing: {result:?}"
+            result.is_ok(),
+            "first-run with no key must auto-generate one and proceed: {result:?}"
+        );
+        assert!(
+            engines
+                .auth_engine
+                .read_api_key_hash()
+                .unwrap()
+                .is_some(),
+            "auto-generated hash must be persisted to disk"
+        );
+        assert!(
+            frontend
+                .messages
+                .iter()
+                .any(|m| m.contains("No API key configured")),
+            "must explain that a key was auto-generated; got: {:?}",
+            frontend.messages
+        );
+        assert!(
+            frontend.messages.iter().any(|m| m.starts_with('╔')),
+            "must emit the banner; got: {:?}",
+            frontend.messages
         );
     }
 
@@ -636,6 +715,7 @@ mod tests {
             background: false,
             refresh_key: false,
             dangerously_skip_auth: true,
+            dangerously_skip_tls: false,
         };
 
         let mut frontend = NullFrontend {
@@ -645,6 +725,90 @@ mod tests {
         assert!(
             result.is_ok(),
             "dangerously_skip_auth must bypass auth check: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_dangerously_skip_tls_yields_plain_http_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let engines = make_engines(tmp.path());
+        let api_paths = engines.auth_engine.api_paths().clone();
+        api_paths.ensure_root().unwrap();
+
+        struct CaptureFrontend {
+            messages: Vec<String>,
+            tls_was_present: Option<bool>,
+            persisted_scheme: Option<String>,
+            api_paths: crate::data::fs::ApiPaths,
+        }
+        impl UserMessageSink for CaptureFrontend {
+            fn write_message(&mut self, msg: UserMessage) {
+                self.messages.push(msg.text);
+            }
+            fn replay_queued(&mut self) {}
+        }
+        #[async_trait::async_trait]
+        impl ApiServerCommandFrontend for CaptureFrontend {
+            async fn serve_until_shutdown(
+                &mut self,
+                config: ApiServeConfig,
+            ) -> Result<(), crate::command::error::CommandError> {
+                self.tls_was_present = Some(config.tls_material.is_some());
+                // Capture the persisted scheme BEFORE run_start's post-serve
+                // cleanup removes the meta file.
+                self.persisted_scheme = crate::data::fs::api_process::read_server_meta(
+                    &self.api_paths.server_meta_file(),
+                )
+                .ok()
+                .flatten()
+                .map(|m| m.scheme);
+                Ok(())
+            }
+        }
+
+        let flags = ApiServerStartFlags {
+            port: 9876,
+            workdirs: Vec::new(),
+            background: false,
+            refresh_key: false,
+            dangerously_skip_auth: true,
+            dangerously_skip_tls: true,
+        };
+
+        let mut frontend = CaptureFrontend {
+            messages: Vec::new(),
+            tls_was_present: None,
+            persisted_scheme: None,
+            api_paths: api_paths.clone(),
+        };
+        let result = run_start(flags, &engines, &mut frontend, &api_paths).await;
+        assert!(result.is_ok(), "skip-tls must allow startup: {result:?}");
+        assert_eq!(
+            frontend.tls_was_present,
+            Some(false),
+            "serve_until_shutdown must be called with tls_material = None"
+        );
+        assert!(
+            frontend
+                .messages
+                .iter()
+                .any(|m| m.contains("--dangerously-skip-tls")),
+            "must warn about plaintext mode; got: {:?}",
+            frontend.messages
+        );
+        assert!(
+            frontend
+                .messages
+                .iter()
+                .any(|m| m.contains("http://127.0.0.1:9876")),
+            "must announce the http:// scheme; got: {:?}",
+            frontend.messages
+        );
+        assert_eq!(
+            frontend.persisted_scheme.as_deref(),
+            Some("http"),
+            "server meta scheme must be persisted as http while the server is running"
         );
     }
 

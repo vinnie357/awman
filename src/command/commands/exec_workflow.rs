@@ -267,6 +267,14 @@ impl ContainerFrontend for ContainerFrontendProxy {
     fn take_container_io(&mut self) -> crate::engine::container::frontend::ContainerIo {
         self.0.lock().unwrap().take_container_io()
     }
+
+    fn grace_timeout(&self) -> std::time::Duration {
+        self.0.lock().unwrap().grace_timeout()
+    }
+
+    fn stuck_timeout(&self) -> std::time::Duration {
+        self.0.lock().unwrap().stuck_timeout()
+    }
 }
 
 impl UserMessageSink for ContainerFrontendProxy {
@@ -926,9 +934,21 @@ impl Command for ExecWorkflowCommand {
         );
 
         // 11. Report summary.
+        //
+        // `exit_code` is the unambiguous overall outcome:
+        //   Some(0) — workflow completed successfully
+        //   Some(N) — a step failed (Failed → failing step's exit code;
+        //             Aborted → 1, since the user/engine bailed after a failure)
+        //   None    — workflow paused; no terminal status yet
+        //
+        // Callers (CLI, TUI, API queue worker) inspect this to determine the
+        // final success/failure of the run.
         let exit_code = match &engine_result {
+            Ok(WorkflowOutcome::Completed) => Some(0),
             Ok(WorkflowOutcome::Failed { exit_code, .. }) => Some(*exit_code),
-            _ => None,
+            Ok(WorkflowOutcome::Aborted) => Some(1),
+            Ok(WorkflowOutcome::Paused) => None,
+            Err(_) => Some(1),
         };
         frontend.report_workflow_summary(&WorkflowSummary {
             steps_completed: step_counts.0,

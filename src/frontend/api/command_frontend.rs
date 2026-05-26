@@ -306,14 +306,14 @@ fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
         }
     }
 
-    // --yolo is always implied for API dispatch.
-    // --non-interactive is derived from the shared TTY-detection logic;
-    // in an HTTP server context stdin is never a TTY, so this is always true.
-    let ni_requested = bools.get("non-interactive").copied().unwrap_or(false);
-    bools.insert(
-        "non-interactive".to_string(),
-        crate::frontend::effective_non_interactive(ni_requested),
-    );
+    // --yolo and --non-interactive are always implied for API dispatch.
+    // Each command is invoked over HTTP — no human is attached to the
+    // worker's stdin even when the API server itself was launched in the
+    // foreground with a TTY. Forcing non_interactive=true keeps the engine
+    // from requesting a PTY for the agent container, which on Apple's
+    // `container` CLI surfaces as `ENOTTY` / "Inappropriate ioctl for
+    // device" when stdin is piped.
+    bools.insert("non-interactive".to_string(), true);
     bools.insert("yolo".to_string(), true);
 
     ParsedArgs {
@@ -487,6 +487,14 @@ impl ContainerFrontend for ApiDispatchFrontend {
             initial_size: None,
         }
     }
+
+    /// API runs unattended workloads — an agent may need minutes to pull
+    /// an image or warm up a model before producing output. A 15-minute
+    /// startup grace gives the container reasonable runway before the
+    /// detector kills it as failed-to-start.
+    fn grace_timeout(&self) -> Duration {
+        Duration::from_secs(15 * 60)
+    }
 }
 
 // ─── HasContainerFrontend ───────────────────────────────────────────────────
@@ -600,6 +608,10 @@ impl ContainerFrontend for ApiContainerSink {
             resize: None,
             initial_size: None,
         }
+    }
+
+    fn grace_timeout(&self) -> Duration {
+        Duration::from_secs(15 * 60)
     }
 }
 
@@ -977,9 +989,6 @@ impl ReadyFrontend for ApiDispatchFrontend {
     }
     fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError> {
         Ok(false)
-    }
-    fn ask_migrate_legacy_layout(&mut self, _agent_name: &AgentName) -> Result<bool, EngineError> {
-        Ok(true)
     }
     fn report_phase(&mut self, phase: &ReadyPhase) {
         self.event_bus.emit(EventPayload::StatusMessage {

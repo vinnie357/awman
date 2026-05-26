@@ -201,7 +201,13 @@ mod tests {
         // api start's CliOnly flags must not appear in TUI completions.
         let comps = cat.tui_completions("api start ");
         let flag_completions: Vec<&str> = comps.iter().map(|c| c.completion.as_str()).collect();
-        for cli_only_flag in &["--port", "--workdirs", "--background", "--refresh-key"] {
+        for cli_only_flag in &[
+            "--port",
+            "--workdirs",
+            "--background",
+            "--refresh-key",
+            "--dangerously-skip-tls",
+        ] {
             assert!(
                 !flag_completions.contains(cli_only_flag),
                 "CLI-only flag '{cli_only_flag}' must not appear in TUI completions; got: {flag_completions:?}"
