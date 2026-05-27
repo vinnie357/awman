@@ -132,6 +132,7 @@ fn make_step(name: &str, deps: &[&str]) -> WorkflowStep {
         prompt_template: format!("Run {name}"),
         agent: None,
         model: None,
+        overlays: None,
     }
 }
 

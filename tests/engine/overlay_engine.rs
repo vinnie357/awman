@@ -107,7 +107,7 @@ fn skill_overlays_claude_ro_mount_when_skills_dir_exists() {
 
     let specs = with_amux_config_home(tmp.path(), || {
         engine
-            .skill_overlays(&agent, &None, std::path::Path::new("/"))
+            .skill_overlays(&agent, true, &[], &None, std::path::Path::new("/"))
             .unwrap()
     });
 
@@ -140,7 +140,7 @@ fn skill_overlays_empty_when_global_skills_dir_absent() {
 
     let specs = with_amux_config_home(tmp.path(), || {
         engine
-            .skill_overlays(&agent, &None, std::path::Path::new("/"))
+            .skill_overlays(&agent, true, &[], &None, std::path::Path::new("/"))
             .unwrap()
     });
 
@@ -160,7 +160,7 @@ fn skill_overlays_empty_for_maki_agent_no_error() {
 
     // Must return Ok(vec![]) — not an error — even though maki has no known skills dir.
     let result = with_amux_config_home(tmp.path(), || {
-        engine.skill_overlays(&agent, &None, std::path::Path::new("/"))
+        engine.skill_overlays(&agent, true, &[], &None, std::path::Path::new("/"))
     });
 
     assert!(
@@ -190,7 +190,7 @@ fn build_overlays_includes_skills_mount_when_include_skills_true() {
         .unwrap()
     };
     let request = OverlayRequest {
-        include_skills: true,
+        include_all_skills: true,
         agent: Some(AgentName::new("claude").unwrap()),
         ..Default::default()
     };
@@ -235,7 +235,7 @@ fn build_overlays_skills_and_dir_overlay_both_present() {
         .unwrap()
     };
     let request = OverlayRequest {
-        include_skills: true,
+        include_all_skills: true,
         agent: Some(AgentName::new("claude").unwrap()),
         directories: vec![DirectorySpec {
             host: host_dir.path().to_string_lossy().into_owned(),

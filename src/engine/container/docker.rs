@@ -646,17 +646,6 @@ pub(super) fn build_run_argv(
         }
     }
 
-    // SSH directory mount (read-only).
-    if let Some(ssh) = &options.mount_ssh {
-        let target = options
-            .dockerfile_user
-            .as_deref()
-            .map(|u| format!("/home/{u}/.ssh"))
-            .unwrap_or_else(|| "/root/.ssh".to_string());
-        args.push("-v".into());
-        args.push(format!("{}:{}:ro", ssh.display(), target));
-    }
-
     // Container CPU/memory limits.
     if let Some(cpu) = options.cpu {
         args.push("--cpus".into());
@@ -1072,35 +1061,6 @@ mod tests {
             argv.windows(2)
                 .any(|w| w[0] == "--name" && w[1] == "my-container"),
             "container name must appear as --name <name>"
-        );
-    }
-
-    #[test]
-    fn build_run_argv_mount_ssh_adds_ro_volume() {
-        let ssh_src = PathBuf::from("/home/user/.ssh");
-        let resolved = resolve(vec![
-            ContainerOption::Image(ImageRef::new("img:latest")),
-            ContainerOption::MountSsh {
-                source: ssh_src.clone(),
-            },
-        ]);
-        let argv = build_run_argv(
-            &ContainerName::new("ctr"),
-            &ImageRef::new("img:latest"),
-            &resolved,
-        );
-        let ssh_vol = argv
-            .windows(2)
-            .find(|w| w[0] == "-v" && w[1].contains(".ssh"))
-            .map(|w| w[1].clone())
-            .expect("SSH mount volume must be present");
-        assert!(
-            ssh_vol.ends_with(":ro"),
-            "SSH mount must be read-only: {ssh_vol}"
-        );
-        assert!(
-            ssh_vol.starts_with("/home/user/.ssh:"),
-            "SSH host path must match: {ssh_vol}"
         );
     }
 

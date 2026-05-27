@@ -7,7 +7,7 @@ use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
 use crate::command::commands::Command;
-use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list, resolve_agent};
+use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list, resolve_agent, warn_legacy_config};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::{AgentName, Session};
@@ -20,7 +20,6 @@ pub struct ChatCommandFlags {
     pub non_interactive: bool,
     pub plan: bool,
     pub allow_docker: bool,
-    pub mount_ssh: bool,
     pub yolo: bool,
     pub auto: bool,
     pub agent: Option<String>,
@@ -127,7 +126,10 @@ impl Command for ChatCommand {
             }
             all
         };
-        let (directory_overlays, skills_enabled) = collect_all_overlay_specs(&session, cli_typed);
+        let collected = collect_all_overlay_specs(&session, cli_typed, None)?;
+
+        // Emit deprecation warnings for legacy config fields.
+        warn_legacy_config(&session, frontend.as_mut());
 
         // 3. Ensure the agent is available (Dockerfile + image present, build
         //    if missing). Runs before PTY activation so any download/build
@@ -182,12 +184,16 @@ impl Command for ChatCommand {
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),
             allow_docker: self.flags.allow_docker,
-            mount_ssh: self.flags.mount_ssh,
             non_interactive: self.flags.non_interactive,
             model: self.flags.model.clone(),
-            env_passthrough: Some(session.effective_config().env_passthrough()),
-            directory_overlays,
-            include_skills: skills_enabled,
+            env_passthrough: if collected.env_passthrough.is_empty() {
+                None
+            } else {
+                Some(collected.env_passthrough)
+            },
+            directory_overlays: collected.directories,
+            include_all_skills: collected.include_all_skills,
+            named_skills: collected.named_skills,
             ..Default::default()
         };
         let env_overrides = credentials.env_vars.clone();

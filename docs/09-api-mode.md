@@ -426,7 +426,7 @@ curl -s http://localhost:9876/v1/status \
   -H "Authorization: <your-api-key>"
 ```
 
-When using `awman remote` subcommands, the key is resolved and injected automatically — see [Remote Mode: API key](09-remote-mode.md#api-key-authentication).
+When using `awman remote` subcommands, the key is resolved and injected automatically — see [Remote Mode: API key](10-remote-mode.md#api-key-authentication).
 
 **Error responses from the middleware:**
 
@@ -1101,7 +1101,7 @@ done
 
 If the endpoint returns HTTP 404 on the first poll, the command either has not started yet or is not a workflow command — treat 404 as "no workflow" and skip the strip. If 404 is returned after a non-404 response, the workflow was removed; stop polling.
 
-The [Remote-bound TUI tabs](09-remote-mode.md#remote-bound-tui-tabs) feature uses this endpoint internally to render the workflow state strip for commands running on a remote API server.
+The [Remote-bound TUI tabs](10-remote-mode.md#remote-bound-tui-tabs) feature uses this endpoint internally to render the workflow state strip for commands running on a remote API server.
 
 ---
 
@@ -1349,4 +1349,4 @@ On `SIGTERM` or `SIGINT`, the server finishes all in-flight HTTP responses and a
 
 ---
 
-[← Configuration](07-configuration.md) · [Remote Mode →](09-remote-mode.md)
+[← Overlays](08-overlays.md) · [Remote Mode →](10-remote-mode.md)

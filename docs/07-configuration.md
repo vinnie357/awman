@@ -87,12 +87,12 @@ Applies to all projects on the machine unless overridden by a per-repo config.
 | `envPassthrough` | string array | `[]` | Host environment variable names to inject into agent containers at launch. See [`envPassthrough`](#envpassthrough) |
 | `overlays.skills` | boolean | false | When `true`, mount your global awman skills directory (`~/.awman/skills/`) into every agent container as its native slash commands. **Additive** — enable it here, per-repo config, `AWMAN_OVERLAYS`, or `--overlay` flags. See [`overlays`](#overlays) |
 | `overlays.directories` | object array | `[]` | Host directories to mount into agent containers automatically across all projects. **Additive** with per-repo overlays — both lists are merged. See [`overlays`](#overlays) |
-| `api.workDirs` | string array | `[]` | Working directories pre-approved for API mode session creation. Merged with `--workdirs` flags at server startup. See [API Mode](08-api-mode.md#working-directory-allowlist) |
-| `api.alwaysNonInteractive` | boolean | `false` | When `true`, all dispatched commands automatically run in non-interactive mode. Useful for API servers where no TTY is available. See [API Mode](08-api-mode.md#alwaysnoninteractive) |
-| `api.workers` | integer | `2` | Number of worker tasks that process the command queue in parallel. Each worker claims one queued command at a time and executes it. Higher values allow more concurrent command execution across sessions (one command per session). See [API Mode: Job Queue](08-api-mode.md#job-queue) |
-| `remote.defaultAddr` | string | (not set) | Default address of the remote API awman server (e.g. `http://host:9876`). Overridden by `--remote-addr` or `AWMAN_REMOTE_ADDR`. See [Remote Mode](09-remote-mode.md#connecting-to-a-remote-host) |
-| `remote.defaultAPIKey` | string | (not set) | API key sent with every request to `remote.defaultAddr`. **Only sent when the target address exactly matches `remote.defaultAddr`** — never forwarded to other hosts. Overridden by `--api-key` or `AWMAN_API_KEY`. See [Remote Mode](09-remote-mode.md#api-key-authentication) |
-| `remote.savedDirs` | string array | `[]` | Absolute paths (on the remote host) shown in the TUI saved-dir picker for `remote session start`. See [Remote Mode](09-remote-mode.md#configuration) |
+| `api.workDirs` | string array | `[]` | Working directories pre-approved for API mode session creation. Merged with `--workdirs` flags at server startup. See [API Mode](09-api-mode.md#working-directory-allowlist) |
+| `api.alwaysNonInteractive` | boolean | `false` | When `true`, all dispatched commands automatically run in non-interactive mode. Useful for API servers where no TTY is available. See [API Mode](09-api-mode.md#alwaysnoninteractive) |
+| `api.workers` | integer | `2` | Number of worker tasks that process the command queue in parallel. Each worker claims one queued command at a time and executes it. Higher values allow more concurrent command execution across sessions (one command per session). See [API Mode: Job Queue](09-api-mode.md#job-queue) |
+| `remote.defaultAddr` | string | (not set) | Default address of the remote API awman server (e.g. `http://host:9876`). Overridden by `--remote-addr` or `AWMAN_REMOTE_ADDR`. See [Remote Mode](10-remote-mode.md#connecting-to-a-remote-host) |
+| `remote.defaultAPIKey` | string | (not set) | API key sent with every request to `remote.defaultAddr`. **Only sent when the target address exactly matches `remote.defaultAddr`** — never forwarded to other hosts. Overridden by `--api-key` or `AWMAN_API_KEY`. See [Remote Mode](10-remote-mode.md#api-key-authentication) |
+| `remote.savedDirs` | string array | `[]` | Absolute paths (on the remote host) shown in the TUI saved-dir picker for `remote session start`. See [Remote Mode](10-remote-mode.md#configuration) |
 
 **Note:** `runtime` is a global (machine-level) setting only. It is not available in the per-repo config — container runtime is a property of the machine, not the project.
 
@@ -535,202 +535,9 @@ If a variable name appears in both `envPassthrough` and the agent's keychain cre
 
 ## Overlays
 
-Overlays let you mount additional host directories into agent containers, and optionally inject your personal awman skills library. Unlike `envPassthrough`, overlay sources from all scopes are **additive** — entries from global config, per-repo config, the `AWMAN_OVERLAYS` env var, and `--overlay` CLI flags are all merged into the final mount list.
+Overlays let you mount host directories, environment variables, and skills into agent containers. All overlay sources — global config, per-repo config, `AWMAN_OVERLAYS`, `--overlay` flags, and per-step workflow overlays — are **additive**, giving you precise control over what each step can access.
 
-### Configuration
-
-**Per-repo config** (`.awman/config.json`) — applied to every session in this repo:
-```json
-{
-  "overlays": {
-    "skills": true,
-    "directories": [
-      { "host": "/data/fixtures", "container": "/mnt/fixtures", "permission": "ro" },
-      { "host": "~/shared-prompts", "container": "/mnt/prompts" }
-    ]
-  }
-}
-```
-
-**Global config** (`~/.awman/config.json`) — applied to every session across all repos:
-```json
-{
-  "overlays": {
-    "skills": true,
-    "directories": [
-      { "host": "~/personal-prompts", "container": "/mnt/prompts", "permission": "ro" }
-    ]
-  }
-}
-```
-
-#### Skills overlay
-
-The `skills` overlay (boolean, default `false`) mounts your global awman skills directory (`~/.awman/skills/`) into the agent container at its native skills location. This makes any custom skills you've created with `awman new skill` available as slash commands inside the container, without manually wiring up paths.
-
-When `skills` is set to `true` in any config source or via `--overlay "skill()"`, the mount is applied automatically. The container path is determined by the agent type:
-
-| Agent | Container path | Notes |
-|-------|---|---|
-| `claude` | `~/.claude/commands` | Claude Code traverses subdirectories; each `<skill-name>/SKILL.md` appears as a namespaced command |
-| `codex` | `~/.codex/skills` | Codex recognizes subdirectories containing `SKILL.md` files |
-| `opencode` | `~/.config/opencode/commands` | OpenCode scans its `commands/` directory for `.md` files |
-| `gemini` | `~/.gemini/commands` | Gemini CLI custom commands directory |
-| `copilot` | `~/.copilot/instructions` | Copilot reads instruction files from this directory |
-| `crush` | `~/.config/crush/commands` | Custom commands directory |
-| `cline` | `~/.cline/skills` | Cline's skills format matches awman format exactly |
-| `maki` | *(not supported)* | maki has no known skills directory; mount is skipped |
-
-If the skills directory doesn't exist on the host (you haven't created any skills yet), the mount is skipped silently with a debug-level log — it's not an error.
-
-#### Directory entries
-
-Each directory entry accepts:
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `host` | string | yes | Host path. Absolute or `~`-prefixed (expanded to home directory). |
-| `container` | string | yes | Absolute path inside the container. |
-| `permission` | string | no | `"ro"` (read-only, default) or `"rw"` (read-write). |
-
-### The `AWMAN_OVERLAYS` environment variable
-
-Set `AWMAN_OVERLAYS` in your shell profile to inject personal overlays into every session without touching any config file. It uses typed overlay expressions separated by commas. Supported types:
-
-- `skill()` — mount your global awman skills directory (no arguments)
-- `dir(host:container[:permission])` — mount a host directory
-
-```sh
-# In ~/.bashrc, ~/.zshrc, etc.
-export AWMAN_OVERLAYS="skill(),dir(~/personal-prompts:/mnt/prompts),dir(/data/shared-fixtures:/mnt/fixtures:ro)"
-```
-
-`AWMAN_OVERLAYS` has higher priority than config file entries but lower priority than `--overlay` flags.
-
-### Priority order
-
-Overlays are resolved from all sources, then merged. For **directory** overlays, priority order from lowest to highest:
-
-| Priority | Source |
-|----------|--------|
-| 0 (lowest) | Global config (`~/.awman/config.json`) |
-| 1 | Per-repo config (`.awman/config.json`) |
-| 2 | `AWMAN_OVERLAYS` environment variable |
-| 3 (highest) | `--overlay` CLI flags |
-
-All entries from all sources are combined into one list. Entries with different host paths are kept as independent mounts — they do not replace each other.
-
-**Skills overlay** (`overlays.skills`) works differently — it is **additive OR**. If *any* source sets `"skills": true` or includes `skill()` in `--overlay` flags, the mount is enabled. There is no priority hierarchy; only a boolean check: is skills enabled anywhere?
-
-### Conflict resolution
-
-When two sources specify the **same host path**:
-
-- The **higher-priority source** wins for the container path.
-- The **more restrictive permission wins** — `:ro` always beats `:rw`, regardless of which source is higher priority. A warning is logged when permissions are downgraded. This is intentional: a lower-priority config (e.g. global) declaring `:ro` prevents a higher-priority flag from silently escalating access to `:rw`.
-
-Example: global config sets `/data` as `:rw`, but a `--overlay` flag sets `/data` as `:ro` → the final mount is `:ro`, and a warning is logged.
-
-When two sources specify **different host paths** that map to the **same container path**, both mounts are applied and a warning is logged. Docker will shadow one mount with the other (the last one in the list wins).
-
-### Missing host paths
-
-If a configured host path does not exist at launch time, awman logs a warning and skips that entry — the session proceeds without it:
-
-```
-WARN overlay host path '/data/reference' does not exist; skipping
-```
-
-### CLI flag
-
-The `--overlay` flag is available on all agent-launching commands: `chat`, `exec prompt`, and `exec workflow`. It accepts both `skill()` and `dir(...)` entries.
-
-```sh
-# Skills overlay alone
-awman exec workflow path/to/workflow.md --overlay "skill()"
-
-# Skills overlay with directory overlays (repeated flag or comma-separated)
-awman chat --overlay "skill()" --overlay "dir(/data:/mnt/data:ro)"
-awman chat --overlay "skill(),dir(/data:/mnt/data:ro)"
-
-# Directory overlays (tilde expansion supported)
-awman exec workflow path/to/workflow.md --overlay "dir(~/prompts:/mnt/prompts)"
-
-# Multiple directory overlays
-awman chat --overlay "dir(/a:/mnt/a:ro)" --overlay "dir(/b:/mnt/b:rw)"
-awman chat --overlay "dir(/a:/mnt/a:ro),dir(/b:/mnt/b:rw)"
-```
-
-Malformed `--overlay` values are a fatal error — the command exits immediately with a descriptive message rather than silently skipping the bad entry:
-
-```
-error: malformed overlay expression (missing opening parenthesis): "notvalid"
-
-error: 'skill()' takes no arguments, got 'arg' in 'skill(arg)'
-```
-
-### Paths with spaces
-
-Spaces in host or container paths are supported natively — the parser splits on `:`, not on whitespace, so no quoting or percent-encoding is needed inside the `dir(...)` expression:
-
-```sh
-awman chat --overlay "dir(/path with spaces:/mnt/ref:ro)"
-```
-
-### Common use cases
-
-#### Personal skills library (skills overlay)
-
-If you've built custom skills with `awman new skill` and stored them in `~/.awman/skills/`, enable the skills overlay to make them available in every agent session:
-
-```json
-{ "overlays": { "skills": true } }
-```
-
-Once enabled, your skills appear as slash commands inside the agent. This is useful for:
-- Sharing a personal library of prompt templates and utilities across all projects
-- Making team-wide skills available to all developers in a repo (set in `.awman/config.json`)
-- Avoiding the need to manually copy or link skill files into containers
-
-#### Shared project assets (directory overlay)
-
-Mount fixture files, reference data, or shared prompts into containers:
-
-```json
-{
-  "overlays": {
-    "directories": [
-      { "host": "/var/data/fixtures", "container": "/mnt/fixtures", "permission": "ro" },
-      { "host": "~/team-prompts", "container": "/mnt/prompts", "permission": "ro" }
-    ]
-  }
-}
-```
-
-#### Combining both
-
-Enable your personal skills library AND mount shared team assets:
-
-```sh
-# In ~/.awman/config.json (global)
-export AWMAN_OVERLAYS="skill(),dir(~/team-shared:/mnt/shared:ro)"
-
-# Or in .awman/config.json (per-repo)
-{
-  "overlays": {
-    "skills": true,
-    "directories": [
-      { "host": "~/team-shared", "container": "/mnt/shared", "permission": "ro" }
-    ]
-  }
-}
-```
-
-### Security
-
-Overlay mounts are printed in the full Docker command before each session, so you always see exactly what is mounted. `:ro` prevents the agent from modifying the overlaid directory. Skills are always mounted read-only and cannot be modified by the agent. Only use `:rw` for directory overlays when the task genuinely requires write access to that directory.
-
-See [Security & Isolation](03-security-and-isolation.md#overlay-mounts) for a complete reference.
+For comprehensive documentation on overlay syntax, configuration, merge semantics, and common use cases, see [Overlays](08-overlays.md).
 
 ---
 
@@ -803,4 +610,4 @@ The tag push triggers the release CI pipeline, which builds binaries for all pla
 
 ---
 
-[← Headless Mode](06-headless-mode.md) · [Next: API Mode →](08-api-mode.md)
+[← Headless Mode](06-headless-mode.md) · [Next: Overlays →](08-overlays.md)

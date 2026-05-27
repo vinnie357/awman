@@ -17,6 +17,7 @@ use awman::command::dispatch::Engines;
 use awman::data::config::global::GlobalConfig;
 use awman::data::error::DataError;
 use awman::data::migration;
+use awman::data::config::env::Env;
 use awman::data::session::{GitRootResolver, Session, SessionOpenOptions};
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
@@ -65,7 +66,10 @@ async fn main() -> Result<ExitCode> {
     let session = Session::open_at_git_root(
         working_dir.clone(),
         git_root,
-        SessionOpenOptions::default(),
+        SessionOpenOptions {
+            env: Some(Env::from_process()),
+            ..Default::default()
+        },
     )
     .context("failed to open session")?;
 

@@ -203,6 +203,7 @@ mod tests {
             prompt_template: String::new(),
             agent: None,
             model: None,
+            overlays: None,
         }
     }
 

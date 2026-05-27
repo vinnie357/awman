@@ -524,12 +524,12 @@ impl ReadyEngine {
                         disallowed_tools: vec![],
                         initial_prompt: Some(ready_audit_prompt().to_string()),
                         allow_docker: self.options.allow_docker,
-                        mount_ssh: false,
                         non_interactive: self.options.non_interactive,
                         model: None,
                         env_passthrough: self.options.env_passthrough.clone(),
                         directory_overlays: vec![],
-                        include_skills: false,
+                        include_all_skills: false,
+                        named_skills: vec![],
                     };
                     match self.agent_engine.build_options(
                         &self.session,

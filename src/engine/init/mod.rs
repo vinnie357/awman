@@ -314,12 +314,12 @@ impl InitEngine {
                     disallowed_tools: vec![],
                     initial_prompt: Some(init_audit_prompt().to_string()),
                     allow_docker: false,
-                    mount_ssh: false,
                     non_interactive: false,
                     model: None,
                     env_passthrough: None,
                     directory_overlays: vec![],
-                    include_skills: false,
+                    include_all_skills: false,
+                    named_skills: vec![],
                 };
                 match self
                     .agent_engine

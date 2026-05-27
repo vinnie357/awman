@@ -565,7 +565,7 @@ curl -s "$SERVER/v1/commands/$CMD/logs" \
   -H "Authorization: Bearer $KEY" | jq -r .output
 ```
 
-See [API Mode](08-api-mode.md) for the full HTTP API reference, including session management endpoints.
+See [API Mode](09-api-mode.md) for the full HTTP API reference, including session management endpoints.
 
 ---
 
@@ -608,4 +608,4 @@ See [API Mode](08-api-mode.md) for the full HTTP API reference, including sessio
 
 ---
 
-[← API Mode](08-api-mode.md) · [Architecture →](architecture.md)
+[← API Mode](09-api-mode.md) · [Architecture Overview →](11-architecture-overview.md)

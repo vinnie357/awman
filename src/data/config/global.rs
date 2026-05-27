@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::config::repo::{ApiConfig, OverlaysConfig, RemoteConfig};
+use crate::data::config::repo::{ApiConfig, RemoteConfig};
 use crate::data::error::DataError;
 
 /// Filename of the global config inside the resolved global directory.
@@ -30,14 +30,14 @@ pub struct GlobalConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub yolo_disallowed_tools: Option<Vec<String>>,
-    #[serde(rename = "envPassthrough", skip_serializing_if = "Option::is_none")]
-    pub env_passthrough: Option<Vec<String>>,
+    #[serde(rename = "envPassthrough", default, skip_serializing)]
+    pub legacy_env_passthrough: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub overlays: Option<OverlaysConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlays: Option<Vec<String>>,
     #[serde(rename = "agentStuckTimeout", skip_serializing_if = "Option::is_none")]
     pub agent_stuck_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,7 +137,7 @@ mod tests {
             terminal_scrollback_lines: Some(8000),
             runtime: Some("docker".to_string()),
             yolo_disallowed_tools: Some(vec!["rm".to_string()]),
-            env_passthrough: Some(vec!["HOME".to_string()]),
+            legacy_env_passthrough: None,
             api: Some(ApiConfig {
                 work_dirs: Some(vec!["/work".to_string()]),
                 always_non_interactive: Some(true),

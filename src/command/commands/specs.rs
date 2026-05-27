@@ -406,7 +406,7 @@ pub(crate) async fn create_new_spec(
         let run_opts = AgentRunOptions {
             initial_prompt: Some(prompt),
             non_interactive,
-            env_passthrough: Some(session.effective_config().env_passthrough()),
+            env_passthrough: None,
             ..Default::default()
         };
         let mut options = match engines

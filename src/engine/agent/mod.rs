@@ -39,7 +39,6 @@ pub struct AgentRunOptions {
     pub disallowed_tools: Vec<String>,
     pub initial_prompt: Option<String>,
     pub allow_docker: bool,
-    pub mount_ssh: bool,
     pub non_interactive: bool,
     /// Optional explicit model name; if `None`, the engine emits no model flag.
     pub model: Option<String>,
@@ -48,9 +47,10 @@ pub struct AgentRunOptions {
     pub env_passthrough: Option<Vec<String>>,
     /// User-supplied directory overlays.
     pub directory_overlays: Vec<DirectorySpec>,
-    /// When true, mount the global awman skills directory into the agent's
-    /// native skills path inside the container.
-    pub include_skills: bool,
+    /// When true, mount all skill directories.
+    pub include_all_skills: bool,
+    /// Named skills to mount (when `include_all_skills` is false).
+    pub named_skills: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -198,14 +198,6 @@ impl AgentEngine {
             ContainerOption::SessionLabel(session.id().to_string()),
         ];
 
-        if run.mount_ssh {
-            if let Some(home) = dirs::home_dir() {
-                options.push(ContainerOption::MountSsh {
-                    source: home.join(".ssh"),
-                });
-            }
-        }
-
         // Mode flags.
         if let Some(y) = run.yolo {
             options.push(ContainerOption::Yolo(y));
@@ -302,12 +294,18 @@ impl AgentEngine {
         ));
 
         // Overlays — agent settings + user-supplied dirs + skills.
+        // Detect non-root container user for overlay path expansion.
+        let container_home = {
+            let home = dirs::home_dir().unwrap_or_default();
+            crate::engine::overlay::detect_container_home(&home, agent.as_str(), session.git_root())
+        };
         let request = OverlayRequest {
             directories: run.directory_overlays.clone(),
-            include_skills: run.include_skills,
+            include_all_skills: run.include_all_skills,
+            named_skills: run.named_skills.clone(),
             agent: Some(agent.clone()),
             yolo: matches!(run.yolo, Some(YoloMode::Enabled)),
-            container_home: None,
+            container_home,
         };
         for spec in self.overlay_engine.build_overlays(session, &request)? {
             options.push(ContainerOption::Overlay(spec));

@@ -12,7 +12,7 @@ use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
 use crate::command::commands::worktree_lifecycle::{WorktreeLifecycle, WorktreeLifecycleFrontend};
 use crate::command::commands::Command;
-use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list};
+use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list, warn_legacy_config, TypedOverlay};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::Session;
@@ -40,7 +40,6 @@ pub struct ExecWorkflowCommandFlags {
     pub plan: bool,
     pub allow_docker: bool,
     pub worktree: bool,
-    pub mount_ssh: bool,
     pub yolo: bool,
     pub auto: bool,
     pub agent: Option<String>,
@@ -297,8 +296,7 @@ struct CommandLayerFactory {
     shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
     engines: Engines,
     flags: Arc<ExecWorkflowCommandFlags>,
-    directory_overlays: Vec<crate::engine::overlay::DirectorySpec>,
-    include_skills: bool,
+    cli_typed_overlays: Vec<TypedOverlay>,
     work_item_context: Option<WorkItemContext>,
     /// The original repository git root (not the worktree). Used for image tag
     /// derivation so worktree-based runs use the correct project image.
@@ -316,6 +314,14 @@ impl ContainerExecutionFactory for CommandLayerFactory {
         let substitution =
             substitute_prompt(&step.prompt_template, self.work_item_context.as_ref());
 
+        // Compute per-step overlays by merging config/env/CLI with step-level overlays.
+        let collected = collect_all_overlay_specs(
+            session,
+            self.cli_typed_overlays.clone(),
+            step.overlays.as_deref(),
+        )
+        .map_err(|e| EngineError::Other(format!("overlay collection failed: {e}")))?;
+
         let run_opts = AgentRunOptions {
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
@@ -324,12 +330,16 @@ impl ContainerExecutionFactory for CommandLayerFactory {
             disallowed_tools: vec![],
             initial_prompt: Some(substitution.rendered),
             allow_docker: self.flags.allow_docker,
-            mount_ssh: self.flags.mount_ssh,
             non_interactive: self.flags.non_interactive,
             model: runtime.step_model.clone(),
-            env_passthrough: Some(session.effective_config().env_passthrough()),
-            directory_overlays: self.directory_overlays.clone(),
-            include_skills: self.include_skills,
+            env_passthrough: if collected.env_passthrough.is_empty() {
+                None
+            } else {
+                Some(collected.env_passthrough)
+            },
+            directory_overlays: collected.directories,
+            include_all_skills: collected.include_all_skills,
+            named_skills: collected.named_skills,
         };
         let mut options =
             self.engines
@@ -415,6 +425,9 @@ impl Command for ExecWorkflowCommand {
             self.session.working_dir().join(&self.flags.workflow)
         };
 
+        // Emit deprecation warnings for legacy config fields.
+        warn_legacy_config(&self.session, frontend.as_mut());
+
         if self.flags.yolo && self.flags.worktree {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Info,
@@ -447,6 +460,28 @@ impl Command for ExecWorkflowCommand {
                 return Err(err);
             }
         };
+
+        // 1b. Validate that setup/teardown overlays do not contain skill() expressions.
+        if let Err(e) = validate_phase_entry_overlays(
+            workflow.setup.iter().map(|e| e.overlays.as_ref()),
+            "setup",
+        ) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
+        if let Err(e) = validate_phase_entry_overlays(
+            workflow.teardown.iter().map(|e| e.overlays.as_ref()),
+            "teardown",
+        ) {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Error,
+                text: format!("exec workflow: {e}"),
+            });
+            return Err(e);
+        }
 
         // 2. Resolve mount scope — confirm with the user when cwd differs from git root.
         let cwd = self.session.working_dir().to_path_buf();
@@ -711,15 +746,18 @@ impl Command for ExecWorkflowCommand {
             self.session
         };
 
-        // Merge CLI overlays with config/env sources now that session is available.
-        let (directory_overlays, skills_enabled) = collect_all_overlay_specs(&session, cli_typed);
-
         // 9. Run the engine with three-phase coordination.
         // The engine block is scoped so proxy + factory are dropped before we
         // reclaim the frontend via Arc::try_unwrap.
         let yolo = self.flags.yolo;
-        let setup_steps = workflow.setup.clone();
-        let teardown_steps = workflow.teardown.clone();
+        let setup_steps: Vec<crate::data::workflow_definition::SetupStep> =
+            workflow.setup.iter().map(|e| e.step.clone()).collect();
+        let teardown_steps: Vec<crate::data::workflow_definition::TeardownStep> =
+            workflow.teardown.iter().map(|e| e.step.clone()).collect();
+        let setup_entry_overlays: Vec<Option<Vec<String>>> =
+            workflow.setup.iter().map(|e| e.overlays.clone()).collect();
+        let teardown_entry_overlays: Vec<Option<Vec<String>>> =
+            workflow.teardown.iter().map(|e| e.overlays.clone()).collect();
         let teardown_on_failure = workflow.teardown_on_failure;
         let engine_work_item_context = work_item_context.clone();
         let (engine_result, step_counts) = {
@@ -728,8 +766,7 @@ impl Command for ExecWorkflowCommand {
                 shared: Arc::clone(&shared),
                 engines: self.engines.clone(),
                 flags: Arc::clone(&flags_arc),
-                directory_overlays,
-                include_skills: skills_enabled,
+                cli_typed_overlays: cli_typed.clone(),
                 work_item_context,
                 image_git_root: git_root_for_scope.clone(),
             };
@@ -760,19 +797,21 @@ impl Command for ExecWorkflowCommand {
             let mut setup_failed = false;
             if !setup_steps.is_empty() && !engine.state().setup_completed {
                 let base_image = resolve_base_image(&session, &git_root_for_scope);
-                let env = collect_passthrough_env(&session);
-                let overlay_specs = match collect_overlay_specs_for_phase(
+                let phase_result = collect_phase_overlays(
                     &self.engines,
                     &session,
-                ) {
-                    Ok(specs) => specs,
+                    &cli_typed,
+                    setup_entry_overlays.iter().map(|o| o.as_ref()),
+                );
+                let (overlay_specs, env) = match phase_result {
+                    Ok(pair) => pair,
                     Err(e) => {
                         shared.lock().unwrap().write_message(UserMessage {
                             level: MessageLevel::Error,
                             text: format!("exec workflow: {e}"),
                         });
                         setup_failed = true;
-                        Vec::new()
+                        (Vec::new(), std::collections::HashMap::new())
                     }
                 };
 
@@ -835,16 +874,14 @@ impl Command for ExecWorkflowCommand {
                 let should_run = teardown_on_failure || workflow_succeeded;
                 if should_run {
                     let base_image = resolve_base_image(&session, &git_root_for_scope);
-                    let env = collect_passthrough_env(&session);
-                    // Overlay resolution failure is fatal for teardown too —
-                    // running with no overlays would silently drop secrets and
-                    // env vars (e.g. GH_TOKEN) that `create_pull_request`
-                    // requires. Surface the error and skip teardown.
-                    let overlay_specs = match collect_overlay_specs_for_phase(
+                    let phase_result = collect_phase_overlays(
                         &self.engines,
                         &session,
-                    ) {
-                        Ok(specs) => Some(specs),
+                        &cli_typed,
+                        teardown_entry_overlays.iter().map(|o| o.as_ref()),
+                    );
+                    let phase_pair = match phase_result {
+                        Ok(pair) => Some(pair),
                         Err(e) => {
                             shared.lock().unwrap().write_message(UserMessage {
                                 level: MessageLevel::Error,
@@ -856,7 +893,7 @@ impl Command for ExecWorkflowCommand {
                         }
                     };
 
-                    if let Some(overlay_specs) = overlay_specs {
+                    if let Some((overlay_specs, env)) = phase_pair {
                         tokio::task::block_in_place(|| {
                             match self.engines.runtime.start_background(
                                 &base_image,
@@ -994,44 +1031,80 @@ fn resolve_base_image(session: &Session, git_root: &std::path::Path) -> String {
     crate::data::image_tags::project_image_tag(git_root)
 }
 
-/// Resolve overlays for a setup/teardown container.
+/// Validate that setup/teardown entry overlays do not contain skill() expressions.
+/// `skills(...)` is already rejected at parse time; this catches `skill(*)` and
+/// `skill(name)` which parse successfully but are invalid on non-agent steps.
+fn validate_phase_entry_overlays<'a>(
+    entries_overlays: impl Iterator<Item = Option<&'a Vec<String>>>,
+    phase_name: &str,
+) -> Result<(), CommandError> {
+    for overlays in entries_overlays.flatten() {
+        for s in overlays {
+            let parsed = parse_overlay_list(s).map_err(|reason| {
+                CommandError::InvalidOverlaySpec {
+                    spec: s.clone(),
+                    reason,
+                }
+            })?;
+            for typed in parsed {
+                if matches!(typed, TypedOverlay::Skill(_)) {
+                    return Err(CommandError::Other(format!(
+                        "{phase_name} step overlays cannot contain skill() expressions; \
+                         skill overlays are only valid on agent workflow steps"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Collect overlay specs and env vars for a setup/teardown phase container.
 ///
-/// Contract for the setup/teardown phase code: on `Err`, the caller MUST NOT
-/// call `start_background` for that phase. For setup this surfaces as a hard
-/// failure that also blocks the main phase; for teardown the phase is skipped
-/// (running with no overlays would silently drop env vars like `GH_TOKEN`
-/// that `create_pull_request` requires).
-fn collect_overlay_specs_for_phase(
+/// Unions all per-entry overlay strings from the phase, merges with config/env/CLI
+/// sources, then resolves directories via the overlay engine and env vars from the
+/// host process environment.
+fn collect_phase_overlays<'a>(
     engines: &Engines,
     session: &Session,
-) -> Result<Vec<crate::engine::container::options::OverlaySpec>, crate::engine::error::EngineError> {
+    cli_typed: &[TypedOverlay],
+    entries_overlays: impl Iterator<Item = Option<&'a Vec<String>>>,
+) -> Result<(Vec<crate::engine::container::options::OverlaySpec>, std::collections::HashMap<String, String>), CommandError> {
+    let mut all_step_overlays: Vec<String> = Vec::new();
+    for overlays in entries_overlays.flatten() {
+        all_step_overlays.extend(overlays.iter().cloned());
+    }
+
+    let step_ref: Option<&[String]> = if all_step_overlays.is_empty() {
+        None
+    } else {
+        Some(&all_step_overlays)
+    };
+    let collected = collect_all_overlay_specs(session, cli_typed.to_vec(), step_ref)?;
+
     let request = crate::engine::overlay::OverlayRequest {
-        directories: Vec::new(),
-        include_skills: false,
+        directories: collected.directories,
+        include_all_skills: false,
+        named_skills: Vec::new(),
         agent: None,
         yolo: false,
         container_home: None,
     };
-    engines
+    let overlay_specs = engines
         .overlay_engine
         .build_overlays(session, &request)
-        .map_err(|e| crate::engine::error::EngineError::Other(
+        .map_err(|e| CommandError::Other(
             format!("failed to resolve overlays for setup/teardown container: {e}")
-        ))
-}
+        ))?;
 
-/// Collect the env-passthrough variables (from flag/repo/global config) that
-/// are set on the host, so setup/teardown containers see the same env as
-/// agent containers. Crucially this carries `GH_TOKEN`/`GITHUB_TOKEN` for the
-/// `create_pull_request` teardown step.
-fn collect_passthrough_env(session: &Session) -> std::collections::HashMap<String, String> {
     let mut env = std::collections::HashMap::new();
-    for key in session.effective_config().env_passthrough() {
-        if let Ok(value) = std::env::var(&key) {
-            env.insert(key, value);
+    for var_name in &collected.env_passthrough {
+        if let Ok(val) = std::env::var(var_name) {
+            env.insert(var_name.clone(), val);
         }
     }
-    env
+
+    Ok((overlay_specs, env))
 }
 
 /// Extract a numeric work item number from strings like "0069", "69", "WI-69",
@@ -1376,7 +1449,7 @@ prompt = "do something"
             plan: false,
             allow_docker: false,
             worktree: false,
-            mount_ssh: false,
+
             yolo: false,
             auto: false,
             agent: None,
@@ -1436,7 +1509,7 @@ prompt = "do something"
             plan: false,
             allow_docker: false,
             worktree: false,
-            mount_ssh: false,
+
             yolo: false,
             auto: false,
             agent: None,
@@ -1458,7 +1531,7 @@ prompt = "do something"
             plan: false,
             allow_docker: false,
             worktree: true,
-            mount_ssh: false,
+
             yolo: true,
             auto: false,
             agent: None,

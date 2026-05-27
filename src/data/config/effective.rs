@@ -85,21 +85,6 @@ impl EffectiveConfig {
         self.global.default_agent.clone()
     }
 
-    /// Effective env-passthrough list. Replace semantics: the highest source that
-    /// sets the field wins outright.
-    pub fn env_passthrough(&self) -> Vec<String> {
-        if let Some(values) = self.flags.env_passthrough.as_ref() {
-            return values.clone();
-        }
-        if let Some(values) = self.repo.env_passthrough.as_ref() {
-            return values.clone();
-        }
-        if let Some(values) = self.global.env_passthrough.as_ref() {
-            return values.clone();
-        }
-        Vec::new()
-    }
-
     /// Effective `yoloDisallowedTools` list.
     pub fn yolo_disallowed_tools(&self) -> Vec<String> {
         if let Some(values) = self.flags.yolo_disallowed_tools.as_ref() {
@@ -424,51 +409,6 @@ mod tests {
             Duration::from_secs(DEFAULT_AGENT_STUCK_TIMEOUT_SECS)
         );
         assert_eq!(ec.agent_stuck_timeout(), Duration::from_secs(30));
-    }
-
-    // ─── env_passthrough ─────────────────────────────────────────────────────
-
-    #[test]
-    fn env_passthrough_flag_beats_repo_and_global() {
-        let flags = FlagConfig {
-            env_passthrough: Some(vec!["FLAG_VAR".to_string()]),
-            ..Default::default()
-        };
-        let repo = RepoConfig {
-            env_passthrough: Some(vec!["REPO_VAR".to_string()]),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            env_passthrough: Some(vec!["GLOBAL_VAR".to_string()]),
-            ..Default::default()
-        };
-        let ec = make_effective(flags, EnvSnapshot::empty(), repo, global);
-        assert_eq!(ec.env_passthrough(), vec!["FLAG_VAR"]);
-    }
-
-    #[test]
-    fn env_passthrough_repo_beats_global() {
-        let repo = RepoConfig {
-            env_passthrough: Some(vec!["REPO_VAR".to_string()]),
-            ..Default::default()
-        };
-        let global = GlobalConfig {
-            env_passthrough: Some(vec!["GLOBAL_VAR".to_string()]),
-            ..Default::default()
-        };
-        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
-        assert_eq!(ec.env_passthrough(), vec!["REPO_VAR"]);
-    }
-
-    #[test]
-    fn env_passthrough_empty_when_all_unset() {
-        let ec = make_effective(
-            FlagConfig::default(),
-            EnvSnapshot::empty(),
-            RepoConfig::default(),
-            GlobalConfig::default(),
-        );
-        assert!(ec.env_passthrough().is_empty());
     }
 
     // ─── yolo_disallowed_tools ────────────────────────────────────────────────

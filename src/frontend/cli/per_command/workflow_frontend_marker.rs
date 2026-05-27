@@ -496,6 +496,7 @@ mod tests {
             prompt_template: "test prompt".to_string(),
             agent: None,
             model: None,
+            overlays: None,
         }
     }
 

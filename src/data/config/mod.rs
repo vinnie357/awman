@@ -12,7 +12,7 @@ pub use env::{Env, EnvSnapshot};
 pub use flags::FlagConfig;
 pub use global::GlobalConfig;
 pub use repo::{
-    DirectoryOverlayConfig, ApiConfig, OverlaysConfig, RemoteConfig, RepoConfig,
+    ApiConfig, RemoteConfig, RepoConfig,
     WorkItemsConfig, REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR,
 };
 

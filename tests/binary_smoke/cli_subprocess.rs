@@ -181,21 +181,21 @@ fn make_git_repo() -> tempfile::TempDir {
     repo
 }
 
-/// `skill(anything)` as --overlay value must exit non-zero with a descriptive
-/// error; the flag itself must be recognised (not "unknown flag").
+/// `skill()` (empty parens, no args) as --overlay value must exit non-zero with
+/// a descriptive error; the flag itself must be recognised (not "unknown flag").
 #[test]
 fn skill_with_args_flag_exits_nonzero_with_descriptive_error() {
     let repo = make_git_repo();
     // Use `chat --non-interactive` which accepts --overlay without a required positional arg.
     let out = Command::new(awman_bin())
         .current_dir(repo.path())
-        .args(["chat", "--non-interactive", "--overlay", "skill(something)"])
+        .args(["chat", "--non-interactive", "--overlay", "skill()"])
         .output()
         .expect("failed to run awman");
 
     assert!(
         !out.status.success(),
-        "skill(something) must cause a non-zero exit; got: {:?}",
+        "skill() must cause a non-zero exit; got: {:?}",
         out.status.code()
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -205,9 +205,9 @@ fn skill_with_args_flag_exits_nonzero_with_descriptive_error() {
             && !stderr.contains("unrecognized argument --overlay"),
         "--overlay must be a recognised flag; got: {stderr}"
     );
-    // Must report a parse-level error mentioning the invalid use of arguments.
+    // Must report a parse-level error mentioning that skill() requires an argument.
     assert!(
-        stderr.contains("takes no arguments") || stderr.contains("skill"),
+        stderr.contains("requires an argument") || stderr.contains("skill"),
         "error must describe the invalid skill() usage; got: {stderr}"
     );
 }

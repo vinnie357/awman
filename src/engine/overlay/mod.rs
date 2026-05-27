@@ -35,9 +35,10 @@ pub const CLAUDE_DENYLIST: &[&str] = &[
 pub struct OverlayRequest {
     /// Inline directory specs (host:container[:perm]).
     pub directories: Vec<DirectorySpec>,
-    /// When true, mount the global awman skills directory into the agent's
-    /// native skills/commands path inside the container.
-    pub include_skills: bool,
+    /// When true, mount all skill directories.
+    pub include_all_skills: bool,
+    /// Named skills to mount (when `include_all_skills` is false).
+    pub named_skills: Vec<String>,
     /// Whether to include agent-settings overlays for `agent`. When `Some`
     /// the engine prepares per-agent host configs (e.g. `~/.claude.json`).
     pub agent: Option<AgentName>,
@@ -111,7 +112,7 @@ impl OverlayEngine {
 
         // 1. User-supplied directory overlays.
         for spec in &request.directories {
-            let resolved = self.resolve_user_overlay(spec, session.working_dir())?;
+            let resolved = self.resolve_user_overlay(spec, session.working_dir(), request.container_home.as_deref())?;
             let key = OverlayPathResolver::conflict_key(&resolved.host_path);
             insert_or_merge(&mut by_key, key, resolved);
         }
@@ -128,11 +129,15 @@ impl OverlayEngine {
         }
 
         // 3. Skills overlay (mount ~/.awman/skills/ read-only into agent's native path).
-        if request.include_skills {
+        if request.include_all_skills || !request.named_skills.is_empty() {
             if let Some(agent) = &request.agent {
-                for spec in
-                    self.skill_overlays(agent, &request.container_home, session.git_root())?
-                {
+                for spec in self.skill_overlays(
+                    agent,
+                    request.include_all_skills,
+                    &request.named_skills,
+                    &request.container_home,
+                    session.git_root(),
+                )? {
                     let key = OverlayPathResolver::conflict_key(&spec.host_path);
                     insert_or_merge(&mut by_key, key, spec);
                 }
@@ -152,8 +157,10 @@ impl OverlayEngine {
         &self,
         spec: &DirectorySpec,
         cwd: &Path,
+        container_home: Option<&str>,
     ) -> Result<OverlaySpec, EngineError> {
-        if !Path::new(&spec.container).is_absolute() {
+        // Allow container paths starting with ~/ (expanded below).
+        if !Path::new(&spec.container).is_absolute() && !spec.container.starts_with("~/") {
             return Err(EngineError::Other(format!(
                 "overlay container path '{}' must be absolute",
                 spec.container
@@ -161,9 +168,16 @@ impl OverlayEngine {
         }
         let host_abs = OverlayPathResolver::make_absolute_with_cwd(&spec.host, cwd);
         let host_canon = OverlayPathResolver::canonicalize_lossy(&host_abs);
+        // Expand ~/ in container path to the container home directory.
+        let container_path = if spec.container.starts_with("~/") {
+            let home = container_home.unwrap_or("/root");
+            format!("{}{}", home, &spec.container[1..])
+        } else {
+            spec.container.clone()
+        };
         Ok(OverlaySpec {
             host_path: host_canon,
-            container_path: PathBuf::from(&spec.container),
+            container_path: PathBuf::from(container_path),
             permission: spec.permission,
         })
     }
@@ -334,9 +348,15 @@ impl OverlayEngine {
     pub fn skill_overlays(
         &self,
         agent: &AgentName,
+        include_all: bool,
+        names: &[String],
         container_home_override: &Option<String>,
         git_root: &Path,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
+        // Early return when no skills requested.
+        if !include_all && names.is_empty() {
+            return Ok(vec![]);
+        }
         let skill_dirs = crate::data::fs::skill_dirs::SkillDirs::from_process_env(None)
             .map_err(EngineError::Data)?;
         let host_skills_dir = skill_dirs.global_dir();
@@ -375,11 +395,31 @@ impl OverlayEngine {
             }
         };
 
-        Ok(vec![OverlaySpec {
-            host_path: OverlayPathResolver::canonicalize_lossy(&host_skills_dir),
-            container_path: PathBuf::from(container_path),
-            permission: OverlayPermission::ReadOnly,
-        }])
+        if include_all {
+            Ok(vec![OverlaySpec {
+                host_path: OverlayPathResolver::canonicalize_lossy(&host_skills_dir),
+                container_path: PathBuf::from(container_path),
+                permission: OverlayPermission::ReadOnly,
+            }])
+        } else {
+            let mut specs = Vec::new();
+            for name in names {
+                let skill_dir = host_skills_dir.join(name);
+                if !skill_dir.exists() {
+                    return Err(EngineError::Other(format!(
+                        "named skill '{}' not found in {}",
+                        name,
+                        host_skills_dir.display()
+                    )));
+                }
+                specs.push(OverlaySpec {
+                    host_path: OverlayPathResolver::canonicalize_lossy(&skill_dir),
+                    container_path: PathBuf::from(format!("{}/{}", container_path, name)),
+                    permission: OverlayPermission::ReadOnly,
+                });
+            }
+            Ok(specs)
+        }
     }
 }
 
@@ -560,7 +600,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Looks for a `USER <name>` directive (where `<name>` is not "root" or "0")
 /// in `Dockerfile.<agent>` files under `<git_root>/.awman/` and `<home>/.awman/`.
 /// Returns `Some("/home/<name>")` when found, `None` otherwise.
-fn detect_container_home(home: &Path, agent: &str, git_root: &Path) -> Option<String> {
+pub(crate) fn detect_container_home(home: &Path, agent: &str, git_root: &Path) -> Option<String> {
     let dockerfile_name = format!("Dockerfile.{agent}");
     let search_dirs: Vec<PathBuf> = [git_root.join(".awman"), home.join(".awman")]
         .into_iter()
@@ -657,7 +697,7 @@ mod tests {
 
         let specs = with_awman_config_home(tmp.path(), || {
             engine
-                .skill_overlays(&agent, &None, Path::new("/"))
+                .skill_overlays(&agent, true, &[], &None, Path::new("/"))
                 .unwrap()
         });
 
@@ -689,7 +729,7 @@ mod tests {
 
         let specs = with_awman_config_home(tmp.path(), || {
             engine
-                .skill_overlays(&agent, &None, Path::new("/"))
+                .skill_overlays(&agent, true, &[], &None, Path::new("/"))
                 .unwrap()
         });
 
@@ -714,7 +754,7 @@ mod tests {
 
         let specs = with_awman_config_home(tmp.path(), || {
             engine
-                .skill_overlays(&agent, &None, Path::new("/"))
+                .skill_overlays(&agent, true, &[], &None, Path::new("/"))
                 .unwrap()
         });
 
@@ -739,7 +779,7 @@ mod tests {
 
         let specs = with_awman_config_home(tmp.path(), || {
             engine
-                .skill_overlays(&agent, &None, Path::new("/"))
+                .skill_overlays(&agent, true, &[], &None, Path::new("/"))
                 .unwrap()
         });
 
@@ -764,7 +804,7 @@ mod tests {
 
         let specs = with_awman_config_home(tmp.path(), || {
             engine
-                .skill_overlays(&agent, &None, Path::new("/"))
+                .skill_overlays(&agent, true, &[], &None, Path::new("/"))
                 .unwrap()
         });
 
@@ -789,7 +829,7 @@ mod tests {
 
         let specs = with_awman_config_home(tmp.path(), || {
             engine
-                .skill_overlays(&agent, &None, Path::new("/"))
+                .skill_overlays(&agent, true, &[], &None, Path::new("/"))
                 .unwrap()
         });
 
@@ -814,7 +854,7 @@ mod tests {
 
         let specs = with_awman_config_home(tmp.path(), || {
             engine
-                .skill_overlays(&agent, &None, Path::new("/"))
+                .skill_overlays(&agent, true, &[], &None, Path::new("/"))
                 .unwrap()
         });
 
@@ -840,7 +880,7 @@ mod tests {
 
         let specs = with_awman_config_home(tmp.path(), || {
             engine
-                .skill_overlays(&agent, &None, Path::new("/"))
+                .skill_overlays(&agent, true, &[], &None, Path::new("/"))
                 .unwrap()
         });
 
@@ -858,7 +898,7 @@ mod tests {
 
         let specs = with_awman_config_home(tmp.path(), || {
             engine
-                .skill_overlays(&agent, &None, Path::new("/"))
+                .skill_overlays(&agent, true, &[], &None, Path::new("/"))
                 .unwrap()
         });
 
@@ -877,7 +917,7 @@ mod tests {
 
         let specs = with_awman_config_home(tmp.path(), || {
             engine
-                .skill_overlays(&agent, &override_home, Path::new("/"))
+                .skill_overlays(&agent, true, &[], &override_home, Path::new("/"))
                 .unwrap()
         });
 
@@ -899,7 +939,7 @@ mod tests {
         let agent = AgentName::new("claude").unwrap();
 
         let specs = with_awman_config_home(tmp.path(), || {
-            engine.skill_overlays(&agent, &None, tmp.path()).unwrap()
+            engine.skill_overlays(&agent, true, &[], &None, tmp.path()).unwrap()
         });
 
         assert_eq!(specs.len(), 1);
@@ -920,7 +960,7 @@ mod tests {
             permission: OverlayPermission::ReadOnly,
         };
         let err = engine
-            .resolve_user_overlay(&spec, Path::new("/"))
+            .resolve_user_overlay(&spec, Path::new("/"), None)
             .unwrap_err();
         assert!(matches!(err, EngineError::Other(_)));
     }
@@ -992,7 +1032,8 @@ mod tests {
                     permission: OverlayPermission::ReadOnly,
                 },
             ],
-            include_skills: false,
+            include_all_skills: false,
+            named_skills: vec![],
             agent: None,
             yolo: false,
             container_home: None,
@@ -1019,7 +1060,7 @@ mod tests {
             container: "relative/path".into(),
             permission: OverlayPermission::ReadOnly,
         };
-        assert!(engine.resolve_user_overlay(&spec, Path::new("/")).is_err());
+        assert!(engine.resolve_user_overlay(&spec, Path::new("/"), None).is_err());
     }
 
     #[test]
@@ -1224,6 +1265,166 @@ mod tests {
         assert!(
             result.is_none(),
             "detect_container_home must return None when USER is 0"
+        );
+    }
+
+    // ─── resolve_user_overlay tilde expansion ────────────────────────────────
+
+    #[test]
+    fn resolve_user_overlay_expands_tilde_with_container_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh_dir = tmp.path().join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        let engine = make_engine(tmp.path());
+
+        let spec = DirectorySpec {
+            host: ssh_dir.to_str().unwrap().to_string(),
+            container: "~/.ssh".to_string(),
+            permission: OverlayPermission::ReadOnly,
+        };
+
+        let result = engine
+            .resolve_user_overlay(&spec, Path::new("/"), Some("/home/alice"))
+            .unwrap();
+        assert_eq!(
+            result.container_path,
+            std::path::PathBuf::from("/home/alice/.ssh"),
+            "~/.ssh must expand to /home/alice/.ssh when container_home is /home/alice"
+        );
+    }
+
+    #[test]
+    fn resolve_user_overlay_expands_tilde_without_container_home_defaults_to_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh_dir = tmp.path().join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        let engine = make_engine(tmp.path());
+
+        let spec = DirectorySpec {
+            host: ssh_dir.to_str().unwrap().to_string(),
+            container: "~/.ssh".to_string(),
+            permission: OverlayPermission::ReadOnly,
+        };
+
+        let result = engine
+            .resolve_user_overlay(&spec, Path::new("/"), None)
+            .unwrap();
+        assert_eq!(
+            result.container_path,
+            std::path::PathBuf::from("/root/.ssh"),
+            "~/.ssh must default to /root/.ssh when container_home is None"
+        );
+    }
+
+    // ─── skill_overlays: named skills ─────────────────────────────────────────
+
+    #[test]
+    fn skill_overlays_named_only_emits_that_skill() {
+        let (tmp, _) = make_home_with_skills();
+        // Create a named skill directory inside the global skills dir.
+        let lint_dir = tmp.path().join("skills").join("lint");
+        std::fs::create_dir_all(&lint_dir).unwrap();
+
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+
+        let specs = with_awman_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, false, &["lint".to_string()], &None, Path::new("/"))
+                .unwrap()
+        });
+
+        assert_eq!(specs.len(), 1, "only the named skill must be emitted; got {specs:?}");
+        assert!(
+            specs[0].container_path.to_string_lossy().ends_with("/lint"),
+            "container path must include the skill name 'lint'; got {:?}",
+            specs[0].container_path
+        );
+        assert_eq!(
+            specs[0].permission,
+            OverlayPermission::ReadOnly,
+            "named skill must be mounted read-only"
+        );
+    }
+
+    #[test]
+    fn skill_overlays_nonexistent_named_skill_returns_engine_error() {
+        let (tmp, _) = make_home_with_skills();
+        // Deliberately do NOT create a "nonexistent" skill directory.
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+
+        let result = with_awman_config_home(tmp.path(), || {
+            engine.skill_overlays(
+                &agent,
+                false,
+                &["nonexistent".to_string()],
+                &None,
+                Path::new("/"),
+            )
+        });
+
+        assert!(result.is_err(), "nonexistent named skill must return EngineError");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("nonexistent"),
+            "error must name the missing skill; got: {msg}"
+        );
+    }
+
+    // ─── build_overlays: least-permissive-wins ────────────────────────────────
+
+    #[test]
+    fn build_overlays_least_permissive_wins_for_same_host_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let host_dir = tmp.path().join("shared");
+        std::fs::create_dir_all(&host_dir).unwrap();
+        let engine = make_engine(tmp.path());
+
+        let session_tmp = tempfile::tempdir().unwrap();
+        let session = {
+            use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
+            let resolver = StaticGitRootResolver::new(session_tmp.path());
+            crate::data::session::Session::open(
+                session_tmp.path().to_path_buf(),
+                &resolver,
+                SessionOpenOptions::default(),
+            )
+            .unwrap()
+        };
+
+        let request = OverlayRequest {
+            directories: vec![
+                DirectorySpec {
+                    host: host_dir.to_str().unwrap().to_string(),
+                    container: "/app/data".into(),
+                    permission: OverlayPermission::ReadOnly,
+                },
+                DirectorySpec {
+                    host: host_dir.to_str().unwrap().to_string(),
+                    container: "/app/data".into(),
+                    permission: OverlayPermission::ReadWrite,
+                },
+            ],
+            include_all_skills: false,
+            named_skills: vec![],
+            agent: None,
+            yolo: false,
+            container_home: None,
+        };
+
+        let overlays = engine.build_overlays(&session, &request).unwrap();
+        let host_canon = host_dir.canonicalize().unwrap_or_else(|_| host_dir.clone());
+        let matched: Vec<_> = overlays
+            .iter()
+            .filter(|o| o.host_path == host_canon)
+            .collect();
+        assert_eq!(matched.len(), 1, "same host path must deduplicate; got {overlays:?}");
+        assert_eq!(
+            matched[0].permission,
+            OverlayPermission::ReadOnly,
+            "ReadOnly must win over ReadWrite (least-permissive-wins); got {:?}",
+            matched[0].permission
         );
     }
 

@@ -448,6 +448,7 @@ mod tests {
             prompt_template: "do the thing".into(),
             agent: None,
             model: None,
+            overlays: None,
         }
     }
 
@@ -575,6 +576,7 @@ mod tests {
                     prompt_template: "".into(),
                     agent: None,
                     model: None,
+                    overlays: None,
                 },
                 WorkflowStep {
                     name: "test".into(),
@@ -582,6 +584,7 @@ mod tests {
                     prompt_template: "".into(),
                     agent: None,
                     model: None,
+                    overlays: None,
                 },
             ],
             "hash".into(),
@@ -600,6 +603,7 @@ mod tests {
                     prompt_template: "".into(),
                     agent: None,
                     model: None,
+                    overlays: None,
                 },
                 WorkflowStep {
                     name: "test-a".into(),
@@ -607,6 +611,7 @@ mod tests {
                     prompt_template: "".into(),
                     agent: None,
                     model: None,
+                    overlays: None,
                 },
                 WorkflowStep {
                     name: "test-b".into(),
@@ -614,6 +619,7 @@ mod tests {
                     prompt_template: "".into(),
                     agent: None,
                     model: None,
+                    overlays: None,
                 },
             ],
             "hash".into(),

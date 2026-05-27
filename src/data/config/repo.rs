@@ -42,28 +42,6 @@ pub struct ApiConfig {
     pub always_non_interactive: Option<bool>,
 }
 
-/// Overlay configuration for mounting host resources into agent containers.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OverlaysConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub directories: Option<Vec<DirectoryOverlayConfig>>,
-    /// When true, mount the global awman skills dir into the agent container.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skills: Option<bool>,
-}
-
-/// A single directory overlay entry as stored in JSON config.
-#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DirectoryOverlayConfig {
-    /// Host path (absolute or `~`-expanded).
-    pub host: String,
-    /// Container path (absolute).
-    pub container: String,
-    /// Mount permission: `"ro"` or `"rw"`. Defaults to `"ro"` when absent.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub permission: Option<String>,
-}
-
 /// Work-items configuration nested within `RepoConfig`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkItemsConfig {
@@ -89,12 +67,12 @@ pub struct RepoConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub yolo_disallowed_tools: Option<Vec<String>>,
-    #[serde(rename = "envPassthrough", skip_serializing_if = "Option::is_none")]
-    pub env_passthrough: Option<Vec<String>>,
+    #[serde(rename = "envPassthrough", default, skip_serializing)]
+    pub legacy_env_passthrough: Option<Vec<String>>,
     #[serde(rename = "workItems", skip_serializing_if = "Option::is_none")]
     pub work_items: Option<WorkItemsConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub overlays: Option<OverlaysConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlays: Option<Vec<String>>,
     #[serde(rename = "agentStuckTimeout", skip_serializing_if = "Option::is_none")]
     pub agent_stuck_timeout_secs: Option<u64>,
     #[serde(rename = "baseImage", skip_serializing_if = "Option::is_none")]
@@ -204,7 +182,6 @@ mod tests {
             agent: Some("claude".to_string()),
             terminal_scrollback_lines: Some(5000),
             yolo_disallowed_tools: Some(vec!["bash".to_string(), "python".to_string()]),
-            env_passthrough: Some(vec!["HOME".to_string(), "PATH".to_string()]),
             agent_stuck_timeout_secs: Some(60),
             ..Default::default()
         };
@@ -274,58 +251,113 @@ mod tests {
         );
     }
 
-    // ─── OverlaysConfig / skills deserialization ──────────────────────────────
+    // ─── Overlay field deserialization ───────────────────────────────────────
 
     #[test]
-    fn overlays_config_skills_true_deserializes() {
-        let json = r#"{"overlays": {"skills": true}}"#;
-        let cfg: RepoConfig = serde_json::from_str(json).unwrap();
-        let overlays = cfg.overlays.expect("overlays must be present");
+    fn overlays_new_flat_format_deserializes_correctly() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"overlays": ["skill(*)", "env(X)"]}"#,
+        )
+        .unwrap();
+
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
         assert_eq!(
-            overlays.skills,
-            Some(true),
-            "skills: true must deserialize to Some(true)"
+            cfg.overlays,
+            Some(vec!["skill(*)".to_string(), "env(X)".to_string()]),
+            "new flat overlays array must deserialize correctly"
         );
-        assert!(overlays.directories.is_none(), "directories must be None");
+        assert!(cfg.legacy_env_passthrough.is_none());
     }
 
     #[test]
-    fn overlays_config_skills_false_deserializes() {
-        let json = r#"{"overlays": {"skills": false}}"#;
-        let cfg: RepoConfig = serde_json::from_str(json).unwrap();
-        let overlays = cfg.overlays.expect("overlays must be present");
-        assert_eq!(
-            overlays.skills,
-            Some(false),
-            "skills: false must deserialize to Some(false)"
-        );
-    }
+    fn overlays_old_object_format_fails_to_deserialize() {
+        // Old format: {"overlays": {"directories": [...], "skills": true}}
+        // Must not silently migrate — must surface a config parse error.
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"overlays": {"directories": [], "skills": true}}"#,
+        )
+        .unwrap();
 
-    #[test]
-    fn overlays_config_missing_skills_key_deserializes_to_none() {
-        let json = r#"{"overlays": {}}"#;
-        let cfg: RepoConfig = serde_json::from_str(json).unwrap();
-        let overlays = cfg.overlays.expect("overlays must be present");
+        let result = RepoConfig::load(tmp.path());
         assert!(
-            overlays.skills.is_none(),
-            "missing 'skills' key must deserialize to None; got {:?}",
-            overlays.skills
+            result.is_err(),
+            "old object-format overlays must fail to deserialize (no auto-migration); got Ok"
+        );
+        assert!(
+            matches!(result.unwrap_err(), DataError::ConfigParse { .. }),
+            "error must be ConfigParse"
         );
     }
 
     #[test]
-    fn overlays_config_only_directories_deserializes_without_error() {
-        let json = r#"{"overlays": {"directories": [{"host": "/h", "container": "/c", "permission": "ro"}]}}"#;
-        let cfg: RepoConfig = serde_json::from_str(json).unwrap();
-        let overlays = cfg.overlays.expect("overlays must be present");
-        assert!(
-            overlays.skills.is_none(),
-            "skills must be None when not in JSON"
-        );
+    fn legacy_env_passthrough_deserializes_with_overlays_absent() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"envPassthrough": ["MY_VAR", "OTHER_VAR"]}"#,
+        )
+        .unwrap();
+
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
         assert_eq!(
-            overlays.directories.as_ref().map(|d| d.len()),
-            Some(1),
-            "directories must have 1 entry"
+            cfg.legacy_env_passthrough,
+            Some(vec!["MY_VAR".to_string(), "OTHER_VAR".to_string()]),
+            "legacy envPassthrough must deserialize into legacy_env_passthrough"
+        );
+        assert!(
+            cfg.overlays.is_none(),
+            "overlays must be absent when only envPassthrough is present"
+        );
+    }
+
+    #[test]
+    fn overlays_round_trip_with_dir_and_env_expressions() {
+        let tmp = make_git_root();
+        let original = RepoConfig {
+            overlays: Some(vec![
+                "dir(~/data:/workspace:ro)".to_string(),
+                "env(TOKEN)".to_string(),
+            ]),
+            ..Default::default()
+        };
+        original.save(tmp.path()).unwrap();
+        let reloaded = RepoConfig::load(tmp.path()).unwrap();
+        assert_eq!(
+            original.overlays, reloaded.overlays,
+            "overlays with dir() and env() expressions must round-trip correctly"
+        );
+    }
+
+    #[test]
+    fn legacy_env_passthrough_is_not_serialized_in_save() {
+        // legacy_env_passthrough has skip_serializing — it must not appear in the
+        // JSON written by save(), so it doesn't persist across a load/save cycle.
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"envPassthrough": ["VAR"]}"#,
+        )
+        .unwrap();
+
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
+        cfg.save(tmp.path()).unwrap();
+
+        let written = std::fs::read_to_string(RepoConfig::path(tmp.path())).unwrap();
+        assert!(
+            !written.contains("envPassthrough"),
+            "legacy envPassthrough must not be re-serialized by save(); got: {written}"
         );
     }
 }

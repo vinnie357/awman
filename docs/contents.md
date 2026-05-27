@@ -16,9 +16,10 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 05 | [Yolo Mode](05-yolo-mode.md) | Fully autonomous operation, disallowed tools, countdown |
 | 06 | [Headless Mode](06-headless-mode.md) | TTY detection, non-interactive operation, CI/CD integration |
 | 07 | [Configuration](07-configuration.md) | Config files, runtime selection, all fields |
-| 08 | [API Mode](08-api-mode.md) | HTTP server, sessions, commands, CI/automation, auditability |
-| 09 | [Remote Mode](09-remote-mode.md) | `remote run`, `remote session`, live log streaming, TUI pickers |
-| 10 | [Architecture Overview](10-architecture-overview.md) | Four-layer design, layers 0–4, design principles, adding features |
+| 08 | [Overlays](08-overlays.md) | Directory mounts, environment variables, skills, merge semantics |
+| 09 | [API Mode](09-api-mode.md) | HTTP server, sessions, commands, CI/automation, auditability |
+| 10 | [Remote Mode](10-remote-mode.md) | `remote run`, `remote session`, live log streaming, TUI pickers |
+| 11 | [Architecture Overview](11-architecture-overview.md) | Four-layer design, layers 0–4, design principles, adding features |
 | — | [Architecture (Detailed)](architecture.md) | Source layout, modules, in-depth design decisions |
 
 ---

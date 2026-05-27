@@ -54,7 +54,9 @@ add_all = true
 
 [[teardown]]
 type = "push_branch"
+overlays = ["ssh()"]
 
 [[teardown]]
 type = "create_pull_request"
 title = "Implement {{work_item_number}}"
+overlays = ["env(GITHUB_TOKEN)"]

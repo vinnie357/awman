@@ -1274,7 +1274,7 @@ const NEW_SKILL: CommandSpec = CommandSpec {
 /// Agent-run flag set used by `chat` and `exec prompt` (no worktree, no
 /// workflow). All optional. Mode flags `yolo` / `auto` / `plan` are mutually
 /// exclusive.
-const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
+const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 8] = [
     FlagSpec {
         long: "non-interactive",
         short: Some('n'),
@@ -1301,17 +1301,6 @@ const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
         long: "allow-docker",
         short: None,
         help: "Mount the host Docker daemon socket into the agent container.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "mount-ssh",
-        short: None,
-        help: "Mount host ~/.ssh read-only into the agent container.",
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::All,
@@ -1376,7 +1365,7 @@ const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
     },
 ];
 
-const EXEC_WORKFLOW_FLAGS: [FlagSpec; 11] = [
+const EXEC_WORKFLOW_FLAGS: [FlagSpec; 10] = [
     FlagSpec {
         long: "work-item",
         short: None,
@@ -1425,17 +1414,6 @@ const EXEC_WORKFLOW_FLAGS: [FlagSpec; 11] = [
         long: "worktree",
         short: None,
         help: "Run in an isolated Git worktree under ~/.awman/worktrees/.",
-        kind: FlagKind::Bool,
-        default: FlagDefault::Bool(false),
-        frontends: FrontendVisibility::All,
-        conflicts_with: &[],
-        implies: &[],
-        optional: true,
-    },
-    FlagSpec {
-        long: "mount-ssh",
-        short: None,
-        help: "Mount host ~/.ssh read-only into the agent container.",
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::All,
@@ -1685,12 +1663,6 @@ mod tests {
         FlagCheck {
             path: &["chat"],
             flag: "allow-docker",
-            is_bool: true,
-            is_optional: true,
-        },
-        FlagCheck {
-            path: &["chat"],
-            flag: "mount-ssh",
             is_bool: true,
             is_optional: true,
         },

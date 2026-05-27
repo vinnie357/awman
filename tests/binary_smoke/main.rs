@@ -11,4 +11,5 @@ mod helpers;
 
 mod cli_subprocess;
 mod headless_no_tty;
+mod overlay_0082;
 mod rename_0077;

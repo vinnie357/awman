@@ -1488,6 +1488,7 @@ fn workflow_state_to_view_state_maps_all_phases() {
             prompt_template: String::new(),
             agent: None,
             model: None,
+            overlays: None,
         }
     }
 
@@ -1581,6 +1582,7 @@ fn workflow_state_to_view_state_no_phase_steps() {
         prompt_template: String::new(),
         agent: Some("claude".into()),
         model: None,
+        overlays: None,
     }];
     let state = WorkflowState::new("minimal-wf".into(), &steps, "h".into(), None);
     let view = workflow_state_to_view_state(&state);
@@ -1605,6 +1607,7 @@ fn workflow_state_to_view_state_current_step_index() {
             prompt_template: String::new(),
             agent: None,
             model: None,
+            overlays: None,
         },
         WorkflowStep {
             name: "beta".into(),
@@ -1612,6 +1615,7 @@ fn workflow_state_to_view_state_current_step_index() {
             prompt_template: String::new(),
             agent: None,
             model: None,
+            overlays: None,
         },
     ];
     let mut state = WorkflowState::new("wf".into(), &steps, "h".into(), None);
@@ -1648,6 +1652,7 @@ fn workflow_state_to_view_state_phase_step_statuses() {
         prompt_template: String::new(),
         agent: None,
         model: None,
+        overlays: None,
     }];
     let mut state = WorkflowState::new("wf".into(), &steps, "h".into(), None);
     state.setup_step_states = vec![

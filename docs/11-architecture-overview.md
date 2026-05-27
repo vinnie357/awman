@@ -178,3 +178,7 @@ This scans all imports and fails if a lower layer imports from a higher layer. I
 - **Design principles**: `aspec/architecture/design.md`
 - **Security constraints**: `aspec/architecture/security.md`
 - **Work item (WI 0073)**: `aspec/work-items/0073-grand-architecture-finalize.md`
+
+---
+
+[← Remote Mode](10-remote-mode.md)

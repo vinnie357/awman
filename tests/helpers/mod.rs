@@ -129,5 +129,6 @@ pub fn wf_step(name: &str, deps: &[&str], prompt: &str) -> WorkflowStep {
         prompt_template: prompt.to_string(),
         agent: None,
         model: None,
+        overlays: None,
     }
 }

@@ -48,6 +48,8 @@ pub struct WorkflowStep {
     pub agent: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub overlays: Option<Vec<String>>,
 }
 
 /// A setup phase step — executed before the main workflow steps.
@@ -116,6 +118,24 @@ pub enum TeardownStep {
     },
 }
 
+/// A setup step entry with optional per-step overlays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupStepEntry {
+    #[serde(default)]
+    pub overlays: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub step: SetupStep,
+}
+
+/// A teardown step entry with optional per-step overlays.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeardownStepEntry {
+    #[serde(default)]
+    pub overlays: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub step: TeardownStep,
+}
+
 /// Parsed, validated workflow definition. The DAG (`workflow_dag.rs`) and
 /// runtime state (`workflow_state.rs`) live in separate modules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,22 +150,74 @@ pub struct Workflow {
     pub model: Option<String>,
     /// Setup steps run before the first workflow step.
     #[serde(default)]
-    pub setup: Vec<SetupStep>,
+    pub setup: Vec<SetupStepEntry>,
     /// Teardown steps run after the last workflow step (or on failure, if configured).
     #[serde(default)]
-    pub teardown: Vec<TeardownStep>,
+    pub teardown: Vec<TeardownStepEntry>,
     /// If true, teardown runs even when the workflow fails.
     #[serde(default)]
     pub teardown_on_failure: bool,
 }
 
+/// Validate that no setup or teardown step's overlay list contains a `skill(...)`
+/// or `skills(...)` expression. Those overlay types require an agent container and
+/// are meaningless on host-executed setup/teardown steps.
+///
+/// `skills(...)` is checked first so its "removed form" error is reported before
+/// the generic "skills not valid on setup/teardown" error.
+fn validate_setup_teardown_overlays(wf: &Workflow) -> Result<(), DataError> {
+    for (i, entry) in wf.setup.iter().enumerate() {
+        if let Some(overlays) = &entry.overlays {
+            for overlay in overlays {
+                let t = overlay.trim();
+                if t.starts_with("skills(") {
+                    return Err(DataError::WorkflowState(format!(
+                        "setup step {i}: '{overlay}': skills() has been removed; \
+                         use skill(*) to mount all skills or skill(name) for a specific named skill — \
+                         and only on agent (workflow step) entries, not setup steps"
+                    )));
+                }
+                if t.starts_with("skill(") {
+                    return Err(DataError::WorkflowState(format!(
+                        "setup step {i}: '{overlay}': skill() overlays are only valid on agent \
+                         (workflow step) entries; setup steps do not run agent containers"
+                    )));
+                }
+            }
+        }
+    }
+    for (i, entry) in wf.teardown.iter().enumerate() {
+        if let Some(overlays) = &entry.overlays {
+            for overlay in overlays {
+                let t = overlay.trim();
+                if t.starts_with("skills(") {
+                    return Err(DataError::WorkflowState(format!(
+                        "teardown step {i}: '{overlay}': skills() has been removed; \
+                         use skill(*) to mount all skills or skill(name) for a specific named skill — \
+                         and only on agent (workflow step) entries, not teardown steps"
+                    )));
+                }
+                if t.starts_with("skill(") {
+                    return Err(DataError::WorkflowState(format!(
+                        "teardown step {i}: '{overlay}': skill() overlays are only valid on agent \
+                         (workflow step) entries; teardown steps do not run agent containers"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Workflow {
     /// Parse a workflow file's *content* given the resolved format.
     pub fn parse(content: &str, format: WorkflowFormat) -> Result<Self, DataError> {
-        match format {
+        let wf = match format {
             WorkflowFormat::Toml => parse_toml(content),
             WorkflowFormat::Yaml => parse_yaml(content),
-        }
+        }?;
+        validate_setup_teardown_overlays(&wf)?;
+        Ok(wf)
     }
 
     /// Convenience: read and parse a workflow from disk.
@@ -169,6 +241,8 @@ struct RawStep {
     agent: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    overlays: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,9 +258,9 @@ struct TomlWorkflow {
     #[serde(rename = "step", alias = "steps", default)]
     steps: Vec<RawStep>,
     #[serde(default)]
-    setup: Vec<SetupStep>,
+    setup: Vec<SetupStepEntry>,
     #[serde(default)]
-    teardown: Vec<TeardownStep>,
+    teardown: Vec<TeardownStepEntry>,
     #[serde(default)]
     teardown_on_failure: bool,
 }
@@ -204,9 +278,9 @@ struct YamlWorkflow {
     #[serde(default)]
     steps: Vec<RawStep>,
     #[serde(default)]
-    setup: Vec<SetupStep>,
+    setup: Vec<SetupStepEntry>,
     #[serde(default)]
-    teardown: Vec<TeardownStep>,
+    teardown: Vec<TeardownStepEntry>,
     #[serde(default)]
     teardown_on_failure: bool,
 }
@@ -231,6 +305,7 @@ fn raw_to_steps(raw: Vec<RawStep>) -> Result<Vec<WorkflowStep>, DataError> {
             prompt_template,
             agent: r.agent,
             model: r.model,
+            overlays: r.overlays,
         });
     }
     if steps.is_empty() {
@@ -370,19 +445,19 @@ body = "Automated PR from awman workflow"
         assert!(wf.teardown_on_failure);
 
         assert!(matches!(
-            &wf.setup[0],
+            &wf.setup[0].step,
             SetupStep::CheckoutCreateBranch { branch, .. } if branch == "feature/my-thing"
         ));
         assert!(matches!(
-            &wf.setup[1],
+            &wf.setup[1].step,
             SetupStep::RunShell { command, .. } if command == "cargo fetch"
         ));
         assert!(matches!(
-            &wf.teardown[0],
+            &wf.teardown[0].step,
             TeardownStep::RunShell { command, .. } if command == "cargo test"
         ));
         assert!(matches!(
-            &wf.teardown[1],
+            &wf.teardown[1].step,
             TeardownStep::CreatePullRequest { title, body, .. }
                 if title == "feat: implement my feature" && body.as_deref() == Some("Automated PR from awman workflow")
         ));
@@ -413,11 +488,11 @@ teardown:
         assert!(wf.teardown_on_failure);
 
         assert!(matches!(
-            &wf.teardown[0],
+            &wf.teardown[0].step,
             TeardownStep::CommitChanges { message, add_all } if message == "auto: implemented feature" && *add_all
         ));
         assert!(matches!(
-            &wf.teardown[1],
+            &wf.teardown[1].step,
             TeardownStep::PushBranch { remote, branch } if remote.is_none() && branch.is_none()
         ));
     }
@@ -433,5 +508,140 @@ prompt = "do A"
         assert!(wf.setup.is_empty());
         assert!(wf.teardown.is_empty());
         assert!(!wf.teardown_on_failure);
+    }
+
+    // ─── TeardownStepEntry overlays ───────────────────────────────────────────
+
+    #[test]
+    fn teardown_push_branch_with_ssh_overlay_deserializes() {
+        let toml = r#"
+[[steps]]
+name = "impl"
+prompt = "do work"
+
+[[teardown]]
+type = "push_branch"
+overlays = ["ssh()"]
+"#;
+        let wf = Workflow::parse(toml, WorkflowFormat::Toml).unwrap();
+        assert_eq!(wf.teardown.len(), 1);
+        assert!(
+            matches!(&wf.teardown[0].step, TeardownStep::PushBranch { .. }),
+            "teardown step must be PushBranch; got {:?}",
+            wf.teardown[0].step
+        );
+        assert_eq!(
+            wf.teardown[0].overlays,
+            Some(vec!["ssh()".to_string()]),
+            "ssh() overlay must be preserved in TeardownStepEntry"
+        );
+    }
+
+    #[test]
+    fn teardown_create_pr_with_env_overlay_deserializes() {
+        let yaml = r#"
+steps:
+  - name: impl
+    prompt: do work
+teardown:
+  - type: create_pull_request
+    title: "My PR"
+    overlays:
+      - "env(GITHUB_TOKEN)"
+"#;
+        let wf = Workflow::parse(yaml, WorkflowFormat::Yaml).unwrap();
+        assert_eq!(wf.teardown.len(), 1);
+        assert!(
+            matches!(&wf.teardown[0].step, TeardownStep::CreatePullRequest { title, .. } if title == "My PR"),
+            "teardown step must be CreatePullRequest with correct title"
+        );
+        assert_eq!(
+            wf.teardown[0].overlays,
+            Some(vec!["env(GITHUB_TOKEN)".to_string()]),
+            "env(GITHUB_TOKEN) overlay must be preserved"
+        );
+    }
+
+    // ─── Setup/teardown overlay validation ───────────────────────────────────
+
+    #[test]
+    fn setup_step_with_skill_overlay_is_data_error_at_load_time() {
+        let toml = r#"
+[[setup]]
+type = "run_shell"
+command = "echo hello"
+overlays = ["skill(*)"]
+
+[[steps]]
+name = "impl"
+prompt = "do work"
+"#;
+        let result = Workflow::parse(toml, WorkflowFormat::Toml);
+        assert!(result.is_err(), "skill(*) in setup step must be a DataError");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("skill(") || msg.contains("setup"),
+            "error must mention skill or setup step context; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn setup_step_with_skills_plural_overlay_is_error_before_skill_check() {
+        // skills() is the removed plural form — its error must fire before the
+        // "skill not valid on setup" check, so the message mentions the removed form.
+        let toml = r#"
+[[setup]]
+type = "run_shell"
+command = "echo hello"
+overlays = ["skills()"]
+
+[[steps]]
+name = "impl"
+prompt = "do work"
+"#;
+        let result = Workflow::parse(toml, WorkflowFormat::Toml);
+        assert!(result.is_err(), "skills() in setup step overlays must be an error");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("skills()") || msg.contains("removed"),
+            "error must mention the removed skills() form; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn teardown_step_with_skill_overlay_is_data_error() {
+        let yaml = r#"
+steps:
+  - name: impl
+    prompt: do work
+teardown:
+  - type: run_shell
+    command: echo done
+    overlays:
+      - "skill(*)"
+"#;
+        let result = Workflow::parse(yaml, WorkflowFormat::Yaml);
+        assert!(result.is_err(), "skill(*) in teardown step must be a DataError");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("skill(") || msg.contains("teardown"),
+            "error must mention skill or teardown context; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn workflow_step_with_skill_overlay_is_valid() {
+        // skill() is valid on agent (workflow) steps — not setup/teardown.
+        let toml = r#"
+[[steps]]
+name = "impl"
+prompt = "do work"
+overlays = ["skill(*)", "skill(lint)"]
+"#;
+        let wf = Workflow::parse(toml, WorkflowFormat::Toml).unwrap();
+        assert_eq!(
+            wf.steps[0].overlays,
+            Some(vec!["skill(*)".to_string(), "skill(lint)".to_string()])
+        );
     }
 }

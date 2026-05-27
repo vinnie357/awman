@@ -32,7 +32,7 @@ awman exec workflow aspec/workflows/implement-hard.toml --work-item 0027
 awman exec workflow aspec/workflows/dependency-upgrade.toml
 ```
 
-Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution. See [API Mode](08-api-mode.md#awman-exec-workflow-path--awman-exec-wf-path) for usage in CI and scripting contexts.
+Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution. See [API Mode](09-api-mode.md#awman-exec-workflow-path--awman-exec-wf-path) for usage in CI and scripting contexts.
 
 The TUI shows a **workflow status strip** between the execution window and the command box, with one coloured box per step. After each step completes, a confirmation dialog appears — press **Enter** to advance, **q** to pause. State is saved to disk so you can resume later.
 

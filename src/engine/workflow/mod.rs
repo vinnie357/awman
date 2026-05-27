@@ -1716,6 +1716,7 @@ mod tests {
             prompt_template: "do something".to_string(),
             agent: agent.map(|s| s.to_string()),
             model: None,
+            overlays: None,
         }
     }
 
