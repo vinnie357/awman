@@ -149,7 +149,11 @@
       "Bash(sudo chown *)",
       "WebFetch(domain:google-gemini.github.io)",
       "WebFetch(domain:developers.openai.com)",
-      "Bash(CARGO_TARGET_DIR=/tmp/amux-target cargo test)"
+      "Bash(CARGO_TARGET_DIR=/tmp/amux-target cargo test)",
+      "WebFetch(domain:antigravity.google)",
+      "WebFetch(domain:dev.to)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:antigravitylab.net)"
     ]
   }
 }
