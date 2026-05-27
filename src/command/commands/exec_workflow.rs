@@ -461,28 +461,6 @@ impl Command for ExecWorkflowCommand {
             }
         };
 
-        // 1b. Validate that setup/teardown overlays do not contain skill() expressions.
-        if let Err(e) = validate_phase_entry_overlays(
-            workflow.setup.iter().map(|e| e.overlays.as_ref()),
-            "setup",
-        ) {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("exec workflow: {e}"),
-            });
-            return Err(e);
-        }
-        if let Err(e) = validate_phase_entry_overlays(
-            workflow.teardown.iter().map(|e| e.overlays.as_ref()),
-            "teardown",
-        ) {
-            frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("exec workflow: {e}"),
-            });
-            return Err(e);
-        }
-
         // 2. Resolve mount scope — confirm with the user when cwd differs from git root.
         let cwd = self.session.working_dir().to_path_buf();
         let git_root_for_scope = self.session.git_root().to_path_buf();
@@ -794,67 +772,84 @@ impl Command for ExecWorkflowCommand {
             engine.set_yolo(yolo);
 
             // === SETUP PHASE ===
+            //
+            // Each setup entry runs in its own container built from THAT
+            // entry's overlays only (WI-0082): per-step isolation matters
+            // because, e.g. an entry asking for `env(GITHUB_TOKEN)` must not
+            // leak that token into a sibling entry that only asked for
+            // `ssh()`. Container start/stop cost is amortized acceptably by
+            // the small number of setup steps in real workflows.
             let mut setup_failed = false;
             if !setup_steps.is_empty() && !engine.state().setup_completed {
                 let base_image = resolve_base_image(&session, &git_root_for_scope);
-                let phase_result = collect_phase_overlays(
-                    &self.engines,
-                    &session,
-                    &cli_typed,
-                    setup_entry_overlays.iter().map(|o| o.as_ref()),
-                );
-                let (overlay_specs, env) = match phase_result {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        shared.lock().unwrap().write_message(UserMessage {
-                            level: MessageLevel::Error,
-                            text: format!("exec workflow: {e}"),
-                        });
-                        setup_failed = true;
-                        (Vec::new(), std::collections::HashMap::new())
+
+                // Pre-validate each entry's overlays so that a parse error in
+                // ANY entry aborts the phase before any container starts.
+                // Without this, a bad entry midway through would only surface
+                // after earlier steps had already mutated the workspace.
+                let entry_overlays = setup_entry_overlays.clone();
+                let mut validated: Vec<(
+                    Vec<crate::engine::container::options::OverlaySpec>,
+                    std::collections::HashMap<String, String>,
+                )> = Vec::with_capacity(setup_steps.len());
+                for entry in &entry_overlays {
+                    match collect_single_entry_overlays(
+                        &self.engines,
+                        &session,
+                        &cli_typed,
+                        entry.as_deref(),
+                    ) {
+                        Ok(pair) => validated.push(pair),
+                        Err(e) => {
+                            shared.lock().unwrap().write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("exec workflow: {e}"),
+                            });
+                            setup_failed = true;
+                            break;
+                        }
                     }
-                };
+                }
 
                 if !setup_failed {
+                    let runtime = Arc::clone(&self.engines.runtime);
+                    let mount = mount_path.clone();
+                    let base = base_image.clone();
+                    let shared_for_factory = Arc::clone(&shared);
+                    let validated = std::sync::Arc::new(std::sync::Mutex::new(validated));
                     // The setup container exec calls are blocking; keep the
                     // tokio worker free by routing them through block_in_place.
-                    tokio::task::block_in_place(|| {
-                        match self.engines.runtime.start_background(
-                            &base_image,
-                            &mount_path,
-                            &env,
-                            &overlay_specs,
-                        ) {
-                            Ok(setup_container) => {
-                                let setup_result =
-                                    engine.run_setup(&setup_steps, &setup_container);
-                                if let Err(e) = setup_container.kill() {
-                                    shared.lock().unwrap().write_message(UserMessage {
-                                        level: MessageLevel::Warning,
-                                        text: format!(
-                                            "exec workflow: failed to kill setup container: {e}"
-                                        ),
-                                    });
-                                }
-                                if let Err(e) = setup_result {
-                                    shared.lock().unwrap().write_message(UserMessage {
-                                        level: MessageLevel::Error,
-                                        text: format!("exec workflow: setup phase failed: {e}"),
-                                    });
-                                    setup_failed = true;
-                                }
-                            }
-                            Err(e) => {
-                                shared.lock().unwrap().write_message(UserMessage {
-                                    level: MessageLevel::Error,
-                                    text: format!(
-                                        "exec workflow: failed to start setup container: {e}"
-                                    ),
-                                });
-                                setup_failed = true;
-                            }
+                    let setup_result = tokio::task::block_in_place(|| {
+                        let factory = |idx: usize| -> Result<
+                            Box<dyn crate::engine::container::ContainerExec>,
+                            EngineError,
+                        > {
+                            let (overlays, env) = validated
+                                .lock()
+                                .unwrap()
+                                .get(idx)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    EngineError::Other(format!(
+                                        "internal: missing pre-validated overlays for setup step {idx}",
+                                    ))
+                                })?;
+                            let container =
+                                runtime.start_background(&base, &mount, &env, &overlays)?;
+                            Ok(Box::new(container))
+                        };
+                        let r = engine.run_setup(&setup_steps, factory);
+                        if let Err(e) = &r {
+                            shared_for_factory.lock().unwrap().write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!("exec workflow: setup phase failed: {e}"),
+                            });
                         }
+                        r
                     });
+                    if setup_result.is_err() {
+                        setup_failed = true;
+                    }
                 }
             }
 
@@ -870,64 +865,44 @@ impl Command for ExecWorkflowCommand {
             let workflow_succeeded = matches!(result, Ok(WorkflowOutcome::Completed { .. }));
 
             // === TEARDOWN PHASE ===
+            //
+            // Same per-entry container pattern as setup. Teardown is
+            // best-effort: a per-step container failure (overlay error or
+            // backend failure) is reported and the next step still runs.
             if !teardown_steps.is_empty() {
                 let should_run = teardown_on_failure || workflow_succeeded;
                 if should_run {
                     let base_image = resolve_base_image(&session, &git_root_for_scope);
-                    let phase_result = collect_phase_overlays(
-                        &self.engines,
-                        &session,
-                        &cli_typed,
-                        teardown_entry_overlays.iter().map(|o| o.as_ref()),
-                    );
-                    let phase_pair = match phase_result {
-                        Ok(pair) => Some(pair),
-                        Err(e) => {
-                            shared.lock().unwrap().write_message(UserMessage {
-                                level: MessageLevel::Error,
-                                text: format!(
-                                    "exec workflow: teardown overlay resolution failed; teardown skipped: {e}"
-                                ),
-                            });
-                            None
-                        }
-                    };
-
-                    if let Some((overlay_specs, env)) = phase_pair {
-                        tokio::task::block_in_place(|| {
-                            match self.engines.runtime.start_background(
-                                &base_image,
-                                &mount_path,
-                                &env,
-                                &overlay_specs,
-                            ) {
-                                Ok(teardown_container) => {
-                                    let _ = engine.run_teardown(
-                                        &teardown_steps,
-                                        workflow_succeeded,
-                                        teardown_on_failure,
-                                        &teardown_container,
-                                    );
-                                    if let Err(e) = teardown_container.kill() {
-                                        shared.lock().unwrap().write_message(UserMessage {
-                                            level: MessageLevel::Warning,
-                                            text: format!(
-                                                "exec workflow: failed to kill teardown container: {e}"
-                                            ),
-                                        });
-                                    }
-                                }
-                                Err(e) => {
-                                    shared.lock().unwrap().write_message(UserMessage {
-                                        level: MessageLevel::Warning,
-                                        text: format!(
-                                            "exec workflow: failed to start teardown container: {e}"
-                                        ),
-                                    });
-                                }
-                            }
-                        });
-                    }
+                    let runtime = Arc::clone(&self.engines.runtime);
+                    let mount = mount_path.clone();
+                    let entry_overlays = teardown_entry_overlays.clone();
+                    let engines_for_factory = self.engines.clone();
+                    let session_for_factory = session.clone();
+                    let cli_typed_for_factory = cli_typed.clone();
+                    tokio::task::block_in_place(|| {
+                        let factory = |idx: usize| -> Result<
+                            Box<dyn crate::engine::container::ContainerExec>,
+                            EngineError,
+                        > {
+                            let entry = entry_overlays.get(idx).and_then(|o| o.as_deref());
+                            let (overlays, env) = collect_single_entry_overlays(
+                                &engines_for_factory,
+                                &session_for_factory,
+                                &cli_typed_for_factory,
+                                entry,
+                            )
+                            .map_err(|e| EngineError::Other(e.to_string()))?;
+                            let container = runtime
+                                .start_background(&base_image, &mount, &env, &overlays)?;
+                            Ok(Box::new(container))
+                        };
+                        let _ = engine.run_teardown(
+                            &teardown_steps,
+                            workflow_succeeded,
+                            teardown_on_failure,
+                            factory,
+                        );
+                    });
                 }
             }
 
@@ -1031,56 +1006,28 @@ fn resolve_base_image(session: &Session, git_root: &std::path::Path) -> String {
     crate::data::image_tags::project_image_tag(git_root)
 }
 
-/// Validate that setup/teardown entry overlays do not contain skill() expressions.
-/// `skills(...)` is already rejected at parse time; this catches `skill(*)` and
-/// `skill(name)` which parse successfully but are invalid on non-agent steps.
-fn validate_phase_entry_overlays<'a>(
-    entries_overlays: impl Iterator<Item = Option<&'a Vec<String>>>,
-    phase_name: &str,
-) -> Result<(), CommandError> {
-    for overlays in entries_overlays.flatten() {
-        for s in overlays {
-            let parsed = parse_overlay_list(s).map_err(|reason| {
-                CommandError::InvalidOverlaySpec {
-                    spec: s.clone(),
-                    reason,
-                }
-            })?;
-            for typed in parsed {
-                if matches!(typed, TypedOverlay::Skill(_)) {
-                    return Err(CommandError::Other(format!(
-                        "{phase_name} step overlays cannot contain skill() expressions; \
-                         skill overlays are only valid on agent workflow steps"
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Collect overlay specs and env vars for a setup/teardown phase container.
+/// Collect overlay specs and env vars for a single setup or teardown entry.
 ///
-/// Unions all per-entry overlay strings from the phase, merges with config/env/CLI
-/// sources, then resolves directories via the overlay engine and env vars from the
-/// host process environment.
-fn collect_phase_overlays<'a>(
+/// Merges the entry's own overlays with the global / repo / `AWMAN_OVERLAYS`
+/// / `--overlay` flag sources, then resolves directories via the overlay
+/// engine and captures env vars from the host process environment.
+///
+/// One call per entry — that's the whole point post-WI-0082: each step's
+/// container sees only the entry's own overlays plus the standing sources,
+/// not the union of all phase entries' overlays.
+fn collect_single_entry_overlays(
     engines: &Engines,
     session: &Session,
     cli_typed: &[TypedOverlay],
-    entries_overlays: impl Iterator<Item = Option<&'a Vec<String>>>,
-) -> Result<(Vec<crate::engine::container::options::OverlaySpec>, std::collections::HashMap<String, String>), CommandError> {
-    let mut all_step_overlays: Vec<String> = Vec::new();
-    for overlays in entries_overlays.flatten() {
-        all_step_overlays.extend(overlays.iter().cloned());
-    }
-
-    let step_ref: Option<&[String]> = if all_step_overlays.is_empty() {
-        None
-    } else {
-        Some(&all_step_overlays)
-    };
-    let collected = collect_all_overlay_specs(session, cli_typed.to_vec(), step_ref)?;
+    entry_overlays: Option<&[String]>,
+) -> Result<
+    (
+        Vec<crate::engine::container::options::OverlaySpec>,
+        std::collections::HashMap<String, String>,
+    ),
+    CommandError,
+> {
+    let collected = collect_all_overlay_specs(session, cli_typed.to_vec(), entry_overlays)?;
 
     let request = crate::engine::overlay::OverlayRequest {
         directories: collected.directories,
@@ -1093,9 +1040,11 @@ fn collect_phase_overlays<'a>(
     let overlay_specs = engines
         .overlay_engine
         .build_overlays(session, &request)
-        .map_err(|e| CommandError::Other(
-            format!("failed to resolve overlays for setup/teardown container: {e}")
-        ))?;
+        .map_err(|e| {
+            CommandError::Other(format!(
+                "failed to resolve overlays for setup/teardown container: {e}",
+            ))
+        })?;
 
     let mut env = std::collections::HashMap::new();
     for var_name in &collected.env_passthrough {
@@ -1550,5 +1499,64 @@ prompt = "do something"
         };
         assert_eq!(s.steps_failed, 0);
         assert_eq!(s.steps_completed, 3);
+    }
+
+    // ─── Per-entry overlay isolation (WI-0082 §1 review fix) ─────────────────
+
+    /// `collect_single_entry_overlays` must scope env passthrough to the
+    /// caller-supplied entry + standing sources only. The orchestrator calls
+    /// it once per setup/teardown entry; if it leaked information across
+    /// calls, sibling steps would inherit each other's overlays.
+    #[test]
+    fn collect_single_entry_overlays_isolates_env_per_entry() {
+        use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+        use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        let session = Session::open(
+            tmp.path().to_path_buf(),
+            &resolver,
+            SessionOpenOptions {
+                env: Some(env),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let engines = make_engines();
+
+        // Set both env vars on the host so passthrough can capture them.
+        std::env::set_var("WI0082_REVIEW_TOKEN_A", "value-a");
+        std::env::set_var("WI0082_REVIEW_TOKEN_B", "value-b");
+
+        let entry_a = vec!["env(WI0082_REVIEW_TOKEN_A)".to_string()];
+        let entry_b = vec!["env(WI0082_REVIEW_TOKEN_B)".to_string()];
+
+        let (_, env_a) =
+            collect_single_entry_overlays(&engines, &session, &[], Some(&entry_a)).unwrap();
+        let (_, env_b) =
+            collect_single_entry_overlays(&engines, &session, &[], Some(&entry_b)).unwrap();
+
+        std::env::remove_var("WI0082_REVIEW_TOKEN_A");
+        std::env::remove_var("WI0082_REVIEW_TOKEN_B");
+
+        assert!(
+            env_a.contains_key("WI0082_REVIEW_TOKEN_A"),
+            "entry A's env must contain its own var; got: {env_a:?}"
+        );
+        assert!(
+            !env_a.contains_key("WI0082_REVIEW_TOKEN_B"),
+            "entry A's env must NOT include entry B's var (no cross-step leak); got: {env_a:?}"
+        );
+        assert!(
+            env_b.contains_key("WI0082_REVIEW_TOKEN_B"),
+            "entry B's env must contain its own var; got: {env_b:?}"
+        );
+        assert!(
+            !env_b.contains_key("WI0082_REVIEW_TOKEN_A"),
+            "entry B's env must NOT include entry A's var (no cross-step leak); got: {env_b:?}"
+        );
     }
 }

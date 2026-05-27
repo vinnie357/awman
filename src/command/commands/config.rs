@@ -25,9 +25,8 @@ const VALID_CONFIG_FIELDS: &[(&str, FieldScope)] = &[
     ("auto_agent_auth_accepted", FieldScope::GlobalOnly),
     ("terminal_scrollback_lines", FieldScope::Both),
     ("yoloDisallowedTools", FieldScope::Both),
-    ("envPassthrough", FieldScope::Both),
     ("workItems", FieldScope::RepoOnly),
-    ("overlays", FieldScope::RepoOnly),
+    ("overlays", FieldScope::Both),
     ("agentStuckTimeout", FieldScope::Both),
     ("runtime", FieldScope::GlobalOnly),
     ("default_agent", FieldScope::GlobalOnly),
@@ -42,6 +41,23 @@ const VALID_CONFIG_FIELDS: &[(&str, FieldScope)] = &[
     ("remote.defaultAddr", FieldScope::Both),
     ("remote.defaultAPIKey", FieldScope::Both),
 ];
+
+/// Field names that were removed in WI-0082 (overlay unification). Naming any
+/// of these in `awman config get|set` returns a guidance error instead of the
+/// generic "unknown field" suggestion list.
+const REMOVED_CONFIG_FIELDS: &[(&str, &str)] = &[(
+    "envPassthrough",
+    "the 'envPassthrough' field was removed; express env passthrough as overlay entries \
+     instead (e.g. `awman config set overlays \"env(VAR_NAME)\"` or add `\"env(VAR_NAME)\"` \
+     to the `overlays` array in `.awman/config.json`). See `docs/08-overlays.md`.",
+)];
+
+fn removed_field_message(name: &str) -> Option<&'static str> {
+    REMOVED_CONFIG_FIELDS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, msg)| *msg)
+}
 
 /// Flat list of all valid field names (for suggestions / validation).
 fn valid_field_names() -> Vec<&'static str> {
@@ -75,7 +91,7 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
             }
             Ok(serde_json::Value::String(value.to_string()))
         }
-        "yoloDisallowedTools" | "envPassthrough" | "api.workDirs" => {
+        "yoloDisallowedTools" | "overlays" | "api.workDirs" => {
             // Parse comma-separated into array
             let items: Vec<&str> = value
                 .split(',')
@@ -407,6 +423,9 @@ impl Command for ConfigCommand {
             }
             ConfigSubcommand::Get(f) => {
                 // Validate field name.
+                if let Some(msg) = removed_field_message(&f.field) {
+                    return Err(CommandError::Other(msg.to_string()));
+                }
                 if !names.contains(&f.field.as_str()) {
                     let suggestions = levenshtein_suggestions(&f.field, &names);
                     return Err(CommandError::UnknownConfigField {
@@ -437,6 +456,9 @@ impl Command for ConfigCommand {
             }
             ConfigSubcommand::Set(f) => {
                 // Validate field name.
+                if let Some(msg) = removed_field_message(&f.field) {
+                    return Err(CommandError::Other(msg.to_string()));
+                }
                 if !names.contains(&f.field.as_str()) {
                     let suggestions = levenshtein_suggestions(&f.field, &names);
                     return Err(CommandError::UnknownConfigField {
@@ -729,6 +751,33 @@ mod tests {
         assert_eq!(
             validate_and_coerce("some_field", "hello").unwrap(),
             serde_json::Value::String("hello".into())
+        );
+    }
+
+    // ── removed_field_message ────────────────────────────────────────────────
+
+    #[test]
+    fn env_passthrough_is_recognized_as_removed_field() {
+        let msg = removed_field_message("envPassthrough")
+            .expect("envPassthrough must be flagged as a removed field");
+        assert!(
+            msg.contains("env(VAR_NAME)") || msg.contains("overlays"),
+            "removed-field message must steer users to the env() overlay form; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn unknown_field_returns_no_removed_message() {
+        assert!(removed_field_message("agent").is_none());
+        assert!(removed_field_message("notARealField").is_none());
+    }
+
+    #[test]
+    fn env_passthrough_is_not_in_valid_fields() {
+        let names = valid_field_names();
+        assert!(
+            !names.contains(&"envPassthrough"),
+            "envPassthrough must be removed from VALID_CONFIG_FIELDS"
         );
     }
 

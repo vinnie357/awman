@@ -34,7 +34,7 @@ dir(~/personal-prompts:/mnt/prompts)
 dir(/shared/fixtures:/workspace/fixtures:rw)
 ```
 
-If the host path does not exist when you launch the session, awman logs a warning and skips that overlay — the session proceeds without it.
+If the host path does not exist when you launch the session, awman exits with an error before launching any container — this catches typos and missing prerequisites (such as `~/.ssh`) early instead of letting Docker silently auto-create an empty mount source.
 
 ### `ssh()`
 
@@ -289,7 +289,7 @@ Setup and teardown steps (the phases that run before and after workflow steps) a
 **TOML example:**
 ```toml
 [[setup]]
-type = "run"
+type = "run_shell"
 command = "apt-get update"
 overlays = ["dir(/cache:/var/cache:rw)", "env(DEBIAN_FRONTEND)"]
 

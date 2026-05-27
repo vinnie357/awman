@@ -1363,11 +1363,23 @@ impl WorkflowEngine {
     /// Run setup phase steps inside the provided background container.
     /// Returns `Ok(())` on success, `Err` if any step fails (remaining steps
     /// are skipped).
-    pub fn run_setup(
+    /// Run the setup phase, asking the caller for a fresh container per step.
+    ///
+    /// `container_for_step(idx)` is invoked once per step and must return a
+    /// container with that step's overlays/env applied — and only that step's.
+    /// The returned container is dropped when the step finishes, which kills
+    /// the container via `BackgroundContainer::drop`. This is what gives each
+    /// step its own isolated resource set (WI-0082): two teardown entries
+    /// declaring `overlays = ["ssh()"]` and `overlays = ["env(GITHUB_TOKEN)"]`
+    /// must NOT each see both.
+    pub fn run_setup<F>(
         &mut self,
         steps: &[crate::data::workflow_definition::SetupStep],
-        container: &impl ContainerExec,
-    ) -> Result<(), EngineError> {
+        mut container_for_step: F,
+    ) -> Result<(), EngineError>
+    where
+        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+    {
         use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowPhase};
         use crate::engine::workflow::step_commands::{
             setup_step_description, setup_step_to_shell, substitute_setup_step,
@@ -1395,6 +1407,7 @@ impl WorkflowEngine {
 
             self.frontend.on_setup_step_started(&desc);
 
+            let container = container_for_step(idx)?;
             let result = container.exec(&command, env.as_ref())?;
 
             for line in result.stdout.lines() {
@@ -1420,6 +1433,7 @@ impl WorkflowEngine {
             self.state.setup_step_states[idx].status = PhaseStepStatus::Succeeded;
             self.persist()?;
             self.frontend.on_setup_step_completed(&desc);
+            // `container` drops here, killing the per-step BackgroundContainer.
         }
 
         self.state.setup_completed = true;
@@ -1428,16 +1442,27 @@ impl WorkflowEngine {
         Ok(())
     }
 
-    /// Run teardown phase steps inside the provided background container.
+    /// Run teardown phase steps, asking the caller for a fresh container per step.
+    ///
     /// Skips all steps and returns `Ok(())` if `!teardown_on_failure && !workflow_succeeded`.
     /// Failing teardown steps are logged but do not abort the remaining steps (best-effort).
-    pub fn run_teardown(
+    /// See [`run_setup`] for the rationale behind per-step containers.
+    ///
+    /// When the per-step container factory itself fails (e.g. an overlay won't
+    /// resolve, or the runtime can't start the container), the engine records
+    /// that step as `Failed`, surfaces the error to the frontend, and proceeds
+    /// to the next step — matching the best-effort semantics already used for
+    /// non-zero exit codes.
+    pub fn run_teardown<F>(
         &mut self,
         steps: &[crate::data::workflow_definition::TeardownStep],
         workflow_succeeded: bool,
         teardown_on_failure: bool,
-        container: &impl ContainerExec,
-    ) -> Result<(), EngineError> {
+        mut container_for_step: F,
+    ) -> Result<(), EngineError>
+    where
+        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+    {
         use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowPhase};
         use crate::engine::workflow::step_commands::{
             substitute_teardown_step, teardown_step_description, teardown_step_to_shell,
@@ -1469,6 +1494,18 @@ impl WorkflowEngine {
 
             self.frontend.on_teardown_step_started(&desc);
 
+            let container = match container_for_step(idx) {
+                Ok(c) => c,
+                Err(e) => {
+                    let msg = e.to_string();
+                    self.state.teardown_step_states[idx].status = PhaseStepStatus::Failed {
+                        error: msg.clone(),
+                    };
+                    self.persist()?;
+                    self.frontend.on_teardown_step_failed(&desc, 1, &msg);
+                    continue;
+                }
+            };
             let result = container.exec(&command, env.as_ref())?;
 
             for line in result.stdout.lines() {
@@ -1491,6 +1528,7 @@ impl WorkflowEngine {
                 self.persist()?;
                 self.frontend.on_teardown_step_completed(&desc);
             }
+            // `container` drops here, killing the per-step BackgroundContainer.
         }
 
         self.state.teardown_completed = true;
@@ -2884,6 +2922,9 @@ mod tests {
         results: Mutex<VecDeque<(String, String, i32)>>,
         /// Recorded commands (in call order).
         calls: Mutex<Vec<String>>,
+        /// Number of times a fresh container was handed out — exercised by
+        /// per-step-container assertions (WI-0082).
+        container_handouts: Mutex<usize>,
     }
 
     impl MockBackgroundContainer {
@@ -2892,6 +2933,7 @@ mod tests {
             Self {
                 results: Mutex::new(VecDeque::new()),
                 calls: Mutex::new(Vec::new()),
+                container_handouts: Mutex::new(0),
             }
         }
 
@@ -2900,11 +2942,49 @@ mod tests {
             Self {
                 results: Mutex::new(results.into_iter().collect()),
                 calls: Mutex::new(Vec::new()),
+                container_handouts: Mutex::new(0),
             }
         }
 
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn handouts(&self) -> usize {
+            *self.container_handouts.lock().unwrap()
+        }
+
+        /// Build a factory closure for `WorkflowEngine::run_setup` /
+        /// `run_teardown` that records one container handout per step and
+        /// delegates exec calls back to this mock. Tests that previously
+        /// passed `&mock` directly can now pass `mock.factory()`.
+        fn factory<'a>(
+            self: &'a Arc<Self>,
+        ) -> impl FnMut(
+            usize,
+        )
+            -> Result<Box<dyn crate::engine::container::ContainerExec>, EngineError>
+               + 'a {
+            move |_idx| {
+                *self.container_handouts.lock().unwrap() += 1;
+                Ok(Box::new(SharedMockExec(Arc::clone(self))))
+            }
+        }
+    }
+
+    /// Trampoline that lets the test factory hand out fresh `Box<dyn
+    /// ContainerExec>` values while keeping all recorded state in the single
+    /// shared `MockBackgroundContainer`.
+    struct SharedMockExec(Arc<MockBackgroundContainer>);
+
+    impl crate::engine::container::ContainerExec for SharedMockExec {
+        fn exec(
+            &self,
+            command: &str,
+            env: Option<&std::collections::HashMap<String, String>>,
+        ) -> Result<crate::engine::container::ExecOutput, crate::engine::error::EngineError>
+        {
+            self.0.exec(command, env)
         }
     }
 
@@ -2980,9 +3060,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = make_minimal_engine(&tmp);
         let steps = setup_steps_sample();
-        let mock = MockBackgroundContainer::always_success();
+        let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, &mock).unwrap();
+        engine.run_setup(&steps, mock.factory()).unwrap();
 
         let calls = mock.calls();
         assert_eq!(calls.len(), 3);
@@ -2992,17 +3072,53 @@ mod tests {
     }
 
     #[test]
+    fn run_setup_uses_one_fresh_container_per_step() {
+        // WI-0082 invariant: each phase step gets its own container so per-step
+        // overlays do not leak across step boundaries.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = setup_steps_sample(); // 3 steps
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+
+        engine.run_setup(&steps, mock.factory()).unwrap();
+
+        assert_eq!(
+            mock.handouts(),
+            3,
+            "the factory must be invoked once per step (one container per step)",
+        );
+    }
+
+    #[test]
+    fn run_teardown_uses_one_fresh_container_per_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = teardown_steps_sample(); // 2 steps
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+
+        engine
+            .run_teardown(&steps, true, false, mock.factory())
+            .unwrap();
+
+        assert_eq!(
+            mock.handouts(),
+            2,
+            "teardown must request one container per step",
+        );
+    }
+
+    #[test]
     fn run_setup_aborts_on_second_step_failure() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = make_minimal_engine(&tmp);
         let steps = setup_steps_sample(); // 3 steps
-        let mock = MockBackgroundContainer::with_results([
+        let mock = Arc::new(MockBackgroundContainer::with_results([
             ("".into(), "".into(), 0),                 // step 1 succeeds
             ("".into(), "build error".into(), 1),      // step 2 fails
             ("".into(), "".into(), 0),                 // step 3 (never reached)
-        ]);
+        ]));
 
-        let result = engine.run_setup(&steps, &mock);
+        let result = engine.run_setup(&steps, mock.factory());
 
         assert!(result.is_err(), "run_setup must return Err on step failure");
         assert_eq!(mock.calls().len(), 2, "third step must not be exec'd");
@@ -3013,14 +3129,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = make_minimal_engine(&tmp);
         let steps = teardown_steps_sample();
-        let mock = MockBackgroundContainer::always_success();
+        let mock = Arc::new(MockBackgroundContainer::always_success());
 
         // teardown_on_failure = false, workflow_succeeded = false → skip all
         engine
-            .run_teardown(&steps, false, false, &mock)
+            .run_teardown(&steps, false, false, mock.factory())
             .unwrap();
 
         assert_eq!(mock.calls().len(), 0, "no exec calls should be made");
+        assert_eq!(
+            mock.handouts(),
+            0,
+            "no containers should be requested when teardown is skipped",
+        );
     }
 
     #[test]
@@ -3028,10 +3149,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = make_minimal_engine(&tmp);
         let steps = teardown_steps_sample();
-        let mock = MockBackgroundContainer::always_success();
+        let mock = Arc::new(MockBackgroundContainer::always_success());
 
         engine
-            .run_teardown(&steps, true, false, &mock)
+            .run_teardown(&steps, true, false, mock.factory())
             .unwrap();
 
         assert_eq!(mock.calls().len(), 2, "both teardown steps must exec");
@@ -3042,15 +3163,61 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = make_minimal_engine(&tmp);
         let steps = teardown_steps_sample();
-        let mock = MockBackgroundContainer::with_results([
+        let mock = Arc::new(MockBackgroundContainer::with_results([
             ("".into(), "test failure".into(), 1), // step 1 fails
             ("".into(), "".into(), 0),             // step 2 succeeds
-        ]);
+        ]));
 
         // Teardown is best-effort: returns Ok even if a step fails.
-        let result = engine.run_teardown(&steps, true, false, &mock);
+        let result = engine.run_teardown(&steps, true, false, mock.factory());
         assert!(result.is_ok(), "run_teardown must return Ok despite step failure");
         assert_eq!(mock.calls().len(), 2, "both steps must be exec'd");
+    }
+
+    #[test]
+    fn run_teardown_continues_after_per_step_container_factory_failure() {
+        // Per-step container build failure must not abort teardown; it should
+        // record the step as Failed and proceed to the next one.
+        use crate::data::workflow_definition::TeardownStep;
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = vec![
+            TeardownStep::RunShell { command: "first".into(), env: None },
+            TeardownStep::RunShell { command: "second".into(), env: None },
+        ];
+
+        // Factory fails on step 0 (returns Err), succeeds on step 1.
+        let mock = Arc::new(MockBackgroundContainer::always_success());
+        let mock_for_factory = Arc::clone(&mock);
+        let factory = move |idx: usize| -> Result<
+            Box<dyn crate::engine::container::ContainerExec>,
+            EngineError,
+        > {
+            if idx == 0 {
+                Err(EngineError::Other("simulated overlay resolve failure".into()))
+            } else {
+                *mock_for_factory.container_handouts.lock().unwrap() += 1;
+                Ok(Box::new(SharedMockExec(Arc::clone(&mock_for_factory))))
+            }
+        };
+
+        let result = engine.run_teardown(&steps, true, false, factory);
+        assert!(result.is_ok(), "factory failure must not abort teardown");
+
+        let states = &engine.state().teardown_step_states;
+        assert!(
+            matches!(&states[0].status, PhaseStepStatus::Failed { error } if error.contains("simulated overlay resolve failure")),
+            "step 0 must be recorded as Failed with the factory error: {:?}",
+            states[0].status,
+        );
+        assert_eq!(
+            states[1].status,
+            PhaseStepStatus::Succeeded,
+            "step 1 must still execute after step 0's factory failure",
+        );
+        assert_eq!(mock.calls().len(), 1, "only step 1 reaches exec");
     }
 
     #[test]
@@ -3060,9 +3227,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = make_minimal_engine(&tmp);
         let steps = setup_steps_sample();
-        let mock = MockBackgroundContainer::always_success();
+        let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, &mock).unwrap();
+        engine.run_setup(&steps, mock.factory()).unwrap();
 
         assert_eq!(
             engine.state().current_phase,
@@ -3087,9 +3254,9 @@ mod tests {
             SetupStep::RunShell { command: "step1".into(), env: None },
             SetupStep::RunShell { command: "step2".into(), env: None },
         ];
-        let mock = MockBackgroundContainer::always_success();
+        let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, &mock).unwrap();
+        engine.run_setup(&steps, mock.factory()).unwrap();
 
         let states = &engine.state().setup_step_states;
         assert_eq!(states.len(), 2);
@@ -3109,9 +3276,11 @@ mod tests {
             TeardownStep::RunShell { command: "td1".into(), env: None },
             TeardownStep::RunShell { command: "td2".into(), env: None },
         ];
-        let mock = MockBackgroundContainer::always_success();
+        let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_teardown(&steps, true, false, &mock).unwrap();
+        engine
+            .run_teardown(&steps, true, false, mock.factory())
+            .unwrap();
 
         let states = &engine.state().teardown_step_states;
         assert_eq!(states.len(), 2);
@@ -3131,12 +3300,12 @@ mod tests {
             SetupStep::RunShell { command: "ok-step".into(), env: None },
             SetupStep::RunShell { command: "bad-step".into(), env: None },
         ];
-        let mock = MockBackgroundContainer::with_results([
+        let mock = Arc::new(MockBackgroundContainer::with_results([
             ("".into(), "".into(), 0),
             ("".into(), "stderr content".into(), 1),
-        ]);
+        ]));
 
-        let result = engine.run_setup(&steps, &mock);
+        let result = engine.run_setup(&steps, mock.factory());
         assert!(result.is_err());
 
         let states = &engine.state().setup_step_states;
@@ -3155,9 +3324,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = make_minimal_engine(&tmp);
         let steps = teardown_steps_sample();
-        let mock = MockBackgroundContainer::always_success();
+        let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_teardown(&steps, true, false, &mock).unwrap();
+        engine
+            .run_teardown(&steps, true, false, mock.factory())
+            .unwrap();
 
         assert_eq!(
             engine.state().current_phase,
@@ -3188,9 +3359,9 @@ mod tests {
 
         use crate::data::workflow_definition::SetupStep;
         let steps = vec![SetupStep::RunShell { command: "go".into(), env: None }];
-        let mock = MockBackgroundContainer::always_success();
+        let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, &mock).unwrap();
+        engine.run_setup(&steps, mock.factory()).unwrap();
 
         // Verify the on-disk state was persisted with the correct phase fields.
         let store = WorkflowStateStore::at_git_root(tmp.path());

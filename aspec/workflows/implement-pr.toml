@@ -1,6 +1,10 @@
 title = "Implement Feature and Create PR Workflow"
 teardown_on_failure = false
 
+[[setup]]
+type = "run_shell"
+command = "echo hello"
+
 [[step]]
 name = "implement"
 model = "claude-opus-4-6"

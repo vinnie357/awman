@@ -29,6 +29,18 @@ use awman::frontend::tui;
 
 #[tokio::main]
 async fn main() -> Result<ExitCode> {
+    // WI-0082: `--mount-ssh` was removed in favour of `--overlay ssh()`.
+    // Intercept it before clap renders the generic "unexpected argument"
+    // message so the user sees a migration hint instead.
+    if std::env::args().any(|a| a == "--mount-ssh" || a.starts_with("--mount-ssh=")) {
+        eprintln!(
+            "error: --mount-ssh has been removed. Pass `--overlay ssh()` instead \
+             (or set `overlays = [\"ssh()\"]` in a per-step workflow entry). \
+             See `docs/08-overlays.md`."
+        );
+        return Ok(ExitCode::from(2));
+    }
+
     let clap_cmd = CommandCatalogue::get().build_clap_command();
     let matches = clap_cmd.get_matches();
 
@@ -110,17 +122,13 @@ async fn main() -> Result<ExitCode> {
 /// `RUST_LOG` for overrides. ANSI colors are auto-enabled by the `fmt`
 /// layer when stderr is a TTY.
 ///
-/// The TUI initializes its own renderer on a separate path; tracing
-/// records still go to stderr but are not visible behind the alt-screen
-/// until the TUI exits, which is the same trade-off any tracing-enabled
-/// TUI accepts.
+/// When the TUI is active, stderr writes would paint raw text over the
+/// alternate-screen rendering. The writer gates on `is_tui_active()` and
+/// redirects to `io::sink()` while the TUI owns the terminal.
 fn init_tracing() {
-    use tracing_subscriber::fmt::{format::Writer, time::FormatTime};
+    use tracing_subscriber::fmt::{format::Writer, time::FormatTime, MakeWriter};
     use tracing_subscriber::{fmt, EnvFilter};
 
-    /// Compact wall-clock timer: `HH:MM:SS.mmm`. The default `SystemTime`
-    /// timer prints a full ISO-8601 string per line which dominates short
-    /// API log records like `info: Restored session`.
     struct ShortLocalTime;
     impl FormatTime for ShortLocalTime {
         fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
@@ -128,10 +136,41 @@ fn init_tracing() {
         }
     }
 
+    enum MaybeStderr {
+        Stderr(std::io::Stderr),
+        Sink(std::io::Sink),
+    }
+    impl std::io::Write for MaybeStderr {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            match self {
+                Self::Stderr(w) => w.write(buf),
+                Self::Sink(w) => w.write(buf),
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            match self {
+                Self::Stderr(w) => w.flush(),
+                Self::Sink(w) => w.flush(),
+            }
+        }
+    }
+
+    struct TuiAwareWriter;
+    impl<'a> MakeWriter<'a> for TuiAwareWriter {
+        type Writer = MaybeStderr;
+        fn make_writer(&'a self) -> Self::Writer {
+            if tui::is_tui_active() {
+                MaybeStderr::Sink(std::io::sink())
+            } else {
+                MaybeStderr::Stderr(std::io::stderr())
+            }
+        }
+    }
+
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = fmt()
         .with_env_filter(filter)
-        .with_writer(std::io::stderr)
+        .with_writer(TuiAwareWriter)
         .with_target(false)
         .with_timer(ShortLocalTime)
         .compact()

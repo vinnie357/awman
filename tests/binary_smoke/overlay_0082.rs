@@ -46,6 +46,34 @@ fn mount_ssh_flag_rejected_with_nonzero_exit() {
             && !stderr.contains("unexpected argument '--overlay'"),
         "--overlay must remain a recognised flag; stderr: {stderr}"
     );
+    assert!(
+        stderr.contains("--mount-ssh"),
+        "rejection message must name the removed --mount-ssh flag; stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("ssh()") || stderr.contains("--overlay"),
+        "rejection message must point users at `--overlay ssh()` as the replacement; stderr: {stderr}"
+    );
+}
+
+#[test]
+fn mount_ssh_with_value_form_also_rejected_with_guidance() {
+    let repo = make_git_repo();
+    let output = awman()
+        .current_dir(repo.path())
+        .args(["chat", "--non-interactive", "--mount-ssh=true"])
+        .output()
+        .expect("failed to run awman");
+
+    assert!(
+        !output.status.success(),
+        "--mount-ssh=true must be rejected with a non-zero exit; got 0"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--mount-ssh") && (stderr.contains("ssh()") || stderr.contains("--overlay")),
+        "--mount-ssh=true must produce the same guidance message; stderr: {stderr}"
+    );
 }
 
 // ─── skills() plural form removed ────────────────────────────────────────────

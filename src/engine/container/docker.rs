@@ -334,7 +334,7 @@ fn spawn_pty_bridged_docker(
     instance: Box<DockerContainerInstance>,
     io: crate::engine::container::frontend::ContainerIo,
     argv: Vec<String>,
-    seeded: Option<String>,
+    _seeded: Option<String>,
     started_at: chrono::DateTime<chrono::Utc>,
     handle: crate::data::session::ContainerHandle,
     bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
@@ -362,12 +362,10 @@ fn spawn_pty_bridged_docker(
         .spawn_command(cmd)
         .map_err(|e| EngineError::Container(format!("spawn docker via pty: {e}")))?;
 
-    // Write seeded prompt into stdin channel before the writer task starts
-    // draining, so it's guaranteed to be the first bytes the container reads.
-    if let Some(prompt) = seeded {
-        let _ = io.stdin_tx.send(prompt.into_bytes());
-        let _ = io.stdin_tx.send(b"\n".to_vec());
-    }
+    // Interactive PTY runs pass the seeded prompt as a CLI positional arg
+    // (appended by `build_run_argv`), so it must NOT also be written to stdin.
+    // Writing it here would cause the PTY to echo the prompt text into the
+    // terminal output, painting it over the TUI before the agent starts.
 
     let (master_arc, bridge) =
         crate::engine::container::io_bridge::bridge_pty(io, pair, bridge_cfg)?;

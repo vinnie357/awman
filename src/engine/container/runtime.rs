@@ -43,10 +43,7 @@ impl ContainerRuntime {
                 }
             }
             Some(other) => {
-                eprintln!(
-                    "awman: warning: unknown runtime '{}', falling back to Docker",
-                    other
-                );
+                tracing::warn!(runtime = other, "unknown runtime, falling back to Docker");
                 Backend::Docker
             }
         };

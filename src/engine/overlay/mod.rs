@@ -118,11 +118,16 @@ impl OverlayEngine {
         }
 
         // 2. Agent settings overlays. Forward the yolo flag so Claude's
-        //    settings sanitization can inject the bypass-permissions overlay.
+        //    settings sanitization can inject the bypass-permissions overlay,
+        //    and the request's container_home so settings paths agree with
+        //    user-supplied overlays.
         if let Some(agent) = &request.agent {
-            for spec in
-                self.agent_settings_overlays_with(agent, request.yolo, session.git_root())?
-            {
+            for spec in self.agent_settings_overlays_with(
+                agent,
+                request.yolo,
+                session.git_root(),
+                request.container_home.as_deref(),
+            )? {
                 let key = OverlayPathResolver::conflict_key(&spec.host_path);
                 insert_or_merge(&mut by_key, key, spec);
             }
@@ -153,6 +158,11 @@ impl OverlayEngine {
     ///
     /// Relative host paths are resolved against `cwd` (the session's working
     /// directory), not the process's current directory.
+    ///
+    /// Fails fast when the host path does not exist on disk. Without this
+    /// guard, Docker would auto-create an empty bind-mount source at run
+    /// time and silently break tools that expect real content there
+    /// (e.g. `ssh()` against a missing `~/.ssh`).
     pub fn resolve_user_overlay(
         &self,
         spec: &DirectorySpec,
@@ -168,6 +178,13 @@ impl OverlayEngine {
         }
         let host_abs = OverlayPathResolver::make_absolute_with_cwd(&spec.host, cwd);
         let host_canon = OverlayPathResolver::canonicalize_lossy(&host_abs);
+        if !host_canon.exists() {
+            return Err(EngineError::Other(format!(
+                "overlay host path '{}' does not exist (resolved to '{}')",
+                spec.host,
+                host_canon.display()
+            )));
+        }
         // Expand ~/ in container path to the container home directory.
         let container_path = if spec.container.starts_with("~/") {
             let home = container_home.unwrap_or("/root");
@@ -189,21 +206,27 @@ impl OverlayEngine {
         agent: &AgentName,
         git_root: &Path,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
-        self.agent_settings_overlays_with(agent, false, git_root)
+        self.agent_settings_overlays_with(agent, false, git_root, None)
     }
 
     /// Like `agent_settings_overlays` but threading the `yolo` flag so the
-    /// Claude agent path can inject the bypass-permissions setting.
+    /// Claude agent path can inject the bypass-permissions setting, and an
+    /// optional `container_home_override` so all overlay container paths
+    /// agree on the agent's home directory (matches `resolve_user_overlay`
+    /// and `skill_overlays`).
     pub fn agent_settings_overlays_with(
         &self,
         agent: &AgentName,
         yolo: bool,
         git_root: &Path,
+        container_home_override: Option<&str>,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
         let home = self.auth_resolver.home();
         let paths = self.auth_resolver.resolve(agent.as_str());
         let mut out = Vec::new();
-        let container_home = detect_container_home(home, agent.as_str(), git_root)
+        let container_home = container_home_override
+            .map(|s| s.to_string())
+            .or_else(|| detect_container_home(home, agent.as_str(), git_root))
             .unwrap_or_else(|| "/root".to_string());
 
         match agent.as_str() {
@@ -1183,7 +1206,7 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
         let overlays = engine
-            .agent_settings_overlays_with(&agent, true, tmp.path())
+            .agent_settings_overlays_with(&agent, true, tmp.path(), None)
             .unwrap();
         let dir_overlay = overlays
             .iter()
@@ -1265,6 +1288,56 @@ mod tests {
         assert!(
             result.is_none(),
             "detect_container_home must return None when USER is 0"
+        );
+    }
+
+    // ─── resolve_user_overlay missing-host fail-fast ─────────────────────────
+
+    #[test]
+    fn resolve_user_overlay_errors_when_host_path_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-dir");
+        let engine = make_engine(tmp.path());
+
+        let spec = DirectorySpec {
+            host: missing.to_str().unwrap().to_string(),
+            container: "/workspace/data".into(),
+            permission: OverlayPermission::ReadOnly,
+        };
+
+        let err = engine
+            .resolve_user_overlay(&spec, Path::new("/"), None)
+            .expect_err("missing host path must surface an EngineError");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not exist"),
+            "error must say the host path doesn't exist; got: {msg}"
+        );
+        assert!(
+            msg.contains("no-such-dir"),
+            "error must name the offending host path; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_user_overlay_errors_when_ssh_dir_missing() {
+        // The realistic `ssh()` case: ~/.ssh doesn't exist on the host.
+        let tmp = tempfile::tempdir().unwrap();
+        let ssh_dir = tmp.path().join(".ssh"); // deliberately not created
+        let engine = make_engine(tmp.path());
+
+        let spec = DirectorySpec {
+            host: ssh_dir.to_str().unwrap().to_string(),
+            container: "~/.ssh".into(),
+            permission: OverlayPermission::ReadOnly,
+        };
+
+        let err = engine
+            .resolve_user_overlay(&spec, Path::new("/"), None)
+            .expect_err("missing ~/.ssh must surface an EngineError");
+        assert!(
+            err.to_string().contains("does not exist"),
+            "ssh() with missing ~/.ssh must fail fast; got: {err}"
         );
     }
 
@@ -1437,7 +1510,7 @@ mod tests {
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("claude").unwrap();
         let overlays = engine
-            .agent_settings_overlays_with(&agent, false, tmp.path())
+            .agent_settings_overlays_with(&agent, false, tmp.path(), None)
             .unwrap();
         let dir_overlay = overlays
             .iter()

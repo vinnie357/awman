@@ -5,8 +5,15 @@
 
 use std::io;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn is_tui_active() -> bool {
+    TUI_ACTIVE.load(Ordering::Relaxed)
+}
 
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -147,15 +154,19 @@ fn run_event_loop(app: &mut App) -> io::Result<()> {
     // would appear as a literal escape sequence in the user's prompt.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        TUI_ACTIVE.store(false, Ordering::Relaxed);
         restore_terminal(keyboard_enhanced);
         original_hook(info);
     }));
+
+    TUI_ACTIVE.store(true, Ordering::Relaxed);
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let result = main_loop(&mut terminal, app);
 
+    TUI_ACTIVE.store(false, Ordering::Relaxed);
     restore_terminal(keyboard_enhanced);
     let _ = std::panic::take_hook();
 

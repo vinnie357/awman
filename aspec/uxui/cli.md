@@ -68,12 +68,11 @@ Initialize the current Git repo for use with awman.
 | `-n, --non-interactive` | bool | false | Non-interactive (print) mode. |
 | `--plan` | bool | false | Plan mode (read-only). |
 | `--allow-docker` | bool | false | Mount the host Docker daemon socket. |
-| `--mount-ssh` | bool | false | Mount host `~/.ssh` read-only. |
 | `--yolo` | bool | false | Fully autonomous mode. |
 | `--auto` | bool | false | Auto permission mode. |
 | `--agent <name>` | string | — | Override the agent for this run. |
 | `--model <name>` | string | — | Override the model for this run. |
-| `--overlay <spec>` | repeatable string | — | Mount a host directory into the container. |
+| `--overlay <spec>` | repeatable string | — | Overlay expression: `dir(host:container[:ro\|rw])`, `ssh()`, `env(VAR_NAME)`, `skill(*)`, or `skill(name)`. To mount `~/.ssh` read-only, pass `--overlay ssh()`. See `docs/08-overlays.md`. |
 
 ### `awman specs`
 
@@ -93,8 +92,10 @@ Initialize the current Git repo for use with awman.
 
 | Subcommand | Arguments | Flags |
 |---|---|---|
-| `prompt <prompt>` | `<prompt>` | `-n/--non-interactive`, `--plan`, `--allow-docker`, `--mount-ssh`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--overlay <spec>` (repeatable). |
-| `workflow <path>` (alias `wf`) | `<path>` | `--work-item <num>`, `-n/--non-interactive`, `--plan`, `--allow-docker`, `--worktree`, `--mount-ssh`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--overlay <spec>` (repeatable). `--yolo`/`--auto` imply `--worktree`. |
+| `prompt <prompt>` | `<prompt>` | `-n/--non-interactive`, `--plan`, `--allow-docker`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--overlay <spec>` (repeatable). |
+| `workflow <path>` (alias `wf`) | `<path>` | `--work-item <num>`, `-n/--non-interactive`, `--plan`, `--allow-docker`, `--worktree`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--overlay <spec>` (repeatable). `--yolo`/`--auto` imply `--worktree`. |
+
+`--overlay` accepts the same typed overlay expressions everywhere (CLI flags, `AWMAN_OVERLAYS`, repo/global config `overlays` array, and per-step `overlays` in workflow files): `dir(host:container[:ro|rw])`, `ssh()` (shorthand for `~/.ssh` read-only), `env(VAR_NAME)`, `skill(*)`, `skill(name)`. The legacy `--mount-ssh` flag has been removed; pass `--overlay ssh()` instead. See `docs/08-overlays.md` for the full reference.
 
 ### `awman config`
 

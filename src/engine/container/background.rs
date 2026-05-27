@@ -81,9 +81,10 @@ impl Drop for BackgroundContainer {
     fn drop(&mut self) {
         if !self.killed {
             if let Err(e) = self.do_kill() {
-                eprintln!(
-                    "awman: warning: failed to kill background container {}: {e}",
-                    self.container_id
+                tracing::warn!(
+                    container_id = %self.container_id,
+                    error = %e,
+                    "failed to kill background container"
                 );
             }
         }
