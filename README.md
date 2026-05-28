@@ -34,7 +34,7 @@ The installer detects your platform and puts `awman` on your `PATH`.
 mise use -g github:prettysmartdev/awman
 ```
 
-To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.9.0`
+To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.9.1`
 
 **From GitHub Releases** — download the binary for your platform from [GitHub Releases](https://github.com/prettysmartdev/awman/releases):
 
