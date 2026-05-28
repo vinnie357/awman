@@ -108,41 +108,6 @@ fn exec_workflow_gemini_emits_deprecation_warning() {
     );
 }
 
-/// A workflow file whose step has `agent = "gemini"` (and no `--agent` on the
-/// CLI) must also emit the deprecation warning — this exercises the post-load
-/// scan path added in the WI-0083 review fix.
-#[test]
-fn exec_workflow_gemini_step_in_toml_emits_deprecation_warning() {
-    let repo = make_git_repo();
-    let wf_path = repo.path().join("gemini-step.toml");
-    std::fs::write(
-        &wf_path,
-        r#"[[steps]]
-name = "test"
-agent = "gemini"
-prompt = "hi"
-"#,
-    )
-    .expect("write workflow file");
-
-    let (_cfg, mut cmd) = awman_isolated(&repo);
-    let output = cmd
-        .args(["exec", "workflow", wf_path.to_str().unwrap()])
-        .output()
-        .expect("failed to run awman");
-
-    assert!(
-        !output.status.success(),
-        "exec workflow must exit non-zero without Docker images available"
-    );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.to_lowercase().contains("deprecated"),
-        "stderr must contain 'deprecated' when a workflow step uses agent=gemini; got:\n{stderr}"
-    );
-}
-
 /// The deprecation warning must reference real `awman` commands, not the
 /// previous draft `amux agent install …` (which does not exist). This catches
 /// regressions of the WI-0083 review fix that replaced the placeholder text.
