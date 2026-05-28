@@ -34,7 +34,7 @@ The installer detects your platform and puts `awman` on your `PATH`.
 mise use -g github:prettysmartdev/awman
 ```
 
-To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.8.0`
+To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.9.0`
 
 **From GitHub Releases** — download the binary for your platform from [GitHub Releases](https://github.com/prettysmartdev/awman/releases):
 
@@ -95,44 +95,75 @@ If a running agent gets stuck or completes its task, its tab turns yellow so you
 
 A workflow breaks complex work into phases — for example, plan → implement → review → docs. Each phase is a separate agent session. You review the output between phases and decide whether to continue, retry, or redirect.
 
-Workflows are plain Markdown (or TOML, or YAML) files in your repo:
+Workflows are TOML or YAML files in your repo. They can include setup and teardown phases to prepare the environment and handle post-workflow actions like committing, pushing, and opening PRs:
 
-```markdown
-## Step: plan
-Prompt: Read work item {{work_item_content}} and produce an implementation plan.
+```toml
+title = "Implement Feature"
 
-## Step: implement
-Depends-on: plan
-Prompt: Implement work item {{work_item_number}} according to the plan.
+[[setup]]
+type = "checkout_create_branch"
+branch = "feature/{{work_item_number}}"
+base = "main"
 
-## Step: review
-Depends-on: implement
-Prompt: Review the implementation for correctness and style.
+[[step]]
+name = "plan"
+prompt = "Read work item {{work_item_content}} and produce an implementation plan."
+
+[[step]]
+name = "implement"
+depends_on = ["plan"]
+prompt = "Implement work item {{work_item_number}} according to the plan."
+
+[[step]]
+name = "review"
+depends_on = ["implement"]
+prompt = "Review the implementation for correctness and style."
+
+[[teardown]]
+type = "run_shell"
+command = "make test"
+
+[[teardown]]
+type = "commit_changes"
+message = "Implement {{work_item_number}}"
+add_all = true
+
+[[teardown]]
+type = "push_branch"
+overlays = ["ssh()"]
+
+[[teardown]]
+type = "create_pull_request"
+title = "Implement {{work_item_number}}"
+overlays = ["env(GITHUB_TOKEN)"]
 ```
 
 ```sh
-awman exec workflow ./aspec/workflows/implement-feature.md --work-item 0027
+awman exec workflow ./aspec/workflows/implement-pr.toml --work-item 0027
 ```
-Workflows can optionally be passed a specific work item - a spec you've written - to work on new features, fix bugs, etc.
+Workflows can optionally be passed a specific work item — a spec you've written — to work on new features, fix bugs, etc.
 
 
 ### Use different agents per step
 
-Each workflow step can specify which agent runs it:
+Each workflow step can specify which agent runs it, and each step can have its own overlays for SSH access, environment variables, or skills:
 
-```markdown
-## Step: implement
-Depends-on: plan
-Agent: codex
-Prompt: Implement the plan.
+```toml
+[[step]]
+name = "implement"
+depends_on = ["plan"]
+agent = "codex"
+prompt = "Implement the plan."
 
-## Step: review
-Depends-on: implement
-Agent: claude
-Prompt: Review for correctness and style.
+[[step]]
+name = "review"
+depends_on = ["implement"]
+agent = "claude"
+prompt = "Review for correctness and style."
+overlays = ["skill(review)"]
 ```
 
-Supported agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, `cline`. Steps without an `Agent:` field use your configured default.
+Supported agents: `claude`, `codex`, `opencode`, `maki`, `antigravity`, `copilot`, `crush`, `cline`. Steps without an `agent` field use your configured default.
 
 
 ### Hand off to the agent workflow completely (yolo mode)
@@ -143,7 +174,7 @@ Supported agents: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `c
 
 ```sh
 # Implement fully autonomously, changes isolated to a git worktree
-awman exec workflow ./aspec/workflows/implement-feature.md --yolo --work-item 0042
+awman exec workflow ./aspec/workflows/implement-pr.toml --yolo --work-item 0042
 ```
 
 When a workflow step completes, a 60-second yolo countdown starts. If the agent doesn't resume, the workflow advances automatically. The countdown is visible in the tab bar across all tabs — you can monitor multiple autonomous sessions without switching to each one.
@@ -167,7 +198,7 @@ From your local machine, use `awman remote` or cURL:
 awman config set remote.defaultAPIKey <key>
 awman config set remote.defaultAddr <host>
 awman remote session start /workspace/myproject
-awman remote run "exec workflow aspec/workflows/implement-feature.md --work-item 0027" --session <id> --follow
+awman remote run "exec workflow aspec/workflows/implement-pr.toml --work-item 0027" --session <id> --follow
 ```
 
 ```sh
@@ -182,7 +213,7 @@ curl -s -X POST http://localhost:9090/v1/commands \
   -H "Authorization: Bearer <key>" \
   -H "x-awman-session: <session-id>" \
   -H "Content-Type: application/json" \
-  -d '{"subcommand": "exec", "args": ["workflow", "aspec/workflows/implement-feature.md", "--work-item", "0027"]}'
+  -d '{"subcommand": "exec", "args": ["workflow", "aspec/workflows/implement-pr.toml", "--work-item", "0027"]}'
 
 # Poll for completion, then fetch the log
 curl -s http://localhost:9090/v1/commands/<command-id>
@@ -190,7 +221,7 @@ curl -s http://localhost:9090/v1/commands/<command-id>/logs
 ```
 API commands run inside containers with the same isolation as running awman locally. All inputs and outputs and logs are stored in `~/.awman/api/` on the server for later review or auditing. The API server is authenticated using an API key generated the first time it is run, and can be refreshed (invalidating the old key) using `awman api start --refresh-key`.
 
-See [API Mode](docs/08-api-mode.md) and [Remote Mode](docs/09-remote-mode.md) for details.
+See [API Mode](docs/09-api-mode.md) and [Remote Mode](docs/10-remote-mode.md) for details.
 
 ---
 
@@ -245,9 +276,10 @@ All commands work in both TUI mode (without the `awman` prefix) and CLI mode.
 - [Workflows](docs/04-workflows.md)
 - [Yolo Mode](docs/05-yolo-mode.md)
 - [Configuration](docs/07-configuration.md)
-- [API Mode](docs/08-api-mode.md)
-- [Remote Mode](docs/09-remote-mode.md)
-- [Architecture](docs/architecture.md)
+- [Overlays](docs/08-overlays.md)
+- [API Mode](docs/09-api-mode.md)
+- [Remote Mode](docs/10-remote-mode.md)
+- [Architecture](docs/11-architecture-overview.md)
 
 ---
 

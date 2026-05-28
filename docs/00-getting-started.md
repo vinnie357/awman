@@ -67,7 +67,7 @@ Work items can be executed via workflows using `awman exec workflow`. See the [W
 - **A container runtime** — one of:
   - **Docker** (default, all platforms) — a running Docker daemon ([install Docker](https://docs.docker.com/get-docker/))
   - **Apple Containers** (macOS 26+ only) — Apple's native `container` CLI; no Docker Desktop required
-- **A supported agent** — one of: Claude Code, OpenAI Codex, OpenCode, Maki, Google Gemini CLI, GitHub Copilot CLI, Crush, or Cline installed and authenticated on your machine
+- **A supported agent** — one of: Claude Code, OpenAI Codex, OpenCode, Maki, Google Antigravity 2.0, GitHub Copilot CLI, Crush, or Cline installed and authenticated on your machine
 
 ---
 
@@ -88,7 +88,7 @@ The installer detects your platform and installs `awman` to `/usr/local/bin`.
 mise use -g github:prettysmartdev/awman
 ```
 
-To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.8.0`
+To pin to a specific version: `mise use -g github:prettysmartdev/awman@0.9.0`
 
 **From GitHub Releases** — download the binary for your platform from the [Releases page](https://github.com/prettysmartdev/awman/releases), make it executable, and move it onto your `PATH`:
 
@@ -274,7 +274,7 @@ To execute a work item, create a workflow that references it, then run the workf
 For example, to run a workflow bundled with awman:
 
 ```sh
-awman exec workflow aspec/workflows/implement-feature.md --work-item 0001
+awman exec workflow aspec/workflows/implement-pr.toml --work-item 0001
 ```
 
 The agent reads the work item spec, writes code, runs tests, and reports back — all inside a container.
