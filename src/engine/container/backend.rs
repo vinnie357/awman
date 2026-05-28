@@ -89,6 +89,24 @@ pub(super) trait ContainerBackend: Send + Sync {
         )
     }
 
+    fn exec_in_background_streaming(
+        &self,
+        container_id: &str,
+        command: &str,
+        working_dir: &str,
+        env: Option<&HashMap<String, String>>,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<ExecOutput, EngineError> {
+        super::background::default_exec_in_background_streaming(
+            self.cli_binary(),
+            container_id,
+            command,
+            working_dir,
+            env,
+            on_line,
+        )
+    }
+
     fn stop_and_remove(&self, container_id: &str) -> Result<(), EngineError> {
         super::background::default_stop_and_remove(self.cli_binary(), container_id);
         Ok(())

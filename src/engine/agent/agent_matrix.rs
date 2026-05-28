@@ -153,12 +153,26 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             supports_stdin_injection: false,
         },
         "antigravity" => AgentMatrix {
+            // Verified against `agy --help` (v1.0.x). Flags actually accepted:
+            //   --print / -p / --prompt           (non-interactive)
+            //   --prompt-interactive / -i         (interactive seed)
+            //   --dangerously-skip-permissions    (yolo)
+            //   --print-timeout                   (default 5m, not surfaced here)
+            //   --continue / --conversation       (session resume, not wired)
+            //   --add-dir                         (extra workspace dirs)
+            //   --log-file, --sandbox
+            // There is **no** `--approval-mode` / `--plan` / `--auto-edit`
+            // CLI flag — those are settings.json (`toolPermission`) values
+            // surfaced through agy's interactive `/...` slash commands.
+            // Don't emit them; the binary just dumps `--help` and treats the
+            // prompt as the agy executable name. Leaving plan/auto as `None`
+            // keeps non-yolo modes a silent no-op (matches opencode/maki).
             agent: "antigravity",
             interactive_entrypoint: vec!["agy"],
             non_interactive_flag: Some("--print"),
-            plan_flag: Some(&["--approval-mode=plan"]),
+            plan_flag: None,
             yolo_flag: Some("--dangerously-skip-permissions"),
-            auto_flag: Some(&["--approval-mode=auto_edit"]),
+            auto_flag: None,
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::Unsupported,

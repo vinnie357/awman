@@ -1,4 +1,4 @@
-FROM awman-amux:latest
+FROM awman-awman:latest
 
 # Force root for installation: a base image may have switched to a non-root
 # user, and apt/cp/install need write access to /usr/local, /etc, /root.
@@ -26,30 +26,10 @@ ENTRYPOINT []
 CMD ["/bin/bash"]
 
 # ── Install agent binary ──────────────────────────────────────────────────────
-# The Copilot CLI install script auto-detects platform/arch. It may drop the
-# binary at /usr/local/bin/copilot, or place a launcher symlink under
-# $HOME/.local/bin pointing at a deeper path under $HOME/.local/share. So we:
-#   1. Save the script to disk first so `--retry` can recover from transient
-#      curl failures without `curl ... | bash` muddling pipefail semantics.
-#   2. Check the well-known launcher path directly before falling back to a
-#      wider find that includes symlinks and goes deep enough to reach the
-#      real binary.
-#   3. Use `install` to copy through the symlink — it dereferences the source
-#      and produces a real binary at /usr/local/bin/copilot.
+# Official installer; curl is inherited from the base image.
 RUN curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 \
-        https://gh.io/copilot-install -o /tmp/copilot-install.sh \
-    && bash /tmp/copilot-install.sh \
-    && rm -f /tmp/copilot-install.sh \
-    && BIN="" \
-    && if [ -e "$HOME/.local/bin/copilot" ]; then BIN="$HOME/.local/bin/copilot"; fi \
-    && if [ -z "$BIN" ]; then BIN="$(command -v copilot 2>/dev/null || true)"; fi \
-    && if [ -z "$BIN" ]; then \
-           BIN="$(find / -maxdepth 8 \( -type f -o -type l \) -name copilot -print -quit 2>/dev/null || true)"; \
-       fi \
-    && if [ -z "$BIN" ]; then \
-           echo "ERROR: copilot binary not found after installation" >&2; exit 1; \
-       fi \
-    && if [ "$BIN" != /usr/local/bin/copilot ]; then install -m 0755 "$BIN" /usr/local/bin/copilot; fi
+        https://antigravity.google/cli/install.sh | bash \
+    && cp /root/.local/bin/agy /usr/local/bin/agy
 
 # ── amux user + workspace (idempotent against a base that already created it) ─
 # Outer braces keep the && chain associated with the user-creation block,
@@ -68,4 +48,4 @@ WORKDIR /workspace
 
 # ── Smoke test: run as the runtime user so we verify the binary is on PATH and
 # executable from the actual entrypoint context, not just for root. ───────────
-RUN test -x "$(command -v copilot)"
+RUN test -x "$(command -v agy)"

@@ -838,6 +838,13 @@ impl WorkflowFrontend for ApiDispatchFrontend {
                 "failed",
                 "Workflow aborted".to_string(),
             ),
+            WorkflowOutcome::CompletedTeardownFailed => (
+                "done".to_string(),
+                Some(1),
+                Some("Teardown failed".to_string()),
+                "teardown_failed",
+                "Workflow completed but teardown failed".to_string(),
+            ),
             WorkflowOutcome::Failed {
                 last_step,
                 exit_code,

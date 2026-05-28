@@ -64,9 +64,20 @@ pub struct DirectoryOverlay {
     pub permission: OverlayPermission,
 }
 
-#[derive(Debug)]
+/// Pluggable provider for per-agent file-form keychain artifacts. The
+/// production binding shells out to the host OS keychain
+/// (`engine::auth::keychain::agent_keychain_files`); tests inject a stub so
+/// they don't accidentally read the dev's real macOS keychain.
+pub type AgentSecretFilesProvider = std::sync::Arc<
+    dyn Fn(&AgentName) -> Vec<crate::engine::auth::keychain::AgentSecretFile> + Send + Sync,
+>;
+
 pub struct OverlayEngine {
     auth_resolver: AuthPathResolver,
+    /// Source of file-form host-keychain artifacts to plant into agent
+    /// settings overlays (e.g. `~/.gemini/antigravity-cli/...`). Injectable
+    /// for testability; defaults to the real host-keychain reader.
+    secret_files_provider: AgentSecretFilesProvider,
     /// Sanitized temp directories that back agent-settings overlays. Held
     /// here so the directories live as long as this engine instance and are
     /// removed on `Drop` (RAII via `tempfile::TempDir`). This prevents the
@@ -75,11 +86,21 @@ pub struct OverlayEngine {
     sanitized: std::sync::Mutex<Vec<tempfile::TempDir>>,
 }
 
+impl std::fmt::Debug for OverlayEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OverlayEngine")
+            .field("auth_resolver", &self.auth_resolver)
+            .field("sanitized", &"<TempDir guard>")
+            .finish_non_exhaustive()
+    }
+}
+
 impl OverlayEngine {
     pub fn new(_session: &Session) -> Result<Self, EngineError> {
         let auth_resolver = AuthPathResolver::from_process_env().map_err(EngineError::Data)?;
         Ok(Self {
             auth_resolver,
+            secret_files_provider: default_secret_files_provider(),
             sanitized: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -87,8 +108,17 @@ impl OverlayEngine {
     pub fn with_auth_resolver(auth_resolver: AuthPathResolver) -> Self {
         Self {
             auth_resolver,
+            secret_files_provider: default_secret_files_provider(),
             sanitized: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Replace the keychain provider. Used in tests to substitute a stub for
+    /// the OS-keychain reader so the test suite stays deterministic and never
+    /// reads a developer's real credentials.
+    pub fn with_secret_files_provider(mut self, provider: AgentSecretFilesProvider) -> Self {
+        self.secret_files_provider = provider;
+        self
     }
 
     /// Track a sanitized tempdir so its cleanup is deferred until this
@@ -327,12 +357,43 @@ impl OverlayEngine {
                 }
             }
             "antigravity" => {
-                if let Some(dir) = paths.settings_dir.as_ref() {
-                    if dir.exists() {
+                // Antigravity reads its OAuth token from a fixed file inside
+                // `~/.gemini/antigravity-cli/` when the in-container keyring
+                // (Secret Service / D-Bus) is unreachable — which is always
+                // the case in our agent containers. We pull the same token
+                // from the host keychain and seed it into the staged dir.
+                let secret_files = (self.secret_files_provider)(agent);
+                let host_dir = paths.settings_dir.as_ref();
+                let dir_exists = host_dir.map(|p| p.exists()).unwrap_or(false);
+                if dir_exists || !secret_files.is_empty() {
+                    let staged = if dir_exists {
+                        stage_settings_dir_with_secrets(
+                            host_dir.unwrap(),
+                            &secret_files,
+                            "awman-antigravity-",
+                        )
+                    } else {
+                        // First-time user: no host `~/.gemini` but a keychain
+                        // token is still good enough for agy to authenticate.
+                        synthesize_settings_dir_with_secrets(
+                            &secret_files,
+                            "awman-antigravity-minimal-",
+                        )
+                    };
+                    let host_path = match staged {
+                        Ok((tmp, path)) => {
+                            let _retained = self.retain_tempdir(tmp);
+                            path
+                        }
+                        Err(_) => host_dir
+                            .cloned()
+                            .unwrap_or_else(|| PathBuf::from("/nonexistent")),
+                    };
+                    if host_path.exists() {
                         out.push(OverlaySpec {
-                            host_path: dir.clone(),
+                            host_path,
                             container_path: PathBuf::from(format!(
-                                "{container_home}/.gemini/antigravity-cli"
+                                "{container_home}/.gemini"
                             )),
                             permission: OverlayPermission::ReadWrite,
                         });
@@ -617,6 +678,82 @@ fn synthesize_minimal_claude_settings_dir(
     Ok((tmp, tmp_root))
 }
 
+/// Copy a host settings dir into a `TempDir` snapshot, then write each
+/// `AgentSecretFile` into the staged tree (creating parent dirs as needed).
+///
+/// Reusable across any agent whose container expects an on-disk credential
+/// file inside its settings dir. Currently used by antigravity to seed
+/// `antigravity-cli/antigravity-oauth-token` alongside the host's `~/.gemini`
+/// snapshot; structured so future agents (e.g. ones that store tokens in
+/// libsecret on Linux) can drop straight in.
+fn stage_settings_dir_with_secrets(
+    src: &Path,
+    secret_files: &[crate::engine::auth::keychain::AgentSecretFile],
+    tmpdir_prefix: &str,
+) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
+    let tmp = tempfile::Builder::new().prefix(tmpdir_prefix).tempdir()?;
+    let tmp_root = tmp.path().to_path_buf();
+    copy_dir_all(src, &tmp_root)?;
+    for f in secret_files {
+        write_secret_file(&tmp_root, f)?;
+    }
+    Ok((tmp, tmp_root))
+}
+
+/// Build a fresh empty settings dir and plant the given secret files into it.
+/// Used for first-time-user paths where the host has no settings dir on disk
+/// but the agent's keychain entry is sufficient on its own.
+fn synthesize_settings_dir_with_secrets(
+    secret_files: &[crate::engine::auth::keychain::AgentSecretFile],
+    tmpdir_prefix: &str,
+) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
+    let tmp = tempfile::Builder::new().prefix(tmpdir_prefix).tempdir()?;
+    let tmp_root = tmp.path().to_path_buf();
+    for f in secret_files {
+        write_secret_file(&tmp_root, f)?;
+    }
+    Ok((tmp, tmp_root))
+}
+
+/// Write a single `AgentSecretFile` under the staged root, creating parent
+/// directories. On Unix the file is opened with the requested mode so the
+/// secret never lands on disk world-readable.
+fn write_secret_file(
+    staged_root: &Path,
+    file: &crate::engine::auth::keychain::AgentSecretFile,
+) -> std::io::Result<()> {
+    let dest = staged_root.join(&file.relative_path);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut handle = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(file.mode)
+            .open(&dest)?;
+        handle.write_all(&file.contents)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&dest, &file.contents)?;
+    }
+    Ok(())
+}
+
+/// Production binding for `AgentSecretFilesProvider`: reads file-form
+/// keychain artifacts from the host OS keychain via
+/// `engine::auth::keychain::agent_keychain_files`.
+fn default_secret_files_provider() -> AgentSecretFilesProvider {
+    std::sync::Arc::new(|agent: &AgentName| {
+        crate::engine::auth::keychain::agent_keychain_files(agent)
+    })
+}
+
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     if let Ok(entries) = std::fs::read_dir(src) {
@@ -712,7 +849,22 @@ mod tests {
     }
 
     fn make_engine(home: &Path) -> OverlayEngine {
+        // Default test engine substitutes a no-op host-keychain reader so the
+        // suite stays deterministic on dev macOS machines that may actually
+        // have antigravity/claude credentials in their real keychain. Tests
+        // that want to exercise the file-seed path inject their own provider
+        // via `OverlayEngine::with_secret_files_provider`.
         OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(home))
+            .with_secret_files_provider(std::sync::Arc::new(|_| Vec::new()))
+    }
+
+    /// Build an engine with an explicit stub for file-form keychain artifacts.
+    fn make_engine_with_secrets(
+        home: &Path,
+        files: Vec<crate::engine::auth::keychain::AgentSecretFile>,
+    ) -> OverlayEngine {
+        OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(home))
+            .with_secret_files_provider(std::sync::Arc::new(move |_| files.clone()))
     }
 
     // ─── skill_overlays ───────────────────────────────────────────────────────
@@ -731,9 +883,10 @@ mod tests {
     #[test]
     fn antigravity_settings_overlay_when_dir_exists() {
         let tmp = tempfile::tempdir().unwrap();
-        // Create ~/.gemini/antigravity-cli/ so the overlay fires.
-        let antigravity_dir = tmp.path().join(".gemini").join("antigravity-cli");
-        std::fs::create_dir_all(&antigravity_dir).unwrap();
+        // Create ~/.gemini/ with a config file so the overlay fires.
+        let gemini_dir = tmp.path().join(".gemini");
+        std::fs::create_dir_all(&gemini_dir).unwrap();
+        std::fs::write(gemini_dir.join("settings.json"), r#"{"key":"val"}"#).unwrap();
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("antigravity").unwrap();
 
@@ -744,22 +897,32 @@ mod tests {
         assert_eq!(
             overlays.len(),
             1,
-            "exactly one overlay expected when ~/.gemini/antigravity-cli exists; got {overlays:?}"
+            "exactly one overlay expected when ~/.gemini exists; got {overlays:?}"
         );
         assert!(
             overlays[0]
                 .container_path
                 .to_string_lossy()
-                .ends_with(".gemini/antigravity-cli"),
-            "container_path must end with .gemini/antigravity-cli; got {:?}",
+                .ends_with(".gemini"),
+            "container_path must end with .gemini; got {:?}",
             overlays[0].container_path
+        );
+        // Must be a temp-dir copy, not the original.
+        assert_ne!(
+            overlays[0].host_path, gemini_dir,
+            "host_path must be a temp-dir copy, not the original ~/.gemini"
+        );
+        // The copied content must be present.
+        assert!(
+            overlays[0].host_path.join("settings.json").exists(),
+            "copied settings.json must exist in the temp-dir overlay"
         );
     }
 
     #[test]
     fn antigravity_settings_overlay_empty_when_dir_absent() {
         let tmp = tempfile::tempdir().unwrap();
-        // Deliberately do NOT create ~/.gemini/antigravity-cli/.
+        // Deliberately do NOT create ~/.gemini/.
         let engine = make_engine(tmp.path());
         let agent = AgentName::new("antigravity").unwrap();
 
@@ -769,8 +932,94 @@ mod tests {
 
         assert!(
             overlays.is_empty(),
-            "overlay list must be empty when ~/.gemini/antigravity-cli does not exist; got {overlays:?}"
+            "overlay list must be empty when ~/.gemini does not exist and no \
+             keychain credential is available; got {overlays:?}"
         );
+    }
+
+    #[test]
+    fn antigravity_settings_overlay_plants_keychain_token_file_alongside_host_copy() {
+        use crate::engine::auth::keychain::AgentSecretFile;
+        let tmp = tempfile::tempdir().unwrap();
+        let gemini_dir = tmp.path().join(".gemini");
+        std::fs::create_dir_all(&gemini_dir).unwrap();
+        std::fs::write(gemini_dir.join("settings.json"), r#"{"model":"flash"}"#).unwrap();
+        let token_payload = br#"{"token":{"access_token":"a","token_type":"Bearer",
+            "refresh_token":"r","expiry":"2099-01-01T00:00:00Z"},"auth_method":"consumer"}"#;
+        let engine = make_engine_with_secrets(
+            tmp.path(),
+            vec![AgentSecretFile {
+                relative_path: std::path::PathBuf::from("antigravity-cli")
+                    .join("antigravity-oauth-token"),
+                contents: token_payload.to_vec(),
+                mode: 0o600,
+            }],
+        );
+        let agent = AgentName::new("antigravity").unwrap();
+
+        let overlays = engine
+            .agent_settings_overlays_with(&agent, false, tmp.path(), None)
+            .unwrap();
+
+        assert_eq!(overlays.len(), 1, "expected one .gemini overlay");
+        let staged = &overlays[0].host_path;
+        let staged_token = staged.join("antigravity-cli/antigravity-oauth-token");
+        assert!(
+            staged_token.exists(),
+            "staged dir must contain antigravity-cli/antigravity-oauth-token; \
+             listed under {:?}",
+            std::fs::read_dir(staged).map(|d| d
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .collect::<Vec<_>>()),
+        );
+        assert_eq!(
+            std::fs::read(&staged_token).unwrap(),
+            token_payload.to_vec(),
+            "staged token contents must round-trip"
+        );
+        // Host copy is preserved alongside the planted secret.
+        assert!(staged.join("settings.json").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&staged_token)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "token file must be mode 0600; got {mode:o}");
+        }
+    }
+
+    #[test]
+    fn antigravity_settings_overlay_synthesizes_dir_when_only_keychain_present() {
+        use crate::engine::auth::keychain::AgentSecretFile;
+        let tmp = tempfile::tempdir().unwrap();
+        // No host ~/.gemini, but keychain has a token. This mirrors the
+        // first-time-container-user path where the host never ran agy
+        // directly but did authorize it through some other route.
+        let token_payload = br#"{"token":{"access_token":"a","token_type":"Bearer",
+            "refresh_token":"r","expiry":"2099-01-01T00:00:00Z"},"auth_method":"consumer"}"#;
+        let engine = make_engine_with_secrets(
+            tmp.path(),
+            vec![AgentSecretFile {
+                relative_path: std::path::PathBuf::from("antigravity-cli")
+                    .join("antigravity-oauth-token"),
+                contents: token_payload.to_vec(),
+                mode: 0o600,
+            }],
+        );
+        let agent = AgentName::new("antigravity").unwrap();
+
+        let overlays = engine
+            .agent_settings_overlays_with(&agent, false, tmp.path(), None)
+            .unwrap();
+
+        assert_eq!(overlays.len(), 1, "expected synthesized overlay");
+        let staged_token = overlays[0]
+            .host_path
+            .join("antigravity-cli/antigravity-oauth-token");
+        assert!(staged_token.exists(), "synthesized dir must hold the token");
     }
 
     // ─── antigravity skill_overlays ───────────────────────────────────────────

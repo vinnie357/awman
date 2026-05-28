@@ -67,7 +67,7 @@ impl AuthPathResolver {
             "antigravity" => AgentAuthPaths {
                 agent: agent.to_string(),
                 config_file: None,
-                settings_dir: Some(self.home.join(".gemini").join("antigravity-cli")),
+                settings_dir: Some(self.home.join(".gemini")),
             },
             "opencode" => AgentAuthPaths {
                 agent: agent.to_string(),
@@ -144,14 +144,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_antigravity_settings_dir_is_gemini_antigravity_cli() {
+    fn resolve_antigravity_settings_dir_is_gemini() {
         let r = resolver();
         let paths = r.resolve("antigravity");
         assert_eq!(paths.agent, "antigravity");
         assert_eq!(paths.config_file, None);
         assert_eq!(
             paths.settings_dir,
-            Some(Path::new("/home/testuser/.gemini/antigravity-cli").to_path_buf())
+            Some(Path::new("/home/testuser/.gemini").to_path_buf())
         );
     }
 

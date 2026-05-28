@@ -133,6 +133,7 @@ fn make_step(name: &str, deps: &[&str]) -> WorkflowStep {
         agent: None,
         model: None,
         overlays: None,
+        abort_on_failure: false,
     }
 }
 

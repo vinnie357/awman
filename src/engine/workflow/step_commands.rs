@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use crate::data::workflow_definition::{SetupStep, TeardownStep};
-use crate::data::workflow_prompt_template::{substitute_prompt, WorkItemContext};
+use crate::data::workflow_prompt_template::{extract_section, substitute_prompt, WorkItemContext};
 
 /// Quote `s` as a single POSIX shell word so embedded whitespace, quotes, and
 /// metacharacters cannot break out of the argument. Workflow files are
@@ -85,10 +85,13 @@ pub fn teardown_step_to_shell(step: &TeardownStep) -> (String, Option<HashMap<St
             (cmd, None)
         }
         TeardownStep::CreatePullRequest { title, body, base } => {
-            let mut cmd = format!("gh pr create --title {}", sh_quote(title));
-            if let Some(b) = body {
-                cmd.push_str(&format!(" --body {}", sh_quote(b)));
-            }
+            let t = title.as_deref().unwrap_or("Automated PR");
+            let b = body.as_deref().unwrap_or("");
+            let mut cmd = format!(
+                "gh pr create --title {} --body {}",
+                sh_quote(t),
+                sh_quote(b),
+            );
             if let Some(base) = base {
                 cmd.push_str(&format!(" --base {}", sh_quote(base)));
             }
@@ -126,9 +129,10 @@ pub fn teardown_step_description(step: &TeardownStep) -> String {
         TeardownStep::RunShell { command, .. } => format!("run_shell: {command}"),
         TeardownStep::RunScript { path } => format!("run_script: {path}"),
         TeardownStep::CommitChanges { message, .. } => format!("commit_changes: {message}"),
-        TeardownStep::CreatePullRequest { title, .. } => {
-            format!("create_pull_request: {title}")
-        }
+        TeardownStep::CreatePullRequest { title, .. } => match title {
+            Some(t) => format!("create_pull_request: {t}"),
+            None => "create_pull_request".to_string(),
+        },
         TeardownStep::PushBranch { remote, branch } => match (remote, branch) {
             (Some(r), Some(b)) => format!("push_branch: {r} {b}"),
             _ => "push_branch".to_string(),
@@ -189,9 +193,17 @@ pub fn substitute_teardown_step(
             add_all: *add_all,
         },
         TeardownStep::CreatePullRequest { title, body, base } => {
+            let resolved_title = match title {
+                Some(t) => Some(sub(t, ctx)),
+                None => ctx.map(|wi| format!("Implement awman/work-item-{:04}", wi.number)),
+            };
+            let resolved_body = match body {
+                Some(b) => Some(sub(b, ctx)),
+                None => ctx.and_then(|wi| extract_section(&wi.content, "Summary")),
+            };
             TeardownStep::CreatePullRequest {
-                title: sub(title, ctx),
-                body: sub_opt(body, ctx),
+                title: resolved_title,
+                body: resolved_body,
                 base: sub_opt(base, ctx),
             }
         }
@@ -319,7 +331,7 @@ mod tests {
     #[test]
     fn create_pr_full() {
         let step = TeardownStep::CreatePullRequest {
-            title: "feat: my feature".to_string(),
+            title: Some("feat: my feature".to_string()),
             body: Some("PR body text".to_string()),
             base: Some("main".to_string()),
         };
@@ -333,12 +345,29 @@ mod tests {
     #[test]
     fn create_pr_minimal() {
         let step = TeardownStep::CreatePullRequest {
-            title: "feat: my feature".to_string(),
+            title: Some("feat: my feature".to_string()),
             body: None,
             base: None,
         };
         let (cmd, _) = teardown_step_to_shell(&step);
-        assert_eq!(cmd, "gh pr create --title 'feat: my feature'");
+        assert_eq!(
+            cmd,
+            "gh pr create --title 'feat: my feature' --body ''"
+        );
+    }
+
+    #[test]
+    fn create_pr_no_title_defaults() {
+        let step = TeardownStep::CreatePullRequest {
+            title: None,
+            body: None,
+            base: None,
+        };
+        let (cmd, _) = teardown_step_to_shell(&step);
+        assert_eq!(
+            cmd,
+            "gh pr create --title 'Automated PR' --body ''"
+        );
     }
 
     #[test]
@@ -401,12 +430,12 @@ mod tests {
         // A hostile/typo'd title with shell metacharacters must stay inside
         // a single argument when interpolated.
         let step = TeardownStep::CreatePullRequest {
-            title: "x\"; rm -rf / #".to_string(),
+            title: Some("x\"; rm -rf / #".to_string()),
             body: None,
             base: None,
         };
         let (cmd, _) = teardown_step_to_shell(&step);
-        assert_eq!(cmd, "gh pr create --title 'x\"; rm -rf / #'");
+        assert_eq!(cmd, "gh pr create --title 'x\"; rm -rf / #' --body ''");
     }
 
     #[test]
@@ -492,11 +521,19 @@ mod tests {
         );
         assert_eq!(
             teardown_step_description(&TeardownStep::CreatePullRequest {
-                title: "feat: x".to_string(),
+                title: Some("feat: x".to_string()),
                 body: None,
                 base: None,
             }),
             "create_pull_request: feat: x"
+        );
+        assert_eq!(
+            teardown_step_description(&TeardownStep::CreatePullRequest {
+                title: None,
+                body: None,
+                base: None,
+            }),
+            "create_pull_request"
         );
         assert_eq!(
             teardown_step_description(&TeardownStep::PushBranch {
@@ -540,16 +577,51 @@ mod tests {
     #[test]
     fn substitute_teardown_create_pr() {
         let step = TeardownStep::CreatePullRequest {
-            title: "feat: WI {{work_item_number}}".to_string(),
+            title: Some("feat: WI {{work_item_number}}".to_string()),
             body: Some("Content: {{work_item_section:[Summary]}}".to_string()),
             base: Some("main".to_string()),
         };
         let result = substitute_teardown_step(&step, Some(&wi()));
         match result {
             TeardownStep::CreatePullRequest { title, body, base } => {
-                assert_eq!(title, "feat: WI 0042");
+                assert_eq!(title.unwrap(), "feat: WI 0042");
                 assert_eq!(body.unwrap(), "Content: Do the thing");
                 assert_eq!(base.unwrap(), "main");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn substitute_teardown_create_pr_defaults_from_work_item() {
+        let step = TeardownStep::CreatePullRequest {
+            title: None,
+            body: None,
+            base: None,
+        };
+        let result = substitute_teardown_step(&step, Some(&wi()));
+        match result {
+            TeardownStep::CreatePullRequest { title, body, base } => {
+                assert_eq!(title.unwrap(), "Implement awman/work-item-0042");
+                assert_eq!(body.unwrap(), "Do the thing");
+                assert!(base.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn substitute_teardown_create_pr_defaults_without_work_item() {
+        let step = TeardownStep::CreatePullRequest {
+            title: None,
+            body: None,
+            base: None,
+        };
+        let result = substitute_teardown_step(&step, None);
+        match result {
+            TeardownStep::CreatePullRequest { title, body, .. } => {
+                assert!(title.is_none());
+                assert!(body.is_none());
             }
             _ => panic!("wrong variant"),
         }

@@ -746,8 +746,14 @@ mod tests {
 
     fn make_session_empty() -> (tempfile::TempDir, Session) {
         let tmp = tempfile::tempdir().unwrap();
+        // Pin `AWMAN_CONFIG_HOME` at an empty tempdir so the session can't
+        // fall through to the developer's real `~/.awman/config.json` (which
+        // on a working machine may legitimately have `remote.defaultAddr`
+        // configured and would silently invalidate the "no source" assertion).
+        let env =
+            EnvSnapshot::with_overrides([("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap())]);
         let opts = SessionOpenOptions {
-            env: Some(EnvSnapshot::empty()),
+            env: Some(env),
             ..Default::default()
         };
         let session =

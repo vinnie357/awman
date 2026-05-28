@@ -176,6 +176,9 @@ impl WorkflowFrontend for TuiCommandFrontend {
         }
         match outcome {
             WorkflowOutcome::Completed => self.messages.success("Workflow completed successfully"),
+            WorkflowOutcome::CompletedTeardownFailed => {
+                self.messages.warning("Workflow completed but teardown failed");
+            }
             WorkflowOutcome::Paused => self.messages.info("Workflow paused"),
             WorkflowOutcome::Aborted => self.messages.warning("Workflow aborted"),
             WorkflowOutcome::Failed {
@@ -449,6 +452,7 @@ mod tests {
             agent: None,
             model: None,
             overlays: None,
+            abort_on_failure: false,
         }
     }
 
@@ -577,6 +581,7 @@ mod tests {
                     agent: None,
                     model: None,
                     overlays: None,
+                    abort_on_failure: false,
                 },
                 WorkflowStep {
                     name: "test".into(),
@@ -585,6 +590,7 @@ mod tests {
                     agent: None,
                     model: None,
                     overlays: None,
+                    abort_on_failure: false,
                 },
             ],
             "hash".into(),
@@ -604,6 +610,7 @@ mod tests {
                     agent: None,
                     model: None,
                     overlays: None,
+                    abort_on_failure: false,
                 },
                 WorkflowStep {
                     name: "test-a".into(),
@@ -612,6 +619,7 @@ mod tests {
                     agent: None,
                     model: None,
                     overlays: None,
+                    abort_on_failure: false,
                 },
                 WorkflowStep {
                     name: "test-b".into(),
@@ -620,6 +628,7 @@ mod tests {
                     agent: None,
                     model: None,
                     overlays: None,
+                    abort_on_failure: false,
                 },
             ],
             "hash".into(),

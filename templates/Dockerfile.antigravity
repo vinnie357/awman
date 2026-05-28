@@ -26,19 +26,10 @@ ENTRYPOINT []
 CMD ["/bin/bash"]
 
 # ── Install agent binary ──────────────────────────────────────────────────────
-# Wipe inherited apt state before updating in case the base left a broken
-# sources.list or stale lock. Then install Node 20 and the agent npm package;
-# nodesource defaults its npm prefix to /usr/local, so the binary lands in
-# /usr/local/bin where the smoke test expects it.
-RUN rm -rf /var/lib/apt/lists/* \
-    && apt-get clean \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends gnupg \
-    && curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 https://deb.nodesource.com/setup_20.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN npm install -g --prefix=/usr/local @google/antigravity-cli
+# Official installer; curl is inherited from the base image.
+RUN curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 60 \
+        https://antigravity.google/cli/install.sh | bash \
+    && cp /root/.local/bin/agy /usr/local/bin/agy
 
 # ── amux user + workspace (idempotent against a base that already created it) ─
 # Outer braces keep the && chain associated with the user-creation block,

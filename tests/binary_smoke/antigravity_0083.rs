@@ -26,6 +26,25 @@ fn make_git_repo() -> TempDir {
     repo
 }
 
+/// Build an `awman` subprocess scoped to a fresh empty config home so the
+/// developer's real `~/.awman/config.json` (which on a working machine often
+/// has a `runtime` and image registry configured) can never bleed into the
+/// test's exit-code or warning-text assertions.
+fn awman_isolated(repo: &TempDir) -> (TempDir, Command) {
+    let cfg_home = TempDir::new().expect("config TempDir::new");
+    let mut cmd = Command::new(awman_bin());
+    cmd.current_dir(repo.path())
+        .env("AWMAN_CONFIG_HOME", cfg_home.path())
+        // Also pin the API root so the binary doesn't notice the dev
+        // machine's real `~/.awman/api/` (sessions DB etc.). Belt and braces.
+        .env("AWMAN_API_ROOT", cfg_home.path().join("api"))
+        .env_remove("AWMAN_REMOTE_ADDR")
+        .env_remove("AWMAN_REMOTE_SESSION")
+        .env_remove("AWMAN_API_KEY")
+        .env_remove("AWMAN_OVERLAYS");
+    (cfg_home, cmd)
+}
+
 // ─── Gemini deprecation warning — chat ───────────────────────────────────────
 
 /// `amux chat gemini` must emit a deprecation warning containing "deprecated"
@@ -34,8 +53,8 @@ fn make_git_repo() -> TempDir {
 #[test]
 fn chat_gemini_emits_deprecation_warning_before_container_start() {
     let repo = make_git_repo();
-    let output = awman()
-        .current_dir(repo.path())
+    let (_cfg, mut cmd) = awman_isolated(&repo);
+    let output = cmd
         .args(["chat", "--agent", "gemini"])
         .output()
         .expect("failed to run awman");
@@ -64,8 +83,8 @@ fn chat_gemini_emits_deprecation_warning_before_container_start() {
 #[test]
 fn exec_workflow_gemini_emits_deprecation_warning() {
     let repo = make_git_repo();
-    let output = awman()
-        .current_dir(repo.path())
+    let (_cfg, mut cmd) = awman_isolated(&repo);
+    let output = cmd
         .args([
             "exec",
             "workflow",
@@ -105,8 +124,8 @@ prompt = "hi"
     )
     .expect("write workflow file");
 
-    let output = awman()
-        .current_dir(repo.path())
+    let (_cfg, mut cmd) = awman_isolated(&repo);
+    let output = cmd
         .args(["exec", "workflow", wf_path.to_str().unwrap()])
         .output()
         .expect("failed to run awman");
@@ -129,8 +148,8 @@ prompt = "hi"
 #[test]
 fn gemini_deprecation_warning_uses_real_commands() {
     let repo = make_git_repo();
-    let output = awman()
-        .current_dir(repo.path())
+    let (_cfg, mut cmd) = awman_isolated(&repo);
+    let output = cmd
         .args(["chat", "--agent", "gemini"])
         .output()
         .expect("failed to run awman");
@@ -161,8 +180,8 @@ fn gemini_deprecation_warning_uses_real_commands() {
 #[test]
 fn chat_antigravity_model_flag_exits_nonzero() {
     let repo = make_git_repo();
-    let output = awman()
-        .current_dir(repo.path())
+    let (_cfg, mut cmd) = awman_isolated(&repo);
+    let output = cmd
         .args(["chat", "--agent", "antigravity", "--model", "gemini-3.5-flash"])
         .output()
         .expect("failed to run awman");
@@ -182,8 +201,8 @@ fn chat_antigravity_model_flag_exits_nonzero() {
 #[test]
 fn chat_antigravity_model_flag_stderr_or_exit_nonzero() {
     let repo = make_git_repo();
-    let output = awman()
-        .current_dir(repo.path())
+    let (_cfg, mut cmd) = awman_isolated(&repo);
+    let output = cmd
         .args(["chat", "--agent", "antigravity", "--model", "gemini-3.5-flash"])
         .output()
         .expect("failed to run awman");

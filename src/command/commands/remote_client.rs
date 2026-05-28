@@ -637,8 +637,31 @@ mod tests {
 
     fn make_session(env: EnvSnapshot) -> (tempfile::TempDir, Session) {
         let tmp = tempfile::tempdir().unwrap();
+        // Pin `AWMAN_CONFIG_HOME` at an empty tempdir so the session can't
+        // fall through to the developer's real `~/.awman/config.json` (which
+        // on a working machine may legitimately have `remote` configured and
+        // would invalidate the "no source" / "addr mismatch" assertions).
+        // All current callers pass either `EnvSnapshot::empty()` or a snapshot
+        // with `AWMAN_API_KEY` only, so we rebuild the snapshot with the
+        // config-home pin added on top of those known keys.
+        let mut entries: Vec<(String, String)> = Vec::new();
+        for key in [
+            "AWMAN_API_KEY",
+            "AWMAN_REMOTE_ADDR",
+            "AWMAN_REMOTE_SESSION",
+            "AWMAN_OVERLAYS",
+            "AWMAN_API_ROOT",
+        ] {
+            if let Some(v) = env.get(key) {
+                entries.push((key.to_string(), v.to_string()));
+            }
+        }
+        entries.push((
+            "AWMAN_CONFIG_HOME".to_string(),
+            tmp.path().to_str().unwrap().to_string(),
+        ));
         let opts = SessionOpenOptions {
-            env: Some(env),
+            env: Some(EnvSnapshot::with_overrides(entries)),
             ..Default::default()
         };
         let session =

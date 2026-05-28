@@ -5,6 +5,7 @@
 //! (`sleep infinity`) and kept alive for the duration of the phase.
 
 use std::collections::HashMap;
+use std::io::BufRead;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -99,6 +100,24 @@ pub trait ContainerExec: Send + Sync {
         command: &str,
         env: Option<&HashMap<String, String>>,
     ) -> Result<ExecOutput, EngineError>;
+
+    /// Execute a command, streaming each output line to `on_line` as it arrives.
+    /// The default falls back to `exec` and iterates the buffered output.
+    fn exec_streaming(
+        &self,
+        command: &str,
+        env: Option<&HashMap<String, String>>,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<ExecOutput, EngineError> {
+        let output = self.exec(command, env)?;
+        for line in output.stdout.lines() {
+            on_line(line);
+        }
+        for line in output.stderr.lines() {
+            on_line(line);
+        }
+        Ok(output)
+    }
 }
 
 impl ContainerExec for BackgroundContainer {
@@ -110,6 +129,21 @@ impl ContainerExec for BackgroundContainer {
         // Delegates to the inherent method; inherent takes priority in method
         // resolution so this does not recurse.
         BackgroundContainer::exec(self, command, env)
+    }
+
+    fn exec_streaming(
+        &self,
+        command: &str,
+        env: Option<&HashMap<String, String>>,
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<ExecOutput, EngineError> {
+        self.backend.exec_in_background_streaming(
+            &self.container_id,
+            command,
+            &self.working_dir,
+            env,
+            on_line,
+        )
     }
 }
 
@@ -246,6 +280,93 @@ pub(super) fn default_exec_in_background(
     Ok(ExecOutput {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code,
+    })
+}
+
+pub(super) fn default_exec_in_background_streaming(
+    cli_bin: &str,
+    container_id: &str,
+    command: &str,
+    working_dir: &str,
+    env: Option<&HashMap<String, String>>,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<ExecOutput, EngineError> {
+    let mut args = vec!["exec".to_string()];
+    args.extend(["-w".to_string(), working_dir.to_string()]);
+
+    if let Some(env_map) = env {
+        for (k, v) in env_map {
+            args.push("-e".to_string());
+            args.push(format!("{k}={v}"));
+        }
+    }
+
+    args.push(container_id.to_string());
+    args.extend(["sh".to_string(), "-c".to_string(), command.to_string()]);
+
+    let mut child = Command::new(cli_bin)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            EngineError::Container(format!(
+                "exec in background container {container_id}: {e}"
+            ))
+        })?;
+
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let stderr_thread = std::thread::spawn(move || {
+        let mut stderr_buf = String::new();
+        if let Some(pipe) = stderr_pipe {
+            let reader = std::io::BufReader::new(pipe);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        stderr_buf.push_str(&l);
+                        stderr_buf.push('\n');
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        stderr_buf
+    });
+
+    let mut stdout_buf = String::new();
+    if let Some(pipe) = stdout_pipe {
+        let reader = std::io::BufReader::new(pipe);
+        for line in reader.lines() {
+            match line {
+                Ok(l) => {
+                    on_line(&l);
+                    stdout_buf.push_str(&l);
+                    stdout_buf.push('\n');
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    let stderr_buf = stderr_thread.join().unwrap_or_default();
+    for line in stderr_buf.lines() {
+        on_line(line);
+    }
+
+    let status = child.wait().map_err(|e| {
+        EngineError::Container(format!(
+            "waiting for exec in background container {container_id}: {e}"
+        ))
+    })?;
+
+    let exit_code = status.code().unwrap_or(-1);
+    Ok(ExecOutput {
+        stdout: stdout_buf,
+        stderr: stderr_buf,
         exit_code,
     })
 }

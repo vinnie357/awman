@@ -302,7 +302,7 @@ Teardown steps are defined in a `[[teardown]]` (TOML) or `teardown:` (YAML) arra
 | `run_script` | `path` (string, required), `env` (object, optional) | Execute a shell script file. |
 | `commit_changes` | `message` (string, required), `add_all` (boolean, optional) | Commit staged changes. If `add_all` is `true`, runs `git add -A` first. |
 | `push_branch` | `remote` (string, optional), `branch` (string, optional) | Push the current branch to a remote. Omit both to use `git push` with defaults. |
-| `create_pull_request` | `title` (string, required), `body` (string, optional), `base` (string, optional) | Create a pull request using the GitHub CLI. Requires `gh` to be available in the base container image. |
+| `create_pull_request` | `title` (string, optional), `body` (string, optional), `base` (string, optional) | Create a pull request using the GitHub CLI. If `base` is provided, it sets the branch the PR will be opened against (via the `--base` flag). Requires `gh` to be available in the base container image. |
 
 Example TOML teardown:
 

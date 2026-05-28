@@ -22,6 +22,7 @@ CMD ["/bin/bash"]
 # musl-tools      : musl-gcc cross-compiler; required to build the
 #                   x86_64-unknown-linux-musl target for the statically-linked
 #                   release binary (aspec/architecture/design.md).
+# openssh-client   : SSH client for git push over SSH in setup/teardown steps.
 RUN rm -rf /var/lib/apt/lists/* \
     && apt-get clean \
     && apt-get update \
@@ -36,6 +37,7 @@ RUN rm -rf /var/lib/apt/lists/* \
         libxcb-shape0-dev \
         libxcb-xfixes0-dev \
         musl-tools \
+        openssh-client \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 

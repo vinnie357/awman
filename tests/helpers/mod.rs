@@ -130,5 +130,6 @@ pub fn wf_step(name: &str, deps: &[&str], prompt: &str) -> WorkflowStep {
         agent: None,
         model: None,
         overlays: None,
+        abort_on_failure: false,
     }
 }

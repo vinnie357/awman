@@ -112,6 +112,7 @@ pub struct WorkflowEngine {
     current_step_model: Option<String>,
     work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
     yolo: bool,
+    abort_on_failure_triggered: bool,
     last_exit_info: Option<ContainerExitInfo>,
     engine_rx: Option<tokio::sync::mpsc::UnboundedReceiver<EngineRequest>>,
 }
@@ -178,9 +179,14 @@ impl WorkflowEngine {
             current_step_model: None,
             work_item_context,
             yolo: false,
+            abort_on_failure_triggered: false,
             last_exit_info: None,
             engine_rx: Some(rx),
         })
+    }
+
+    pub fn abort_on_failure_triggered(&self) -> bool {
+        self.abort_on_failure_triggered
     }
 
     pub fn set_yolo(&mut self, yolo: bool) {
@@ -265,6 +271,7 @@ impl WorkflowEngine {
             current_step_model: None,
             work_item_context,
             yolo: false,
+            abort_on_failure_triggered: false,
             last_exit_info: None,
             engine_rx: Some(rx),
         })
@@ -319,6 +326,24 @@ impl WorkflowEngine {
                 self.frontend.report_workflow_progress(&progress);
 
                 let step = self.find_step(&outcome.step_name)?;
+
+                if step.abort_on_failure {
+                    self.msg_warning(format!(
+                        "Step '{}' failed (abort_on_failure); aborting workflow",
+                        outcome.step_name,
+                    ));
+                    self.abort_on_failure_triggered = true;
+                    for s in &self.workflow.steps {
+                        if !self.state.completed_steps.contains(&s.name) {
+                            self.state.set_status(&s.name, StepState::Cancelled);
+                        }
+                    }
+                    self.persist()?;
+                    let aborted = WorkflowOutcome::Aborted;
+                    self.frontend.report_workflow_completed(&aborted);
+                    return Ok(aborted);
+                }
+
                 let exit_info = self
                     .last_exit_info
                     .clone()
@@ -1375,6 +1400,7 @@ impl WorkflowEngine {
     pub fn run_setup<F>(
         &mut self,
         steps: &[crate::data::workflow_definition::SetupStep],
+        abort_flags: &[bool],
         mut container_for_step: F,
     ) -> Result<(), EngineError>
     where
@@ -1401,6 +1427,7 @@ impl WorkflowEngine {
         for (idx, step) in steps.iter().enumerate() {
             let desc = setup_step_description(step);
             let (command, env) = setup_step_to_shell(step);
+            let abort = abort_flags.get(idx).copied().unwrap_or(false);
 
             self.state.setup_step_states[idx].status = PhaseStepStatus::Running;
             self.persist()?;
@@ -1408,14 +1435,11 @@ impl WorkflowEngine {
             self.frontend.on_setup_step_started(&desc);
 
             let container = container_for_step(idx)?;
-            let result = container.exec(&command, env.as_ref())?;
-
-            for line in result.stdout.lines() {
-                self.frontend.on_setup_step_output(line);
-            }
-            for line in result.stderr.lines() {
-                self.frontend.on_setup_step_output(line);
-            }
+            let result = container.exec_streaming(
+                &command,
+                env.as_ref(),
+                &mut |line| self.frontend.on_setup_step_output(line),
+            )?;
 
             if result.exit_code != 0 {
                 self.state.setup_step_states[idx].status = PhaseStepStatus::Failed {
@@ -1424,10 +1448,14 @@ impl WorkflowEngine {
                 self.persist()?;
                 self.frontend
                     .on_setup_step_failed(&desc, result.exit_code, &result.stderr);
-                return Err(EngineError::Container(format!(
-                    "setup step '{}' failed with exit code {}",
-                    desc, result.exit_code
-                )));
+                if abort {
+                    self.abort_on_failure_triggered = true;
+                    return Err(EngineError::Container(format!(
+                        "setup step '{}' failed with exit code {} (abort_on_failure)",
+                        desc, result.exit_code
+                    )));
+                }
+                continue;
             }
 
             self.state.setup_step_states[idx].status = PhaseStepStatus::Succeeded;
@@ -1453,13 +1481,15 @@ impl WorkflowEngine {
     /// that step as `Failed`, surfaces the error to the frontend, and proceeds
     /// to the next step — matching the best-effort semantics already used for
     /// non-zero exit codes.
+    /// Returns `true` if teardown was aborted by an `abort_on_failure` step.
     pub fn run_teardown<F>(
         &mut self,
         steps: &[crate::data::workflow_definition::TeardownStep],
+        abort_flags: &[bool],
         workflow_succeeded: bool,
         teardown_on_failure: bool,
         mut container_for_step: F,
-    ) -> Result<(), EngineError>
+    ) -> Result<bool, EngineError>
     where
         F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
     {
@@ -1469,7 +1499,7 @@ impl WorkflowEngine {
         };
 
         if !teardown_on_failure && !workflow_succeeded {
-            return Ok(());
+            return Ok(false);
         }
 
         let wi_ctx = self.work_item_context.as_ref();
@@ -1485,9 +1515,11 @@ impl WorkflowEngine {
             .collect();
         self.persist()?;
 
+        let mut teardown_aborted = false;
         for (idx, step) in steps.iter().enumerate() {
             let desc = teardown_step_description(step);
             let (command, env) = teardown_step_to_shell(step);
+            let abort = abort_flags.get(idx).copied().unwrap_or(false);
 
             self.state.teardown_step_states[idx].status = PhaseStepStatus::Running;
             self.persist()?;
@@ -1503,17 +1535,18 @@ impl WorkflowEngine {
                     };
                     self.persist()?;
                     self.frontend.on_teardown_step_failed(&desc, 1, &msg);
+                    if abort {
+                        teardown_aborted = true;
+                        break;
+                    }
                     continue;
                 }
             };
-            let result = container.exec(&command, env.as_ref())?;
-
-            for line in result.stdout.lines() {
-                self.frontend.on_teardown_step_output(line);
-            }
-            for line in result.stderr.lines() {
-                self.frontend.on_teardown_step_output(line);
-            }
+            let result = container.exec_streaming(
+                &command,
+                env.as_ref(),
+                &mut |line| self.frontend.on_teardown_step_output(line),
+            )?;
 
             if result.exit_code != 0 {
                 self.state.teardown_step_states[idx].status = PhaseStepStatus::Failed {
@@ -1522,7 +1555,10 @@ impl WorkflowEngine {
                 self.persist()?;
                 self.frontend
                     .on_teardown_step_failed(&desc, result.exit_code, &result.stderr);
-                // Best-effort: continue to next step.
+                if abort {
+                    teardown_aborted = true;
+                    break;
+                }
             } else {
                 self.state.teardown_step_states[idx].status = PhaseStepStatus::Succeeded;
                 self.persist()?;
@@ -1534,7 +1570,7 @@ impl WorkflowEngine {
         self.state.teardown_completed = true;
         self.state.current_phase = WorkflowPhase::Done;
         self.persist()?;
-        Ok(())
+        Ok(teardown_aborted)
     }
 
     /// Mark the workflow as fully finished. Called by the orchestrator after
@@ -1755,6 +1791,7 @@ mod tests {
             agent: agent.map(|s| s.to_string()),
             model: None,
             overlays: None,
+            abort_on_failure: false,
         }
     }
 
@@ -3062,7 +3099,7 @@ mod tests {
         let steps = setup_steps_sample();
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, mock.factory()).unwrap();
+        engine.run_setup(&steps, &[], mock.factory()).unwrap();
 
         let calls = mock.calls();
         assert_eq!(calls.len(), 3);
@@ -3080,7 +3117,7 @@ mod tests {
         let steps = setup_steps_sample(); // 3 steps
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, mock.factory()).unwrap();
+        engine.run_setup(&steps, &[], mock.factory()).unwrap();
 
         assert_eq!(
             mock.handouts(),
@@ -3097,7 +3134,7 @@ mod tests {
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
         engine
-            .run_teardown(&steps, true, false, mock.factory())
+            .run_teardown(&steps, &[], true, false, mock.factory())
             .unwrap();
 
         assert_eq!(
@@ -3108,7 +3145,24 @@ mod tests {
     }
 
     #[test]
-    fn run_setup_aborts_on_second_step_failure() {
+    fn run_setup_continues_on_failure_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = setup_steps_sample(); // 3 steps
+        let mock = Arc::new(MockBackgroundContainer::with_results([
+            ("".into(), "".into(), 0),                 // step 1 succeeds
+            ("".into(), "build error".into(), 1),      // step 2 fails
+            ("".into(), "".into(), 0),                 // step 3 still runs
+        ]));
+
+        let result = engine.run_setup(&steps, &[], mock.factory());
+
+        assert!(result.is_ok(), "run_setup continues past failures when abort_on_failure=false");
+        assert_eq!(mock.calls().len(), 3, "all steps must be exec'd");
+    }
+
+    #[test]
+    fn run_setup_aborts_on_abort_on_failure_step() {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = make_minimal_engine(&tmp);
         let steps = setup_steps_sample(); // 3 steps
@@ -3117,11 +3171,13 @@ mod tests {
             ("".into(), "build error".into(), 1),      // step 2 fails
             ("".into(), "".into(), 0),                 // step 3 (never reached)
         ]));
+        let abort_flags = vec![false, true, false]; // step 2 has abort_on_failure
 
-        let result = engine.run_setup(&steps, mock.factory());
+        let result = engine.run_setup(&steps, &abort_flags, mock.factory());
 
-        assert!(result.is_err(), "run_setup must return Err on step failure");
+        assert!(result.is_err(), "run_setup must return Err when abort_on_failure step fails");
         assert_eq!(mock.calls().len(), 2, "third step must not be exec'd");
+        assert!(engine.abort_on_failure_triggered());
     }
 
     #[test]
@@ -3133,7 +3189,7 @@ mod tests {
 
         // teardown_on_failure = false, workflow_succeeded = false → skip all
         engine
-            .run_teardown(&steps, false, false, mock.factory())
+            .run_teardown(&steps, &[], false, false, mock.factory())
             .unwrap();
 
         assert_eq!(mock.calls().len(), 0, "no exec calls should be made");
@@ -3152,7 +3208,7 @@ mod tests {
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
         engine
-            .run_teardown(&steps, true, false, mock.factory())
+            .run_teardown(&steps, &[], true, false, mock.factory())
             .unwrap();
 
         assert_eq!(mock.calls().len(), 2, "both teardown steps must exec");
@@ -3169,9 +3225,33 @@ mod tests {
         ]));
 
         // Teardown is best-effort: returns Ok even if a step fails.
-        let result = engine.run_teardown(&steps, true, false, mock.factory());
+        let result = engine.run_teardown(&steps, &[], true, false, mock.factory());
         assert!(result.is_ok(), "run_teardown must return Ok despite step failure");
         assert_eq!(mock.calls().len(), 2, "both steps must be exec'd");
+    }
+
+    #[test]
+    fn run_teardown_aborts_on_abort_on_failure_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_minimal_engine(&tmp);
+        let steps = teardown_steps_sample();
+        let mock = Arc::new(MockBackgroundContainer::with_results([
+            ("".into(), "fatal".into(), 1), // step 0 fails
+            ("".into(), "".into(), 0),      // step 1 would succeed
+        ]));
+
+        // abort_on_failure = true for step 0
+        let result = engine.run_teardown(&steps, &[true, false], true, false, mock.factory());
+        assert!(result.is_ok());
+        assert!(
+            result.unwrap(),
+            "run_teardown must return true when abort_on_failure step fails"
+        );
+        assert_eq!(
+            mock.calls().len(),
+            1,
+            "step 1 must be skipped after abort_on_failure step 0 fails"
+        );
     }
 
     #[test]
@@ -3203,7 +3283,7 @@ mod tests {
             }
         };
 
-        let result = engine.run_teardown(&steps, true, false, factory);
+        let result = engine.run_teardown(&steps, &[], true, false, factory);
         assert!(result.is_ok(), "factory failure must not abort teardown");
 
         let states = &engine.state().teardown_step_states;
@@ -3229,7 +3309,7 @@ mod tests {
         let steps = setup_steps_sample();
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, mock.factory()).unwrap();
+        engine.run_setup(&steps, &[], mock.factory()).unwrap();
 
         assert_eq!(
             engine.state().current_phase,
@@ -3256,7 +3336,7 @@ mod tests {
         ];
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, mock.factory()).unwrap();
+        engine.run_setup(&steps, &[], mock.factory()).unwrap();
 
         let states = &engine.state().setup_step_states;
         assert_eq!(states.len(), 2);
@@ -3279,7 +3359,7 @@ mod tests {
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
         engine
-            .run_teardown(&steps, true, false, mock.factory())
+            .run_teardown(&steps, &[], true, false, mock.factory())
             .unwrap();
 
         let states = &engine.state().teardown_step_states;
@@ -3305,8 +3385,8 @@ mod tests {
             ("".into(), "stderr content".into(), 1),
         ]));
 
-        let result = engine.run_setup(&steps, mock.factory());
-        assert!(result.is_err());
+        let result = engine.run_setup(&steps, &[], mock.factory());
+        assert!(result.is_ok(), "setup continues past failures when abort_on_failure=false");
 
         let states = &engine.state().setup_step_states;
         assert_eq!(states[0].status, PhaseStepStatus::Succeeded);
@@ -3327,7 +3407,7 @@ mod tests {
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
         engine
-            .run_teardown(&steps, true, false, mock.factory())
+            .run_teardown(&steps, &[], true, false, mock.factory())
             .unwrap();
 
         assert_eq!(
@@ -3361,7 +3441,7 @@ mod tests {
         let steps = vec![SetupStep::RunShell { command: "go".into(), env: None }];
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, mock.factory()).unwrap();
+        engine.run_setup(&steps, &[], mock.factory()).unwrap();
 
         // Verify the on-disk state was persisted with the correct phase fields.
         let store = WorkflowStateStore::at_git_root(tmp.path());

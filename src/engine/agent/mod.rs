@@ -584,7 +584,12 @@ mod tests {
     }
 
     #[test]
-    fn build_options_antigravity_plan_includes_approval_mode_plan() {
+    fn build_options_antigravity_plan_returns_plan_unsupported_error() {
+        // agy has no `--approval-mode=plan` CLI flag (verified against
+        // `agy --help`; plan/auto modes live only in settings.json's
+        // `toolPermission` field or interactive slash commands). Asking for
+        // plan mode on antigravity must surface as `PlanModeUnsupported`
+        // rather than silently emitting a flag agy treats as garbage.
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = make_agent_engine(tmp.path());
         let agent = crate::data::session::AgentName::new("antigravity").unwrap();
@@ -593,22 +598,13 @@ mod tests {
             non_interactive: true,
             ..Default::default()
         };
-        let opts = engine.build_options(&session, &agent, &run).unwrap();
-
-        let mode_flags: Vec<String> = opts
-            .iter()
-            .filter_map(|o| {
-                if let ContainerOption::AgentModeFlags(flags) = o {
-                    Some(flags.clone())
-                } else {
-                    None
-                }
-            })
-            .flatten()
-            .collect();
+        let err = engine
+            .build_options(&session, &agent, &run)
+            .expect_err("plan mode on antigravity must be rejected");
+        let msg = err.to_string();
         assert!(
-            mode_flags.contains(&"--approval-mode=plan".to_string()),
-            "AgentModeFlags must contain --approval-mode=plan for antigravity plan; got {mode_flags:?}"
+            msg.contains("antigravity") && msg.to_lowercase().contains("plan"),
+            "error must call out plan-mode for antigravity; got: {msg}"
         );
     }
 

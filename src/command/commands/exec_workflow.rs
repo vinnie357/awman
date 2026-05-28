@@ -752,8 +752,12 @@ impl Command for ExecWorkflowCommand {
             workflow.teardown.iter().map(|e| e.step.clone()).collect();
         let setup_entry_overlays: Vec<Option<Vec<String>>> =
             workflow.setup.iter().map(|e| e.overlays.clone()).collect();
+        let setup_abort_flags: Vec<bool> =
+            workflow.setup.iter().map(|e| e.abort_on_failure).collect();
         let teardown_entry_overlays: Vec<Option<Vec<String>>> =
             workflow.teardown.iter().map(|e| e.overlays.clone()).collect();
+        let teardown_abort_flags: Vec<bool> =
+            workflow.teardown.iter().map(|e| e.abort_on_failure).collect();
         let teardown_on_failure = workflow.teardown_on_failure;
         let engine_work_item_context = work_item_context.clone();
         let (engine_result, step_counts) = {
@@ -788,6 +792,44 @@ impl Command for ExecWorkflowCommand {
                 }
             };
             engine.set_yolo(yolo);
+
+            // Warn if the workflow will commit but git identity is not configured.
+            if teardown_steps.iter().any(|s| {
+                matches!(s, crate::data::workflow_definition::TeardownStep::CommitChanges { .. })
+            }) {
+                let name_ok = std::process::Command::new("git")
+                    .args(["config", "user.name"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                let email_ok = std::process::Command::new("git")
+                    .args(["config", "user.email"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !name_ok || !email_ok {
+                    let missing: Vec<&str> = [
+                        if !name_ok { Some("user.name") } else { None },
+                        if !email_ok { Some("user.email") } else { None },
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                    shared.lock().unwrap().write_message(UserMessage {
+                        level: MessageLevel::Warning,
+                        text: format!(
+                            "workflow has a commit_changes teardown step but git {} not set; \
+                             set them locally (git config {0}) or use a dir() overlay to mount \
+                             your global ~/.gitconfig into the agent container",
+                            missing.join(" and "),
+                        ),
+                    });
+                }
+            }
 
             // === SETUP PHASE ===
             //
@@ -856,7 +898,7 @@ impl Command for ExecWorkflowCommand {
                                 runtime.start_background(&base, &mount, &env, &overlays)?;
                             Ok(Box::new(container))
                         };
-                        let r = engine.run_setup(&setup_steps, factory);
+                        let r = engine.run_setup(&setup_steps, &setup_abort_flags, factory);
                         if let Err(e) = &r {
                             shared_for_factory.lock().unwrap().write_message(UserMessage {
                                 level: MessageLevel::Error,
@@ -880,14 +922,22 @@ impl Command for ExecWorkflowCommand {
                 engine.run_to_completion().await
             };
 
-            let workflow_succeeded = matches!(result, Ok(WorkflowOutcome::Completed { .. }));
+            let workflow_succeeded = matches!(
+                result,
+                Ok(WorkflowOutcome::Completed) | Ok(WorkflowOutcome::CompletedTeardownFailed)
+            );
 
             // === TEARDOWN PHASE ===
             //
             // Same per-entry container pattern as setup. Teardown is
             // best-effort: a per-step container failure (overlay error or
-            // backend failure) is reported and the next step still runs.
-            if !teardown_steps.is_empty() {
+            // backend failure) is reported and the next step still runs
+            // unless the step has `abort_on_failure = true`.
+            //
+            // If the setup or main phase triggered abort_on_failure,
+            // teardown is skipped regardless of teardown_on_failure.
+            let mut teardown_aborted = false;
+            if !teardown_steps.is_empty() && !engine.abort_on_failure_triggered() {
                 let should_run = teardown_on_failure || workflow_succeeded;
                 if should_run {
                     let base_image = resolve_base_image(&session, &git_root_for_scope);
@@ -897,7 +947,7 @@ impl Command for ExecWorkflowCommand {
                     let engines_for_factory = self.engines.clone();
                     let session_for_factory = session.clone();
                     let cli_typed_for_factory = cli_typed.clone();
-                    tokio::task::block_in_place(|| {
+                    teardown_aborted = tokio::task::block_in_place(|| {
                         let factory = |idx: usize| -> Result<
                             Box<dyn crate::engine::container::ContainerExec>,
                             EngineError,
@@ -914,15 +964,26 @@ impl Command for ExecWorkflowCommand {
                                 .start_background(&base_image, &mount, &env, &overlays)?;
                             Ok(Box::new(container))
                         };
-                        let _ = engine.run_teardown(
-                            &teardown_steps,
-                            workflow_succeeded,
-                            teardown_on_failure,
-                            factory,
-                        );
+                        engine
+                            .run_teardown(
+                                &teardown_steps,
+                                &teardown_abort_flags,
+                                workflow_succeeded,
+                                teardown_on_failure,
+                                factory,
+                            )
+                            .unwrap_or(false)
                     });
                 }
             }
+
+            // If a teardown step with abort_on_failure triggered, promote the
+            // result to CompletedTeardownFailed so post-workflow flows know.
+            let result = if teardown_aborted && workflow_succeeded {
+                Ok(WorkflowOutcome::CompletedTeardownFailed)
+            } else {
+                result
+            };
 
             // If teardown didn't run (no teardown steps, or skipped on failure)
             // the engine's current_phase still reads Main — promote it to Done
@@ -960,7 +1021,10 @@ impl Command for ExecWorkflowCommand {
         // 10. Determine whether the workflow ended with an error.
         let had_error = matches!(
             engine_result,
-            Err(_) | Ok(WorkflowOutcome::Failed { .. }) | Ok(WorkflowOutcome::Aborted)
+            Err(_)
+                | Ok(WorkflowOutcome::Failed { .. })
+                | Ok(WorkflowOutcome::Aborted)
+                | Ok(WorkflowOutcome::CompletedTeardownFailed)
         );
 
         // 11. Report summary.
@@ -975,6 +1039,7 @@ impl Command for ExecWorkflowCommand {
         // final success/failure of the run.
         let exit_code = match &engine_result {
             Ok(WorkflowOutcome::Completed) => Some(0),
+            Ok(WorkflowOutcome::CompletedTeardownFailed) => Some(1),
             Ok(WorkflowOutcome::Failed { exit_code, .. }) => Some(*exit_code),
             Ok(WorkflowOutcome::Aborted) => Some(1),
             Ok(WorkflowOutcome::Paused) => None,
@@ -1655,6 +1720,7 @@ prompt = "do something"
                     agent: a.map(|s| s.to_string()),
                     model: None,
                     overlays: None,
+                    abort_on_failure: false,
                 })
                 .collect(),
             agent: workflow_agent.map(|s| s.to_string()),

@@ -156,6 +156,7 @@ mod tests {
             agent: None,
             model: None,
             overlays: None,
+            abort_on_failure: false,
         }
     }
 

@@ -1392,6 +1392,7 @@ async fn api_frontend_workflow_step_transition_index_is_per_step() {
         agent: None,
         model: None,
         overlays: None,
+        abort_on_failure: false,
     };
     let step_b = WorkflowStep {
         name: "beta".into(),
@@ -1400,6 +1401,7 @@ async fn api_frontend_workflow_step_transition_index_is_per_step() {
         agent: None,
         model: None,
         overlays: None,
+        abort_on_failure: false,
     };
 
     fe.report_step_status(&step_a, WorkflowStepStatus::Running);

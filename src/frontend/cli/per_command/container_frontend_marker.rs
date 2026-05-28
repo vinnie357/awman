@@ -67,7 +67,7 @@ impl CliFrontend {
 
     /// Interactive: raw mode, PTY-bridged stdout/stderr, raw stdin reader,
     /// SIGWINCH-driven resize channel.
-    fn take_interactive_io(&mut self) -> ContainerIo {
+    pub(crate) fn take_interactive_io(&mut self) -> ContainerIo {
         let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stderr_tx, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -265,12 +265,19 @@ fn spawn_unix_stdin_reader(
     }
 }
 
-// ─── Standalone proxy used by InitFrontend / ReadyFrontend ─────────────────
+// ─── Standalone proxies used by InitFrontend / ReadyFrontend ────────────────
 
 /// Stand-alone `ContainerFrontend` returned by engines that need a
 /// `Box<dyn ContainerFrontend>` for a single container's lifetime
 /// (`InitFrontend::container_frontend`, etc.). Streams to host stdio.
 pub(crate) struct CliContainerProxy;
+
+/// Interactive variant: wraps a pre-built `ContainerIo` (with `initial_size`,
+/// resize channel, and raw-mode stdin reader already wired) so the engine's
+/// container backend takes the PTY-bridged path instead of piped stdio.
+pub(crate) struct CliInteractiveContainerProxy {
+    pub(crate) container_io: Option<ContainerIo>,
+}
 
 impl UserMessageSink for CliContainerProxy {
     fn write_message(&mut self, msg: UserMessage) {
@@ -321,5 +328,32 @@ impl ContainerFrontend for CliContainerProxy {
             resize: None,
             initial_size: None,
         }
+    }
+}
+
+// ─── CliInteractiveContainerProxy ───────────────────────────────────────
+
+impl UserMessageSink for CliInteractiveContainerProxy {
+    fn write_message(&mut self, msg: UserMessage) {
+        use crate::engine::message::MessageLevel;
+        let prefix = match msg.level {
+            MessageLevel::Info | MessageLevel::Success => "awman:",
+            MessageLevel::Warning => "awman warning:",
+            MessageLevel::Error => "awman error:",
+        };
+        let _ = writeln!(std::io::stderr(), "{prefix} {}", msg.text);
+    }
+    fn replay_queued(&mut self) {}
+}
+
+#[async_trait]
+impl ContainerFrontend for CliInteractiveContainerProxy {
+    fn report_status(&mut self, _status: ContainerStatus) {}
+    fn report_progress(&mut self, _progress: ContainerProgress) {}
+
+    fn take_container_io(&mut self) -> ContainerIo {
+        self.container_io
+            .take()
+            .expect("CliInteractiveContainerProxy::take_container_io called but no ContainerIo available")
     }
 }

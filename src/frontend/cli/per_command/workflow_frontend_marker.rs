@@ -314,6 +314,9 @@ impl WorkflowFrontend for CliFrontend {
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
         let msg = match outcome {
             WorkflowOutcome::Completed => "workflow completed successfully.",
+            WorkflowOutcome::CompletedTeardownFailed => {
+                "workflow completed but teardown failed."
+            }
             WorkflowOutcome::Paused => "workflow paused.",
             WorkflowOutcome::Aborted => "workflow aborted.",
             WorkflowOutcome::Failed {
@@ -497,6 +500,7 @@ mod tests {
             agent: None,
             model: None,
             overlays: None,
+            abort_on_failure: false,
         }
     }
 

@@ -50,6 +50,8 @@ pub struct WorkflowStep {
     pub model: Option<String>,
     #[serde(default)]
     pub overlays: Option<Vec<String>>,
+    #[serde(default)]
+    pub abort_on_failure: bool,
 }
 
 /// A setup phase step — executed before the main workflow steps.
@@ -104,7 +106,8 @@ pub enum TeardownStep {
         add_all: bool,
     },
     CreatePullRequest {
-        title: String,
+        #[serde(default)]
+        title: Option<String>,
         #[serde(default)]
         body: Option<String>,
         #[serde(default)]
@@ -123,6 +126,8 @@ pub enum TeardownStep {
 pub struct SetupStepEntry {
     #[serde(default)]
     pub overlays: Option<Vec<String>>,
+    #[serde(default)]
+    pub abort_on_failure: bool,
     #[serde(flatten)]
     pub step: SetupStep,
 }
@@ -132,6 +137,8 @@ pub struct SetupStepEntry {
 pub struct TeardownStepEntry {
     #[serde(default)]
     pub overlays: Option<Vec<String>>,
+    #[serde(default)]
+    pub abort_on_failure: bool,
     #[serde(flatten)]
     pub step: TeardownStep,
 }
@@ -243,6 +250,8 @@ struct RawStep {
     model: Option<String>,
     #[serde(default)]
     overlays: Option<Vec<String>>,
+    #[serde(default)]
+    abort_on_failure: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -306,6 +315,7 @@ fn raw_to_steps(raw: Vec<RawStep>) -> Result<Vec<WorkflowStep>, DataError> {
             agent: r.agent,
             model: r.model,
             overlays: r.overlays,
+            abort_on_failure: r.abort_on_failure,
         });
     }
     if steps.is_empty() {
@@ -459,7 +469,7 @@ body = "Automated PR from awman workflow"
         assert!(matches!(
             &wf.teardown[1].step,
             TeardownStep::CreatePullRequest { title, body, .. }
-                if title == "feat: implement my feature" && body.as_deref() == Some("Automated PR from awman workflow")
+                if title.as_deref() == Some("feat: implement my feature") && body.as_deref() == Some("Automated PR from awman workflow")
         ));
     }
 
@@ -552,7 +562,7 @@ teardown:
         let wf = Workflow::parse(yaml, WorkflowFormat::Yaml).unwrap();
         assert_eq!(wf.teardown.len(), 1);
         assert!(
-            matches!(&wf.teardown[0].step, TeardownStep::CreatePullRequest { title, .. } if title == "My PR"),
+            matches!(&wf.teardown[0].step, TeardownStep::CreatePullRequest { title, .. } if title.as_deref() == Some("My PR")),
             "teardown step must be CreatePullRequest with correct title"
         );
         assert_eq!(
