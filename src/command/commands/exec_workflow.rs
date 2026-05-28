@@ -619,6 +619,17 @@ impl Command for ExecWorkflowCommand {
             mount_path
         };
 
+        // 4c. When running in a worktree, compute an extra overlay that mounts
+        // the main repo's `.git` directory into setup/teardown containers.
+        // Without this, the worktree's `.git` pointer file references a host
+        // path that doesn't exist inside the container, breaking all git ops.
+        let worktree_git_mount: Option<crate::engine::container::options::OverlaySpec> =
+            if worktree_path.is_some() {
+                worktree_git_overlay(&mount_path)?
+            } else {
+                None
+            };
+
         // 5. Parse CLI overlay specs early so errors surface before PTY is activated.
         let cli_typed = {
             let mut all = Vec::new();
@@ -850,33 +861,23 @@ impl Command for ExecWorkflowCommand {
             let mut setup_failed = false;
             if !setup_steps.is_empty() && !engine.state().setup_completed {
                 let base_image = resolve_base_image(&session, &git_root_for_scope);
+                let resolved = resolve_phase_overlays(
+                    &self.engines,
+                    &session,
+                    &cli_typed,
+                    &setup_entry_overlays,
+                    worktree_git_mount.as_ref(),
+                );
 
-                // Pre-validate each entry's overlays so that a parse error in
-                // ANY entry aborts the phase before any container starts.
-                // Without this, a bad entry midway through would only surface
-                // after earlier steps had already mutated the workspace.
-                let entry_overlays = setup_entry_overlays.clone();
-                let mut validated: Vec<(
-                    Vec<crate::engine::container::options::OverlaySpec>,
-                    std::collections::HashMap<String, String>,
-                )> = Vec::with_capacity(setup_steps.len());
-                for entry in &entry_overlays {
-                    match collect_single_entry_overlays(
-                        &self.engines,
-                        &session,
-                        &cli_typed,
-                        entry.as_deref(),
-                    ) {
-                        Ok(pair) => validated.push(pair),
-                        Err(e) => {
-                            shared.lock().unwrap().write_message(UserMessage {
-                                level: MessageLevel::Error,
-                                text: format!("exec workflow: {e}"),
-                            });
-                            setup_failed = true;
-                            break;
-                        }
-                    }
+                // A bad overlay on ANY entry aborts the whole phase before
+                // any container starts — otherwise earlier steps would have
+                // already mutated the workspace.
+                if let Some(e) = resolved.iter().find_map(|r| r.as_ref().err()) {
+                    shared.lock().unwrap().write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("exec workflow: {e}"),
+                    });
+                    setup_failed = true;
                 }
 
                 if !setup_failed {
@@ -884,26 +885,22 @@ impl Command for ExecWorkflowCommand {
                     let mount = mount_path.clone();
                     let base = base_image.clone();
                     let shared_for_factory = Arc::clone(&shared);
-                    let validated = std::sync::Arc::new(std::sync::Mutex::new(validated));
-                    // The setup container exec calls are blocking; keep the
-                    // tokio worker free by routing them through block_in_place.
                     let setup_result = tokio::task::block_in_place(|| {
                         let factory = |idx: usize| -> Result<
                             Box<dyn crate::engine::container::ContainerExec>,
                             EngineError,
                         > {
-                            let (overlays, env) = validated
-                                .lock()
-                                .unwrap()
+                            let (overlays, env) = resolved
                                 .get(idx)
-                                .cloned()
                                 .ok_or_else(|| {
                                     EngineError::Other(format!(
-                                        "internal: missing pre-validated overlays for setup step {idx}",
+                                        "internal: missing pre-resolved overlays for setup step {idx}",
                                     ))
-                                })?;
+                                })?
+                                .as_ref()
+                                .map_err(|e| EngineError::Other(e.to_string()))?;
                             let container =
-                                runtime.start_background(&base, &mount, &env, &overlays)?;
+                                runtime.start_background(&base, &mount, env, overlays)?;
                             Ok(Box::new(container))
                         };
                         let r = engine.run_setup(&setup_steps, &setup_abort_flags, factory);
@@ -937,10 +934,11 @@ impl Command for ExecWorkflowCommand {
 
             // === TEARDOWN PHASE ===
             //
-            // Same per-entry container pattern as setup. Teardown is
-            // best-effort: a per-step container failure (overlay error or
-            // backend failure) is reported and the next step still runs
-            // unless the step has `abort_on_failure = true`.
+            // Same per-entry container pattern as setup: overlays are
+            // pre-resolved via `resolve_phase_overlays` and the factory
+            // indexes into the results. Unlike setup, no upfront abort
+            // gate — per-entry overlay errors flow through the factory and
+            // `run_teardown` handles them as per-step failures (best-effort).
             //
             // If the setup or main phase triggered abort_on_failure,
             // teardown is skipped regardless of teardown_on_failure.
@@ -950,27 +948,31 @@ impl Command for ExecWorkflowCommand {
                 let should_run = teardown_on_failure || workflow_succeeded;
                 if should_run {
                     let base_image = resolve_base_image(&session, &git_root_for_scope);
+                    let resolved = resolve_phase_overlays(
+                        &self.engines,
+                        &session,
+                        &cli_typed,
+                        &teardown_entry_overlays,
+                        worktree_git_mount.as_ref(),
+                    );
                     let runtime = Arc::clone(&self.engines.runtime);
                     let mount = mount_path.clone();
-                    let entry_overlays = teardown_entry_overlays.clone();
-                    let engines_for_factory = self.engines.clone();
-                    let session_for_factory = session.clone();
-                    let cli_typed_for_factory = cli_typed.clone();
                     (teardown_aborted, any_teardown_failed) = tokio::task::block_in_place(|| {
                         let factory = |idx: usize| -> Result<
                             Box<dyn crate::engine::container::ContainerExec>,
                             EngineError,
                         > {
-                            let entry = entry_overlays.get(idx).and_then(|o| o.as_deref());
-                            let (overlays, env) = collect_single_entry_overlays(
-                                &engines_for_factory,
-                                &session_for_factory,
-                                &cli_typed_for_factory,
-                                entry,
-                            )
-                            .map_err(|e| EngineError::Other(e.to_string()))?;
+                            let (overlays, env) = resolved
+                                .get(idx)
+                                .ok_or_else(|| {
+                                    EngineError::Other(format!(
+                                        "internal: missing pre-resolved overlays for teardown step {idx}",
+                                    ))
+                                })?
+                                .as_ref()
+                                .map_err(|e| EngineError::Other(e.to_string()))?;
                             let container = runtime
-                                .start_background(&base_image, &mount, &env, &overlays)?;
+                                .start_background(&base_image, &mount, env, overlays)?;
                             Ok(Box::new(container))
                         };
                         engine
@@ -1185,6 +1187,47 @@ fn collect_single_entry_overlays(
     Ok((overlay_specs, env))
 }
 
+/// Pre-resolve overlay specs and env vars for every entry in a setup or
+/// teardown phase.
+///
+/// Each entry is resolved independently via [`collect_single_entry_overlays`]
+/// (per-step overlay isolation, WI-0082). When `worktree_git_mount` is
+/// `Some`, the backing `.git` directory overlay is appended to every
+/// successful entry so git operations work inside worktree-mounted
+/// containers.
+///
+/// Returns one `Result` per entry. The caller decides error policy:
+/// - **Setup** aborts the entire phase on the first `Err`.
+/// - **Teardown** passes errors through to the factory; `run_teardown`
+///   handles per-step failures gracefully.
+fn resolve_phase_overlays(
+    engines: &Engines,
+    session: &Session,
+    cli_typed: &[TypedOverlay],
+    entries: &[Option<Vec<String>>],
+    worktree_git_mount: Option<&crate::engine::container::options::OverlaySpec>,
+) -> Vec<
+    Result<
+        (
+            Vec<crate::engine::container::options::OverlaySpec>,
+            std::collections::HashMap<String, String>,
+        ),
+        CommandError,
+    >,
+> {
+    entries
+        .iter()
+        .map(|entry| {
+            let (mut overlays, env) =
+                collect_single_entry_overlays(engines, session, cli_typed, entry.as_deref())?;
+            if let Some(wt) = worktree_git_mount {
+                overlays.push(wt.clone());
+            }
+            Ok((overlays, env))
+        })
+        .collect()
+}
+
 /// Extract a numeric work item number from strings like "0069", "69", "WI-69",
 /// etc. Returns the first run of decimal digits found in `s`, parsed as `u32`.
 fn parse_work_item_number(s: &str) -> Option<u32> {
@@ -1216,6 +1259,30 @@ fn find_work_item_file(git_root: &std::path::Path, number: u32) -> Option<std::p
                 .map(|n| n.starts_with(&prefix))
                 .unwrap_or(false)
         })
+}
+
+/// Build an [`OverlaySpec`] that mounts the main repo's `.git` directory into
+/// a container so git operations work inside a worktree checkout.
+///
+/// A worktree's `.git` is a pointer file referencing an absolute path inside
+/// the main repo's `.git/worktrees/<name>/` directory. When only the worktree
+/// is bind-mounted, that pointer dangles and every git command fails. This
+/// overlay mounts the main `.git` directory at its host-absolute path so the
+/// pointer resolves identically inside the container.
+///
+/// Returns `Ok(None)` when `worktree_path` is a regular repo or has no `.git`.
+fn worktree_git_overlay(
+    worktree_path: &std::path::Path,
+) -> Result<Option<crate::engine::container::options::OverlaySpec>, EngineError> {
+    let main_git_dir = match crate::engine::git::resolve_worktree_git_dir(worktree_path)? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    Ok(Some(crate::engine::container::options::OverlaySpec {
+        host_path: main_git_dir.clone(),
+        container_path: main_git_dir,
+        permission: crate::engine::container::options::OverlayPermission::ReadWrite,
+    }))
 }
 
 #[cfg(test)]

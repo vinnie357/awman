@@ -652,6 +652,47 @@ impl GitRootResolver for GitEngine {
     }
 }
 
+/// Resolve the main `.git` directory backing a worktree checkout.
+///
+/// A worktree's `.git` entry is a *file* containing `gitdir: <path>` where
+/// `<path>` points to `.git/worktrees/<name>/` in the main repository.
+/// This function reads that pointer and returns the main `.git/` directory
+/// (two levels up from the worktree entry).
+///
+/// Returns `Ok(None)` when `worktree_path/.git` is a directory (regular
+/// repo) or does not exist.
+pub fn resolve_worktree_git_dir(worktree_path: &Path) -> Result<Option<PathBuf>, EngineError> {
+    let dot_git = worktree_path.join(".git");
+    if !dot_git.exists() || dot_git.is_dir() {
+        return Ok(None);
+    }
+    let content =
+        std::fs::read_to_string(&dot_git).map_err(|e| EngineError::io(&dot_git, e))?;
+    let gitdir_line = content.trim().strip_prefix("gitdir: ").ok_or_else(|| {
+        EngineError::Git(format!(
+            "unexpected .git file format at {}: {}",
+            dot_git.display(),
+            content.trim(),
+        ))
+    })?;
+    let gitdir = if Path::new(gitdir_line).is_absolute() {
+        PathBuf::from(gitdir_line)
+    } else {
+        worktree_path.join(gitdir_line)
+    };
+    // gitdir → .git/worktrees/<name>  →  parent .git/worktrees/  →  parent .git/
+    let main_git_dir = gitdir
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| {
+            EngineError::Git(format!(
+                "cannot derive main .git dir from worktree gitdir: {}",
+                gitdir.display(),
+            ))
+        })?;
+    Ok(Some(main_git_dir.to_path_buf()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -791,5 +832,41 @@ mod tests {
         g.remove_worktree(repo_tmp.path(), &wt_path)
             .expect("remove_worktree should succeed");
         assert!(!wt_path.exists(), "worktree directory must be gone");
+    }
+
+    #[test]
+    fn resolve_worktree_git_dir_returns_none_for_regular_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        let result = resolve_worktree_git_dir(tmp.path()).unwrap();
+        assert!(result.is_none(), "regular repo should return None");
+    }
+
+    #[test]
+    fn resolve_worktree_git_dir_returns_none_for_non_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = resolve_worktree_git_dir(tmp.path()).unwrap();
+        assert!(result.is_none(), "non-git dir should return None");
+    }
+
+    #[test]
+    fn resolve_worktree_git_dir_finds_main_git_dir() {
+        let repo_tmp = tempfile::tempdir().unwrap();
+        let wt_tmp = tempfile::tempdir().unwrap();
+        init_repo(repo_tmp.path());
+        let g = GitEngine::new();
+        let wt_path = wt_tmp.path().join("my-worktree");
+        g.create_worktree(repo_tmp.path(), &wt_path, "awman/test-resolve")
+            .expect("create_worktree should succeed");
+
+        let result = resolve_worktree_git_dir(&wt_path)
+            .expect("should not error")
+            .expect("worktree should resolve to Some");
+
+        let expected = repo_tmp.path().join(".git").canonicalize().unwrap();
+        let actual = result.canonicalize().unwrap();
+        assert_eq!(actual, expected, "should resolve to main repo .git dir");
+
+        g.remove_worktree(repo_tmp.path(), &wt_path).unwrap();
     }
 }
