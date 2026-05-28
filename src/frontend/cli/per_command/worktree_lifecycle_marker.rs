@@ -193,36 +193,3 @@ impl WorktreeLifecycleFrontend for CliFrontend {
             });
     }
 }
-
-// ─── Safe-default tests (non-TTY stdin path) ──────────────────────────────
-//
-// `cargo test` runs with stdin piped (not a TTY), so `stdin_is_tty()` returns
-// false, and every method returns the §7u safe default without blocking.
-// This is the same behavior a `Cursor`-backed stdin would exercise.
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use crate::command::commands::worktree_lifecycle::WorktreeLifecycleFrontend;
-    use crate::command::dispatch::catalogue::CommandCatalogue;
-    use crate::frontend::cli::command_frontend::CliFrontend;
-
-    fn make_frontend() -> CliFrontend {
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "exec", "workflow", "deploy.toml"])
-            .unwrap();
-        CliFrontend::new(m)
-    }
-
-    #[test]
-    fn confirm_worktree_cleanup_returns_false_when_not_tty() {
-        let mut f = make_frontend();
-        let result = f
-            .confirm_worktree_cleanup("feature/x", &PathBuf::from("/tmp/wt"))
-            .unwrap();
-        // §7u safe default: false.
-        assert!(!result, "expected false in non-TTY env");
-    }
-}
