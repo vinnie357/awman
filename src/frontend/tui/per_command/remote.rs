@@ -60,9 +60,9 @@ impl RemoteWorkflowPoller {
         }
 
         if let Ok(Some(state_json)) = self.client.get_workflow_state(&self.command_id).await {
-            if let Ok(state) = serde_json::from_value::<crate::data::workflow_state::WorkflowState>(
-                state_json,
-            ) {
+            if let Ok(state) =
+                serde_json::from_value::<crate::data::workflow_state::WorkflowState>(state_json)
+            {
                 let view = workflow_state_to_view_state(&state);
                 if let Ok(mut guard) = self.workflow_view.lock() {
                     *guard = Some(view);

@@ -587,7 +587,10 @@ name = "impl"
 prompt = "do work"
 "#;
         let result = Workflow::parse(toml, WorkflowFormat::Toml);
-        assert!(result.is_err(), "skill(*) in setup step must be a DataError");
+        assert!(
+            result.is_err(),
+            "skill(*) in setup step must be a DataError"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("skill(") || msg.contains("setup"),
@@ -610,7 +613,10 @@ name = "impl"
 prompt = "do work"
 "#;
         let result = Workflow::parse(toml, WorkflowFormat::Toml);
-        assert!(result.is_err(), "skills() in setup step overlays must be an error");
+        assert!(
+            result.is_err(),
+            "skills() in setup step overlays must be an error"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("skills()") || msg.contains("removed"),
@@ -631,7 +637,10 @@ teardown:
       - "skill(*)"
 "#;
         let result = Workflow::parse(yaml, WorkflowFormat::Yaml);
-        assert!(result.is_err(), "skill(*) in teardown step must be a DataError");
+        assert!(
+            result.is_err(),
+            "skill(*) in teardown step must be a DataError"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("skill(") || msg.contains("teardown"),

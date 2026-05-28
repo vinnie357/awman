@@ -123,8 +123,7 @@ pub type SharedEngineTx =
 /// Shared stuck sender. The engine publishes the container's stuck
 /// broadcast sender via `set_stuck_sender`; the TUI event loop subscribes
 /// from it for tab-coloring (stuck indicator).
-pub type SharedStuckSender =
-    Arc<Mutex<Option<Arc<tokio::sync::broadcast::Sender<StuckEvent>>>>>;
+pub type SharedStuckSender = Arc<Mutex<Option<Arc<tokio::sync::broadcast::Sender<StuckEvent>>>>>;
 
 /// Shared TUI context for the status command. The event loop refreshes this
 /// on every tick so the status watch loop always sees live tab data.
@@ -419,11 +418,7 @@ impl Tab {
             format!("{}: {}", cmd, workflow_suffix)
         };
 
-        let prefix = if self.stuck {
-            "\u{26a0}\u{fe0f} "
-        } else {
-            ""
-        };
+        let prefix = if self.stuck { "\u{26a0}\u{fe0f} " } else { "" };
         let prefix_chars = prefix.chars().count();
         let max_chars = (tab_width as usize).saturating_sub(4);
         let cmd_max = max_chars.saturating_sub(prefix_chars);

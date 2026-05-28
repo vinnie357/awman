@@ -6,9 +6,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::engine::ready::phase::ReadyPhase;
-use crate::engine::ready::summary::ReadySummary;
-use crate::engine::step_status::StepStatus;
+use crate::data::ready_phase::ReadyPhase;
+use crate::data::ready_summary::ReadySummary;
+use crate::data::step_status::StepStatus;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSetupEvent {
@@ -23,7 +23,7 @@ pub enum SetupEventPayload {
     StageChanged { stage: String, message: String },
     ReadyPhaseChanged { phase: ReadyPhase, message: String },
     ReadyStepStatus { step: String, status: StepStatus },
-    SetupComplete { ready_summary: ReadySummary },
+    SetupComplete { ready_summary: Box<ReadySummary> },
     SetupFailed { stage: String, error: String },
 }
 

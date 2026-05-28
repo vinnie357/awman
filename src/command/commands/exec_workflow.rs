@@ -12,7 +12,9 @@ use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
 use crate::command::commands::worktree_lifecycle::{WorktreeLifecycle, WorktreeLifecycleFrontend};
 use crate::command::commands::Command;
-use crate::command::commands::{collect_all_overlay_specs, parse_overlay_list, warn_legacy_config, TypedOverlay};
+use crate::command::commands::{
+    collect_all_overlay_specs, parse_overlay_list, warn_legacy_config, TypedOverlay,
+};
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
 use crate::data::session::Session;
@@ -535,11 +537,13 @@ impl Command for ExecWorkflowCommand {
         if self.flags.worktree && self.session.session_type().is_remote() {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Info,
-                text: "Skipping worktree creation for remote session — repo is already isolated.".into(),
+                text: "Skipping worktree creation for remote session — repo is already isolated."
+                    .into(),
             });
         }
         let mut worktree_path: Option<PathBuf> = None;
-        let worktree_lifecycle = if self.flags.worktree && !self.session.session_type().is_remote() {
+        let worktree_lifecycle = if self.flags.worktree && !self.session.session_type().is_remote()
+        {
             let git_root = match self.engines.git_engine.resolve_root(&cwd) {
                 Ok(r) => r,
                 Err(e) => {
@@ -773,10 +777,16 @@ impl Command for ExecWorkflowCommand {
             workflow.setup.iter().map(|e| e.overlays.clone()).collect();
         let setup_abort_flags: Vec<bool> =
             workflow.setup.iter().map(|e| e.abort_on_failure).collect();
-        let teardown_entry_overlays: Vec<Option<Vec<String>>> =
-            workflow.teardown.iter().map(|e| e.overlays.clone()).collect();
-        let teardown_abort_flags: Vec<bool> =
-            workflow.teardown.iter().map(|e| e.abort_on_failure).collect();
+        let teardown_entry_overlays: Vec<Option<Vec<String>>> = workflow
+            .teardown
+            .iter()
+            .map(|e| e.overlays.clone())
+            .collect();
+        let teardown_abort_flags: Vec<bool> = workflow
+            .teardown
+            .iter()
+            .map(|e| e.abort_on_failure)
+            .collect();
         let teardown_on_failure = workflow.teardown_on_failure;
         let engine_work_item_context = work_item_context.clone();
         let (engine_result, step_counts) = {
@@ -814,7 +824,10 @@ impl Command for ExecWorkflowCommand {
 
             // Warn if the workflow will commit but git identity is not configured.
             if teardown_steps.iter().any(|s| {
-                matches!(s, crate::data::workflow_definition::TeardownStep::CommitChanges { .. })
+                matches!(
+                    s,
+                    crate::data::workflow_definition::TeardownStep::CommitChanges { .. }
+                )
             }) {
                 let name_ok = std::process::Command::new("git")
                     .args(["config", "user.name"])
@@ -905,10 +918,13 @@ impl Command for ExecWorkflowCommand {
                         };
                         let r = engine.run_setup(&setup_steps, &setup_abort_flags, factory);
                         if let Err(e) = &r {
-                            shared_for_factory.lock().unwrap().write_message(UserMessage {
-                                level: MessageLevel::Error,
-                                text: format!("exec workflow: setup phase failed: {e}"),
-                            });
+                            shared_for_factory
+                                .lock()
+                                .unwrap()
+                                .write_message(UserMessage {
+                                    level: MessageLevel::Error,
+                                    text: format!("exec workflow: setup phase failed: {e}"),
+                                });
                         }
                         r
                     });
@@ -971,8 +987,8 @@ impl Command for ExecWorkflowCommand {
                                 })?
                                 .as_ref()
                                 .map_err(|e| EngineError::Other(e.to_string()))?;
-                            let container = runtime
-                                .start_background(&base_image, &mount, env, overlays)?;
+                            let container =
+                                runtime.start_background(&base_image, &mount, env, overlays)?;
                             Ok(Box::new(container))
                         };
                         engine
@@ -1112,9 +1128,7 @@ fn emit_gemini_deprecation_warning(sink: &mut dyn UserMessageSink) {
 /// `workflow.agent` > session default).
 fn workflow_resolves_to_gemini(workflow: &Workflow, session: &Session) -> bool {
     let workflow_default = workflow.agent.as_deref();
-    let session_default = session
-        .default_agent()
-        .map(|a| a.as_str().to_string());
+    let session_default = session.default_agent().map(|a| a.as_str().to_string());
     for step in &workflow.steps {
         let resolved = step
             .agent
@@ -1203,21 +1217,21 @@ fn collect_single_entry_overlays(
 /// - **Setup** aborts the entire phase on the first `Err`.
 /// - **Teardown** passes errors through to the factory; `run_teardown`
 ///   handles per-step failures gracefully.
+type PhaseOverlayResult = Result<
+    (
+        Vec<crate::engine::container::options::OverlaySpec>,
+        std::collections::HashMap<String, String>,
+    ),
+    CommandError,
+>;
+
 fn resolve_phase_overlays(
     engines: &Engines,
     session: &Session,
     cli_typed: &[TypedOverlay],
     entries: &[Option<Vec<String>>],
     worktree_git_mount: Option<&crate::engine::container::options::OverlaySpec>,
-) -> Vec<
-    Result<
-        (
-            Vec<crate::engine::container::options::OverlaySpec>,
-            std::collections::HashMap<String, String>,
-        ),
-        CommandError,
-    >,
-> {
+) -> Vec<PhaseOverlayResult> {
     entries
         .iter()
         .map(|entry| {
@@ -1712,8 +1726,7 @@ prompt = "do something"
         use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
 
         let tmp = tempfile::tempdir().unwrap();
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let resolver = StaticGitRootResolver::new(tmp.path());
         let session = Session::open(
             tmp.path().to_path_buf(),

@@ -600,7 +600,7 @@ impl GitEngine {
         let cwd = dest
             .parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| std::env::temp_dir());
+            .unwrap_or_else(std::env::temp_dir);
         let output = run_git_logged(&args, &cwd, sink)?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -666,8 +666,7 @@ pub fn resolve_worktree_git_dir(worktree_path: &Path) -> Result<Option<PathBuf>,
     if !dot_git.exists() || dot_git.is_dir() {
         return Ok(None);
     }
-    let content =
-        std::fs::read_to_string(&dot_git).map_err(|e| EngineError::io(&dot_git, e))?;
+    let content = std::fs::read_to_string(&dot_git).map_err(|e| EngineError::io(&dot_git, e))?;
     let gitdir_line = content.trim().strip_prefix("gitdir: ").ok_or_else(|| {
         EngineError::Git(format!(
             "unexpected .git file format at {}: {}",
@@ -681,15 +680,12 @@ pub fn resolve_worktree_git_dir(worktree_path: &Path) -> Result<Option<PathBuf>,
         worktree_path.join(gitdir_line)
     };
     // gitdir → .git/worktrees/<name>  →  parent .git/worktrees/  →  parent .git/
-    let main_git_dir = gitdir
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or_else(|| {
-            EngineError::Git(format!(
-                "cannot derive main .git dir from worktree gitdir: {}",
-                gitdir.display(),
-            ))
-        })?;
+    let main_git_dir = gitdir.parent().and_then(|p| p.parent()).ok_or_else(|| {
+        EngineError::Git(format!(
+            "cannot derive main .git dir from worktree gitdir: {}",
+            gitdir.display(),
+        ))
+    })?;
     Ok(Some(main_git_dir.to_path_buf()))
 }
 

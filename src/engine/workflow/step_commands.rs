@@ -355,10 +355,7 @@ mod tests {
             base: None,
         };
         let (cmd, _) = teardown_step_to_shell(&step);
-        assert_eq!(
-            cmd,
-            "gh pr create --title 'feat: my feature' --body ''"
-        );
+        assert_eq!(cmd, "gh pr create --title 'feat: my feature' --body ''");
     }
 
     #[test]
@@ -369,10 +366,7 @@ mod tests {
             base: None,
         };
         let (cmd, _) = teardown_step_to_shell(&step);
-        assert_eq!(
-            cmd,
-            "gh pr create --title 'Automated PR' --body ''"
-        );
+        assert_eq!(cmd, "gh pr create --title 'Automated PR' --body ''");
     }
 
     #[test]

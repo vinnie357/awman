@@ -14,10 +14,10 @@ use anyhow::{Context, Result};
 
 use awman::command::dispatch::catalogue::CommandCatalogue;
 use awman::command::dispatch::Engines;
+use awman::data::config::env::Env;
 use awman::data::config::global::GlobalConfig;
 use awman::data::error::DataError;
 use awman::data::migration;
-use awman::data::config::env::Env;
 use awman::data::session::{GitRootResolver, Session, SessionOpenOptions};
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;

@@ -142,7 +142,11 @@ impl OverlayEngine {
 
         // 1. User-supplied directory overlays.
         for spec in &request.directories {
-            let resolved = self.resolve_user_overlay(spec, session.working_dir(), request.container_home.as_deref())?;
+            let resolved = self.resolve_user_overlay(
+                spec,
+                session.working_dir(),
+                request.container_home.as_deref(),
+            )?;
             let key = OverlayPathResolver::conflict_key(&resolved.host_path);
             insert_or_merge(&mut by_key, key, resolved);
         }
@@ -392,9 +396,7 @@ impl OverlayEngine {
                     if host_path.exists() {
                         out.push(OverlaySpec {
                             host_path,
-                            container_path: PathBuf::from(format!(
-                                "{container_home}/.gemini"
-                            )),
+                            container_path: PathBuf::from(format!("{container_home}/.gemini")),
                             permission: OverlayPermission::ReadWrite,
                         });
                     }
@@ -1307,7 +1309,9 @@ mod tests {
         let agent = AgentName::new("claude").unwrap();
 
         let specs = with_awman_config_home(tmp.path(), || {
-            engine.skill_overlays(&agent, true, &[], &None, tmp.path()).unwrap()
+            engine
+                .skill_overlays(&agent, true, &[], &None, tmp.path())
+                .unwrap()
         });
 
         assert_eq!(specs.len(), 1);
@@ -1428,7 +1432,9 @@ mod tests {
             container: "relative/path".into(),
             permission: OverlayPermission::ReadOnly,
         };
-        assert!(engine.resolve_user_overlay(&spec, Path::new("/"), None).is_err());
+        assert!(engine
+            .resolve_user_overlay(&spec, Path::new("/"), None)
+            .is_err());
     }
 
     #[test]
@@ -1642,7 +1648,11 @@ mod tests {
     fn detect_home_from_dockerfile_finds_non_root_user() {
         let tmp = tempfile::tempdir().unwrap();
         let df = tmp.path().join("Dockerfile.dev");
-        std::fs::write(&df, "FROM debian:bookworm\nUSER awman\nWORKDIR /workspace\n").unwrap();
+        std::fs::write(
+            &df,
+            "FROM debian:bookworm\nUSER awman\nWORKDIR /workspace\n",
+        )
+        .unwrap();
         assert_eq!(
             detect_home_from_dockerfile(&df),
             Some("/home/awman".to_string()),
@@ -1798,7 +1808,11 @@ mod tests {
                 .unwrap()
         });
 
-        assert_eq!(specs.len(), 1, "only the named skill must be emitted; got {specs:?}");
+        assert_eq!(
+            specs.len(),
+            1,
+            "only the named skill must be emitted; got {specs:?}"
+        );
         assert!(
             specs[0].container_path.to_string_lossy().ends_with("/lint"),
             "container path must include the skill name 'lint'; got {:?}",
@@ -1828,7 +1842,10 @@ mod tests {
             )
         });
 
-        assert!(result.is_err(), "nonexistent named skill must return EngineError");
+        assert!(
+            result.is_err(),
+            "nonexistent named skill must return EngineError"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("nonexistent"),
@@ -1883,7 +1900,11 @@ mod tests {
             .iter()
             .filter(|o| o.host_path == host_canon)
             .collect();
-        assert_eq!(matched.len(), 1, "same host path must deduplicate; got {overlays:?}");
+        assert_eq!(
+            matched.len(),
+            1,
+            "same host path must deduplicate; got {overlays:?}"
+        );
         assert_eq!(
             matched[0].permission,
             OverlayPermission::ReadOnly,

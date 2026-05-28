@@ -88,7 +88,10 @@ pub enum WorkflowOutcome {
     Completed,
     Paused,
     Aborted,
-    Failed { last_step: String, exit_code: i32 },
+    Failed {
+        last_step: String,
+        exit_code: i32,
+    },
     /// Main workflow completed but a teardown step with `abort_on_failure`
     /// failed. Post-workflow actions (worktree flows) should still run, but
     /// non-interactive contexts should default to keeping the worktree.

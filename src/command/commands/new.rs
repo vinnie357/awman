@@ -774,8 +774,8 @@ mod tests {
     }
 
     fn make_engines(root: &std::path::Path) -> Engines {
-        use crate::data::fs::auth_paths::AuthPathResolver;
         use crate::data::fs::api_paths::ApiPaths;
+        use crate::data::fs::auth_paths::AuthPathResolver;
         use crate::engine::container::ContainerRuntime;
         use crate::engine::overlay::OverlayEngine;
         use std::sync::Arc;

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use awman::command::dispatch::Engines;
 use awman::data::fs::api_db::SqliteSessionStore;
 use awman::data::fs::api_paths::ApiPaths;
 use awman::data::fs::auth_paths::AuthPathResolver;
@@ -21,7 +22,6 @@ use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::command::dispatch::Engines;
 use awman::frontend::api::routes::{build_router, AppState, AuthMode};
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
@@ -122,7 +122,10 @@ fn enqueue_and_claim_fifo_order() {
         .unwrap();
 
     let w = "worker-1";
-    let claimed1 = store.claim_next_command(w).unwrap().expect("c1 must be claimed");
+    let claimed1 = store
+        .claim_next_command(w)
+        .unwrap()
+        .expect("c1 must be claimed");
     assert_eq!(claimed1.id, "c1", "first claim must be c1 (FIFO)");
     assert_eq!(claimed1.status, "running");
     assert_eq!(claimed1.worker_id.as_deref(), Some(w));
@@ -137,17 +140,26 @@ fn enqueue_and_claim_fifo_order() {
     // Complete c1, then the next queued command becomes claimable.
     store.complete_command("c1", "done", Some(0), None).unwrap();
 
-    let claimed2 = store.claim_next_command(w).unwrap().expect("c2 must be claimed");
+    let claimed2 = store
+        .claim_next_command(w)
+        .unwrap()
+        .expect("c2 must be claimed");
     assert_eq!(claimed2.id, "c2", "second claim must be c2 (FIFO)");
     store.complete_command("c2", "done", Some(0), None).unwrap();
 
-    let claimed3 = store.claim_next_command(w).unwrap().expect("c3 must be claimed");
+    let claimed3 = store
+        .claim_next_command(w)
+        .unwrap()
+        .expect("c3 must be claimed");
     assert_eq!(claimed3.id, "c3");
     store.complete_command("c3", "done", Some(0), None).unwrap();
 
     // Queue is empty.
     let nothing = store.claim_next_command(w).unwrap();
-    assert!(nothing.is_none(), "queue is empty — fourth claim must be None");
+    assert!(
+        nothing.is_none(),
+        "queue is empty — fourth claim must be None"
+    );
 }
 
 /// Spawn N threads all racing to claim from N commands simultaneously.
@@ -240,15 +252,16 @@ fn session_exclusive_execution_one_running_at_a_time() {
     let r2 = h2.join().unwrap();
 
     // Exactly one claim succeeds; the other returns None.
-    let (claimed, empty) = match (r1, r2) {
+    let (claimed, _empty) = match (r1, r2) {
         (Some(c), None) => (c, ()),
         (None, Some(c)) => (c, ()),
         (Some(_), Some(_)) => panic!("both workers claimed — session exclusion violated"),
         (None, None) => panic!("neither worker claimed — unexpected"),
     };
-    let _ = empty;
-
-    assert_eq!(claimed.id, "c1", "only the first-queued command is claimable");
+    assert_eq!(
+        claimed.id, "c1",
+        "only the first-queued command is claimable"
+    );
     assert_eq!(claimed.status, "running");
 }
 
@@ -316,7 +329,11 @@ fn stale_command_recovery_resets_old_running_commands() {
 
     // Recover with a 1-second timeout — this command is years old.
     let recovered = store.recover_stale_commands(1).unwrap();
-    assert_eq!(recovered, vec!["stale-cmd"], "stale command must be recovered");
+    assert_eq!(
+        recovered,
+        vec!["stale-cmd"],
+        "stale command must be recovered"
+    );
 
     // Now it should be 'queued' with worker_id and started_at cleared.
     let cmd_after = store.get_command("stale-cmd").unwrap().unwrap();
@@ -399,9 +416,15 @@ fn count_queued_for_session_is_accurate() {
 
     assert_eq!(store.count_queued_for_session("s1").unwrap(), 0);
 
-    store.enqueue_command("c1", "s1", "exec workflow", "[]", "/logs/c1").unwrap();
-    store.enqueue_command("c2", "s1", "exec workflow", "[]", "/logs/c2").unwrap();
-    store.enqueue_command("c3", "s1", "exec workflow", "[]", "/logs/c3").unwrap();
+    store
+        .enqueue_command("c1", "s1", "exec workflow", "[]", "/logs/c1")
+        .unwrap();
+    store
+        .enqueue_command("c2", "s1", "exec workflow", "[]", "/logs/c2")
+        .unwrap();
+    store
+        .enqueue_command("c3", "s1", "exec workflow", "[]", "/logs/c3")
+        .unwrap();
     assert_eq!(store.count_queued_for_session("s1").unwrap(), 3);
 
     // Claim one — depth drops to 2 (it's now 'running').
@@ -419,9 +442,15 @@ fn cancel_queued_for_session_cancels_all_queued() {
         .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
         .unwrap();
 
-    store.enqueue_command("c1", "s1", "exec workflow", "[]", "/l1").unwrap();
-    store.enqueue_command("c2", "s1", "exec workflow", "[]", "/l2").unwrap();
-    store.enqueue_command("c3", "s1", "exec workflow", "[]", "/l3").unwrap();
+    store
+        .enqueue_command("c1", "s1", "exec workflow", "[]", "/l1")
+        .unwrap();
+    store
+        .enqueue_command("c2", "s1", "exec workflow", "[]", "/l2")
+        .unwrap();
+    store
+        .enqueue_command("c3", "s1", "exec workflow", "[]", "/l3")
+        .unwrap();
 
     let mut cancelled = store.cancel_queued_for_session("s1").unwrap();
     cancelled.sort();
@@ -446,11 +475,17 @@ fn queue_position_for_command_is_zero_indexed() {
         .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
         .unwrap();
 
-    store.enqueue_command("c1", "s1", "exec workflow", "[]", "/l1").unwrap();
+    store
+        .enqueue_command("c1", "s1", "exec workflow", "[]", "/l1")
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(2));
-    store.enqueue_command("c2", "s1", "exec workflow", "[]", "/l2").unwrap();
+    store
+        .enqueue_command("c2", "s1", "exec workflow", "[]", "/l2")
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(2));
-    store.enqueue_command("c3", "s1", "exec workflow", "[]", "/l3").unwrap();
+    store
+        .enqueue_command("c3", "s1", "exec workflow", "[]", "/l3")
+        .unwrap();
 
     let pos0 = store.queue_position_for_command("c1", "s1").unwrap();
     let pos1 = store.queue_position_for_command("c2", "s1").unwrap();
@@ -470,7 +505,9 @@ fn queue_position_is_none_for_non_queued_commands() {
         .insert_session_full("s1", "/wd", &ts, "ready", "local", None)
         .unwrap();
 
-    store.enqueue_command("c1", "s1", "exec workflow", "[]", "/l1").unwrap();
+    store
+        .enqueue_command("c1", "s1", "exec workflow", "[]", "/l1")
+        .unwrap();
     store.claim_next_command("w1").unwrap(); // now 'running'
 
     let pos = store.queue_position_for_command("c1", "s1").unwrap();
@@ -516,7 +553,9 @@ fn queue_depth_under_load_no_duplicates() {
         for wid in 0..4usize {
             if let Some(cmd) = store.claim_next_command(&format!("loader-{wid}")).unwrap() {
                 batch_claimed.push(cmd.id.clone());
-                store.complete_command(&cmd.id, "done", Some(0), None).unwrap();
+                store
+                    .complete_command(&cmd.id, "done", Some(0), None)
+                    .unwrap();
             }
         }
         if batch_claimed.is_empty() {
@@ -708,7 +747,10 @@ async fn real_network_post_commands_no_longer_blocks_session() {
     );
 
     // Both must be in the DB as 'queued'.
-    let cmds = state.store.list_commands_for_session("sess-double", 10).unwrap();
+    let cmds = state
+        .store
+        .list_commands_for_session("sess-double", 10)
+        .unwrap();
     assert_eq!(cmds.len(), 2, "both commands must be in the DB");
     for c in &cmds {
         assert_eq!(c.status, "queued", "both commands must be 'queued'");
@@ -852,35 +894,46 @@ async fn real_network_queue_status_endpoint_returns_correct_state() {
 
     // Manually set up 3 commands: 1 done, 1 running, 1 queued.
     let now = chrono::Utc::now().to_rfc3339();
-    state.store.with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path,
+    state
+        .store
+        .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO commands (id, session_id, subcommand, args, status, log_path,
                      queued_at, started_at, finished_at, exit_code)
              VALUES ('cmd-done', ?1, 'exec prompt', '[]', 'done', '/l',
                      ?2, ?2, ?2, 0)",
-            rusqlite::params![sess_id, now],
-        ).map_err(awman::data::error::DataError::from)
-    }).unwrap();
+                rusqlite::params![sess_id, now],
+            )
+            .map_err(awman::data::error::DataError::from)
+        })
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(2));
     let now2 = chrono::Utc::now().to_rfc3339();
-    state.store.with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path,
+    state
+        .store
+        .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO commands (id, session_id, subcommand, args, status, log_path,
                      queued_at, started_at, worker_id)
              VALUES ('cmd-running', ?1, 'exec prompt', '[]', 'running', '/l',
                      ?2, ?2, 'worker-x')",
-            rusqlite::params![sess_id, now2],
-        ).map_err(awman::data::error::DataError::from)
-    }).unwrap();
+                rusqlite::params![sess_id, now2],
+            )
+            .map_err(awman::data::error::DataError::from)
+        })
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(2));
     let now3 = chrono::Utc::now().to_rfc3339();
-    state.store.with_conn(|conn| {
-        conn.execute(
+    state
+        .store
+        .with_conn(|conn| {
+            conn.execute(
             "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at)
              VALUES ('cmd-queued', ?1, 'exec prompt', '[]', 'queued', '/l', ?2)",
             rusqlite::params![sess_id, now3],
         ).map_err(awman::data::error::DataError::from)
-    }).unwrap();
+        })
+        .unwrap();
 
     let resp = reqwest::get(format!("http://{addr}/v1/sessions/{sess_id}/queue"))
         .await
@@ -909,7 +962,11 @@ async fn real_network_queue_status_endpoint_returns_correct_state() {
     );
 
     let queued_arr = body["queued"].as_array().expect("queued must be array");
-    assert_eq!(queued_arr.len(), 1, "exactly 1 queued command; got {queued_arr:?}");
+    assert_eq!(
+        queued_arr.len(),
+        1,
+        "exactly 1 queued command; got {queued_arr:?}"
+    );
     assert_eq!(queued_arr[0]["command_id"].as_str(), Some("cmd-queued"));
     assert_eq!(queued_arr[0]["position"].as_i64(), Some(0));
 
@@ -1026,7 +1083,8 @@ async fn real_network_delete_session_with_queued_commands_cancels_all() {
 
     // Enqueue 3 commands directly.
     for i in 0..3u32 {
-        state.store
+        state
+            .store
             .enqueue_command(
                 &format!("qcmd-{i}"),
                 "del-queued",
@@ -1047,12 +1105,17 @@ async fn real_network_delete_session_with_queued_commands_cancels_all() {
     assert_eq!(
         resp.status().as_u16(),
         200,
-        "delete with only queued commands must return 200; got {}", resp.status()
+        "delete with only queued commands must return 200; got {}",
+        resp.status()
     );
 
     // All 3 commands must be cancelled.
     for i in 0..3u32 {
-        let cmd = state.store.get_command(&format!("qcmd-{i}")).unwrap().unwrap();
+        let cmd = state
+            .store
+            .get_command(&format!("qcmd-{i}"))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             cmd.status, "cancelled",
             "qcmd-{i} must be 'cancelled'; got '{}'",
@@ -1086,19 +1149,24 @@ async fn real_network_delete_session_with_running_command_returns_202() {
 
     let now = chrono::Utc::now().to_rfc3339();
     // Insert a running command manually.
-    state.store.with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path,
+    state
+        .store
+        .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO commands (id, session_id, subcommand, args, status, log_path,
                      queued_at, started_at, worker_id)
              VALUES ('running-cmd', 'del-running', 'exec prompt', '[]', 'running', '/l',
                      ?1, ?1, 'active-worker')",
-            rusqlite::params![now],
-        ).map_err(awman::data::error::DataError::from)
-    }).unwrap();
+                rusqlite::params![now],
+            )
+            .map_err(awman::data::error::DataError::from)
+        })
+        .unwrap();
 
     // Also enqueue a second command that should get cancelled.
     std::thread::sleep(std::time::Duration::from_millis(2));
-    state.store
+    state
+        .store
         .enqueue_command("queued-cmd", "del-running", "exec prompt", "[]", "/l")
         .unwrap();
 
@@ -1112,7 +1180,8 @@ async fn real_network_delete_session_with_running_command_returns_202() {
     assert_eq!(
         resp.status().as_u16(),
         202,
-        "delete with running command must return 202; got {}", resp.status()
+        "delete with running command must return 202; got {}",
+        resp.status()
     );
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(
@@ -1152,10 +1221,14 @@ async fn real_network_post_commands_rejected_on_closing_session() {
 
     // Insert a session and manually set it to 'closing'.
     let ts = chrono::Utc::now().to_rfc3339();
-    state.store
+    state
+        .store
         .insert_session_full("closing-sess", "/work", &ts, "ready", "local", None)
         .unwrap();
-    state.store.update_session_status("closing-sess", "closing").unwrap();
+    state
+        .store
+        .update_session_status("closing-sess", "closing")
+        .unwrap();
 
     let client = reqwest::Client::new();
     let resp = client
@@ -1172,11 +1245,15 @@ async fn real_network_post_commands_rejected_on_closing_session() {
     assert_eq!(
         resp.status().as_u16(),
         409,
-        "POST to closing session must return 409; got {}", resp.status()
+        "POST to closing session must return 409; got {}",
+        resp.status()
     );
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(
-        body["error"].as_str().unwrap_or_default().contains("closing"),
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("closing"),
         "409 body must mention 'closing'; got {body}"
     );
 
@@ -1195,10 +1272,14 @@ async fn real_network_double_delete_returns_200_with_current_state() {
 
     // Create a session and manually put it in 'closing'.
     let ts = chrono::Utc::now().to_rfc3339();
-    state.store
+    state
+        .store
         .insert_session_full("double-del-sess", "/work", &ts, "ready", "local", None)
         .unwrap();
-    state.store.update_session_status("double-del-sess", "closing").unwrap();
+    state
+        .store
+        .update_session_status("double-del-sess", "closing")
+        .unwrap();
 
     let client = reqwest::Client::new();
     let resp = client
@@ -1233,7 +1314,8 @@ async fn real_network_delete_already_closed_session_returns_200() {
     };
 
     let ts = chrono::Utc::now().to_rfc3339();
-    state.store
+    state
+        .store
         .insert_session_full("already-closed", "/work", &ts, "ready", "local", None)
         .unwrap();
     state.store.close_session("already-closed", &ts).unwrap();
@@ -1245,7 +1327,11 @@ async fn real_network_delete_already_closed_session_returns_200() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status().as_u16(), 200, "delete of closed session must return 200");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "delete of closed session must return 200"
+    );
 
     server.abort();
 }
@@ -1402,7 +1488,8 @@ async fn real_network_workflow_state_endpoint_returns_correct_json() {
     let sess_id = "wf-state-sess";
     let cmd_id = "wf-state-cmd";
     insert_ready_session(&state.store, sess_id, "/work");
-    state.store
+    state
+        .store
         .enqueue_command(cmd_id, sess_id, "exec workflow", r#"["wf.toml"]"#, "/l")
         .unwrap();
 
@@ -1456,7 +1543,8 @@ async fn real_network_workflow_state_404_when_no_state_file() {
     };
 
     insert_ready_session(&state.store, "wf-404-sess", "/work");
-    state.store
+    state
+        .store
         .enqueue_command("wf-404-cmd", "wf-404-sess", "exec workflow", "[]", "/l")
         .unwrap();
 
@@ -1525,11 +1613,13 @@ fn workflow_state_to_view_state_maps_all_phases() {
     // Setup steps come first with [setup] prefix.
     assert!(
         view.steps[0].name.starts_with("[setup]"),
-        "first step must be a setup step; got '{}'", view.steps[0].name
+        "first step must be a setup step; got '{}'",
+        view.steps[0].name
     );
     assert!(
         view.steps[0].name.contains("clone_repo"),
-        "first setup step must be clone_repo; got '{}'", view.steps[0].name
+        "first setup step must be clone_repo; got '{}'",
+        view.steps[0].name
     );
     assert_eq!(
         view.steps[0].status, "done",
@@ -1538,7 +1628,8 @@ fn workflow_state_to_view_state_maps_all_phases() {
 
     assert!(
         view.steps[1].name.contains("install_deps"),
-        "second setup step must be install_deps; got '{}'", view.steps[1].name
+        "second setup step must be install_deps; got '{}'",
+        view.steps[1].name
     );
     assert_eq!(
         view.steps[1].status, "running",
@@ -1548,21 +1639,25 @@ fn workflow_state_to_view_state_maps_all_phases() {
     // Main steps follow.
     assert_eq!(
         view.steps[2].name, "analyze",
-        "third step must be 'analyze'; got '{}'", view.steps[2].name
+        "third step must be 'analyze'; got '{}'",
+        view.steps[2].name
     );
     assert_eq!(
         view.steps[3].name, "implement",
-        "fourth step must be 'implement'; got '{}'", view.steps[3].name
+        "fourth step must be 'implement'; got '{}'",
+        view.steps[3].name
     );
 
     // Teardown comes last with [teardown] prefix.
     assert!(
         view.steps[4].name.starts_with("[teardown]"),
-        "last step must be a teardown step; got '{}'", view.steps[4].name
+        "last step must be a teardown step; got '{}'",
+        view.steps[4].name
     );
     assert!(
         view.steps[4].name.contains("commit_changes"),
-        "teardown step must be commit_changes; got '{}'", view.steps[4].name
+        "teardown step must be commit_changes; got '{}'",
+        view.steps[4].name
     );
     assert_eq!(
         view.steps[4].status, "pending",
@@ -1630,16 +1725,19 @@ fn workflow_state_to_view_state_current_step_index() {
     let view = workflow_state_to_view_state(&state);
     assert_eq!(
         view.steps[0].status, "done",
-        "alpha must be 'done'; got '{}'", view.steps[0].status
+        "alpha must be 'done'; got '{}'",
+        view.steps[0].status
     );
     assert_eq!(
         view.steps[1].status, "running",
-        "beta must be 'running'; got '{}'", view.steps[1].status
+        "beta must be 'running'; got '{}'",
+        view.steps[1].status
     );
     assert_eq!(
         view.current_step.as_deref(),
         Some("beta"),
-        "current_step must be 'beta'; got {:?}", view.current_step
+        "current_step must be 'beta'; got {:?}",
+        view.current_step
     );
 }
 
@@ -1725,7 +1823,9 @@ fn complete_command_sets_status_and_result() {
     store.claim_next_command("w1").unwrap();
 
     let result_json = r#"{"exit_code":0}"#;
-    store.complete_command("c1", "done", Some(0), Some(result_json)).unwrap();
+    store
+        .complete_command("c1", "done", Some(0), Some(result_json))
+        .unwrap();
 
     let cmd = store.get_command("c1").unwrap().unwrap();
     assert_eq!(cmd.status, "done");
@@ -1747,7 +1847,9 @@ fn complete_command_error_path() {
     store.claim_next_command("w1").unwrap();
 
     let result_json = r#"{"exit_code":1,"error":"workflow file not found"}"#;
-    store.complete_command("c1", "error", Some(1), Some(result_json)).unwrap();
+    store
+        .complete_command("c1", "error", Some(1), Some(result_json))
+        .unwrap();
 
     let cmd = store.get_command("c1").unwrap().unwrap();
     assert_eq!(cmd.status, "error");
@@ -1793,7 +1895,10 @@ fn close_session_force_is_idempotent_for_already_closed() {
     store.close_session_force("s1", &ts).unwrap();
     // Second close must not change anything.
     let ok = store.close_session_force("s1", &ts).unwrap();
-    assert!(!ok, "close_session_force on already-closed must return false");
+    assert!(
+        !ok,
+        "close_session_force on already-closed must return false"
+    );
 }
 
 // ─── Regression tests for review-cycle fixes ─────────────────────────────────
@@ -1815,31 +1920,40 @@ async fn real_network_queue_status_position_is_oldest_first() {
 
     // Insert 3 queued commands at distinct timestamps.
     let t1 = chrono::Utc::now().to_rfc3339();
-    state.store.with_conn(|conn| {
-        conn.execute(
+    state
+        .store
+        .with_conn(|conn| {
+            conn.execute(
             "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at)
              VALUES ('oldest', ?1, 'exec prompt', '[]', 'queued', '/l', ?2)",
             rusqlite::params![sess_id, t1],
         ).map_err(awman::data::error::DataError::from)
-    }).unwrap();
+        })
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
     let t2 = chrono::Utc::now().to_rfc3339();
-    state.store.with_conn(|conn| {
-        conn.execute(
+    state
+        .store
+        .with_conn(|conn| {
+            conn.execute(
             "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at)
              VALUES ('middle', ?1, 'exec prompt', '[]', 'queued', '/l', ?2)",
             rusqlite::params![sess_id, t2],
         ).map_err(awman::data::error::DataError::from)
-    }).unwrap();
+        })
+        .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(5));
     let t3 = chrono::Utc::now().to_rfc3339();
-    state.store.with_conn(|conn| {
-        conn.execute(
+    state
+        .store
+        .with_conn(|conn| {
+            conn.execute(
             "INSERT INTO commands (id, session_id, subcommand, args, status, log_path, queued_at)
              VALUES ('newest', ?1, 'exec prompt', '[]', 'queued', '/l', ?2)",
             rusqlite::params![sess_id, t3],
         ).map_err(awman::data::error::DataError::from)
-    }).unwrap();
+        })
+        .unwrap();
 
     let resp = reqwest::get(format!("http://{addr}/v1/sessions/{sess_id}/queue"))
         .await
@@ -1848,7 +1962,11 @@ async fn real_network_queue_status_position_is_oldest_first() {
     let body: serde_json::Value = resp.json().await.unwrap();
 
     let queued = body["queued"].as_array().expect("queued must be array");
-    assert_eq!(queued.len(), 3, "all 3 queued commands must appear; got {body}");
+    assert_eq!(
+        queued.len(),
+        3,
+        "all 3 queued commands must appear; got {body}"
+    );
 
     assert_eq!(
         queued[0]["command_id"].as_str(),
@@ -1889,22 +2007,30 @@ async fn real_network_queue_status_recent_completed_orders_by_finished_at() {
     std::thread::sleep(std::time::Duration::from_millis(5));
     let f_old = chrono::Utc::now().to_rfc3339();
 
-    state.store.with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path,
+    state
+        .store
+        .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO commands (id, session_id, subcommand, args, status, log_path,
                      queued_at, started_at, finished_at, exit_code)
              VALUES ('c-old', ?1, 'exec prompt', '[]', 'done', '/l', ?2, ?2, ?3, 0)",
-            rusqlite::params![sess_id, q_old, f_old],
-        ).map_err(awman::data::error::DataError::from)
-    }).unwrap();
-    state.store.with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO commands (id, session_id, subcommand, args, status, log_path,
+                rusqlite::params![sess_id, q_old, f_old],
+            )
+            .map_err(awman::data::error::DataError::from)
+        })
+        .unwrap();
+    state
+        .store
+        .with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO commands (id, session_id, subcommand, args, status, log_path,
                      queued_at, started_at, finished_at, exit_code)
              VALUES ('c-new', ?1, 'exec prompt', '[]', 'done', '/l', ?2, ?2, ?3, 0)",
-            rusqlite::params![sess_id, q_new, f_new],
-        ).map_err(awman::data::error::DataError::from)
-    }).unwrap();
+                rusqlite::params![sess_id, q_new, f_new],
+            )
+            .map_err(awman::data::error::DataError::from)
+        })
+        .unwrap();
 
     let resp = reqwest::get(format!("http://{addr}/v1/sessions/{sess_id}/queue"))
         .await
@@ -1995,8 +2121,14 @@ fn recover_stale_commands_zero_threshold_recovers_all_running() {
     assert_eq!(recovered, vec!["c-fresh".to_string()]);
     let cmd = store.get_command("c-fresh").unwrap().unwrap();
     assert_eq!(cmd.status, "queued");
-    assert!(cmd.worker_id.is_none(), "worker_id must be cleared on recover");
-    assert!(cmd.started_at.is_none(), "started_at must be cleared on recover");
+    assert!(
+        cmd.worker_id.is_none(),
+        "worker_id must be cleared on recover"
+    );
+    assert!(
+        cmd.started_at.is_none(),
+        "started_at must be cleared on recover"
+    );
 }
 
 /// DELETE /v1/sessions/{id} must set the session to 'closing' BEFORE

@@ -234,7 +234,12 @@ impl WorkflowEngine {
                 }
                 saved
             }
-            None => WorkflowState::new(workflow_name, &workflow.steps, workflow_hash, work_item_number),
+            None => WorkflowState::new(
+                workflow_name,
+                &workflow.steps,
+                workflow_hash,
+                work_item_number,
+            ),
         };
 
         let interrupted = state.interrupted_running_steps();
@@ -561,10 +566,7 @@ impl WorkflowEngine {
             .and_then(|e| e.cancel_handle());
 
         // Subscribe to stuck/unstuck events from the container's io_bridge.
-        let mut stuck_rx = self
-            .current_execution
-            .as_ref()
-            .map(|e| e.subscribe_stuck());
+        let mut stuck_rx = self.current_execution.as_ref().map(|e| e.subscribe_stuck());
 
         // Publish the stuck sender to the frontend (TUI uses it for tab coloring).
         if let Some(exec) = self.current_execution.as_ref() {
@@ -828,28 +830,19 @@ impl WorkflowEngine {
         )>,
         stuck_rx: &mut Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
     ) -> Result<Option<InterruptibleStepResult>, EngineError> {
-        self.msg_warning(format!(
-            "Step '{}' appears stuck (no output)",
-            step_name,
-        ));
+        self.msg_warning(format!("Step '{}' appears stuck (no output)", step_name,));
         if self.yolo && !self.is_last_step() {
-            let yolo_result = self.run_mid_step_yolo_countdown(
-                step_name,
-                cancel_handle,
-                wait_rx,
-                stuck_rx,
-            ).await?;
+            let yolo_result = self
+                .run_mid_step_yolo_countdown(step_name, cancel_handle, wait_rx, stuck_rx)
+                .await?;
             match yolo_result {
                 MidStepYoloResult::StepCompleted(o) => {
-                    return Ok(Some(InterruptibleStepResult::StepCompleted(o)));
+                    Ok(Some(InterruptibleStepResult::StepCompleted(o)))
                 }
                 MidStepYoloResult::ShowControlBoard => {
-                    let mid = self.handle_mid_step_control_board(
-                        step_name,
-                        cancel_handle,
-                        wait_rx,
-                    )?;
-                    return Ok(match mid {
+                    let mid =
+                        self.handle_mid_step_control_board(step_name, cancel_handle, wait_rx)?;
+                    Ok(match mid {
                         MidStepOutcome::Continue => None,
                         MidStepOutcome::StepCompleted(o) => {
                             Some(InterruptibleStepResult::StepCompleted(o))
@@ -857,60 +850,44 @@ impl WorkflowEngine {
                         MidStepOutcome::WorkflowEnded(wo) => {
                             Some(InterruptibleStepResult::WorkflowEnded(wo))
                         }
-                        MidStepOutcome::LoopContinue => {
-                            Some(InterruptibleStepResult::LoopContinue)
-                        }
-                    });
+                        MidStepOutcome::LoopContinue => Some(InterruptibleStepResult::LoopContinue),
+                    })
                 }
-                MidStepYoloResult::Cancelled | MidStepYoloResult::Recovered => {
-                    return Ok(None);
-                }
+                MidStepYoloResult::Cancelled | MidStepYoloResult::Recovered => Ok(None),
                 MidStepYoloResult::Advanced => {
-                    self.msg_info(format!(
-                        "Yolo auto-advancing past step '{}'",
-                        step_name,
-                    ));
+                    self.msg_info(format!("Yolo auto-advancing past step '{}'", step_name,));
                     if let Some(ch) = cancel_handle {
                         let _ = ch.cancel();
                     }
                     self.state.set_status(step_name, StepState::Succeeded);
                     self.persist()?;
                     let step = self.find_step(step_name)?;
-                    self.frontend.report_step_status(
-                        &step,
-                        WorkflowStepStatus::Succeeded,
-                    );
+                    self.frontend
+                        .report_step_status(&step, WorkflowStepStatus::Succeeded);
                     let progress = self.workflow_progress_info();
                     self.frontend.report_workflow_progress(&progress);
 
                     if self.is_last_step() {
                         let available = self.compute_available_actions()?;
-                        let action = self.frontend
+                        let action = self
+                            .frontend
                             .show_workflow_control_board(&self.state, &available)?;
                         return Ok(Some(self.execute_top_level_action(action)?));
                     }
 
-                    return Ok(Some(InterruptibleStepResult::LoopContinue));
+                    Ok(Some(InterruptibleStepResult::LoopContinue))
                 }
             }
         } else {
-            let mid = self.handle_mid_step_control_board(
-                step_name,
-                cancel_handle,
-                wait_rx,
-            )?;
-            return Ok(match mid {
+            let mid = self.handle_mid_step_control_board(step_name, cancel_handle, wait_rx)?;
+            Ok(match mid {
                 MidStepOutcome::Continue => None,
-                MidStepOutcome::StepCompleted(o) => {
-                    Some(InterruptibleStepResult::StepCompleted(o))
-                }
+                MidStepOutcome::StepCompleted(o) => Some(InterruptibleStepResult::StepCompleted(o)),
                 MidStepOutcome::WorkflowEnded(wo) => {
                     Some(InterruptibleStepResult::WorkflowEnded(wo))
                 }
-                MidStepOutcome::LoopContinue => {
-                    Some(InterruptibleStepResult::LoopContinue)
-                }
-            });
+                MidStepOutcome::LoopContinue => Some(InterruptibleStepResult::LoopContinue),
+            })
         }
     }
 
@@ -1412,7 +1389,10 @@ impl WorkflowEngine {
         };
 
         let wi_ctx = self.work_item_context.as_ref();
-        let steps: Vec<_> = steps.iter().map(|s| substitute_setup_step(s, wi_ctx)).collect();
+        let steps: Vec<_> = steps
+            .iter()
+            .map(|s| substitute_setup_step(s, wi_ctx))
+            .collect();
 
         self.state.current_phase = WorkflowPhase::Setup;
         self.state.setup_step_states = steps
@@ -1435,11 +1415,9 @@ impl WorkflowEngine {
             self.frontend.on_setup_step_started(&desc);
 
             let container = container_for_step(idx)?;
-            let result = container.exec_streaming(
-                &command,
-                env.as_ref(),
-                &mut |line| self.frontend.on_setup_step_output(line),
-            )?;
+            let result = container.exec_streaming(&command, env.as_ref(), &mut |line| {
+                self.frontend.on_setup_step_output(line)
+            })?;
 
             if result.exit_code != 0 {
                 self.state.setup_step_states[idx].status = PhaseStepStatus::Failed {
@@ -1505,7 +1483,10 @@ impl WorkflowEngine {
         }
 
         let wi_ctx = self.work_item_context.as_ref();
-        let steps: Vec<_> = steps.iter().map(|s| substitute_teardown_step(s, wi_ctx)).collect();
+        let steps: Vec<_> = steps
+            .iter()
+            .map(|s| substitute_teardown_step(s, wi_ctx))
+            .collect();
 
         self.state.current_phase = WorkflowPhase::Teardown;
         self.state.teardown_step_states = steps
@@ -1533,9 +1514,8 @@ impl WorkflowEngine {
                 Ok(c) => c,
                 Err(e) => {
                     let msg = e.to_string();
-                    self.state.teardown_step_states[idx].status = PhaseStepStatus::Failed {
-                        error: msg.clone(),
-                    };
+                    self.state.teardown_step_states[idx].status =
+                        PhaseStepStatus::Failed { error: msg.clone() };
                     self.persist()?;
                     self.frontend.on_teardown_step_failed(&desc, 1, &msg);
                     any_step_failed = true;
@@ -1546,11 +1526,9 @@ impl WorkflowEngine {
                     continue;
                 }
             };
-            let result = container.exec_streaming(
-                &command,
-                env.as_ref(),
-                &mut |line| self.frontend.on_teardown_step_output(line),
-            )?;
+            let result = container.exec_streaming(&command, env.as_ref(), &mut |line| {
+                self.frontend.on_teardown_step_output(line)
+            })?;
 
             if result.exit_code != 0 {
                 self.state.teardown_step_states[idx].status = PhaseStepStatus::Failed {
@@ -2342,7 +2320,11 @@ mod tests {
                     started_at: now,
                 };
                 let (stuck_tx, _) = tokio::sync::broadcast::channel(4);
-                Ok(ContainerExecution::new(handle, backend, std::sync::Arc::new(stuck_tx)))
+                Ok(ContainerExecution::new(
+                    handle,
+                    backend,
+                    std::sync::Arc::new(stuck_tx),
+                ))
             } else {
                 let now = Utc::now();
                 let info = ContainerExitInfo {
@@ -2859,10 +2841,7 @@ mod tests {
                     .push((step.name.clone(), status));
             }
             fn report_workflow_completed(&mut self, _: &WorkflowOutcome) {}
-            fn set_engine_sender(
-                &mut self,
-                tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>,
-            ) {
+            fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
                 *self.engine_tx.lock().unwrap() = Some(tx);
             }
         }
@@ -3002,10 +2981,7 @@ mod tests {
         /// passed `&mock` directly can now pass `mock.factory()`.
         fn factory<'a>(
             self: &'a Arc<Self>,
-        ) -> impl FnMut(
-            usize,
-        )
-            -> Result<Box<dyn crate::engine::container::ContainerExec>, EngineError>
+        ) -> impl FnMut(usize) -> Result<Box<dyn crate::engine::container::ContainerExec>, EngineError>
                + 'a {
             move |_idx| {
                 *self.container_handouts.lock().unwrap() += 1;
@@ -3094,7 +3070,12 @@ mod tests {
             Some("claude"),
             vec![make_step("step-a", &[], None)],
         );
-        make_engine(&session, workflow, FakeContainerExecutionFactory::always_success(), [])
+        make_engine(
+            &session,
+            workflow,
+            FakeContainerExecutionFactory::always_success(),
+            [],
+        )
     }
 
     #[test]
@@ -3157,14 +3138,17 @@ mod tests {
         let mut engine = make_minimal_engine(&tmp);
         let steps = setup_steps_sample(); // 3 steps
         let mock = Arc::new(MockBackgroundContainer::with_results([
-            ("".into(), "".into(), 0),                 // step 1 succeeds
-            ("".into(), "build error".into(), 1),      // step 2 fails
-            ("".into(), "".into(), 0),                 // step 3 still runs
+            ("".into(), "".into(), 0),            // step 1 succeeds
+            ("".into(), "build error".into(), 1), // step 2 fails
+            ("".into(), "".into(), 0),            // step 3 still runs
         ]));
 
         let result = engine.run_setup(&steps, &[], mock.factory());
 
-        assert!(result.is_ok(), "run_setup continues past failures when abort_on_failure=false");
+        assert!(
+            result.is_ok(),
+            "run_setup continues past failures when abort_on_failure=false"
+        );
         assert_eq!(mock.calls().len(), 3, "all steps must be exec'd");
     }
 
@@ -3174,15 +3158,18 @@ mod tests {
         let mut engine = make_minimal_engine(&tmp);
         let steps = setup_steps_sample(); // 3 steps
         let mock = Arc::new(MockBackgroundContainer::with_results([
-            ("".into(), "".into(), 0),                 // step 1 succeeds
-            ("".into(), "build error".into(), 1),      // step 2 fails
-            ("".into(), "".into(), 0),                 // step 3 (never reached)
+            ("".into(), "".into(), 0),            // step 1 succeeds
+            ("".into(), "build error".into(), 1), // step 2 fails
+            ("".into(), "".into(), 0),            // step 3 (never reached)
         ]));
         let abort_flags = vec![false, true, false]; // step 2 has abort_on_failure
 
         let result = engine.run_setup(&steps, &abort_flags, mock.factory());
 
-        assert!(result.is_err(), "run_setup must return Err when abort_on_failure step fails");
+        assert!(
+            result.is_err(),
+            "run_setup must return Err when abort_on_failure step fails"
+        );
         assert_eq!(mock.calls().len(), 2, "third step must not be exec'd");
         assert!(engine.abort_on_failure_triggered());
     }
@@ -3237,10 +3224,16 @@ mod tests {
 
         // Teardown is best-effort: returns Ok even if a step fails.
         let result = engine.run_teardown(&steps, &[], true, false, mock.factory());
-        assert!(result.is_ok(), "run_teardown must return Ok despite step failure");
+        assert!(
+            result.is_ok(),
+            "run_teardown must return Ok despite step failure"
+        );
         let (aborted, any_failed) = result.unwrap();
         assert!(!aborted, "no abort_on_failure steps were set");
-        assert!(any_failed, "any_step_failed must be true when a step exits non-zero");
+        assert!(
+            any_failed,
+            "any_step_failed must be true when a step exits non-zero"
+        );
         assert_eq!(mock.calls().len(), 2, "both steps must be exec'd");
     }
 
@@ -3280,8 +3273,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut engine = make_minimal_engine(&tmp);
         let steps = vec![
-            TeardownStep::RunShell { command: "first".into(), env: None },
-            TeardownStep::RunShell { command: "second".into(), env: None },
+            TeardownStep::RunShell {
+                command: "first".into(),
+                env: None,
+            },
+            TeardownStep::RunShell {
+                command: "second".into(),
+                env: None,
+            },
         ];
 
         // Factory fails on step 0 (returns Err), succeeds on step 1.
@@ -3292,7 +3291,9 @@ mod tests {
             EngineError,
         > {
             if idx == 0 {
-                Err(EngineError::Other("simulated overlay resolve failure".into()))
+                Err(EngineError::Other(
+                    "simulated overlay resolve failure".into(),
+                ))
             } else {
                 *mock_for_factory.container_handouts.lock().unwrap() += 1;
                 Ok(Box::new(SharedMockExec(Arc::clone(&mock_for_factory))))
@@ -3302,7 +3303,10 @@ mod tests {
         let result = engine.run_teardown(&steps, &[], true, false, factory);
         assert!(result.is_ok(), "factory failure must not abort teardown");
         let (_aborted, any_failed) = result.unwrap();
-        assert!(any_failed, "any_step_failed must be true when factory fails");
+        assert!(
+            any_failed,
+            "any_step_failed must be true when factory fails"
+        );
 
         let states = &engine.state().teardown_step_states;
         assert!(
@@ -3349,8 +3353,14 @@ mod tests {
 
         use crate::data::workflow_definition::SetupStep;
         let steps = vec![
-            SetupStep::RunShell { command: "step1".into(), env: None },
-            SetupStep::RunShell { command: "step2".into(), env: None },
+            SetupStep::RunShell {
+                command: "step1".into(),
+                env: None,
+            },
+            SetupStep::RunShell {
+                command: "step2".into(),
+                env: None,
+            },
         ];
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
@@ -3371,8 +3381,14 @@ mod tests {
 
         use crate::data::workflow_definition::TeardownStep;
         let steps = vec![
-            TeardownStep::RunShell { command: "td1".into(), env: None },
-            TeardownStep::RunShell { command: "td2".into(), env: None },
+            TeardownStep::RunShell {
+                command: "td1".into(),
+                env: None,
+            },
+            TeardownStep::RunShell {
+                command: "td2".into(),
+                env: None,
+            },
         ];
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
@@ -3397,8 +3413,14 @@ mod tests {
 
         use crate::data::workflow_definition::SetupStep;
         let steps = vec![
-            SetupStep::RunShell { command: "ok-step".into(), env: None },
-            SetupStep::RunShell { command: "bad-step".into(), env: None },
+            SetupStep::RunShell {
+                command: "ok-step".into(),
+                env: None,
+            },
+            SetupStep::RunShell {
+                command: "bad-step".into(),
+                env: None,
+            },
         ];
         let mock = Arc::new(MockBackgroundContainer::with_results([
             ("".into(), "".into(), 0),
@@ -3406,7 +3428,10 @@ mod tests {
         ]));
 
         let result = engine.run_setup(&steps, &[], mock.factory());
-        assert!(result.is_ok(), "setup continues past failures when abort_on_failure=false");
+        assert!(
+            result.is_ok(),
+            "setup continues past failures when abort_on_failure=false"
+        );
 
         let states = &engine.state().setup_step_states;
         assert_eq!(states[0].status, PhaseStepStatus::Succeeded);
@@ -3458,7 +3483,10 @@ mod tests {
         let mut engine = make_minimal_engine(&tmp);
 
         use crate::data::workflow_definition::SetupStep;
-        let steps = vec![SetupStep::RunShell { command: "go".into(), env: None }];
+        let steps = vec![SetupStep::RunShell {
+            command: "go".into(),
+            env: None,
+        }];
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
         engine.run_setup(&steps, &[], mock.factory()).unwrap();

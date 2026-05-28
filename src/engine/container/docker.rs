@@ -312,14 +312,13 @@ fn bridge_config_for(
     stuck_timeout: std::time::Duration,
 ) -> crate::engine::container::io_bridge::BridgeConfig {
     let container_name = name.0.clone();
-    let cancel: crate::engine::container::io_bridge::CancelFn =
-        std::sync::Arc::new(move || {
-            let _ = Command::new("docker")
-                .args(["stop", &container_name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        });
+    let cancel: crate::engine::container::io_bridge::CancelFn = std::sync::Arc::new(move || {
+        let _ = Command::new("docker")
+            .args(["stop", &container_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    });
     crate::engine::container::io_bridge::BridgeConfig {
         grace_timeout,
         stuck_timeout,
@@ -378,7 +377,11 @@ fn spawn_pty_bridged_docker(
         container_name: instance.name.0.clone(),
         started_at,
     };
-    Ok(ContainerExecution::new(handle, Box::new(backend), bridge.stuck_tx))
+    Ok(ContainerExecution::new(
+        handle,
+        Box::new(backend),
+        bridge.stuck_tx,
+    ))
 }
 
 /// Spawn `docker run` with piped stdio and bridge through `ContainerIo`.
@@ -432,7 +435,11 @@ fn spawn_piped_docker(
         container_name: instance.name.0.clone(),
         started_at,
     };
-    Ok(ContainerExecution::new(handle, Box::new(backend), bridge.stuck_tx))
+    Ok(ContainerExecution::new(
+        handle,
+        Box::new(backend),
+        bridge.stuck_tx,
+    ))
 }
 
 struct DockerExecution {

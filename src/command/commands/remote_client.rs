@@ -230,9 +230,8 @@ impl RemoteClient {
         session_id: &str,
     ) -> Result<SessionSetupStatusResponse, CommandError> {
         let resp = self.get(&["sessions", session_id, "status"]).await?;
-        serde_json::from_value::<SessionSetupStatusResponse>(resp.body).map_err(|e| {
-            CommandError::Other(format!("invalid session-status response: {e}"))
-        })
+        serde_json::from_value::<SessionSetupStatusResponse>(resp.body)
+            .map_err(|e| CommandError::Other(format!("invalid session-status response: {e}")))
     }
 
     /// Submit an exec-prompt or exec-workflow job. Returns the command id.
@@ -299,10 +298,7 @@ impl RemoteClient {
         use crate::data::execution_event::EventPayload;
         use futures_util::StreamExt;
 
-        let url = format!(
-            "{}/v1/commands/{job_id}/logs",
-            self.base_url
-        );
+        let url = format!("{}/v1/commands/{job_id}/logs", self.base_url);
 
         let resp = self
             .http
@@ -673,7 +669,8 @@ mod tests {
     fn make_session_with_global_config(config_json: &str) -> (tempfile::TempDir, Session) {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("config.json"), config_json).unwrap();
-        let env = EnvSnapshot::with_overrides([("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap())]);
+        let env =
+            EnvSnapshot::with_overrides([("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap())]);
         let opts = SessionOpenOptions {
             env: Some(env),
             ..Default::default()

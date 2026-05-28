@@ -99,14 +99,15 @@ fn per_job_logs_route_present() {
     let has_job_logs = EXPECTED_ROUTES
         .iter()
         .any(|(_, p)| *p == "/v1/commands/:id/logs");
-    assert!(has_job_logs, "per-command structured SSE endpoint must be registered");
+    assert!(
+        has_job_logs,
+        "per-command structured SSE endpoint must be registered"
+    );
 }
 
 #[test]
 fn legacy_command_log_routes_are_removed() {
-    let has_legacy = EXPECTED_ROUTES
-        .iter()
-        .any(|(_, p)| p.contains("/jobs/"));
+    let has_legacy = EXPECTED_ROUTES.iter().any(|(_, p)| p.contains("/jobs/"));
     assert!(
         !has_legacy,
         "legacy /v1/sessions/{{id}}/jobs/{{job_id}}/logs endpoints must not be present"

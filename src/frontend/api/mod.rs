@@ -6,6 +6,7 @@
 
 pub mod command_frontend;
 pub mod event_bus;
+pub mod queue_worker;
 pub mod routes;
 pub mod session_setup;
 
@@ -67,7 +68,10 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
         crate::engine::container::ContainerRuntime::detect(&global_config)
             .map_err(|e| CommandError::Other(format!("container runtime detect: {e}")))?,
     );
-    tracing::info!(runtime = runtime.runtime_name(), "Container runtime resolved");
+    tracing::info!(
+        runtime = runtime.runtime_name(),
+        "Container runtime resolved"
+    );
     let git_engine = Arc::new(crate::engine::git::GitEngine::new());
     let overlay_engine = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
         auth_paths,
@@ -129,13 +133,11 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
                     // only the variant and cloned_path are actually consumed.
                     if rec.session_type == "remote" {
                         if let Some(cloned) = rec.cloned_path.as_deref() {
-                            s.set_session_type(
-                                crate::data::session::SessionType::Remote {
-                                    repo_url: String::new(),
-                                    branch: String::new(),
-                                    cloned_path: std::path::PathBuf::from(cloned),
-                                },
-                            );
+                            s.set_session_type(crate::data::session::SessionType::Remote {
+                                repo_url: String::new(),
+                                branch: String::new(),
+                                cloned_path: std::path::PathBuf::from(cloned),
+                            });
                         }
                     }
                     restored_sessions.insert(rec.id.clone(), Arc::new(tokio::sync::RwLock::new(s)));
@@ -180,16 +182,12 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
                 // Update or create setup_state.json so /status reflects the
                 // restart failure once the in-memory bus is gone.
                 let setup_path = api_paths.session_dir(&rec.id).join("setup_state.json");
-                let mut ss = match std::fs::read_to_string(&setup_path)
+                let mut ss: SessionSetupState = std::fs::read_to_string(&setup_path)
                     .ok()
                     .and_then(|c| serde_json::from_str::<SessionSetupState>(&c).ok())
-                {
-                    Some(s) => s,
-                    None => SessionSetupState::new(),
-                };
+                    .unwrap_or_default();
                 ss.status = SessionSetupStatus::Failed;
-                ss.current_stage =
-                    Some("Server restarted during session setup".to_string());
+                ss.current_stage = Some("Server restarted during session setup".to_string());
                 ss.error = Some(SessionSetupError {
                     stage: "server_restart".to_string(),
                     message: "Server restarted during session setup".to_string(),
@@ -223,9 +221,7 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
     }
 
     let sessions = Arc::new(tokio::sync::Mutex::new(restored_sessions));
-    let event_buses = Arc::new(tokio::sync::Mutex::new(
-        std::collections::HashMap::new(),
-    ));
+    let event_buses = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     let state = Arc::new(routes::AppState {
         store: Arc::clone(&store),
@@ -246,7 +242,7 @@ pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError> {
         tracing::warn!("workers config is 0 — no queue workers will run; commands will be enqueued but never processed");
     }
     for i in 0..worker_count {
-        let worker = crate::command::QueueWorker::new(
+        let worker = queue_worker::QueueWorker::new(
             format!("worker-{i}-{}", uuid::Uuid::new_v4()),
             Arc::clone(&store),
             engines.clone(),

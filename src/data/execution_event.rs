@@ -59,9 +59,7 @@ impl EventPayload {
         match self {
             EventPayload::StdoutLine(line) => Some(line.clone()),
             EventPayload::StderrLine(line) => Some(line.clone()),
-            EventPayload::StatusMessage { phase, message } => {
-                Some(format!("[{phase}] {message}"))
-            }
+            EventPayload::StatusMessage { phase, message } => Some(format!("[{phase}] {message}")),
             EventPayload::WorkflowStepTransition {
                 step_name,
                 step_index,

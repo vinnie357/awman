@@ -271,9 +271,7 @@ pub(super) fn default_exec_in_background(
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| {
-            EngineError::Container(format!(
-                "exec in background container {container_id}: {e}"
-            ))
+            EngineError::Container(format!("exec in background container {container_id}: {e}"))
         })?;
 
     let exit_code = output.status.code().unwrap_or(-1);
@@ -312,9 +310,7 @@ pub(super) fn default_exec_in_background_streaming(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
-            EngineError::Container(format!(
-                "exec in background container {container_id}: {e}"
-            ))
+            EngineError::Container(format!("exec in background container {container_id}: {e}"))
         })?;
 
     let stdout_pipe = child.stdout.take();
@@ -477,14 +473,13 @@ mod tests {
     fn explicit_kill_records_one_stop_event() {
         let backend = Arc::new(RecordingBackend::default());
         let id = backend
-            .start_background(
-                "img",
-                std::path::Path::new("/w"),
-                &HashMap::new(),
-                &[],
-            )
+            .start_background("img", std::path::Path::new("/w"), &HashMap::new(), &[])
             .unwrap();
-        let bg = BackgroundContainer::new(id, backend.clone() as Arc<dyn ContainerBackend>, "/w".into());
+        let bg = BackgroundContainer::new(
+            id,
+            backend.clone() as Arc<dyn ContainerBackend>,
+            "/w".into(),
+        );
         let _ = bg.exec("echo hi", None).unwrap();
         bg.kill().unwrap();
 
@@ -500,37 +495,38 @@ mod tests {
     fn drop_without_explicit_kill_still_kills_once() {
         let backend = Arc::new(RecordingBackend::default());
         let id = backend
-            .start_background(
-                "img",
-                std::path::Path::new("/w"),
-                &HashMap::new(),
-                &[],
-            )
+            .start_background("img", std::path::Path::new("/w"), &HashMap::new(), &[])
             .unwrap();
         {
-            let _bg =
-                BackgroundContainer::new(id, backend.clone() as Arc<dyn ContainerBackend>, "/w".into());
+            let _bg = BackgroundContainer::new(
+                id,
+                backend.clone() as Arc<dyn ContainerBackend>,
+                "/w".into(),
+            );
         } // dropped here
         let kill_events: Vec<_> = backend
             .events()
             .into_iter()
             .filter(|e| e.starts_with("kill"))
             .collect();
-        assert_eq!(kill_events, vec!["kill[bg-test]"], "Drop must trigger kill exactly once");
+        assert_eq!(
+            kill_events,
+            vec!["kill[bg-test]"],
+            "Drop must trigger kill exactly once"
+        );
     }
 
     #[test]
     fn explicit_kill_then_drop_kills_only_once() {
         let backend = Arc::new(RecordingBackend::default());
         let id = backend
-            .start_background(
-                "img",
-                std::path::Path::new("/w"),
-                &HashMap::new(),
-                &[],
-            )
+            .start_background("img", std::path::Path::new("/w"), &HashMap::new(), &[])
             .unwrap();
-        let bg = BackgroundContainer::new(id, backend.clone() as Arc<dyn ContainerBackend>, "/w".into());
+        let bg = BackgroundContainer::new(
+            id,
+            backend.clone() as Arc<dyn ContainerBackend>,
+            "/w".into(),
+        );
         bg.kill().unwrap();
         let kill_events: Vec<_> = backend
             .events()

@@ -18,17 +18,15 @@ use tokio::sync::RwLock;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::trace::TraceLayer;
 
-use crate::command::dispatch::Engines;
 use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
+use crate::command::dispatch::Engines;
 use crate::data::execution_event::{EventPayload, ExecutionEvent};
 use crate::data::fs::api_db::SqliteSessionStore;
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
 use crate::data::session_setup_event::{SessionSetupState, SessionSetupStatus, SetupEventPayload};
 use crate::frontend::api::event_bus::EventBus;
-use crate::frontend::api::session_setup::{
-    log_session_setup, SessionSetupBus, TracingSetupSink,
-};
+use crate::frontend::api::session_setup::{log_session_setup, SessionSetupBus, TracingSetupSink};
 
 // ─── Auth mode ───────────────────────────────────────────────────────────────
 
@@ -413,7 +411,10 @@ async fn handle_create_session(
         &created_at,
         "initializing",
         &session_type,
-        cloned_path.as_ref().map(|p| p.to_string_lossy().into_owned()).as_deref(),
+        cloned_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .as_deref(),
     ) {
         tracing::error!(error = %e, "Failed to insert session");
         return (
@@ -596,11 +597,17 @@ async fn run_session_setup(
         });
         log_session_setup(
             &session_id,
-            &format!("state → {:?}: clone stage", SessionSetupStatus::CloningRepository),
+            &format!(
+                "state → {:?}: clone stage",
+                SessionSetupStatus::CloningRepository
+            ),
         );
 
         let url = plan.repo_url.clone().unwrap_or_default();
-        let dest = plan.cloned_path.clone().expect("remote sessions have cloned_path");
+        let dest = plan
+            .cloned_path
+            .clone()
+            .expect("remote sessions have cloned_path");
         tracing::info!(
             session_id = %session_id,
             repo_url = %url,
@@ -632,8 +639,8 @@ async fn run_session_setup(
             // Cleanup any partial clone.
             let git = Arc::clone(&state.engines.git_engine);
             let dest_for_cleanup = dest.clone();
-            let _ = tokio::task::spawn_blocking(move || git.delete_directory(&dest_for_cleanup))
-                .await;
+            let _ =
+                tokio::task::spawn_blocking(move || git.delete_directory(&dest_for_cleanup)).await;
             let _ = state.store.update_setup_status(&session_id, "failed");
             persist_setup_state(&state, &session_id, &setup_bus).await;
             cleanup_setup_bus(state, session_id, setup_bus).await;
@@ -724,7 +731,9 @@ async fn run_session_setup(
 
     // ── Stage 3 (all): open Session ──────────────────────────────────────────
     bus_sender.update_status(SessionSetupStatus::RunningReady);
-    let _ = state.store.update_setup_status(&session_id, "running_ready");
+    let _ = state
+        .store
+        .update_setup_status(&session_id, "running_ready");
     bus_sender.update_stage("Opening session...");
     bus_sender.emit(SetupEventPayload::StageChanged {
         stage: "running_ready".into(),
@@ -765,8 +774,7 @@ async fn run_session_setup(
             if plan.session_type == "remote" {
                 if let Some(dest) = plan.cloned_path.clone() {
                     let git = Arc::clone(&state.engines.git_engine);
-                    let _ =
-                        tokio::task::spawn_blocking(move || git.delete_directory(&dest)).await;
+                    let _ = tokio::task::spawn_blocking(move || git.delete_directory(&dest)).await;
                 }
             }
             let _ = state.store.update_setup_status(&session_id, "failed");
@@ -848,25 +856,20 @@ async fn run_session_setup(
 
     let event_bus = EventBus::new(4096);
     let event_sender = event_bus.sender();
-    let mut setup_frontend =
-        SetupReadyFrontend::new(&session_id, setup_bus.sender(), event_sender);
+    let mut setup_frontend = SetupReadyFrontend::new(&session_id, setup_bus.sender(), event_sender);
 
     // Cap ReadyEngine at 10 minutes — any legitimate run, including a clean
     // base-image build, completes well within this. If the wall-clock exceeds
     // the cap (e.g. Docker daemon is unresponsive), mark the setup as failed
     // so the session row reaches a terminal state and the bus is cleaned up.
     let ready_fut = ready_engine.run_to_completion(&mut setup_frontend);
-    let ready_outcome = tokio::time::timeout(
-        std::time::Duration::from_secs(600),
-        ready_fut,
-    )
-    .await;
+    let ready_outcome = tokio::time::timeout(std::time::Duration::from_secs(600), ready_fut).await;
 
     match ready_outcome {
         Ok(Ok(summary)) => {
             setup_bus.sender().set_ready(summary.clone());
             bus_sender.emit(SetupEventPayload::SetupComplete {
-                ready_summary: summary,
+                ready_summary: Box::new(summary),
             });
             let _ = state.store.update_setup_status(&session_id, "ready");
             tracing::info!(session_id = %session_id, "Session setup complete");
@@ -885,8 +888,7 @@ async fn run_session_setup(
             if plan.session_type == "remote" {
                 if let Some(dest) = plan.cloned_path.clone() {
                     let git = Arc::clone(&state.engines.git_engine);
-                    let _ =
-                        tokio::task::spawn_blocking(move || git.delete_directory(&dest)).await;
+                    let _ = tokio::task::spawn_blocking(move || git.delete_directory(&dest)).await;
                 }
             }
             let _ = state.store.update_setup_status(&session_id, "failed");
@@ -902,8 +904,7 @@ async fn run_session_setup(
             if plan.session_type == "remote" {
                 if let Some(dest) = plan.cloned_path.clone() {
                     let git = Arc::clone(&state.engines.git_engine);
-                    let _ =
-                        tokio::task::spawn_blocking(move || git.delete_directory(&dest)).await;
+                    let _ = tokio::task::spawn_blocking(move || git.delete_directory(&dest)).await;
                 }
             }
             let _ = state.store.update_setup_status(&session_id, "failed");
@@ -1024,17 +1025,15 @@ async fn handle_close_session(
         }
         Ok(Some(s)) if s.status == "closing" => {
             // Already closing — return current state.
-            let running_cmd = state
-                .store
-                .running_command_for_session(&id)
-                .ok()
-                .flatten();
+            let running_cmd = state.store.running_command_for_session(&id).ok().flatten();
             return Json(SessionClosingResponse {
                 session_id: id,
                 status: "closing".to_string(),
                 running_command_id: running_cmd.map(|c| c.id),
                 cancelled_count: 0,
-                message: "Session is already closing. Poll GET /v1/sessions/{id}/status to monitor.".to_string(),
+                message:
+                    "Session is already closing. Poll GET /v1/sessions/{id}/status to monitor."
+                        .to_string(),
             })
             .into_response();
         }
@@ -1056,11 +1055,7 @@ async fn handle_close_session(
     let cancelled_count = cancelled_ids.len();
 
     // Step 3: Check for a running command.
-    let running_cmd = state
-        .store
-        .running_command_for_session(&id)
-        .ok()
-        .flatten();
+    let running_cmd = state.store.running_command_for_session(&id).ok().flatten();
 
     if let Some(running) = running_cmd {
         // Running command exists — return 202 and let the worker handle
@@ -1208,10 +1203,12 @@ async fn resolve_setup_status(
         let s = bus.snapshot();
         let is_ready = matches!(s.status, SessionSetupStatus::Ready);
         let status_str = s.status.as_str().to_string();
-        let err_payload = s.error.as_ref().map(|e| serde_json::json!({
-            "stage": e.stage,
-            "message": e.message,
-        }));
+        let err_payload = s.error.as_ref().map(|e| {
+            serde_json::json!({
+                "stage": e.stage,
+                "message": e.message,
+            })
+        });
         return (is_ready, status_str, err_payload);
     }
     // No bus. Try setup_state.json.
@@ -1220,10 +1217,12 @@ async fn resolve_setup_status(
         if let Ok(ss) = serde_json::from_str::<SessionSetupState>(&content) {
             let is_ready = matches!(ss.status, SessionSetupStatus::Ready);
             let status_str = ss.status.as_str().to_string();
-            let err_payload = ss.error.as_ref().map(|e| serde_json::json!({
-                "stage": e.stage,
-                "message": e.message,
-            }));
+            let err_payload = ss.error.as_ref().map(|e| {
+                serde_json::json!({
+                    "stage": e.stage,
+                    "message": e.message,
+                })
+            });
             return (is_ready, status_str, err_payload);
         }
     }
@@ -1340,7 +1339,8 @@ async fn handle_create_command(
 
     // Job submission guard: reject if session setup is not ready.
     {
-        let (setup_ready, status_str, error_payload) = resolve_setup_status(&state, &session_id).await;
+        let (setup_ready, status_str, error_payload) =
+            resolve_setup_status(&state, &session_id).await;
         if !setup_ready {
             let mut body = serde_json::json!({
                 "error": "session is not ready",
@@ -1622,9 +1622,7 @@ async fn handle_stream_command_logs(
                     _ => false,
                 };
                 if cmd_terminal {
-                    if let Ok(content) =
-                        tokio::fs::read_to_string(&events_log_for_replay).await
-                    {
+                    if let Ok(content) = tokio::fs::read_to_string(&events_log_for_replay).await {
                         for line in content.lines() {
                             let line = line.trim();
                             if line.is_empty() {
@@ -1672,7 +1670,9 @@ async fn handle_stream_command_logs(
                 // Keepalive comment so the SSE connection stays alive on
                 // intermediaries and the client knows we're still here.
                 if tx
-                    .send(Ok(Event::default().comment("waiting for worker to claim job")))
+                    .send(Ok(
+                        Event::default().comment("waiting for worker to claim job")
+                    ))
                     .is_err()
                 {
                     return;
@@ -1702,7 +1702,8 @@ async fn handle_stream_command_logs(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::warn!(lagged = n, "SSE subscriber lagged");
-                        let comment = Event::default().comment(format!("lagged: {n} events skipped"));
+                        let comment =
+                            Event::default().comment(format!("lagged: {n} events skipped"));
                         if tx.send(Ok(comment)).is_err() {
                             return;
                         }
@@ -1763,10 +1764,7 @@ async fn handle_get_session_queue(
         Ok(Some(_)) => {}
     }
 
-    let queue_depth = state
-        .store
-        .count_queued_for_session(&id)
-        .unwrap_or(0);
+    let queue_depth = state.store.count_queued_for_session(&id).unwrap_or(0);
 
     let running = match state.store.running_command_for_session(&id) {
         Ok(Some(c)) => {
@@ -1918,9 +1916,9 @@ mod tests {
 
     fn make_test_state(tmp: &std::path::Path) -> Arc<AppState> {
         use crate::command::dispatch::Engines;
-        use crate::data::fs::auth_paths::AuthPathResolver;
         use crate::data::fs::api_db::SqliteSessionStore;
         use crate::data::fs::api_paths::ApiPaths;
+        use crate::data::fs::auth_paths::AuthPathResolver;
         use crate::engine::agent::AgentEngine;
         use crate::engine::auth::AuthEngine;
         use crate::engine::container::ContainerRuntime;
@@ -2031,13 +2029,13 @@ mod tests {
         // We assert they respond with something (connection succeeds and we get any HTTP response).
         let resource_routes: &[(&str, &str, u16)] = &[
             // (method, path, expected_status_for_missing_resource)
-            ("GET", "/v1/sessions/test-id", 404),        // session not found
-            ("DELETE", "/v1/sessions/test-id", 404),      // session not found
-            ("GET", "/v1/sessions/test-id/status", 404),  // session not found
-            ("GET", "/v1/sessions/test-id/queue", 404),   // session not found
-            ("GET", "/v1/commands/test-id/status", 404),  // command not found
-            ("GET", "/v1/commands/test-id/logs", 404),    // command not found
-            ("GET", "/v1/workflows/test-cmd", 404),       // command not found
+            ("GET", "/v1/sessions/test-id", 404), // session not found
+            ("DELETE", "/v1/sessions/test-id", 404), // session not found
+            ("GET", "/v1/sessions/test-id/status", 404), // session not found
+            ("GET", "/v1/sessions/test-id/queue", 404), // session not found
+            ("GET", "/v1/commands/test-id/status", 404), // command not found
+            ("GET", "/v1/commands/test-id/logs", 404), // command not found
+            ("GET", "/v1/workflows/test-cmd", 404), // command not found
         ];
 
         for (method, path, expected_status) in resource_routes {

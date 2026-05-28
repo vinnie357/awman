@@ -175,11 +175,7 @@ impl CommandCatalogue {
     /// Returns `true` if the given command path is allowed for the given
     /// frontend kind. Session management routes are always allowed; only
     /// command execution routes are restricted.
-    pub fn is_allowed_for_frontend(
-        &self,
-        frontend: FrontendKind,
-        path: &[&str],
-    ) -> bool {
+    pub fn is_allowed_for_frontend(&self, frontend: FrontendKind, path: &[&str]) -> bool {
         match frontend {
             FrontendKind::Cli | FrontendKind::Tui => true,
             FrontendKind::Api => {
@@ -215,10 +211,12 @@ impl CommandCatalogue {
                 FrontendKind::Tui => "tui",
                 FrontendKind::Api => "api",
             };
-            Err(crate::command::error::CommandError::NotAvailableForFrontend {
-                command,
-                frontend: frontend_name.to_string(),
-            })
+            Err(
+                crate::command::error::CommandError::NotAvailableForFrontend {
+                    command,
+                    frontend: frontend_name.to_string(),
+                },
+            )
         }
     }
 
@@ -321,7 +319,16 @@ const ROOT: CommandSpec = CommandSpec {
         },
     ],
     subcommands: &[
-        &INIT, &READY, &CHAT, &SPECS, &STATUS, &CONFIG, &EXEC, &API_SERVER, &REMOTE, &NEW,
+        &INIT,
+        &READY,
+        &CHAT,
+        &SPECS,
+        &STATUS,
+        &CONFIG,
+        &EXEC,
+        &API_SERVER,
+        &REMOTE,
+        &NEW,
     ],
 };
 
@@ -950,18 +957,15 @@ const fn count_kept(base: &[FlagSpec], excluded: &[&str]) -> usize {
 
 const REMOTE_EXEC_WORKFLOW_KEPT: usize =
     count_kept(&EXEC_WORKFLOW_FLAGS, REMOTE_EXEC_EXCLUDED_FLAG_NAMES);
-const REMOTE_EXEC_WORKFLOW_TOTAL: usize =
-    REMOTE_TRANSPORT_FLAGS.len() + REMOTE_EXEC_WORKFLOW_KEPT;
+const REMOTE_EXEC_WORKFLOW_TOTAL: usize = REMOTE_TRANSPORT_FLAGS.len() + REMOTE_EXEC_WORKFLOW_KEPT;
 
-const REMOTE_EXEC_PROMPT_KEPT: usize =
-    count_kept(&AGENT_RUN_FLAGS_NO_WORKTREE, REMOTE_EXEC_EXCLUDED_FLAG_NAMES);
-const REMOTE_EXEC_PROMPT_TOTAL: usize =
-    REMOTE_TRANSPORT_FLAGS.len() + REMOTE_EXEC_PROMPT_KEPT;
+const REMOTE_EXEC_PROMPT_KEPT: usize = count_kept(
+    &AGENT_RUN_FLAGS_NO_WORKTREE,
+    REMOTE_EXEC_EXCLUDED_FLAG_NAMES,
+);
+const REMOTE_EXEC_PROMPT_TOTAL: usize = REMOTE_TRANSPORT_FLAGS.len() + REMOTE_EXEC_PROMPT_KEPT;
 
-const fn build_remote_flags<const N: usize>(
-    base: &[FlagSpec],
-    excluded: &[&str],
-) -> [FlagSpec; N] {
+const fn build_remote_flags<const N: usize>(base: &[FlagSpec], excluded: &[&str]) -> [FlagSpec; N] {
     let mut out: [FlagSpec; N] = [REMOTE_TRANSPORT_FLAGS[0]; N];
     let mut idx = 0;
     let mut i = 0;
@@ -1558,8 +1562,7 @@ mod tests {
     fn every_top_level_command_is_present() {
         let cat = CommandCatalogue::get();
         for name in [
-            "init", "ready", "chat", "specs", "status", "config", "exec", "api", "remote",
-            "new",
+            "init", "ready", "chat", "specs", "status", "config", "exec", "api", "remote", "new",
         ] {
             assert!(cat.lookup(&[name]).is_some(), "missing top-level '{name}'");
         }

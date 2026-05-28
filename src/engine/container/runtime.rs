@@ -229,7 +229,9 @@ impl ContainerRuntime {
         env: &HashMap<String, String>,
         overlays: &[OverlaySpec],
     ) -> Result<BackgroundContainer, EngineError> {
-        let container_id = self.backend.start_background(image, workdir, env, overlays)?;
+        let container_id = self
+            .backend
+            .start_background(image, workdir, env, overlays)?;
         let workdir_str = workdir.display().to_string();
         Ok(BackgroundContainer::new(
             container_id,

@@ -127,7 +127,14 @@ fn docker_background_container_start_exec_kill() {
 
     // After kill, the container must no longer appear in `docker ps -a`.
     let ps = Command::new("docker")
-        .args(["ps", "-a", "--filter", &format!("id={}", &container_id[..12]), "--format", "{{.ID}}"])
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("id={}", &container_id[..12]),
+            "--format",
+            "{{.ID}}",
+        ])
         .output()
         .expect("docker ps");
     let listed = String::from_utf8_lossy(&ps.stdout).trim().to_string();
@@ -159,7 +166,9 @@ fn docker_background_container_exec_nonzero_exit() {
         .start_background("alpine:latest", tmp.path(), &env, &overlays)
         .expect("start_background must succeed");
 
-    let output = container.exec("exit 1", None).expect("exec call must not error");
+    let output = container
+        .exec("exit 1", None)
+        .expect("exec call must not error");
     assert_eq!(output.exit_code, 1, "exit code must be 1");
 
     container.kill().expect("kill must succeed");
@@ -190,7 +199,10 @@ fn docker_background_container_env_var_injected() {
     let output = container
         .exec("printenv FOO", None)
         .expect("exec must succeed");
-    assert_eq!(output.stdout, "bar\n", "env var FOO must be bar inside container");
+    assert_eq!(
+        output.stdout, "bar\n",
+        "env var FOO must be bar inside container"
+    );
     assert_eq!(output.exit_code, 0);
 
     container.kill().expect("kill must succeed");
@@ -234,7 +246,10 @@ fn docker_background_container_overlay_mount_applied() {
         .exec("cat /mnt/overlay-test/marker.txt", None)
         .expect("exec must succeed");
     assert_eq!(output.exit_code, 0, "cat exit: stderr={}", output.stderr);
-    assert_eq!(output.stdout, "overlay-ok\n", "overlay file must be readable inside container");
+    assert_eq!(
+        output.stdout, "overlay-ok\n",
+        "overlay file must be readable inside container"
+    );
 
     container.kill().expect("kill must succeed");
 }

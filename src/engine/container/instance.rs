@@ -337,9 +337,9 @@ mod tests {
         let (a1, a2) = (rx1.recv().await.unwrap(), rx1.recv().await.unwrap());
         let (b1, b2) = (rx2.recv().await.unwrap(), rx2.recv().await.unwrap());
 
-        assert_eq!(a1, StuckEvent::Stuck,   "rx1 first event must be Stuck");
+        assert_eq!(a1, StuckEvent::Stuck, "rx1 first event must be Stuck");
         assert_eq!(a2, StuckEvent::Unstuck, "rx1 second event must be Unstuck");
-        assert_eq!(b1, StuckEvent::Stuck,   "rx2 first event must be Stuck");
+        assert_eq!(b1, StuckEvent::Stuck, "rx2 first event must be Stuck");
         assert_eq!(b2, StuckEvent::Unstuck, "rx2 second event must be Unstuck");
     }
 

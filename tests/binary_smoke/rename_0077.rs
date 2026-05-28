@@ -184,11 +184,7 @@ fn deprecated_amux_api_key_emits_deprecation_warning() {
 /// `AMUX_CONFIG_HOME` must also produce a deprecation warning.
 #[test]
 fn deprecated_amux_config_home_emits_deprecation_warning() {
-    let stderr = stderr_from_brief_run(
-        &["status"],
-        "AMUX_CONFIG_HOME",
-        "/tmp/legacy-amux-test",
-    );
+    let stderr = stderr_from_brief_run(&["status"], "AMUX_CONFIG_HOME", "/tmp/legacy-amux-test");
 
     assert!(
         stderr.contains("AMUX_CONFIG_HOME"),

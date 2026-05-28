@@ -264,7 +264,9 @@ impl GitRootResolver for StaticGitRootResolver {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionType {
-    Local { workdir: PathBuf },
+    Local {
+        workdir: PathBuf,
+    },
     Remote {
         repo_url: String,
         branch: String,
@@ -371,7 +373,9 @@ impl Session {
 
         Ok(Self {
             id: SessionId::new(),
-            session_type: SessionType::Local { workdir: working_dir },
+            session_type: SessionType::Local {
+                workdir: working_dir,
+            },
             git_root,
             repo_config,
             global_config,

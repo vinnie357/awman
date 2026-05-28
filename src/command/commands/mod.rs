@@ -8,6 +8,7 @@
 
 pub mod agent_auth;
 pub mod agent_setup;
+pub mod api_server;
 pub mod auth;
 pub mod chat;
 pub mod command_trait;
@@ -15,7 +16,6 @@ pub mod config;
 pub mod download;
 pub mod exec_prompt;
 pub mod exec_workflow;
-pub mod api_server;
 pub mod init;
 pub mod mount_scope;
 pub mod new;
@@ -292,19 +292,17 @@ pub fn collect_all_overlay_specs(
     let mut named_skills: Vec<String> = Vec::new();
     let mut env_passthrough: Vec<String> = Vec::new();
 
-    let mut process_typed = |typed: TypedOverlay| {
-        match typed {
-            TypedOverlay::Directory(spec) => dirs.push(spec),
-            TypedOverlay::Skill(SkillSpec::All) => include_all_skills = true,
-            TypedOverlay::Skill(SkillSpec::Named(name)) => {
-                if !named_skills.contains(&name) {
-                    named_skills.push(name);
-                }
+    let mut process_typed = |typed: TypedOverlay| match typed {
+        TypedOverlay::Directory(spec) => dirs.push(spec),
+        TypedOverlay::Skill(SkillSpec::All) => include_all_skills = true,
+        TypedOverlay::Skill(SkillSpec::Named(name)) => {
+            if !named_skills.contains(&name) {
+                named_skills.push(name);
             }
-            TypedOverlay::Env(var) => {
-                if !env_passthrough.contains(&var) {
-                    env_passthrough.push(var);
-                }
+        }
+        TypedOverlay::Env(var) => {
+            if !env_passthrough.contains(&var) {
+                env_passthrough.push(var);
             }
         }
     };
@@ -381,7 +379,10 @@ pub fn collect_all_overlay_specs(
 }
 
 /// Emit deprecation warnings for legacy `envPassthrough` config fields.
-pub fn warn_legacy_config(session: &crate::data::session::Session, sink: &mut dyn crate::engine::message::UserMessageSink) {
+pub fn warn_legacy_config(
+    session: &crate::data::session::Session,
+    sink: &mut dyn crate::engine::message::UserMessageSink,
+) {
     let ec = session.effective_config();
     if ec.repo().legacy_env_passthrough.is_some() {
         sink.write_message(crate::engine::message::UserMessage {
@@ -466,7 +467,11 @@ mod skill_parser_tests {
         assert_eq!(result.len(), 1);
         match &result[0] {
             TypedOverlay::Directory(spec) => {
-                assert!(spec.host.ends_with(".ssh"), "host must end with .ssh; got: {}", spec.host);
+                assert!(
+                    spec.host.ends_with(".ssh"),
+                    "host must end with .ssh; got: {}",
+                    spec.host
+                );
                 assert_eq!(spec.container, "~/.ssh");
             }
             other => panic!("expected Directory, got {other:?}"),
@@ -563,7 +568,11 @@ mod skill_parser_tests {
     #[test]
     fn env_list_produces_two_separate_env_overlays() {
         let result = parse_overlay_list("env(A), env(B)").unwrap();
-        assert_eq!(result.len(), 2, "two env() expressions must produce two overlays; got {result:?}");
+        assert_eq!(
+            result.len(),
+            2,
+            "two env() expressions must produce two overlays; got {result:?}"
+        );
         assert_eq!(result[0], TypedOverlay::Env("A".to_string()));
         assert_eq!(result[1], TypedOverlay::Env("B".to_string()));
     }
@@ -601,7 +610,10 @@ mod collect_overlay_specs_tests {
         let session = open_session(git_tmp.path(), env);
 
         let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
-        assert!(collected.include_all_skills, "skills must be enabled from repo config");
+        assert!(
+            collected.include_all_skills,
+            "skills must be enabled from repo config"
+        );
     }
 
     #[test]
@@ -618,7 +630,10 @@ mod collect_overlay_specs_tests {
         let session = open_session(git_tmp.path(), env);
 
         let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
-        assert!(collected.include_all_skills, "skills must be enabled from global config");
+        assert!(
+            collected.include_all_skills,
+            "skills must be enabled from global config"
+        );
     }
 
     #[test]
@@ -643,7 +658,9 @@ mod collect_overlay_specs_tests {
         let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
-        let collected = collect_all_overlay_specs(&session, vec![TypedOverlay::Skill(SkillSpec::All)], None).unwrap();
+        let collected =
+            collect_all_overlay_specs(&session, vec![TypedOverlay::Skill(SkillSpec::All)], None)
+                .unwrap();
         assert!(
             collected.include_all_skills,
             "skills must be enabled from CLI TypedOverlay::Skill(All)"
@@ -722,8 +739,7 @@ mod collect_overlay_specs_tests {
     #[test]
     fn skill_star_in_flag_and_named_in_step_union_semantics() {
         let tmp = tempfile::tempdir().unwrap();
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let cli_overlays = vec![TypedOverlay::Skill(SkillSpec::All)];
@@ -751,15 +767,12 @@ mod collect_overlay_specs_tests {
             ..Default::default()
         };
         repo_config.save(git_tmp.path()).unwrap();
-        let env = EnvSnapshot::with_overrides([(
-            AWMAN_CONFIG_HOME,
-            cfg_tmp.path().to_str().unwrap(),
-        )]);
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
         let step_overlays = vec!["skill(bar)".to_string()];
-        let collected =
-            collect_all_overlay_specs(&session, vec![], Some(&step_overlays)).unwrap();
+        let collected = collect_all_overlay_specs(&session, vec![], Some(&step_overlays)).unwrap();
 
         assert!(
             !collected.include_all_skills,
@@ -786,10 +799,8 @@ mod collect_overlay_specs_tests {
             ..Default::default()
         };
         repo_config.save(git_tmp.path()).unwrap();
-        let env = EnvSnapshot::with_overrides([(
-            AWMAN_CONFIG_HOME,
-            cfg_tmp.path().to_str().unwrap(),
-        )]);
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
         let result = collect_all_overlay_specs(&session, vec![], None);
@@ -811,7 +822,10 @@ mod collect_overlay_specs_tests {
         let session = open_session(tmp.path(), env);
 
         let result = collect_all_overlay_specs(&session, vec![], None);
-        assert!(result.is_err(), "skills(foo) in AWMAN_OVERLAYS must return Err");
+        assert!(
+            result.is_err(),
+            "skills(foo) in AWMAN_OVERLAYS must return Err"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("skill(") || msg.contains("removed"),
@@ -825,8 +839,7 @@ mod collect_overlay_specs_tests {
         // After passing through OverlayEngine::build_overlays, there must be
         // exactly one mount for that path (insert_or_merge deduplication).
         let tmp = tempfile::tempdir().unwrap();
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let ssh_typed = parse_overlay_list("ssh()").unwrap().remove(0);
@@ -862,15 +875,12 @@ mod collect_overlay_specs_tests {
             ..Default::default()
         };
         repo_config.save(git_tmp.path()).unwrap();
-        let env = EnvSnapshot::with_overrides([(
-            AWMAN_CONFIG_HOME,
-            cfg_tmp.path().to_str().unwrap(),
-        )]);
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
         let step_overlays = vec!["env(MY_TOKEN)".to_string()];
-        let collected =
-            collect_all_overlay_specs(&session, vec![], Some(&step_overlays)).unwrap();
+        let collected = collect_all_overlay_specs(&session, vec![], Some(&step_overlays)).unwrap();
 
         let count = collected
             .env_passthrough
@@ -894,15 +904,12 @@ mod collect_overlay_specs_tests {
             ..Default::default()
         };
         repo_config.save(git_tmp.path()).unwrap();
-        let env = EnvSnapshot::with_overrides([(
-            AWMAN_CONFIG_HOME,
-            cfg_tmp.path().to_str().unwrap(),
-        )]);
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
         let step_overlays = vec!["env(STEP_VAR)".to_string()];
-        let collected =
-            collect_all_overlay_specs(&session, vec![], Some(&step_overlays)).unwrap();
+        let collected = collect_all_overlay_specs(&session, vec![], Some(&step_overlays)).unwrap();
 
         assert!(
             collected.env_passthrough.contains(&"REPO_VAR".to_string()),
@@ -1009,8 +1016,7 @@ mod warn_legacy_config_tests {
     #[test]
     fn no_legacy_fields_produces_no_warning() {
         let tmp = tempfile::tempdir().unwrap();
-        let env =
-            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
         let mut sink = RecordingMessageSink::new();

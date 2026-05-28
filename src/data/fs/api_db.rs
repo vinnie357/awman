@@ -53,9 +53,15 @@ pub struct CommandRecord {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkerId(pub String);
 
+impl Default for WorkerId {
+    fn default() -> Self {
+        Self(uuid::Uuid::new_v4().to_string())
+    }
+}
+
 impl WorkerId {
     pub fn new() -> Self {
-        Self(uuid::Uuid::new_v4().to_string())
+        Self::default()
     }
 
     pub fn as_str(&self) -> &str {
@@ -200,7 +206,14 @@ impl SqliteSessionStore {
             "INSERT INTO sessions \
                  (id, workdir, created_at, status, setup_status, session_type, cloned_path) \
                  VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6)",
-            params![id, workdir, created_at, setup_status, session_type, cloned_path],
+            params![
+                id,
+                workdir,
+                created_at,
+                setup_status,
+                session_type,
+                cloned_path
+            ],
         )?;
         Ok(())
     }
@@ -611,9 +624,8 @@ impl SqliteSessionStore {
         let conn = self.lock();
         // First get the IDs
         let ids: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT id FROM commands WHERE session_id = ?1 AND status = 'queued'",
-            )?;
+            let mut stmt = conn
+                .prepare("SELECT id FROM commands WHERE session_id = ?1 AND status = 'queued'")?;
             let rows = stmt
                 .query_map(params![session_id], |row| row.get(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

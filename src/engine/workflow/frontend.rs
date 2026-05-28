@@ -9,13 +9,13 @@ use std::time::Duration;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
 use crate::engine::container::instance::ContainerExitInfo;
+use crate::engine::container::instance::StuckEvent;
 use crate::engine::error::EngineError;
 use crate::engine::message::UserMessageSink;
 use crate::engine::workflow::actions::{
     AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
-use crate::engine::container::instance::StuckEvent;
 use crate::engine::workflow::EngineRequest;
 
 /// Per-workflow frontend the engine uses for every Q&A and status report.

@@ -245,9 +245,7 @@ fn config_field_kind(name: &str) -> ConfigFieldKind {
     match name {
         "agent" | "default_agent" => ConfigFieldKind::Enum,
         "auto_agent_auth_accepted" | "api.background" => ConfigFieldKind::Bool,
-        "terminal_scrollback_lines" | "agentStuckTimeout" | "api.port" => {
-            ConfigFieldKind::Number
-        }
+        "terminal_scrollback_lines" | "agentStuckTimeout" | "api.port" => ConfigFieldKind::Number,
         _ => ConfigFieldKind::String,
     }
 }

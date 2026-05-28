@@ -49,11 +49,7 @@ fn migrate_dir(parent: &Path, old_name: &str, new_name: &str) -> Option<String> 
     }
 
     match std::fs::rename(&old, &new) {
-        Ok(()) => Some(format!(
-            "Migrated {} → {}",
-            old.display(),
-            new.display()
-        )),
+        Ok(()) => Some(format!("Migrated {} → {}", old.display(), new.display())),
         Err(e) => Some(format!(
             "warning: failed to migrate {} → {}: {e}",
             old.display(),

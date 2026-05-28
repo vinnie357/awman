@@ -100,10 +100,7 @@ pub enum ApiServerOutcome {
 /// Methods Layer 3 must provide to the api start command.
 #[async_trait]
 pub trait ApiServerStartCommandFrontend: UserMessageSink + Send + Sync {
-    async fn serve_until_shutdown(
-        &mut self,
-        config: ApiServeConfig,
-    ) -> Result<(), CommandError>;
+    async fn serve_until_shutdown(&mut self, config: ApiServeConfig) -> Result<(), CommandError>;
 }
 
 pub trait ApiServerKillCommandFrontend: UserMessageSink + Send + Sync {}
@@ -114,10 +111,7 @@ pub trait ApiServerStatusCommandFrontend: UserMessageSink + Send + Sync {}
 /// `serve_until_shutdown` so the dispatched frontend can boot the server.
 #[async_trait]
 pub trait ApiServerCommandFrontend: UserMessageSink + Send + Sync {
-    async fn serve_until_shutdown(
-        &mut self,
-        config: ApiServeConfig,
-    ) -> Result<(), CommandError>;
+    async fn serve_until_shutdown(&mut self, config: ApiServeConfig) -> Result<(), CommandError>;
 }
 
 pub struct ApiServerCommand {
@@ -205,7 +199,9 @@ async fn run_start(
         let key = engines.auth_engine.refresh_api_key()?;
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
-            text: "No API key configured — generating one now (store it; it will not be shown again):".to_string(),
+            text:
+                "No API key configured — generating one now (store it; it will not be shown again):"
+                    .to_string(),
         });
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
@@ -217,7 +213,9 @@ async fn run_start(
     if flags.dangerously_skip_auth {
         frontend.write_message(UserMessage {
             level: MessageLevel::Warning,
-            text: "--dangerously-skip-auth set — API endpoints will accept unauthenticated requests.".to_string(),
+            text:
+                "--dangerously-skip-auth set — API endpoints will accept unauthenticated requests."
+                    .to_string(),
         });
     }
 
@@ -281,9 +279,7 @@ async fn run_start(
     // start, surface ApiServerAlreadyRunning rather than overwriting.
     if !api_process::write_pid_exclusive(&pid_path, std::process::id())? {
         if let Some(existing) = api_process::read_pid(&pid_path)? {
-            if api_process::is_process_alive(existing)
-                && api_process::pid_is_awman(existing)
-            {
+            if api_process::is_process_alive(existing) && api_process::pid_is_awman(existing) {
                 return Err(CommandError::ApiServerAlreadyRunning { pid: existing });
             }
         }
@@ -325,7 +321,11 @@ async fn run_start(
         Some(mat)
     };
 
-    let scheme = if tls_material.is_some() { "https" } else { "http" };
+    let scheme = if tls_material.is_some() {
+        "https"
+    } else {
+        "http"
+    };
 
     // Persist server metadata so `api status` and remote clients can
     // probe the right endpoint.
@@ -574,8 +574,8 @@ mod tests {
     }
 
     use crate::command::dispatch::Engines;
-    use crate::data::fs::auth_paths::AuthPathResolver;
     use crate::data::fs::api_paths::ApiPaths;
+    use crate::data::fs::auth_paths::AuthPathResolver;
     use crate::engine::auth::AuthEngine;
     use crate::engine::message::{UserMessage, UserMessageSink};
     use std::sync::Arc;
@@ -679,11 +679,7 @@ mod tests {
             "first-run with no key must auto-generate one and proceed: {result:?}"
         );
         assert!(
-            engines
-                .auth_engine
-                .read_api_key_hash()
-                .unwrap()
-                .is_some(),
+            engines.auth_engine.read_api_key_hash().unwrap().is_some(),
             "auto-generated hash must be persisted to disk"
         );
         assert!(
@@ -891,11 +887,7 @@ mod tests {
         // On platforms where pid_is_awman returns false for the test binary,
         // check_already_running will treat it as stale; that's still a
         // useful signal — running=false, responsive=false.
-        crate::data::fs::api_process::write_pid(
-            &api_paths.pid_file(),
-            std::process::id(),
-        )
-        .unwrap();
+        crate::data::fs::api_process::write_pid(&api_paths.pid_file(), std::process::id()).unwrap();
 
         let result = run_status(&api_paths).await.unwrap();
         if let ApiServerOutcome::Status(outcome) = result {

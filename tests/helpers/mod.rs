@@ -12,7 +12,7 @@
 
 use std::path::PathBuf;
 
-use awman::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME, AWMAN_API_ROOT};
+use awman::data::config::env::{EnvSnapshot, AWMAN_API_ROOT, AWMAN_CONFIG_HOME};
 use awman::data::config::flags::FlagConfig;
 use awman::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
 

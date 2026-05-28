@@ -9,6 +9,10 @@
 //! The whole module is pure: it never touches I/O or globals. Tests can call
 //! any renderer directly with a synthesised outcome.
 
+use crate::command::commands::api_server::{
+    ApiServerKillOutcome, ApiServerLogsOutcome, ApiServerOutcome, ApiServerStartOutcome,
+    ApiServerStatusOutcome,
+};
 use crate::command::commands::auth::AuthOutcome;
 use crate::command::commands::chat::ChatOutcome;
 use crate::command::commands::config::{
@@ -17,10 +21,6 @@ use crate::command::commands::config::{
 use crate::command::commands::download::DownloadOutcome;
 use crate::command::commands::exec_prompt::ExecPromptOutcome;
 use crate::command::commands::exec_workflow::ExecWorkflowOutcome;
-use crate::command::commands::api_server::{
-    ApiServerKillOutcome, ApiServerLogsOutcome, ApiServerOutcome, ApiServerStartOutcome,
-    ApiServerStatusOutcome,
-};
 use crate::command::commands::init::InitOutcome;
 use crate::command::commands::new::{
     NewOutcome, NewSkillOutcome, NewSpecOutcome, NewWorkflowOutcome,

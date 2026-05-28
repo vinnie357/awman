@@ -9,8 +9,8 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 use crate::data::session_setup_event::{
-    ReadyStepEntry, SessionSetupError, SessionSetupEvent, SessionSetupState,
-    SessionSetupStatus, SetupEventPayload,
+    ReadyStepEntry, SessionSetupError, SessionSetupEvent, SessionSetupState, SessionSetupStatus,
+    SetupEventPayload,
 };
 use crate::engine::step_status::StepStatus;
 
@@ -167,11 +167,7 @@ pub struct SetupReadyFrontend {
 }
 
 impl SetupReadyFrontend {
-    pub fn new(
-        session_id: &str,
-        bus: SessionSetupBusSender,
-        event_bus: EventBusSender,
-    ) -> Self {
+    pub fn new(session_id: &str, bus: SessionSetupBusSender, event_bus: EventBusSender) -> Self {
         Self {
             bus,
             event_bus,
@@ -260,10 +256,7 @@ impl ReadyFrontend for SetupReadyFrontend {
     }
 
     fn report_summary(&mut self, summary: &ReadySummary) {
-        log_setup_line(
-            &self.session_prefix,
-            &format!("ready summary: {summary:?}"),
-        );
+        log_setup_line(&self.session_prefix, &format!("ready summary: {summary:?}"));
         {
             let mut state = self
                 .bus
@@ -275,7 +268,7 @@ impl ReadyFrontend for SetupReadyFrontend {
             state.current_stage = Some("Setup complete".to_string());
         }
         self.bus.emit(SetupEventPayload::SetupComplete {
-            ready_summary: summary.clone(),
+            ready_summary: Box::new(summary.clone()),
         });
     }
 
@@ -498,10 +491,7 @@ impl UserMessageSink for TracingSetupSink {
             MessageLevel::Error => "error",
             MessageLevel::Success => "ok",
         };
-        log_setup_line(
-            &self.session_prefix,
-            &format!("git [{level}] {}", msg.text),
-        );
+        log_setup_line(&self.session_prefix, &format!("git [{level}] {}", msg.text));
     }
 
     fn replay_queued(&mut self) {}

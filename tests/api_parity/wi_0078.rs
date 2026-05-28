@@ -18,19 +18,19 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use awman::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
+use awman::command::dispatch::Engines;
 use awman::command::error::CommandError;
 use awman::data::execution_event::{EventPayload, ExecutionEvent};
 use awman::data::fs::api_db::SqliteSessionStore;
 use awman::data::fs::api_paths::ApiPaths;
 use awman::data::fs::auth_paths::AuthPathResolver;
-use awman::data::session_setup_event::{SessionSetupStatus, SessionSetupState};
+use awman::data::session_setup_event::{SessionSetupState, SessionSetupStatus};
 use awman::data::EngineWorkflowStateStore;
 use awman::engine::agent::AgentEngine;
 use awman::engine::auth::AuthEngine;
 use awman::engine::container::ContainerRuntime;
 use awman::engine::git::GitEngine;
 use awman::engine::overlay::OverlayEngine;
-use awman::command::dispatch::Engines;
 use awman::frontend::api::event_bus::EventBus;
 use awman::frontend::api::routes::{build_router, AppState, AuthMode};
 use awman::frontend::api::session_setup::SessionSetupBus;
@@ -109,7 +109,9 @@ fn catalogue_api_allowed_commands_is_exactly_exec_workflow_and_exec_prompt() {
         allowed
     );
 
-    let has_exec_workflow = allowed.iter().any(|(p, s)| *p == "exec" && *s == "workflow");
+    let has_exec_workflow = allowed
+        .iter()
+        .any(|(p, s)| *p == "exec" && *s == "workflow");
     let has_exec_prompt = allowed.iter().any(|(p, s)| *p == "exec" && *s == "prompt");
 
     assert!(
@@ -259,7 +261,10 @@ async fn real_network_api_rejects_ready_with_400() {
     let client = reqwest::Client::new();
 
     let (status, body) = post_command(&client, addr, "ready", Some("any-session")).await;
-    assert_eq!(status, 400, "\"ready\" must be rejected with 400; body={body}");
+    assert_eq!(
+        status, 400,
+        "\"ready\" must be rejected with 400; body={body}"
+    );
 
     server.abort();
 }
@@ -275,7 +280,10 @@ async fn real_network_api_rejects_init_with_400() {
     let client = reqwest::Client::new();
 
     let (status, body) = post_command(&client, addr, "init", Some("any-session")).await;
-    assert_eq!(status, 400, "\"init\" must be rejected with 400; body={body}");
+    assert_eq!(
+        status, 400,
+        "\"init\" must be rejected with 400; body={body}"
+    );
 
     server.abort();
 }
@@ -291,7 +299,10 @@ async fn real_network_api_rejects_status_with_400() {
     let client = reqwest::Client::new();
 
     let (status, body) = post_command(&client, addr, "status", Some("any-session")).await;
-    assert_eq!(status, 400, "\"status\" must be rejected with 400; body={body}");
+    assert_eq!(
+        status, 400,
+        "\"status\" must be rejected with 400; body={body}"
+    );
 
     server.abort();
 }
@@ -307,7 +318,10 @@ async fn real_network_api_rejects_api_server_start_with_400() {
     let client = reqwest::Client::new();
 
     let (status, body) = post_command(&client, addr, "api start", Some("any-session")).await;
-    assert_eq!(status, 400, "\"api start\" must be rejected with 400; body={body}");
+    assert_eq!(
+        status, 400,
+        "\"api start\" must be rejected with 400; body={body}"
+    );
 
     server.abort();
 }
@@ -325,7 +339,8 @@ async fn real_network_api_accepts_exec_workflow_routing_not_command_restriction_
     };
     let client = reqwest::Client::new();
 
-    let (status, body) = post_command(&client, addr, "exec workflow", Some("nonexistent-session")).await;
+    let (status, body) =
+        post_command(&client, addr, "exec workflow", Some("nonexistent-session")).await;
 
     // Must NOT be the command-restriction 400
     let is_command_restriction_400 = status == 400
@@ -352,7 +367,8 @@ async fn real_network_api_accepts_exec_prompt_routing_not_command_restriction_40
     };
     let client = reqwest::Client::new();
 
-    let (status, body) = post_command(&client, addr, "exec prompt", Some("nonexistent-session")).await;
+    let (status, body) =
+        post_command(&client, addr, "exec prompt", Some("nonexistent-session")).await;
 
     let is_command_restriction_400 = status == 400
         && body["error"]
@@ -387,16 +403,13 @@ async fn real_network_api_rejection_body_lists_available_commands() {
         "rejection body must include an 'available' array; got {body}"
     );
     let arr = available.as_array().unwrap();
-    let strings: Vec<&str> = arr
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
+    let strings: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
     assert!(
-        strings.iter().any(|s| *s == "exec workflow"),
+        strings.contains(&"exec workflow"),
         "available list must include \"exec workflow\"; got {arr:?}"
     );
     assert!(
-        strings.iter().any(|s| *s == "exec prompt"),
+        strings.contains(&"exec prompt"),
         "available list must include \"exec prompt\"; got {arr:?}"
     );
 
@@ -705,7 +718,9 @@ async fn ndjson_1000_events_all_parseable() {
         match rx.recv().await {
             Ok(event) => {
                 if let Ok(json) = serde_json::to_string(&event) {
-                    file.write_all(format!("{json}\n").as_bytes()).await.unwrap();
+                    file.write_all(format!("{json}\n").as_bytes())
+                        .await
+                        .unwrap();
                 }
                 written += 1;
                 if matches!(event.payload, EventPayload::Done) {
@@ -720,7 +735,11 @@ async fn ndjson_1000_events_all_parseable() {
     }
     file.flush().await.unwrap();
 
-    assert_eq!(written, n + 1, "should have written {n} events + Done sentinel");
+    assert_eq!(
+        written,
+        n + 1,
+        "should have written {n} events + Done sentinel"
+    );
 
     // Parse every line back.
     let content = tokio::fs::read_to_string(&events_log).await.unwrap();
@@ -728,7 +747,8 @@ async fn ndjson_1000_events_all_parseable() {
     assert_eq!(
         lines.len() as u64,
         n + 1,
-        "events.log must have {} lines", n + 1
+        "events.log must have {} lines",
+        n + 1
     );
 
     for (line_no, line) in lines.iter().enumerate() {
@@ -808,8 +828,16 @@ async fn session_setup_bus_ready_step_statuses_accumulate() {
     sender.update_ready_step("preflight", StepStatus::Done);
     {
         let state = bus.snapshot();
-        assert_eq!(state.ready_step_statuses.len(), 2, "update must not add a duplicate");
-        let preflight = state.ready_step_statuses.iter().find(|e| e.step == "preflight").unwrap();
+        assert_eq!(
+            state.ready_step_statuses.len(),
+            2,
+            "update must not add a duplicate"
+        );
+        let preflight = state
+            .ready_step_statuses
+            .iter()
+            .find(|e| e.step == "preflight")
+            .unwrap();
         assert_eq!(preflight.status, StepStatus::Done);
     }
 }
@@ -1068,7 +1096,8 @@ fn api_frontend_always_returns_yolo_true_regardless_of_input() {
         "API frontend must always force yolo=true"
     );
     assert_eq!(
-        fe.flag_bool(&["exec", "prompt"], "non-interactive").unwrap(),
+        fe.flag_bool(&["exec", "prompt"], "non-interactive")
+            .unwrap(),
         Some(true),
         "API frontend must always force non-interactive=true"
     );
@@ -1183,7 +1212,14 @@ fn list_sessions_with_in_progress_setup_finds_non_terminal_sessions() {
         .insert_session_full("s1", "/wd1", "ts", "running_ready", "local", None)
         .unwrap();
     store
-        .insert_session_full("s2", "/wd2", "ts", "cloning_repository", "remote", Some("/clone/s2"))
+        .insert_session_full(
+            "s2",
+            "/wd2",
+            "ts",
+            "cloning_repository",
+            "remote",
+            Some("/clone/s2"),
+        )
         .unwrap();
     store
         .insert_session_full("s3", "/wd3", "ts", "ready", "local", None)
@@ -1195,7 +1231,10 @@ fn list_sessions_with_in_progress_setup_finds_non_terminal_sessions() {
     let in_progress = store.list_sessions_with_in_progress_setup().unwrap();
     let ids: Vec<&str> = in_progress.iter().map(|s| s.id.as_str()).collect();
     assert!(ids.contains(&"s1"), "running_ready must be in-progress");
-    assert!(ids.contains(&"s2"), "cloning_repository must be in-progress");
+    assert!(
+        ids.contains(&"s2"),
+        "cloning_repository must be in-progress"
+    );
     assert!(!ids.contains(&"s3"), "ready is terminal, not in-progress");
     assert!(!ids.contains(&"s4"), "failed is terminal, not in-progress");
     assert_eq!(in_progress.len(), 2);
@@ -1230,11 +1269,9 @@ async fn real_network_job_logs_404_for_unknown_job() {
         return;
     };
 
-    let resp = reqwest::get(format!(
-        "http://{addr}/v1/commands/no-such-cmd/logs"
-    ))
-    .await
-    .expect("GET /commands/logs");
+    let resp = reqwest::get(format!("http://{addr}/v1/commands/no-such-cmd/logs"))
+        .await
+        .expect("GET /commands/logs");
     assert_eq!(resp.status().as_u16(), 404);
 
     server.abort();
@@ -1616,11 +1653,7 @@ mod remote_session_start_wait_tests {
             remote_addr: Some(mock.uri()),
             api_key: None,
         };
-        let cmd = RemoteCommand::new(
-            RemoteSubcommand::SessionStart(flags),
-            engines,
-            session,
-        );
+        let cmd = RemoteCommand::new(RemoteSubcommand::SessionStart(flags), engines, session);
         let outcome = cmd
             .run_with_frontend(Box::new(CapturingSink {
                 messages: messages.clone(),
@@ -1702,11 +1735,7 @@ mod remote_session_start_wait_tests {
             remote_addr: Some(mock.uri()),
             api_key: None,
         };
-        let cmd = RemoteCommand::new(
-            RemoteSubcommand::SessionStart(flags),
-            engines,
-            session,
-        );
+        let cmd = RemoteCommand::new(RemoteSubcommand::SessionStart(flags), engines, session);
         let result = cmd
             .run_with_frontend(Box::new(CapturingSink {
                 messages: messages.clone(),

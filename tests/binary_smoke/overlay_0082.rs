@@ -71,7 +71,8 @@ fn mount_ssh_with_value_form_also_rejected_with_guidance() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--mount-ssh") && (stderr.contains("ssh()") || stderr.contains("--overlay")),
+        stderr.contains("--mount-ssh")
+            && (stderr.contains("ssh()") || stderr.contains("--overlay")),
         "--mount-ssh=true must produce the same guidance message; stderr: {stderr}"
     );
 }

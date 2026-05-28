@@ -818,9 +818,7 @@ mod tests {
     #[test]
     fn flag_u16_default_value_when_absent() {
         let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd
-            .try_get_matches_from(["awman", "api", "start"])
-            .unwrap();
+        let m = cmd.try_get_matches_from(["awman", "api", "start"]).unwrap();
         let frontend = CliFrontend::new(m);
         // Default for `--port` on `api start` is 9876.
         let v = frontend.flag_u16(&["api", "start"], "port").unwrap();

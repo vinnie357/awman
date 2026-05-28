@@ -148,7 +148,11 @@ fn run_macos_keychain_lookup(service: &str, account: Option<&str>) -> Option<Str
         return None;
     }
     let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() { None } else { Some(raw) }
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
 }
 
 fn run_linux_secret_lookup(service: &str, account: &str) -> Option<String> {
@@ -160,7 +164,11 @@ fn run_linux_secret_lookup(service: &str, account: &str) -> Option<String> {
         return None;
     }
     let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() { None } else { Some(raw) }
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
 }
 
 /// Strip the `go-keyring-base64:` envelope (or the legacy
@@ -185,7 +193,7 @@ fn decode_go_keyring_payload(raw: &str) -> Option<Vec<u8>> {
 }
 
 fn decode_hex(input: &str) -> Option<Vec<u8>> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return None;
     }
     (0..input.len())

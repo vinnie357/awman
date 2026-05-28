@@ -7,10 +7,10 @@
 //! - `ApiServeConfig` type name uses "Api" terminology (compile-time evidence).
 //! - The API server startup log message contains "api" and not "headless"/"amux".
 
+use awman::command::commands::api_server::banner::render_api_key_banner;
 use awman::command::commands::api_server::ApiServeConfig;
 use awman::data::config::env::{EnvSnapshot, AWMAN_API_ROOT};
 use awman::data::fs::api_paths::ApiPaths;
-use awman::command::commands::api_server::banner::render_api_key_banner;
 
 // ─── ApiPaths naming ─────────────────────────────────────────────────────────
 
@@ -134,7 +134,11 @@ fn api_startup_log_message_contains_awman_and_api_mode() {
     // "listening", or "stopped" — those are the lifecycle log lines.
     let lifecycle_msgs: Vec<&str> = src
         .lines()
-        .filter_map(|l| l.trim().strip_prefix('"').and_then(|s| s.strip_suffix("\"")))
+        .filter_map(|l| {
+            l.trim()
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix("\""))
+        })
         .filter(|l| {
             let lower = l.to_lowercase();
             lower.contains("starting") || lower.contains("listening") || lower.contains("stopped")
@@ -180,6 +184,7 @@ async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
     use std::sync::Arc;
     use std::time::Instant;
 
+    use awman::command::dispatch::Engines;
     use awman::data::fs::api_db::SqliteSessionStore;
     use awman::data::fs::auth_paths::AuthPathResolver;
     use awman::data::EngineWorkflowStateStore;
@@ -188,7 +193,6 @@ async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
     use awman::engine::container::ContainerRuntime;
     use awman::engine::git::GitEngine;
     use awman::engine::overlay::OverlayEngine;
-    use awman::command::dispatch::Engines;
     use awman::frontend::api::routes::{build_router, AppState, AuthMode};
 
     let tmp = tempfile::tempdir().unwrap();

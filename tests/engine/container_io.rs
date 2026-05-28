@@ -75,12 +75,9 @@ async fn take_container_io_cli_non_interactive_stdin_eof_after_drop() {
     // Drop the returned stdin_tx clone — no more senders → EOF.
     drop(io.stdin_tx);
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        stdin_rx.recv(),
-    )
-    .await
-    .expect("should not time out — EOF should be immediate");
+    let result = tokio::time::timeout(std::time::Duration::from_millis(100), stdin_rx.recv())
+        .await
+        .expect("should not time out — EOF should be immediate");
 
     assert!(
         result.is_none(),
@@ -99,15 +96,15 @@ async fn take_container_io_cli_stdin_tx_sends_reach_stdin_rx() {
     io.stdin_tx.send(payload.clone()).unwrap();
 
     let mut stdin_rx = io.stdin_rx;
-    let received = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        stdin_rx.recv(),
-    )
-    .await
-    .expect("recv should not time out")
-    .expect("channel should be open");
+    let received = tokio::time::timeout(std::time::Duration::from_millis(100), stdin_rx.recv())
+        .await
+        .expect("recv should not time out")
+        .expect("channel should be open");
 
-    assert_eq!(received, payload, "bytes sent via stdin_tx must arrive at stdin_rx");
+    assert_eq!(
+        received, payload,
+        "bytes sent via stdin_tx must arrive at stdin_rx"
+    );
 }
 
 // ─── API ContainerIo ─────────────────────────────────────────────────────────
@@ -129,7 +126,10 @@ async fn take_container_io_api_has_no_pty_fields() {
     let io = fe.take_container_io();
 
     assert!(io.resize.is_none(), "API must not have a resize channel");
-    assert!(io.initial_size.is_none(), "API must not have an initial PTY size");
+    assert!(
+        io.initial_size.is_none(),
+        "API must not have an initial PTY size"
+    );
 }
 
 /// Bytes sent through the API's `stdout` channel must arrive at the event bus
@@ -147,7 +147,9 @@ async fn take_container_io_api_stdout_bytes_arrive_at_event_bus() {
     // Give the drain task time to process.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let event = rx.try_recv().expect("should have received a StdoutLine event");
+    let event = rx
+        .try_recv()
+        .expect("should have received a StdoutLine event");
     assert!(
         matches!(&event.payload, EventPayload::StdoutLine(s) if s == "hello world"),
         "stdout bytes must arrive as StdoutLine at the event bus; got {:?}",
@@ -168,7 +170,9 @@ async fn take_container_io_api_stderr_bytes_arrive_at_event_bus() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let event = rx.try_recv().expect("should have received a StderrLine event");
+    let event = rx
+        .try_recv()
+        .expect("should have received a StderrLine event");
     assert!(
         matches!(&event.payload, EventPayload::StderrLine(s) if s == "error occurred"),
         "stderr bytes must arrive as StderrLine at the event bus; got {:?}",
@@ -184,7 +188,9 @@ async fn take_container_io_api_multiline_stdout_split_into_separate_events() {
     let mut rx = bus.subscribe();
     let io = fe.take_container_io();
 
-    io.stdout.send(b"line one\nline two\nline three\n".to_vec()).unwrap();
+    io.stdout
+        .send(b"line one\nline two\nline three\n".to_vec())
+        .unwrap();
     drop(io.stdout);
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -215,12 +221,9 @@ async fn take_container_io_api_stdin_eof_after_drop() {
     // closes the channel.
     drop(io.stdin_tx);
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        stdin_rx.recv(),
-    )
-    .await
-    .expect("EOF should be immediate — no timeout");
+    let result = tokio::time::timeout(std::time::Duration::from_millis(100), stdin_rx.recv())
+        .await
+        .expect("EOF should be immediate — no timeout");
 
     assert!(
         result.is_none(),
@@ -248,24 +251,18 @@ async fn engine_piped_path_writer_sees_eof_after_seed_drop_api() {
     // `spawn_piped_docker` / `spawn_piped_apple`.
     drop(io.stdin_tx);
 
-    let first = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        stdin_rx.recv(),
-    )
-    .await
-    .expect("seed bytes should arrive promptly")
-    .expect("seed bytes were sent before drop");
+    let first = tokio::time::timeout(std::time::Duration::from_millis(100), stdin_rx.recv())
+        .await
+        .expect("seed bytes should arrive promptly")
+        .expect("seed bytes were sent before drop");
     assert_eq!(first, b"seeded prompt");
 
     let newline = stdin_rx.recv().await.expect("newline was queued");
     assert_eq!(newline, b"\n");
 
-    let eof = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        stdin_rx.recv(),
-    )
-    .await
-    .expect("EOF should arrive promptly after final sender drop");
+    let eof = tokio::time::timeout(std::time::Duration::from_millis(100), stdin_rx.recv())
+        .await
+        .expect("EOF should arrive promptly after final sender drop");
     assert!(
         eof.is_none(),
         "writer task must see None (EOF) once the engine drops the seed sender"
@@ -288,12 +285,11 @@ async fn engine_piped_path_writer_sees_eof_after_seed_drop_cli() {
     let first = stdin_rx.recv().await.expect("seed was sent");
     assert_eq!(first, b"prompt\n");
 
-    let eof = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        stdin_rx.recv(),
-    )
-    .await
-    .expect("EOF should be prompt");
-    assert!(eof.is_none(), "writer task must see EOF after engine drops seed sender");
+    let eof = tokio::time::timeout(std::time::Duration::from_millis(100), stdin_rx.recv())
+        .await
+        .expect("EOF should be prompt");
+    assert!(
+        eof.is_none(),
+        "writer task must see EOF after engine drops seed sender"
+    );
 }
-

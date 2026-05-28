@@ -11,6 +11,10 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use crate::command::commands::api_server::{
+    ApiServerCommand, ApiServerCommandFrontend, ApiServerKillFlags, ApiServerLogsFlags,
+    ApiServerStartFlags, ApiServerStatusFlags, ApiServerSubcommand,
+};
 use crate::command::commands::auth::{AuthCommand, AuthCommandFrontend};
 use crate::command::commands::chat::{ChatCommand, ChatCommandFlags, ChatCommandFrontend};
 use crate::command::commands::config::{
@@ -23,10 +27,6 @@ use crate::command::commands::exec_prompt::{
 };
 use crate::command::commands::exec_workflow::{
     ExecWorkflowCommand, ExecWorkflowCommandFlags, ExecWorkflowCommandFrontend,
-};
-use crate::command::commands::api_server::{
-    ApiServerCommand, ApiServerCommandFrontend, ApiServerKillFlags, ApiServerLogsFlags,
-    ApiServerStartFlags, ApiServerStatusFlags, ApiServerSubcommand,
 };
 use crate::command::commands::init::{InitCommand, InitCommandFlags, InitCommandFrontend};
 use crate::command::commands::new::{
@@ -462,9 +462,7 @@ impl<F: CommandFrontend> Dispatch<F> {
                         workflow,
                         work_item: self.frontend.flag_string(&canonical_refs, "work-item")?,
                         agent: self.frontend.flag_string(&canonical_refs, "agent")?,
-                        remote_addr: self
-                            .frontend
-                            .flag_string(&canonical_refs, "remote-addr")?,
+                        remote_addr: self.frontend.flag_string(&canonical_refs, "remote-addr")?,
                         session: self.frontend.flag_string(&canonical_refs, "session")?,
                         follow: self
                             .frontend
@@ -487,9 +485,7 @@ impl<F: CommandFrontend> Dispatch<F> {
                     RemoteSubcommand::ExecPrompt(RemoteExecPromptFlags {
                         prompt,
                         agent: self.frontend.flag_string(&canonical_refs, "agent")?,
-                        remote_addr: self
-                            .frontend
-                            .flag_string(&canonical_refs, "remote-addr")?,
+                        remote_addr: self.frontend.flag_string(&canonical_refs, "remote-addr")?,
                         session: self.frontend.flag_string(&canonical_refs, "session")?,
                         follow: self
                             .frontend
@@ -512,9 +508,7 @@ impl<F: CommandFrontend> Dispatch<F> {
                         workdir: self.frontend.flag_string(&canonical_refs, "workdir")?,
                         repo_url: self.frontend.flag_string(&canonical_refs, "repo-url")?,
                         branch: self.frontend.flag_string(&canonical_refs, "branch")?,
-                        remote_addr: self
-                            .frontend
-                            .flag_string(&canonical_refs, "remote-addr")?,
+                        remote_addr: self.frontend.flag_string(&canonical_refs, "remote-addr")?,
                         api_key: self.frontend.flag_string(&canonical_refs, "api-key")?,
                     }),
                     self.engines.clone(),

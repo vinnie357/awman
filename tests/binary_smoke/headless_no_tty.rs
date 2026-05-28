@@ -43,7 +43,12 @@ fn exec_workflow_yolo_no_tty_exits_without_prompting() {
     let workflow_path = tmp.path().join("missing.toml");
 
     let mut child = Command::new(awman_bin())
-        .args(["exec", "workflow", workflow_path.to_str().unwrap(), "--yolo"])
+        .args([
+            "exec",
+            "workflow",
+            workflow_path.to_str().unwrap(),
+            "--yolo",
+        ])
         .stdin(null_stdin())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

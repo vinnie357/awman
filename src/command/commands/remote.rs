@@ -222,27 +222,34 @@ fn resolve_session_id(
         .ok_or(CommandError::RemoteSessionMissing)
 }
 
+struct RemoteExecParams<'a> {
+    exec: crate::command::commands::remote_client::ExecArg,
+    subcommand_name: &'a str,
+    extra_args: Vec<String>,
+    remote_addr: Option<&'a str>,
+    session_flag: Option<&'a str>,
+    follow: bool,
+    api_key_flag: Option<&'a str>,
+}
+
 async fn run_remote_exec(
     session: &crate::data::session::Session,
     engines: &Engines,
-    exec: crate::command::commands::remote_client::ExecArg,
-    subcommand_name: &str,
-    extra_args: Vec<String>,
-    remote_addr: Option<&str>,
-    session_flag: Option<&str>,
-    follow: bool,
-    api_key_flag: Option<&str>,
+    params: RemoteExecParams<'_>,
     frontend: &mut dyn UserMessageSink,
 ) -> Result<RemoteExecOutcome, CommandError> {
-    use crate::command::commands::remote_client::{ExecutionEventSink, ExecJobResponse};
+    use crate::command::commands::remote_client::{ExecJobResponse, ExecutionEventSink};
     use crate::data::execution_event::EventPayload;
 
-    let addr = resolve_addr(session, remote_addr)?;
-    let session_id = resolve_session_id(session, session_flag)?;
-    let api_key = RemoteClient::resolve_api_key(session, &addr, api_key_flag)?;
+    let subcommand_name = params.subcommand_name;
+    let addr = resolve_addr(session, params.remote_addr)?;
+    let session_id = resolve_session_id(session, params.session_flag)?;
+    let api_key = RemoteClient::resolve_api_key(session, &addr, params.api_key_flag)?;
     let client = build_remote_client(engines, &addr, api_key.as_ref())?;
 
-    let ExecJobResponse { command_id, .. } = client.exec_job(&session_id, exec, &extra_args).await?;
+    let ExecJobResponse { command_id, .. } = client
+        .exec_job(&session_id, params.exec, &params.extra_args)
+        .await?;
 
     frontend.write_message(UserMessage {
         level: MessageLevel::Info,
@@ -251,7 +258,7 @@ async fn run_remote_exec(
 
     let mut follow_exit_code: Option<i32> = None;
 
-    if follow {
+    if params.follow {
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
             text: "Streaming logs from server...".into(),
@@ -266,10 +273,7 @@ async fn run_remote_exec(
         }
         impl ExecutionEventSink for FollowSink<'_> {
             fn on_event(&mut self, event: crate::data::execution_event::ExecutionEvent) -> bool {
-                if self
-                    .interrupted
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                {
+                if self.interrupted.load(std::sync::atomic::Ordering::Relaxed) {
                     return true;
                 }
                 match event.payload {
@@ -358,9 +362,7 @@ async fn run_remote_exec(
                 }
                 Err(e) => {
                     last_err = Some(e);
-                    if attempt == 0
-                        && !interrupted.load(std::sync::atomic::Ordering::Relaxed)
-                    {
+                    if attempt == 0 && !interrupted.load(std::sync::atomic::Ordering::Relaxed) {
                         sink.sink.write_message(UserMessage {
                             level: MessageLevel::Warning,
                             text: "SSE connection dropped; retrying in 2 seconds...".into(),
@@ -399,7 +401,9 @@ async fn run_remote_exec(
     let (status, exit_code) = match status_resp {
         Ok(r) => (
             r.body["status"].as_str().map(|s| s.to_string()),
-            r.body["exit_code"].as_i64().or_else(|| follow_exit_code.map(|c| c as i64)),
+            r.body["exit_code"]
+                .as_i64()
+                .or_else(|| follow_exit_code.map(|c| c as i64)),
         ),
         Err(_) => (None, follow_exit_code.map(|c| c as i64)),
     };
@@ -434,13 +438,15 @@ async fn run_remote_exec_workflow(
     let outcome = run_remote_exec(
         session,
         engines,
-        ExecArg::Workflow(flags.workflow.to_string_lossy().into_owned()),
-        "workflow",
-        extra,
-        flags.remote_addr.as_deref(),
-        flags.session.as_deref(),
-        flags.follow,
-        flags.api_key.as_deref(),
+        RemoteExecParams {
+            exec: ExecArg::Workflow(flags.workflow.to_string_lossy().into_owned()),
+            subcommand_name: "workflow",
+            extra_args: extra,
+            remote_addr: flags.remote_addr.as_deref(),
+            session_flag: flags.session.as_deref(),
+            follow: flags.follow,
+            api_key_flag: flags.api_key.as_deref(),
+        },
         frontend,
     )
     .await?;
@@ -464,13 +470,15 @@ async fn run_remote_exec_prompt(
     let outcome = run_remote_exec(
         session,
         engines,
-        ExecArg::Prompt(flags.prompt.clone()),
-        "prompt",
-        extra,
-        flags.remote_addr.as_deref(),
-        flags.session.as_deref(),
-        flags.follow,
-        flags.api_key.as_deref(),
+        RemoteExecParams {
+            exec: ExecArg::Prompt(flags.prompt.clone()),
+            subcommand_name: "prompt",
+            extra_args: extra,
+            remote_addr: flags.remote_addr.as_deref(),
+            session_flag: flags.session.as_deref(),
+            follow: flags.follow,
+            api_key_flag: flags.api_key.as_deref(),
+        },
         frontend,
     )
     .await?;
@@ -491,41 +499,44 @@ async fn run_session_start(
     let client = build_remote_client(engines, &addr, api_key.as_ref())?;
 
     let session_type = flags.session_type.to_lowercase();
-    let req = match session_type.as_str() {
-        "local" => {
-            let workdir = flags.workdir.clone().ok_or_else(|| {
-                CommandError::MissingRequiredArgument {
-                    command: vec!["remote".into(), "session".into(), "start".into()],
-                    argument: "workdir".into(),
+    let req =
+        match session_type.as_str() {
+            "local" => {
+                let workdir =
+                    flags
+                        .workdir
+                        .clone()
+                        .ok_or_else(|| CommandError::MissingRequiredArgument {
+                            command: vec!["remote".into(), "session".into(), "start".into()],
+                            argument: "workdir".into(),
+                        })?;
+                StartSessionRequest {
+                    session_type: "local".into(),
+                    workdir: Some(workdir),
+                    repo_url: None,
+                    branch: None,
                 }
-            })?;
-            StartSessionRequest {
-                session_type: "local".into(),
-                workdir: Some(workdir),
-                repo_url: None,
-                branch: None,
             }
-        }
-        "remote" => {
-            let repo_url = flags.repo_url.clone().ok_or_else(|| {
-                CommandError::MissingRequiredArgument {
-                    command: vec!["remote".into(), "session".into(), "start".into()],
-                    argument: "repo-url".into(),
+            "remote" => {
+                let repo_url = flags.repo_url.clone().ok_or_else(|| {
+                    CommandError::MissingRequiredArgument {
+                        command: vec!["remote".into(), "session".into(), "start".into()],
+                        argument: "repo-url".into(),
+                    }
+                })?;
+                StartSessionRequest {
+                    session_type: "remote".into(),
+                    workdir: None,
+                    repo_url: Some(repo_url),
+                    branch: flags.branch.clone(),
                 }
-            })?;
-            StartSessionRequest {
-                session_type: "remote".into(),
-                workdir: None,
-                repo_url: Some(repo_url),
-                branch: flags.branch.clone(),
             }
-        }
-        other => {
-            return Err(CommandError::Other(format!(
-                "--type must be 'local' or 'remote'; got '{other}'"
-            )));
-        }
-    };
+            other => {
+                return Err(CommandError::Other(format!(
+                    "--type must be 'local' or 'remote'; got '{other}'"
+                )));
+            }
+        };
 
     // Detached-HEAD warning: only relevant for local sessions.
     if session_type == "local" && engines.git_engine.is_detached_head(session.git_root()) {
@@ -643,10 +654,7 @@ async fn run_session_start(
                 if !st.ready_step_statuses.is_empty() {
                     let mut text = String::from("Partial step status:\n");
                     for entry in &st.ready_step_statuses {
-                        text.push_str(&format!(
-                            "  {:<20} {:?}\n",
-                            entry.step, entry.status
-                        ));
+                        text.push_str(&format!("  {:<20} {:?}\n", entry.step, entry.status));
                     }
                     frontend.write_message(UserMessage {
                         level: MessageLevel::Error,
@@ -676,7 +684,7 @@ async fn run_session_start(
 /// Render the ReadySummary into a multi-line box similar to the CLI/TUI
 /// `ready` rendering. Uses `render_summary_box` from the CLI helpers.
 fn render_ready_summary(summary: &crate::engine::ready::summary::ReadySummary) -> String {
-    use crate::engine::step_status::StepStatus;
+    use crate::data::step_status::{render_summary_box, StepStatus};
     let rows: Vec<(&str, &StepStatus)> = vec![
         ("Dockerfile", &summary.dockerfile),
         ("Base image", &summary.base_image),
@@ -687,10 +695,7 @@ fn render_ready_summary(summary: &crate::engine::ready::summary::ReadySummary) -
         ("aspec/", &summary.aspec_folder),
         ("Work items config", &summary.work_items_config),
     ];
-    crate::frontend::cli::per_command::helpers::render_summary_box(
-        &format!("Ready Summary ({})", summary.runtime_name),
-        &rows,
-    )
+    render_summary_box(&format!("Ready Summary ({})", summary.runtime_name), &rows)
 }
 
 async fn run_session_kill(
@@ -766,7 +771,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let config_json = format!(r#"{{"remote":{{"defaultAddr":"{addr}"}}}}"#);
         std::fs::write(tmp.path().join("config.json"), &config_json).unwrap();
-        let env = EnvSnapshot::with_overrides([("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap())]);
+        let env =
+            EnvSnapshot::with_overrides([("AWMAN_CONFIG_HOME", tmp.path().to_str().unwrap())]);
         let opts = SessionOpenOptions {
             env: Some(env),
             ..Default::default()

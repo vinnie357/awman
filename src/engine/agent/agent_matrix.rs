@@ -7,7 +7,15 @@ use crate::engine::error::EngineError;
 /// Supported agent names — derived from the legacy `Agent` enum in
 /// `oldsrc/cli.rs`.
 pub const SUPPORTED_AGENTS: &[&str] = &[
-    "claude", "codex", "opencode", "maki", "gemini", "copilot", "crush", "cline", "antigravity",
+    "claude",
+    "codex",
+    "opencode",
+    "maki",
+    "gemini",
+    "copilot",
+    "crush",
+    "cline",
+    "antigravity",
 ];
 
 /// Per-agent metadata used by `AgentEngine::build_options`.

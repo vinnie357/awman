@@ -32,7 +32,10 @@ impl WorktreeLifecycleFrontend for CliFrontend {
         if !stdin_is_tty() {
             return Ok(PreWorktreeDecision::UseLastCommit);
         }
-        eprintln!("awman: {} uncommitted file(s) in working tree:", files.len());
+        eprintln!(
+            "awman: {} uncommitted file(s) in working tree:",
+            files.len()
+        );
         for f in files.iter().take(10) {
             eprintln!("  {f}");
         }

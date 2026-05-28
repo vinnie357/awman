@@ -224,8 +224,7 @@ impl ReadyEngine {
                 let tag = project_image_tag(&git_root);
                 // Rebuild when --build was passed or when the base image is
                 // missing. Otherwise skip (`awman ready` is idempotent).
-                let needs_build = self.options.build
-                    || !self.container_runtime.image_exists(&tag);
+                let needs_build = self.options.build || !self.container_runtime.image_exists(&tag);
                 if !needs_build {
                     self.summary.base_image = StepStatus::Done;
                     frontend.report_step_status("Build base image", StepStatus::Done);
@@ -276,8 +275,7 @@ impl ReadyEngine {
                 let paths = RepoDockerfilePaths::new(&git_root);
                 let agent_dockerfile = paths.agent_dockerfile(self.options.agent.as_str());
                 let tag = agent_image_tag(&git_root, self.options.agent.as_str());
-                let needs_build = self.options.build
-                    || !self.container_runtime.image_exists(&tag);
+                let needs_build = self.options.build || !self.container_runtime.image_exists(&tag);
                 if !needs_build {
                     self.summary.agent_image = StepStatus::Done;
                     frontend.report_step_status("Build agent image", StepStatus::Done);

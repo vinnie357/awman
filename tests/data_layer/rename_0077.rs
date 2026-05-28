@@ -8,11 +8,11 @@
 //! - Migration renames `<git_root>/.amux/` → `<git_root>/.awman/` with an info message.
 //! - Docs internal links all resolve to existing files (no broken links after WI-0077).
 
-use awman::data::config::env::{
-    EnvSnapshot, AWMAN_API_KEY, AWMAN_CONFIG_HOME,
+use awman::data::config::env::{EnvSnapshot, AWMAN_API_KEY, AWMAN_CONFIG_HOME};
+use awman::data::config::global::{
+    GlobalConfig, GLOBAL_CONFIG_FILENAME, GLOBAL_CONFIG_HOME_SUBDIR,
 };
-use awman::data::config::global::{GlobalConfig, GLOBAL_CONFIG_HOME_SUBDIR, GLOBAL_CONFIG_FILENAME};
-use awman::data::config::repo::{RepoConfig, REPO_CONFIG_SUBDIR, REPO_CONFIG_FILENAME};
+use awman::data::config::repo::{RepoConfig, REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR};
 use awman::data::migration;
 
 /// Process-wide mutex for tests that mutate `std::env` vars.
@@ -92,7 +92,9 @@ fn repo_config_path_is_inside_awman_subdir() {
     // Must be <tmp>/.awman/config.json
     assert_eq!(
         p,
-        tmp.path().join(REPO_CONFIG_SUBDIR).join(REPO_CONFIG_FILENAME),
+        tmp.path()
+            .join(REPO_CONFIG_SUBDIR)
+            .join(REPO_CONFIG_FILENAME),
         "RepoConfig::path() must be under .awman/"
     );
     assert!(
@@ -187,9 +189,14 @@ fn deprecated_amux_api_key_returns_warning() {
 fn awman_api_key_produces_no_deprecation_warning() {
     let _guard = ENV_LOCK.lock().unwrap();
     // Ensure no AMUX_* vars are set.
-    for legacy in &["AMUX_API_KEY", "AMUX_CONFIG_HOME", "AMUX_API_ROOT",
-                    "AMUX_OVERLAYS", "AMUX_REMOTE_ADDR", "AMUX_REMOTE_SESSION"]
-    {
+    for legacy in &[
+        "AMUX_API_KEY",
+        "AMUX_CONFIG_HOME",
+        "AMUX_API_ROOT",
+        "AMUX_OVERLAYS",
+        "AMUX_REMOTE_ADDR",
+        "AMUX_REMOTE_SESSION",
+    ] {
         std::env::remove_var(legacy);
     }
     std::env::set_var("AWMAN_API_KEY", "new-valid-key");
@@ -332,9 +339,7 @@ fn docs_internal_links_all_resolve() {
                     .strip_prefix(&docs_dir)
                     .unwrap_or(&file_path)
                     .display();
-                broken.push(format!(
-                    "{rel}: broken link [{link_target}] → {resolved:?}",
-                ));
+                broken.push(format!("{rel}: broken link [{link_target}] → {resolved:?}",));
             }
         }
     }

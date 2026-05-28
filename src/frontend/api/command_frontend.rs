@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::frontend::api::event_bus::EventBusSender;
 use crate::data::execution_event::EventPayload;
+use crate::frontend::api::event_bus::EventBusSender;
 
 use async_trait::async_trait;
 
@@ -24,14 +24,14 @@ use crate::command::commands::agent_auth::{AgentAuthDecision, AgentAuthFrontend}
 use crate::command::commands::agent_setup::{
     AgentSetupDecision, AgentSetupFrontend, HasContainerFrontend,
 };
+use crate::command::commands::api_server::ApiServeConfig;
+use crate::command::commands::api_server::ApiServerCommandFrontend;
 use crate::command::commands::auth::AuthCommandFrontend;
 use crate::command::commands::chat::ChatCommandFrontend;
 use crate::command::commands::config::{ConfigCommandFrontend, ConfigEditRequest, ConfigFieldRow};
 use crate::command::commands::download::DownloadCommandFrontend;
 use crate::command::commands::exec_prompt::ExecPromptCommandFrontend;
 use crate::command::commands::exec_workflow::{ExecWorkflowCommandFrontend, WorkflowSummary};
-use crate::command::commands::api_server::ApiServerCommandFrontend;
-use crate::command::commands::api_server::ApiServeConfig;
 use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFrontend};
 use crate::command::commands::new::NewCommandFrontend;
 use crate::command::commands::remote::RemoteCommandFrontend;
@@ -741,7 +741,10 @@ impl WorkflowFrontend for ApiDispatchFrontend {
             let total = steps.len();
             self.event_bus.emit(EventPayload::WorkflowPhaseTransition {
                 phase: "main".to_string(),
-                step_desc: format!("Running workflow ({total} step{})", if total == 1 { "" } else { "s" }),
+                step_desc: format!(
+                    "Running workflow ({total} step{})",
+                    if total == 1 { "" } else { "s" }
+                ),
                 status: "running".to_string(),
             });
         }
@@ -1039,10 +1042,7 @@ impl ConfigCommandFrontend for ApiDispatchFrontend {
 
 #[async_trait]
 impl ApiServerCommandFrontend for ApiDispatchFrontend {
-    async fn serve_until_shutdown(
-        &mut self,
-        _config: ApiServeConfig,
-    ) -> Result<(), CommandError> {
+    async fn serve_until_shutdown(&mut self, _config: ApiServeConfig) -> Result<(), CommandError> {
         Err(CommandError::Other(
             "Cannot start a nested API server from within API dispatch".into(),
         ))
@@ -1150,10 +1150,7 @@ mod tests {
     #[test]
     fn flag_u16_parses_port_value() {
         let f = make_frontend("api start", &["--port", "9876"]);
-        assert_eq!(
-            f.flag_u16(&["api", "start"], "port").unwrap(),
-            Some(9876)
-        );
+        assert_eq!(f.flag_u16(&["api", "start"], "port").unwrap(), Some(9876));
     }
 
     // ─── argument (positional) ────────────────────────────────────────────────
@@ -1295,7 +1292,9 @@ mod tests {
 
     // ── yolo countdown message throttle ──────────────────────────────────────
 
-    fn count_countdown_events(rx: &mut tokio::sync::broadcast::Receiver<crate::data::execution_event::ExecutionEvent>) -> usize {
+    fn count_countdown_events(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::data::execution_event::ExecutionEvent>,
+    ) -> usize {
         let mut count = 0;
         while let Ok(evt) = rx.try_recv() {
             if matches!(
@@ -1346,18 +1345,30 @@ mod tests {
         let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
 
         // First tick: emits.
-        fe.yolo_countdown_tick("step", std::time::Duration::from_secs(60), std::time::Duration::from_secs(60))
-            .unwrap();
+        fe.yolo_countdown_tick(
+            "step",
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
         // Rapid second tick: throttled.
-        fe.yolo_countdown_tick("step", std::time::Duration::from_secs(59), std::time::Duration::from_secs(60))
-            .unwrap();
+        fe.yolo_countdown_tick(
+            "step",
+            std::time::Duration::from_secs(59),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
 
         // Reset.
         fe.yolo_countdown_finished("step");
 
         // Next tick after reset: must emit again.
-        fe.yolo_countdown_tick("step", std::time::Duration::from_secs(60), std::time::Duration::from_secs(60))
-            .unwrap();
+        fe.yolo_countdown_tick(
+            "step",
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
@@ -1378,20 +1389,31 @@ mod tests {
         let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
 
         // First tick emits.
-        fe.yolo_countdown_tick("step", std::time::Duration::from_secs(60), std::time::Duration::from_secs(60))
-            .unwrap();
+        fe.yolo_countdown_tick(
+            "step",
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
 
         // Rewind the throttle timestamp to simulate 11 seconds having passed.
         fe.last_sink_message_time =
             Some(std::time::Instant::now() - std::time::Duration::from_secs(11));
 
         // Next tick must emit (window elapsed).
-        fe.yolo_countdown_tick("step", std::time::Duration::from_secs(58), std::time::Duration::from_secs(60))
-            .unwrap();
+        fe.yolo_countdown_tick(
+            "step",
+            std::time::Duration::from_secs(58),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let count = count_countdown_events(&mut rx);
-        assert_eq!(count, 2, "expected 2 events: initial tick + tick after simulated 11-second gap");
+        assert_eq!(
+            count, 2,
+            "expected 2 events: initial tick + tick after simulated 11-second gap"
+        );
     }
 }

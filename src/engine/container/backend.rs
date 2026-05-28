@@ -70,7 +70,13 @@ pub(super) trait ContainerBackend: Send + Sync {
         env: &HashMap<String, String>,
         overlays: &[OverlaySpec],
     ) -> Result<String, EngineError> {
-        super::background::default_start_background(self.cli_binary(), image, workdir, env, overlays)
+        super::background::default_start_background(
+            self.cli_binary(),
+            image,
+            workdir,
+            env,
+            overlays,
+        )
     }
 
     fn exec_in_background(

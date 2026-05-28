@@ -92,7 +92,10 @@ async fn recv_returns_err_after_sender_arc_dropped() {
         .await
         .expect("recv should resolve promptly after sender drop");
     assert!(
-        matches!(result, Err(tokio::sync::broadcast::error::RecvError::Closed)),
+        matches!(
+            result,
+            Err(tokio::sync::broadcast::error::RecvError::Closed)
+        ),
         "recv must return Closed once the broadcast sender is dropped; got {:?}",
         result
     );

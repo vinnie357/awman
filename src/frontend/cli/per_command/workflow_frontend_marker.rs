@@ -165,7 +165,11 @@ impl WorkflowFrontend for CliFrontend {
                 let msg = format!(" yolo: auto-advancing in {}s ", secs);
                 if let Ok((_, rows)) = crossterm::terminal::size() {
                     let mut out = std::io::stdout().lock();
-                    let _ = write!(out, "\x1b7\x1b[{};1H\x1b[2K\x1b[7m{}\x1b[0m\x1b8", rows, msg);
+                    let _ = write!(
+                        out,
+                        "\x1b7\x1b[{};1H\x1b[2K\x1b[7m{}\x1b[0m\x1b8",
+                        rows, msg
+                    );
                     let _ = out.flush();
                 } else {
                     // No terminal size — can't position the overlay safely.
@@ -314,9 +318,7 @@ impl WorkflowFrontend for CliFrontend {
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
         let msg = match outcome {
             WorkflowOutcome::Completed => "workflow completed successfully.",
-            WorkflowOutcome::CompletedTeardownFailed => {
-                "workflow completed but teardown failed."
-            }
+            WorkflowOutcome::CompletedTeardownFailed => "workflow completed but teardown failed.",
             WorkflowOutcome::Paused => "workflow paused.",
             WorkflowOutcome::Aborted => "workflow aborted.",
             WorkflowOutcome::Failed {
@@ -541,7 +543,10 @@ mod tests {
 
         fe.report_step_status(&make_step("s"), WorkflowStepStatus::Failed { exit_code: 1 });
 
-        assert!(fe.raw_mode_guard.is_none(), "guard must be dropped on Failed");
+        assert!(
+            fe.raw_mode_guard.is_none(),
+            "guard must be dropped on Failed"
+        );
     }
 
     #[test]
@@ -551,7 +556,10 @@ mod tests {
 
         fe.report_step_status(&make_step("s"), WorkflowStepStatus::Cancelled);
 
-        assert!(fe.raw_mode_guard.is_none(), "guard must be dropped on Cancelled");
+        assert!(
+            fe.raw_mode_guard.is_none(),
+            "guard must be dropped on Cancelled"
+        );
     }
 
     /// On a terminal status, the stdin-reader-shutdown flag must be flipped
@@ -668,7 +676,10 @@ mod tests {
 
         let was_bound = fe.unbind_container_stdio();
 
-        assert!(!was_bound, "unbind must report false when nothing was bound");
+        assert!(
+            !was_bound,
+            "unbind must report false when nothing was bound"
+        );
     }
 
     /// `unbind_container_stdio` returns `true` and drops both the raw mode
@@ -775,8 +786,7 @@ mod tests {
             .unwrap();
 
         // Simulate 11 seconds having passed by rewinding the timestamp.
-        fe.last_sink_message_time =
-            Some(std::time::Instant::now() - Duration::from_secs(11));
+        fe.last_sink_message_time = Some(std::time::Instant::now() - Duration::from_secs(11));
         let rewound = fe.last_sink_message_time.unwrap();
 
         fe.yolo_countdown_tick("step", Duration::from_secs(58), Duration::from_secs(60))

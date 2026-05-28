@@ -166,11 +166,13 @@ fn spawn_stuck_detector(
 ///
 /// Returns the master wrapped in `Arc<Mutex>` (for resize + cleanup) plus
 /// the `BridgeResult`.
+type PtyMaster = Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>;
+
 pub(crate) fn bridge_pty(
     io: ContainerIo,
     pair: portable_pty::PtyPair,
     config: BridgeConfig,
-) -> Result<(Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>, BridgeResult), EngineError> {
+) -> Result<(PtyMaster, BridgeResult), EngineError> {
     let mut reader = pair
         .master
         .try_clone_reader()
@@ -650,7 +652,10 @@ mod tests {
             .expect("writer task should terminate within 100ms when stdin is EOF")
             .expect("writer task must not panic");
 
-        assert_eq!(bytes_received, 0, "no bytes should arrive when sender is dropped");
+        assert_eq!(
+            bytes_received, 0,
+            "no bytes should arrive when sender is dropped"
+        );
     }
 
     // ── bridge_piped wiring (real child process) ─────────────────────────────
@@ -687,7 +692,16 @@ mod tests {
             .spawn()
             .expect("spawn sh");
 
-        let bridge = bridge_piped(io, &mut child, BridgeConfig { grace_timeout: Duration::from_secs(30), stuck_timeout: Duration::from_secs(30), container_start_delay: Duration::ZERO, cancel_on_grace_expired: None });
+        let bridge = bridge_piped(
+            io,
+            &mut child,
+            BridgeConfig {
+                grace_timeout: Duration::from_secs(30),
+                stuck_timeout: Duration::from_secs(30),
+                container_start_delay: Duration::ZERO,
+                cancel_on_grace_expired: None,
+            },
+        );
         // Non-interactive flow: drop the engine's stdin handle so the writer
         // task exits and child stdin closes (mirrors `spawn_piped_docker`).
         drop(bridge.stdin_injector);
@@ -700,7 +714,10 @@ mod tests {
             .await
             .expect("stdout bytes should arrive promptly")
             .expect("channel alive");
-        assert_eq!(bytes, b"hello\n", "bridge_piped must forward child stdout verbatim");
+        assert_eq!(
+            bytes, b"hello\n",
+            "bridge_piped must forward child stdout verbatim"
+        );
     }
 
     /// stderr bytes are routed to the stderr sink (separate from stdout).
@@ -731,7 +748,16 @@ mod tests {
             .spawn()
             .expect("spawn sh");
 
-        let bridge = bridge_piped(io, &mut child, BridgeConfig { grace_timeout: Duration::from_secs(30), stuck_timeout: Duration::from_secs(30), container_start_delay: Duration::ZERO, cancel_on_grace_expired: None });
+        let bridge = bridge_piped(
+            io,
+            &mut child,
+            BridgeConfig {
+                grace_timeout: Duration::from_secs(30),
+                stuck_timeout: Duration::from_secs(30),
+                container_start_delay: Duration::ZERO,
+                cancel_on_grace_expired: None,
+            },
+        );
         drop(bridge.stdin_injector);
 
         let _ = tokio::task::spawn_blocking(move || child.wait()).await;
@@ -777,7 +803,16 @@ mod tests {
             .spawn()
             .expect("spawn cat");
 
-        let bridge = bridge_piped(io, &mut child, BridgeConfig { grace_timeout: Duration::from_secs(30), stuck_timeout: Duration::from_secs(30), container_start_delay: Duration::ZERO, cancel_on_grace_expired: None });
+        let bridge = bridge_piped(
+            io,
+            &mut child,
+            BridgeConfig {
+                grace_timeout: Duration::from_secs(30),
+                stuck_timeout: Duration::from_secs(30),
+                container_start_delay: Duration::ZERO,
+                cancel_on_grace_expired: None,
+            },
+        );
         // Drop the engine's stdin sender so `cat` sees EOF after the payload.
         drop(bridge.stdin_injector);
 
@@ -843,7 +878,16 @@ mod tests {
             .spawn()
             .expect("spawn sh");
 
-        let bridge = bridge_piped(io, &mut child, BridgeConfig { grace_timeout: Duration::from_secs(30), stuck_timeout: Duration::from_secs(30), container_start_delay: Duration::ZERO, cancel_on_grace_expired: None });
+        let bridge = bridge_piped(
+            io,
+            &mut child,
+            BridgeConfig {
+                grace_timeout: Duration::from_secs(30),
+                stuck_timeout: Duration::from_secs(30),
+                container_start_delay: Duration::ZERO,
+                cancel_on_grace_expired: None,
+            },
+        );
         drop(bridge.stdin_injector);
 
         // Child must exit promptly — if the reader stopped draining, this

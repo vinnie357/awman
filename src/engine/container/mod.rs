@@ -18,6 +18,7 @@ pub mod options;
 pub mod runtime;
 pub mod timing;
 
+pub use background::{BackgroundContainer, ContainerExec, ExecOutput};
 pub use frontend::{ContainerFrontend, ContainerProgress, ContainerStatus};
 pub use instance::{
     ContainerExecution, ContainerExitInfo, ContainerId, ContainerInstance, ContainerStats,
@@ -29,5 +30,4 @@ pub use options::{
     EnvVar, ImageRef, MemoryLimit, ModelFlagForm, OverlayPermission, OverlaySpec, PlanMode,
     YoloMode,
 };
-pub use background::{BackgroundContainer, ContainerExec, ExecOutput};
 pub use runtime::ContainerRuntime;

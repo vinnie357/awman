@@ -21,9 +21,11 @@ impl HasContainerFrontend for CliFrontend {
             return self.container_frontend();
         }
         let io = self.take_interactive_io();
-        Box::new(super::container_frontend_marker::CliInteractiveContainerProxy {
-            container_io: Some(io),
-        })
+        Box::new(
+            super::container_frontend_marker::CliInteractiveContainerProxy {
+                container_io: Some(io),
+            },
+        )
     }
 }
 

@@ -177,7 +177,8 @@ impl WorkflowFrontend for TuiCommandFrontend {
         match outcome {
             WorkflowOutcome::Completed => self.messages.success("Workflow completed successfully"),
             WorkflowOutcome::CompletedTeardownFailed => {
-                self.messages.warning("Workflow completed but teardown failed");
+                self.messages
+                    .warning("Workflow completed but teardown failed");
             }
             WorkflowOutcome::Paused => self.messages.info("Workflow paused"),
             WorkflowOutcome::Aborted => self.messages.warning("Workflow aborted"),
@@ -284,8 +285,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
     }
 
     fn on_setup_step_started(&mut self, description: &str) {
-        self.messages
-            .info(format!("setup: {description}"));
+        self.messages.info(format!("setup: {description}"));
     }
 
     fn on_setup_step_output(&mut self, line: &str) {
@@ -293,8 +293,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
     }
 
     fn on_setup_step_completed(&mut self, description: &str) {
-        self.messages
-            .success(format!("setup: {description}"));
+        self.messages.success(format!("setup: {description}"));
     }
 
     fn on_setup_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
@@ -307,8 +306,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
     }
 
     fn on_teardown_step_started(&mut self, description: &str) {
-        self.messages
-            .info(format!("teardown: {description}"));
+        self.messages.info(format!("teardown: {description}"));
     }
 
     fn on_teardown_step_output(&mut self, line: &str) {
@@ -316,8 +314,7 @@ impl WorkflowFrontend for TuiCommandFrontend {
     }
 
     fn on_teardown_step_completed(&mut self, description: &str) {
-        self.messages
-            .success(format!("teardown: {description}"));
+        self.messages.success(format!("teardown: {description}"));
     }
 
     fn on_teardown_step_failed(&mut self, description: &str, exit_code: i32, stderr: &str) {
@@ -337,7 +334,9 @@ impl WorkflowFrontend for TuiCommandFrontend {
 
     fn set_stuck_sender(
         &mut self,
-        sender: std::sync::Arc<tokio::sync::broadcast::Sender<crate::engine::container::instance::StuckEvent>>,
+        sender: std::sync::Arc<
+            tokio::sync::broadcast::Sender<crate::engine::container::instance::StuckEvent>,
+        >,
     ) {
         if let Ok(mut guard) = self.stuck_sender_shared.lock() {
             *guard = Some(sender);

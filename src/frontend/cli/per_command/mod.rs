@@ -13,10 +13,10 @@
 pub(crate) mod helpers;
 pub(crate) mod render;
 
+mod api_server;
 mod chat;
 mod exec_prompt;
 mod exec_workflow;
-mod api_server;
 mod init;
 mod ready;
 

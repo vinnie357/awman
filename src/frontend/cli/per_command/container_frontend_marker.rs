@@ -239,7 +239,7 @@ fn spawn_unix_stdin_reader(
     let stdin = std::io::stdin();
     let mut stdin_lock = stdin.lock();
     let mut buf = [0u8; 1024];
-    let timeout = PollTimeout::try_from(200u16).unwrap_or(PollTimeout::NONE);
+    let timeout = PollTimeout::from(200u16);
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -352,8 +352,8 @@ impl ContainerFrontend for CliInteractiveContainerProxy {
     fn report_progress(&mut self, _progress: ContainerProgress) {}
 
     fn take_container_io(&mut self) -> ContainerIo {
-        self.container_io
-            .take()
-            .expect("CliInteractiveContainerProxy::take_container_io called but no ContainerIo available")
+        self.container_io.take().expect(
+            "CliInteractiveContainerProxy::take_container_io called but no ContainerIo available",
+        )
     }
 }

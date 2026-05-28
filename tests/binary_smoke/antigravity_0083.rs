@@ -11,6 +11,7 @@ fn awman_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_awman"))
 }
 
+#[allow(dead_code)]
 fn awman() -> Command {
     Command::new(awman_bin())
 }
@@ -182,7 +183,13 @@ fn chat_antigravity_model_flag_exits_nonzero() {
     let repo = make_git_repo();
     let (_cfg, mut cmd) = awman_isolated(&repo);
     let output = cmd
-        .args(["chat", "--agent", "antigravity", "--model", "gemini-3.5-flash"])
+        .args([
+            "chat",
+            "--agent",
+            "antigravity",
+            "--model",
+            "gemini-3.5-flash",
+        ])
         .output()
         .expect("failed to run awman");
 
@@ -203,7 +210,13 @@ fn chat_antigravity_model_flag_stderr_or_exit_nonzero() {
     let repo = make_git_repo();
     let (_cfg, mut cmd) = awman_isolated(&repo);
     let output = cmd
-        .args(["chat", "--agent", "antigravity", "--model", "gemini-3.5-flash"])
+        .args([
+            "chat",
+            "--agent",
+            "antigravity",
+            "--model",
+            "gemini-3.5-flash",
+        ])
         .output()
         .expect("failed to run awman");
 

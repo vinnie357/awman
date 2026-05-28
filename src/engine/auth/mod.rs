@@ -9,8 +9,8 @@ use ring::digest;
 use ring::rand::{SecureRandom, SystemRandom};
 use subtle::ConstantTimeEq;
 
-use crate::data::fs::auth_paths::AuthPathResolver;
 use crate::data::fs::api_paths::ApiPaths;
+use crate::data::fs::auth_paths::AuthPathResolver;
 use crate::data::session::{AgentName, Session};
 use crate::engine::error::EngineError;
 
@@ -246,8 +246,11 @@ impl AuthEngine {
                 .ok()
                 .map(|s| s.trim().to_string());
             if stored_ip.as_deref() == Some(&bind_ip.to_string()) {
-                let material =
-                    self.load_tls_from_paths_with_fingerprint(&cert_path, &key_path, &fingerprint_path)?;
+                let material = self.load_tls_from_paths_with_fingerprint(
+                    &cert_path,
+                    &key_path,
+                    &fingerprint_path,
+                )?;
                 return Ok((material, false));
             }
         }
@@ -397,14 +400,11 @@ fn write_file_secure(path: &Path, content: &[u8]) -> Result<PathBuf, EngineError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::fs::auth_paths::AuthPathResolver;
     use crate::data::fs::api_paths::ApiPaths;
+    use crate::data::fs::auth_paths::AuthPathResolver;
 
     fn engine_with(home: &Path, api_root: &Path) -> AuthEngine {
-        AuthEngine::with_paths(
-            AuthPathResolver::at_home(home),
-            ApiPaths::at_root(api_root),
-        )
+        AuthEngine::with_paths(AuthPathResolver::at_home(home), ApiPaths::at_root(api_root))
     }
 
     #[test]

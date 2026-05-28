@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
+use super::command_frontend::ApiDispatchFrontend;
+use super::event_bus::EventBus;
 use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
 use crate::data::execution_event::EventPayload;
 use crate::data::fs::api_db::SqliteSessionStore;
 use crate::data::fs::api_paths::ApiPaths;
 use crate::data::session::Session;
-use crate::frontend::api::command_frontend::ApiDispatchFrontend;
-use crate::frontend::api::event_bus::EventBus;
 
 pub struct QueueWorker {
     worker_id: String,
@@ -97,12 +97,9 @@ impl QueueWorker {
                 "error": format!("Failed to create command directory: {e}"),
             }))
             .ok();
-            let _ = self.store.complete_command(
-                &command_id,
-                "error",
-                None,
-                result_json.as_deref(),
-            );
+            let _ = self
+                .store
+                .complete_command(&command_id, "error", None, result_json.as_deref());
             self.post_execution_check(&session_id).await;
             return;
         }
@@ -133,9 +130,7 @@ impl QueueWorker {
         // Spawn logfile writer task.
         {
             let mut log_rx = event_bus.subscribe();
-            let events_log_path = self
-                .paths
-                .command_events_log_path(&session_id, &command_id);
+            let events_log_path = self.paths.command_events_log_path(&session_id, &command_id);
             let output_log_path = log_path.clone();
             tokio::spawn(async move {
                 use tokio::io::AsyncWriteExt;
@@ -157,14 +152,10 @@ impl QueueWorker {
                     match log_rx.recv().await {
                         Ok(event) => {
                             if let Ok(json) = serde_json::to_string(&event) {
-                                let _ = events_file
-                                    .write_all(format!("{json}\n").as_bytes())
-                                    .await;
+                                let _ = events_file.write_all(format!("{json}\n").as_bytes()).await;
                             }
                             if let Some(text) = event.payload.to_plain_text() {
-                                let _ = output_file
-                                    .write_all(format!("{text}\n").as_bytes())
-                                    .await;
+                                let _ = output_file.write_all(format!("{text}\n").as_bytes()).await;
                             }
                             if matches!(event.payload, EventPayload::Done) {
                                 let _ = events_file.flush().await;
@@ -216,12 +207,9 @@ impl QueueWorker {
                     "error": "Session not found in memory",
                 }))
                 .ok();
-                let _ = self.store.complete_command(
-                    &command_id,
-                    "error",
-                    None,
-                    result_json.as_deref(),
-                );
+                let _ =
+                    self.store
+                        .complete_command(&command_id, "error", None, result_json.as_deref());
                 self.cleanup_event_bus(&command_id).await;
                 self.post_execution_check(&session_id).await;
                 return;
@@ -311,12 +299,9 @@ impl QueueWorker {
             tracing::error!(command_id = %command_id, error = %e, "Command failed");
         }
 
-        let _ = self.store.complete_command(
-            &command_id,
-            status,
-            exit_code,
-            result_json.as_deref(),
-        );
+        let _ = self
+            .store
+            .complete_command(&command_id, status, exit_code, result_json.as_deref());
 
         // Write final metadata.
         {
@@ -365,9 +350,8 @@ impl QueueWorker {
         }
 
         // Check if there's still a running command for this session.
-        match self.store.running_command_for_session(session_id) {
-            Ok(Some(_)) => return, // still running, don't clean up yet
-            _ => {}
+        if let Ok(Some(_)) = self.store.running_command_for_session(session_id) {
+            return;
         }
 
         tracing::info!(
@@ -382,10 +366,9 @@ impl QueueWorker {
                 let path = std::path::PathBuf::from(cloned_path);
                 let git = Arc::clone(&self.engines.git_engine);
                 let path_for_delete = path.clone();
-                let delete_result = tokio::task::spawn_blocking(move || {
-                    git.delete_directory(&path_for_delete)
-                })
-                .await;
+                let delete_result =
+                    tokio::task::spawn_blocking(move || git.delete_directory(&path_for_delete))
+                        .await;
                 match delete_result {
                     Ok(Ok(())) => {
                         tracing::info!(session_id = %session_id, "Remote session clone deleted");
@@ -589,7 +572,10 @@ mod tests {
 
     #[test]
     fn workflow_completed_with_exit_zero_reports_done() {
-        assert_eq!(derive_command_status(&ok_workflow(Some(0))), ("done", Some(0)));
+        assert_eq!(
+            derive_command_status(&ok_workflow(Some(0))),
+            ("done", Some(0))
+        );
     }
 
     #[test]
@@ -597,12 +583,18 @@ mod tests {
         // Aborted workflow now propagates exit_code = Some(1) from
         // exec_workflow.rs — must surface as status=error in the queue,
         // not as the old "status=done success=true".
-        assert_eq!(derive_command_status(&ok_workflow(Some(1))), ("error", Some(1)));
+        assert_eq!(
+            derive_command_status(&ok_workflow(Some(1))),
+            ("error", Some(1))
+        );
     }
 
     #[test]
     fn workflow_failed_step_propagates_step_exit_code() {
-        assert_eq!(derive_command_status(&ok_workflow(Some(42))), ("error", Some(42)));
+        assert_eq!(
+            derive_command_status(&ok_workflow(Some(42))),
+            ("error", Some(42))
+        );
     }
 
     #[test]
@@ -613,13 +605,15 @@ mod tests {
 
     #[test]
     fn prompt_nonzero_exit_reports_error() {
-        assert_eq!(derive_command_status(&ok_prompt(Some(2))), ("error", Some(2)));
+        assert_eq!(
+            derive_command_status(&ok_prompt(Some(2))),
+            ("error", Some(2))
+        );
     }
 
     #[test]
     fn dispatch_err_reports_error_with_generic_exit_one() {
-        let err: Result<CommandOutcome, CommandError> =
-            Err(CommandError::Other("boom".into()));
+        let err: Result<CommandOutcome, CommandError> = Err(CommandError::Other("boom".into()));
         assert_eq!(derive_command_status(&err), ("error", Some(1)));
     }
 

@@ -367,9 +367,7 @@ impl ContainerInstance for AppleContainerInstance {
 
         // PTY-bridged path
         if io.initial_size.is_some() {
-            return spawn_pty_bridged_apple(
-                self, io, argv, seeded, started_at, handle, bridge_cfg,
-            );
+            return spawn_pty_bridged_apple(self, io, argv, seeded, started_at, handle, bridge_cfg);
         }
 
         // Piped path
@@ -386,14 +384,13 @@ fn bridge_config_for(
     stuck_timeout: std::time::Duration,
 ) -> crate::engine::container::io_bridge::BridgeConfig {
     let container_name = name.0.clone();
-    let cancel: crate::engine::container::io_bridge::CancelFn =
-        std::sync::Arc::new(move || {
-            let _ = Command::new("container")
-                .args(["stop", &container_name])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        });
+    let cancel: crate::engine::container::io_bridge::CancelFn = std::sync::Arc::new(move || {
+        let _ = Command::new("container")
+            .args(["stop", &container_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    });
     crate::engine::container::io_bridge::BridgeConfig {
         grace_timeout,
         stuck_timeout,
@@ -453,7 +450,11 @@ fn spawn_pty_bridged_apple(
         container_name: instance.name.0.clone(),
         started_at,
     };
-    Ok(ContainerExecution::new(handle, Box::new(backend), bridge.stuck_tx))
+    Ok(ContainerExecution::new(
+        handle,
+        Box::new(backend),
+        bridge.stuck_tx,
+    ))
 }
 
 /// Spawn `container run` with piped stdio and bridge through `ContainerIo`.
@@ -503,7 +504,11 @@ fn spawn_piped_apple(
         container_name: instance.name.0.clone(),
         started_at,
     };
-    Ok(ContainerExecution::new(handle, Box::new(backend), bridge.stuck_tx))
+    Ok(ContainerExecution::new(
+        handle,
+        Box::new(backend),
+        bridge.stuck_tx,
+    ))
 }
 
 struct AppleExecution {
