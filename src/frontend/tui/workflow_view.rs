@@ -219,6 +219,7 @@ fn phase_step_status_to_str(status: &PhaseStepStatus) -> &'static str {
         PhaseStepStatus::Running => "running",
         PhaseStepStatus::Succeeded => "done",
         PhaseStepStatus::Failed { .. } => "error",
+        PhaseStepStatus::Remediating { .. } => "fixing",
     }
 }
 
@@ -279,6 +280,7 @@ fn build_workflow_columns(state: &WorkflowViewState) -> Vec<Vec<&WorkflowStepVie
 /// - Running → `●` Blue + Bold
 /// - Done → `✓` Green
 /// - Error → `✗` Red + Bold
+/// - Fixing → `🔧` Magenta + Bold (on_failure remediation in progress)
 /// - Cancelled / Skipped → `⊘` DarkGray
 ///
 /// Current step is rendered with extra Bold on top of its status style.
@@ -312,6 +314,12 @@ fn step_box_label_and_style(
         "error" => (
             "\u{2717}",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        "fixing" => (
+            "\u{1f527}",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
         ),
         "cancelled" | "skipped" => ("\u{2298}", Style::default().fg(Color::DarkGray)),
         _ => ("\u{25cb}", Style::default().fg(Color::DarkGray)),

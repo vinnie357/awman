@@ -264,6 +264,7 @@ Setup steps are defined in a `[[setup]]` (TOML) or `setup:` (YAML) array. Each s
 | `pull_branch` | `remote` (string, optional), `branch` (string, optional) | Pull the latest changes from a remote branch. Equivalent to `git pull <remote> <branch>`. Omit both to use `git pull` with defaults. |
 | `run_shell` | `command` (string, required), `env` (object, optional) | Execute a shell command. `env` is an optional object of environment variables to inject (`{"KEY": "value"}`). |
 | `run_script` | `path` (string, required), `env` (object, optional) | Execute a shell script file (relative to the workdir). `env` is an optional object of environment variables. |
+| `poll_ci` | `interval_secs` (integer, optional), `max_retries` (integer, optional) | Poll GitHub for the CI run status of the current branch. Waits for the CI run to complete. `interval_secs` controls the polling interval in seconds (default: 30). `max_retries` limits the number of polling attempts (default: 10). See [Polling CI status](#polling-ci-status) for details. |
 
 Example TOML setup:
 
@@ -295,6 +296,245 @@ setup:
     command: npm run build
 ```
 
+### Polling CI status
+
+Both setup and teardown phases can include a `poll_ci` step to wait for GitHub Actions CI to reach a terminal state (success, failure, or timeout). This is useful for workflows that push code and need to verify that CI passes before proceeding.
+
+**How it works:**
+
+1. `poll_ci` detects the current Git branch and HEAD commit SHA
+2. Polls GitHub for the CI run associated that commit on that branch
+3. Waits for the run to complete (success or failure) or times out after `max_retries` attempts
+4. Fails the step if CI fails, succeeds if CI succeeds, or times out if no completion within the retry limit
+5. All polling events are logged to the message sink so you can see progress
+
+**Configuration:**
+
+```toml
+[[setup]]
+type = "poll_ci"
+interval_secs = 60
+max_retries = 15
+```
+
+```yaml
+setup:
+  - type: poll_ci
+    interval_secs: 60
+    max_retries: 15
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `interval_secs` | integer | 30 | Number of seconds to wait between polling attempts. |
+| `max_retries` | integer | 10 | Maximum number of polling attempts before timing out. Total maximum wait time = `interval_secs × max_retries`. |
+
+**Authentication:**
+
+`poll_ci` uses two strategies in order of preference:
+
+1. **GitHub CLI (`gh`)** — if `gh` is installed and authenticated, awman runs `gh run list` to fetch the most recent run matching the current branch and HEAD commit.
+2. **GitHub REST API** — if `gh` is unavailable or not authenticated, awman calls the GitHub REST API directly using the `GITHUB_TOKEN` environment variable. If `GITHUB_TOKEN` is not set, the step fails immediately with a clear error message.
+
+Both methods are secure: `GITHUB_TOKEN` is never logged or exposed in step output.
+
+**Handling missing or multiple CI runs:**
+
+If the branch was just pushed and GitHub hasn't created a run yet, the first few polls may return "not found". awman treats "not found" as a retryable condition (polling continues) for the first 3 attempts, then hard-fails with a message if no run is found. If multiple runs exist for the branch, awman uses the run whose commit SHA matches the current HEAD; if no match is found, it uses the most recent run with a warning.
+
+**Example use case:**
+
+A teardown workflow that pushes code, then waits for CI to pass before reporting success:
+
+```toml
+[[teardown]]
+type = "push_branch"
+
+[[teardown]]
+type = "poll_ci"
+interval_secs = 60
+max_retries = 20
+```
+
+```yaml
+teardown:
+  - type: push_branch
+  - type: poll_ci
+    interval_secs: 60
+    max_retries: 20
+```
+
+### Step remediation with `on_failure`
+
+Any setup or teardown step can include an optional `on_failure` block that automatically launches an agent to fix problems when the step fails. After the agent runs, the failed step is retried. This enables self-healing workflows where transient or fixable failures are resolved without manual intervention.
+
+**When it's useful:**
+
+- A test suite fails with a fixable error (e.g., a race condition, a dependency issue, a broken assertion)
+- Build commands fail and can be resolved by adjusting configuration or dependencies
+- A CI check fails and you want to automatically push a corrective commit
+- You want human-in-the-loop remediation without fully automating the fix (the agent does its best; humans verify the result)
+
+**How it works:**
+
+1. A setup or teardown step executes and fails (non-zero exit)
+2. If the step has an `on_failure` block, awman launches a container with the configured agent and model
+3. The agent runs the remediation prompt and has full access to the same workdir as the failed step
+4. After the agent completes (regardless of success), the original step is retried
+5. If the retry succeeds, the workflow continues; if the retry still fails and `max_attempts` is exhausted, the step is marked failed and the workflow continues (or stops, depending on the step's `abort_on_failure` setting)
+
+**Configuration:**
+
+```toml
+[[setup]]
+type = "run_shell"
+command = "npm test"
+[setup.on_failure]
+prompt = "The test suite failed. Review the output above and fix any issues."
+max_attempts = 2
+```
+
+```yaml
+setup:
+  - type: run_shell
+    command: npm test
+    on_failure:
+      prompt: |
+        The test suite failed. Review the output above and fix any issues.
+      max_attempts: 2
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `prompt` | string | yes | — | The prompt sent to the remediation agent. Should include context about the failure and guidance for fixing it. |
+| `agent` | string | no | Inherited from workflow | The agent to use for remediation. If omitted, uses the workflow's default agent or the `--agent` flag value. |
+| `model` | string | no | Inherited from workflow | The model to use for remediation. If omitted, uses the workflow's default model or the `--model` flag value. |
+| `max_attempts` | integer | yes | — | Maximum number of remediation and retry cycles before the step fails permanently. Must be ≥ 1. |
+
+**Full example with custom agent and model:**
+
+```toml
+[[teardown]]
+type = "run_shell"
+command = "cargo test"
+[teardown.on_failure]
+prompt = """
+The test suite failed. Analyze the error output and:
+1. Check for flaky tests (retry them first)
+2. Fix any broken assertions or logic errors
+3. Update dependencies if needed
+Re-run `cargo test` to verify your fixes work.
+"""
+agent = "claude"
+model = "claude-opus-4-6"
+max_attempts = 3
+```
+
+```yaml
+teardown:
+  - type: run_shell
+    command: cargo test
+    on_failure:
+      prompt: |
+        The test suite failed. Analyze the error output and:
+        1. Check for flaky tests (retry them first)
+        2. Fix any broken assertions or logic errors
+        3. Update dependencies if needed
+        Re-run `cargo test` to verify your fixes work.
+      agent: claude
+      model: claude-opus-4-6
+      max_attempts: 3
+```
+
+**Combining `on_failure` with `abort_on_failure`:**
+
+If a step has both `abort_on_failure = true` and an `on_failure` block, the remediation loop runs first. Only after all `max_attempts` are exhausted (and the step still fails) does the workflow abort.
+
+```toml
+[[setup]]
+type = "run_shell"
+command = "critical-build-step"
+abort_on_failure = true
+[setup.on_failure]
+prompt = "The build step failed. This is critical; fix it."
+max_attempts = 2
+```
+
+```yaml
+setup:
+  - type: run_shell
+    command: critical-build-step
+    abort_on_failure: true
+    on_failure:
+      prompt: The build step failed. This is critical; fix it.
+      max_attempts: 2
+```
+
+**Best practices:**
+
+- **Be specific in your prompt:** The remediation agent doesn't automatically see logs unless you reference them. Include context about what failed and what the agent should try.
+- **Keep `max_attempts` small:** Each attempt retries the full step, so 2–3 attempts is usually sufficient.
+- **Use for fixable failures:** Remediation works best for transient issues, dependency problems, or test failures with clear causes. For structural errors, fail fast instead.
+- **Combine with `poll_ci`:** A common pattern is a teardown that tries to fix code, commits, pushes, then polls CI to verify the fix worked.
+
+**Example: self-healing CI workflow:**
+
+```toml
+title = "Implement, Test, and Self-Heal"
+
+[[step]]
+name = "implement"
+prompt = "Implement the feature according to the spec."
+
+[[teardown]]
+type = "run_shell"
+command = "cargo test"
+[teardown.on_failure]
+prompt = "Tests failed. Fix the implementation to make them pass."
+max_attempts = 2
+
+[[teardown]]
+type = "commit_changes"
+message = "Implement feature"
+add_all = true
+
+[[teardown]]
+type = "push_branch"
+
+[[teardown]]
+type = "poll_ci"
+interval_secs = 60
+max_retries = 20
+```
+
+```yaml
+title: Implement, Test, and Self-Heal
+
+steps:
+  - name: implement
+    prompt: Implement the feature according to the spec.
+
+teardown:
+  - type: run_shell
+    command: cargo test
+    on_failure:
+      prompt: Tests failed. Fix the implementation to make them pass.
+      max_attempts: 2
+  - type: commit_changes
+    message: Implement feature
+    add_all: true
+  - type: push_branch
+  - type: poll_ci
+    interval_secs: 60
+    max_retries: 20
+```
+
+In this workflow:
+1. The implementation step writes code
+2. Tests run; if they fail, an agent attempts to fix the code, then tests are re-run
+3. If tests pass (either on first run or after remediation), changes are committed and pushed
+4. CI is polled to verify the pushed code passes the remote CI pipeline
+
 ### Teardown step types
 
 Teardown steps are defined in a `[[teardown]]` (TOML) or `teardown:` (YAML) array. Each step has a `type` field and type-specific fields:
@@ -306,6 +546,7 @@ Teardown steps are defined in a `[[teardown]]` (TOML) or `teardown:` (YAML) arra
 | `commit_changes` | `message` (string, required), `add_all` (boolean, optional) | Commit staged changes. If `add_all` is `true`, runs `git add -A` first. |
 | `push_branch` | `remote` (string, optional), `branch` (string, optional) | Push the current branch to a remote. Omit both to use `git push` with defaults. |
 | `create_pull_request` | `title` (string, optional), `body` (string, optional), `base` (string, optional) | Create a pull request using the GitHub CLI. If `base` is provided, it sets the branch the PR will be opened against (via the `--base` flag). Requires `gh` to be available in the base container image. |
+| `poll_ci` | `interval_secs` (integer, optional), `max_retries` (integer, optional) | Poll GitHub for the CI run status of the current branch. Waits for the CI run to complete. `interval_secs` controls the polling interval in seconds (default: 30). `max_retries` limits the number of polling attempts (default: 10). See [Polling CI status](#polling-ci-status) for details. |
 
 Example TOML teardown:
 
@@ -801,6 +1042,11 @@ Running: plan     ┃  ● implement    ✓ review    ⚠️ docs
 | **⚠️** (Yellow, bold) | Step is stuck (no output for >30 seconds) |
 | **●** (Gray, dim) | Step is pending |
 | **✗** (Red, bold) | Step encountered an error |
+| **🔧** (Magenta, bold) | Step failed and remediation is in progress (on_failure agent running) |
+
+### Remediation in progress
+
+When a setup or teardown step fails and has an `on_failure` block, the step status changes to **🔧** (remediating) while the agent runs. The workflow status indicator shows which remediation attempt is in progress (e.g., "attempt 1 of 2"). After the agent completes, the original step is automatically retried. The status returns to **●** (running) for the retry.
 
 ### Stuck steps
 
@@ -933,8 +1179,20 @@ Steps that share the same `Depends-on` set form a **parallel group**. awman exec
 | Setup step with invalid type | Parse error; type must be one of the supported step types |
 | Teardown step with invalid type | Parse error; type must be one of the supported step types |
 | `create_pull_request` step but `gh` not in base image | Step fails at execution time with "command not found: gh" |
+| `poll_ci` step | Polls GitHub for CI status; see [Polling CI status](#polling-ci-status) for authentication and error handling |
+| `poll_ci` with no CI run found yet | First 3 polling attempts treat "not found" as retriable; after 3 attempts, step fails with "No CI run found" |
+| `poll_ci` with multiple CI runs on the branch | Uses the run matching the current HEAD commit SHA; if no match, uses the most recent run with a warning |
+| `poll_ci` with `gh` CLI available but not authenticated | Falls back to GitHub REST API with `GITHUB_TOKEN` |
+| `poll_ci` with neither `gh` nor `GITHUB_TOKEN` | Step fails immediately with "Cannot authenticate with GitHub" error |
+| `poll_ci` when CI fails (red status) | Step fails with CI failure details |
+| `poll_ci` after pushing new commits | Re-detects HEAD SHA; polls for the new CI run, not the old one |
+| Step with `on_failure` block | When step fails, launches a remediation agent; retries the step after agent completes; see [Step remediation](#step-remediation-with-on_failure) |
+| Step with `on_failure` and `max_attempts = 0` | Parse error; `max_attempts` must be ≥ 1 |
+| `on_failure` agent exits with error | Agent exit code is ignored; the original step is retried regardless |
+| `on_failure` exhausts `max_attempts` | Step is marked failed; workflow continues (or stops if `abort_on_failure = true`) |
+| `abort_on_failure = true` + `on_failure` block | Remediation loop runs first; only if all attempts fail does abort trigger |
 | Setup failure | Main workflow steps do not run; go directly to teardown (if `teardown_on_failure = true`) or exit |
-| Teardown step failure (non-zero exit) | Error is logged; execution continues to next teardown step (best-effort) |
+| Teardown step failure (non-zero exit) | Error is logged; execution continues to next teardown step (best-effort); same for `on_failure` remediation |
 | `checkout_create_branch` with no remote configured | Falls back to local branch creation from HEAD or specified `base` |
 | `run_script` step with non-existent path | Step fails with file-not-found error |
 | Setup interrupted and resumed | Full setup phase re-runs from the beginning; steps should be idempotent |

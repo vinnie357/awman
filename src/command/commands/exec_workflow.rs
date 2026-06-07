@@ -889,11 +889,15 @@ impl Command for ExecWorkflowCommand {
             workflow.setup.iter().map(|e| e.overlays.clone()).collect();
         let setup_abort_flags: Vec<bool> =
             workflow.setup.iter().map(|e| e.abort_on_failure).collect();
+        let setup_on_failure_configs: Vec<Option<crate::data::workflow_definition::RemediationConfig>> =
+            workflow.setup.iter().map(|e| e.on_failure.clone()).collect();
         let teardown_entry_overlays: Vec<Option<Vec<String>>> = workflow
             .teardown
             .iter()
             .map(|e| e.overlays.clone())
             .collect();
+        let teardown_on_failure_configs: Vec<Option<crate::data::workflow_definition::RemediationConfig>> =
+            workflow.teardown.iter().map(|e| e.on_failure.clone()).collect();
         let teardown_abort_flags: Vec<bool> = workflow
             .teardown
             .iter()
@@ -1028,7 +1032,7 @@ impl Command for ExecWorkflowCommand {
                                 runtime.start_background(&base, &mount, env, overlays)?;
                             Ok(Box::new(container))
                         };
-                        let r = engine.run_setup(&setup_steps, &setup_abort_flags, factory);
+                        let r = engine.run_setup(&setup_steps, &setup_abort_flags, &setup_on_failure_configs, factory);
                         if let Err(e) = &r {
                             shared_for_factory
                                 .lock()
@@ -1107,6 +1111,7 @@ impl Command for ExecWorkflowCommand {
                             .run_teardown(
                                 &teardown_steps,
                                 &teardown_abort_flags,
+                                &teardown_on_failure_configs,
                                 workflow_succeeded,
                                 teardown_on_failure,
                                 factory,

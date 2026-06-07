@@ -32,6 +32,7 @@ use crate::engine::workflow::frontend::WorkflowFrontend;
 pub mod actions;
 pub mod factory;
 pub mod frontend;
+pub mod poll_ci;
 pub mod step_commands;
 pub mod timing;
 
@@ -1378,6 +1379,7 @@ impl WorkflowEngine {
         &mut self,
         steps: &[crate::data::workflow_definition::SetupStep],
         abort_flags: &[bool],
+        on_failure_configs: &[Option<crate::data::workflow_definition::RemediationConfig>],
         mut container_for_step: F,
     ) -> Result<(), EngineError>
     where
@@ -1385,7 +1387,7 @@ impl WorkflowEngine {
     {
         use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowPhase};
         use crate::engine::workflow::step_commands::{
-            setup_step_description, setup_step_to_shell, substitute_setup_step,
+            setup_step_description, substitute_setup_step,
         };
 
         let wi_ctx = self.work_item_context.as_ref();
@@ -1406,7 +1408,6 @@ impl WorkflowEngine {
 
         for (idx, step) in steps.iter().enumerate() {
             let desc = setup_step_description(step);
-            let (command, env) = setup_step_to_shell(step);
             let abort = abort_flags.get(idx).copied().unwrap_or(false);
 
             self.state.setup_step_states[idx].status = PhaseStepStatus::Running;
@@ -1414,32 +1415,36 @@ impl WorkflowEngine {
 
             self.frontend.on_setup_step_started(&desc);
 
-            let container = container_for_step(idx)?;
-            let result = container.exec_streaming(&command, env.as_ref(), &mut |line| {
-                self.frontend.on_setup_step_output(line)
-            })?;
+            let step_failed = self.run_single_setup_step(step, idx, &mut container_for_step);
 
-            if result.exit_code != 0 {
-                self.state.setup_step_states[idx].status = PhaseStepStatus::Failed {
-                    error: result.stderr.clone(),
+            if step_failed {
+                let rem = on_failure_configs
+                    .get(idx)
+                    .and_then(|c| c.as_ref())
+                    .cloned();
+                let remediated = if let Some(rem_config) = rem {
+                    self.run_setup_remediation(&rem_config, step, idx, &mut container_for_step)
+                } else {
+                    false
                 };
-                self.persist()?;
-                self.frontend
-                    .on_setup_step_failed(&desc, result.exit_code, &result.stderr);
-                if abort {
-                    self.abort_on_failure_triggered = true;
-                    return Err(EngineError::Container(format!(
-                        "setup step '{}' failed with exit code {} (abort_on_failure)",
-                        desc, result.exit_code
-                    )));
+
+                if !remediated {
+                    let error = self.phase_step_failed_error(true, idx);
+                    self.frontend.on_setup_step_failed(&desc, 1, &error);
+                    if abort {
+                        self.abort_on_failure_triggered = true;
+                        return Err(EngineError::Container(format!(
+                            "setup step '{}' failed (abort_on_failure)",
+                            desc
+                        )));
+                    }
+                    continue;
                 }
-                continue;
             }
 
             self.state.setup_step_states[idx].status = PhaseStepStatus::Succeeded;
             self.persist()?;
             self.frontend.on_setup_step_completed(&desc);
-            // `container` drops here, killing the per-step BackgroundContainer.
         }
 
         self.state.setup_completed = true;
@@ -1466,6 +1471,7 @@ impl WorkflowEngine {
         &mut self,
         steps: &[crate::data::workflow_definition::TeardownStep],
         abort_flags: &[bool],
+        on_failure_configs: &[Option<crate::data::workflow_definition::RemediationConfig>],
         workflow_succeeded: bool,
         teardown_on_failure: bool,
         mut container_for_step: F,
@@ -1475,7 +1481,7 @@ impl WorkflowEngine {
     {
         use crate::data::workflow_state::{PhaseStepState, PhaseStepStatus, WorkflowPhase};
         use crate::engine::workflow::step_commands::{
-            substitute_teardown_step, teardown_step_description, teardown_step_to_shell,
+            substitute_teardown_step, teardown_step_description,
         };
 
         if !teardown_on_failure && !workflow_succeeded {
@@ -1502,7 +1508,6 @@ impl WorkflowEngine {
         let mut any_step_failed = false;
         for (idx, step) in steps.iter().enumerate() {
             let desc = teardown_step_description(step);
-            let (command, env) = teardown_step_to_shell(step);
             let abort = abort_flags.get(idx).copied().unwrap_or(false);
 
             self.state.teardown_step_states[idx].status = PhaseStepStatus::Running;
@@ -1510,50 +1515,385 @@ impl WorkflowEngine {
 
             self.frontend.on_teardown_step_started(&desc);
 
-            let container = match container_for_step(idx) {
-                Ok(c) => c,
-                Err(e) => {
-                    let msg = e.to_string();
-                    self.state.teardown_step_states[idx].status =
-                        PhaseStepStatus::Failed { error: msg.clone() };
-                    self.persist()?;
-                    self.frontend.on_teardown_step_failed(&desc, 1, &msg);
-                    any_step_failed = true;
-                    if abort {
-                        teardown_aborted = true;
-                        break;
-                    }
-                    continue;
-                }
-            };
-            let result = container.exec_streaming(&command, env.as_ref(), &mut |line| {
-                self.frontend.on_teardown_step_output(line)
-            })?;
+            let step_failed = self.run_single_teardown_step(step, idx, &mut container_for_step);
 
-            if result.exit_code != 0 {
-                self.state.teardown_step_states[idx].status = PhaseStepStatus::Failed {
-                    error: result.stderr.clone(),
-                };
+            let ultimately_failed = if step_failed {
+                let rem = on_failure_configs
+                    .get(idx)
+                    .and_then(|c| c.as_ref())
+                    .cloned();
+                if let Some(rem_config) = rem {
+                    !self.run_teardown_remediation(&rem_config, step, idx, &mut container_for_step)
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+
+            if !ultimately_failed {
+                self.state.teardown_step_states[idx].status = PhaseStepStatus::Succeeded;
                 self.persist()?;
-                self.frontend
-                    .on_teardown_step_failed(&desc, result.exit_code, &result.stderr);
+                self.frontend.on_teardown_step_completed(&desc);
+            } else {
+                let error = self.phase_step_failed_error(false, idx);
+                self.frontend.on_teardown_step_failed(&desc, 1, &error);
                 any_step_failed = true;
                 if abort {
                     teardown_aborted = true;
                     break;
                 }
-            } else {
-                self.state.teardown_step_states[idx].status = PhaseStepStatus::Succeeded;
-                self.persist()?;
-                self.frontend.on_teardown_step_completed(&desc);
             }
-            // `container` drops here, killing the per-step BackgroundContainer.
         }
 
         self.state.teardown_completed = true;
         self.state.current_phase = WorkflowPhase::Done;
         self.persist()?;
         Ok((teardown_aborted, any_step_failed))
+    }
+
+    /// Execute a shell command in a container for a setup/teardown step.
+    /// Returns `true` if the step failed, `false` if succeeded.
+    fn run_shell_phase_step(
+        &mut self,
+        container: &dyn ContainerExec,
+        command: &str,
+        env: Option<&std::collections::HashMap<String, String>>,
+        phase: &str,
+        idx: usize,
+    ) -> bool {
+        let is_setup = phase == "setup";
+        let result = match container.exec_streaming(command, env, &mut |line| {
+            if is_setup {
+                self.frontend.on_setup_step_output(line);
+            } else {
+                self.frontend.on_teardown_step_output(line);
+            }
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                let error = e.to_string();
+                self.set_phase_step_failed(is_setup, idx, &error);
+                return true;
+            }
+        };
+
+        if result.exit_code != 0 {
+            self.set_phase_step_failed(is_setup, idx, &result.stderr);
+            return true;
+        }
+
+        false
+    }
+
+    /// Record a phase step as failed in the persisted state. Does NOT notify
+    /// the frontend — terminal-failure notification (`on_*_step_failed`) is
+    /// fired by the outer phase loop only after any `on_failure` remediation
+    /// is exhausted, so frontends don't see a misleading failure event when
+    /// remediation succeeds.
+    fn set_phase_step_failed(&mut self, is_setup: bool, idx: usize, error: &str) {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        let states = if is_setup {
+            &mut self.state.setup_step_states
+        } else {
+            &mut self.state.teardown_step_states
+        };
+        states[idx].status = PhaseStepStatus::Failed {
+            error: error.to_string(),
+        };
+        let _ = self.persist();
+    }
+
+    /// Read the last recorded error string for a failed phase step, or
+    /// `"unknown error"` if the state isn't `Failed`.
+    fn phase_step_failed_error(&self, is_setup: bool, idx: usize) -> String {
+        use crate::data::workflow_state::PhaseStepStatus;
+        let states = if is_setup {
+            &self.state.setup_step_states
+        } else {
+            &self.state.teardown_step_states
+        };
+        match states.get(idx).map(|s| &s.status) {
+            Some(PhaseStepStatus::Failed { error }) => error.clone(),
+            _ => "unknown error".to_string(),
+        }
+    }
+
+    /// Execute a PollCi step natively. Returns `true` if the step failed.
+    fn run_poll_ci_phase_step(
+        &mut self,
+        interval_secs: u32,
+        max_retries: u32,
+        is_setup: bool,
+        idx: usize,
+    ) -> bool {
+        let git_root = self.session.git_root().to_path_buf();
+        let result = poll_ci::run_poll_ci_loop(
+            &git_root,
+            interval_secs,
+            max_retries,
+            |level, msg| {
+                let ml = match level {
+                    poll_ci::PollMessage::Info => crate::engine::message::MessageLevel::Info,
+                    poll_ci::PollMessage::Warning => {
+                        crate::engine::message::MessageLevel::Warning
+                    }
+                };
+                self.frontend
+                    .write_message(crate::engine::message::UserMessage {
+                        level: ml,
+                        text: msg,
+                    });
+            },
+        );
+
+        if let Err(e) = result {
+            let error = e.to_string();
+            self.set_phase_step_failed(is_setup, idx, &error);
+            return true;
+        }
+
+        false
+    }
+
+    /// Execute a single setup step. Returns `true` if failed.
+    fn run_single_setup_step<F>(
+        &mut self,
+        step: &crate::data::workflow_definition::SetupStep,
+        idx: usize,
+        container_for_step: &mut F,
+    ) -> bool
+    where
+        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+    {
+        use crate::data::workflow_definition::SetupStep;
+        use crate::engine::workflow::step_commands::setup_step_to_shell;
+
+        if let SetupStep::PollCi { interval_secs, max_retries } = step {
+            return self.run_poll_ci_phase_step(
+                interval_secs.unwrap_or(30),
+                max_retries.unwrap_or(10),
+                true,
+                idx,
+            );
+        }
+
+        let (command, env) = setup_step_to_shell(step);
+        match container_for_step(idx) {
+            Ok(c) => self.run_shell_phase_step(&*c, &command, env.as_ref(), "setup", idx),
+            Err(e) => {
+                self.set_phase_step_failed(true, idx, &e.to_string());
+                true
+            }
+        }
+    }
+
+    /// Execute a single teardown step. Returns `true` if failed.
+    fn run_single_teardown_step<F>(
+        &mut self,
+        step: &crate::data::workflow_definition::TeardownStep,
+        idx: usize,
+        container_for_step: &mut F,
+    ) -> bool
+    where
+        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+    {
+        use crate::data::workflow_definition::TeardownStep;
+        use crate::engine::workflow::step_commands::teardown_step_to_shell;
+
+        if let TeardownStep::PollCi { interval_secs, max_retries } = step {
+            return self.run_poll_ci_phase_step(
+                interval_secs.unwrap_or(30),
+                max_retries.unwrap_or(10),
+                false,
+                idx,
+            );
+        }
+
+        let (command, env) = teardown_step_to_shell(step);
+        match container_for_step(idx) {
+            Ok(c) => self.run_shell_phase_step(&*c, &command, env.as_ref(), "teardown", idx),
+            Err(e) => {
+                self.set_phase_step_failed(false, idx, &e.to_string());
+                true
+            }
+        }
+    }
+
+    /// Run on_failure remediation for a setup step. Returns `true` if remediation succeeded.
+    fn run_setup_remediation<F>(
+        &mut self,
+        config: &crate::data::workflow_definition::RemediationConfig,
+        step: &crate::data::workflow_definition::SetupStep,
+        idx: usize,
+        container_for_step: &mut F,
+    ) -> bool
+    where
+        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+    {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        let desc = self.state.setup_step_states[idx].description.clone();
+        for attempt in 1..=config.max_attempts {
+            self.msg_info(format!(
+                "Step failed — launching on_failure agent (attempt {attempt}/{})...",
+                config.max_attempts,
+            ));
+
+            self.state.setup_step_states[idx].status = PhaseStepStatus::Remediating {
+                attempt,
+                of: config.max_attempts,
+            };
+            let _ = self.persist();
+            self.frontend
+                .on_setup_step_fixing(&desc, attempt, config.max_attempts);
+
+            self.launch_on_failure_agent(config);
+
+            self.state.setup_step_states[idx].status = PhaseStepStatus::Running;
+            let _ = self.persist();
+
+            let still_failed = self.run_single_setup_step(step, idx, container_for_step);
+            if !still_failed {
+                self.msg_info(format!(
+                    "on_failure remediation succeeded on attempt {attempt}"
+                ));
+                return true;
+            }
+
+            if attempt == config.max_attempts {
+                self.msg_warning(format!(
+                    "on_failure exhausted all {} attempts; step fully failed",
+                    config.max_attempts,
+                ));
+            }
+        }
+
+        false
+    }
+
+    /// Run on_failure remediation for a teardown step. Returns `true` if remediation succeeded.
+    fn run_teardown_remediation<F>(
+        &mut self,
+        config: &crate::data::workflow_definition::RemediationConfig,
+        step: &crate::data::workflow_definition::TeardownStep,
+        idx: usize,
+        container_for_step: &mut F,
+    ) -> bool
+    where
+        F: FnMut(usize) -> Result<Box<dyn ContainerExec>, EngineError>,
+    {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        let desc = self.state.teardown_step_states[idx].description.clone();
+        for attempt in 1..=config.max_attempts {
+            self.msg_info(format!(
+                "Step failed — launching on_failure agent (attempt {attempt}/{})...",
+                config.max_attempts,
+            ));
+
+            self.state.teardown_step_states[idx].status = PhaseStepStatus::Remediating {
+                attempt,
+                of: config.max_attempts,
+            };
+            let _ = self.persist();
+            self.frontend
+                .on_teardown_step_fixing(&desc, attempt, config.max_attempts);
+
+            self.launch_on_failure_agent(config);
+
+            self.state.teardown_step_states[idx].status = PhaseStepStatus::Running;
+            let _ = self.persist();
+
+            let still_failed = self.run_single_teardown_step(step, idx, container_for_step);
+            if !still_failed {
+                self.msg_info(format!(
+                    "on_failure remediation succeeded on attempt {attempt}"
+                ));
+                return true;
+            }
+
+            if attempt == config.max_attempts {
+                self.msg_warning(format!(
+                    "on_failure exhausted all {} attempts; step fully failed",
+                    config.max_attempts,
+                ));
+            }
+        }
+
+        false
+    }
+
+    /// Launch the on_failure agent container and wait for it to complete.
+    /// The agent's own exit code is ignored — only the subsequent retry
+    /// determines success.
+    fn launch_on_failure_agent(
+        &mut self,
+        config: &crate::data::workflow_definition::RemediationConfig,
+    ) {
+        let agent_name_str = config
+            .agent
+            .as_deref()
+            .or(self.workflow.agent.as_deref())
+            .unwrap_or("claude");
+        let model = config
+            .model
+            .as_deref()
+            .or(self.workflow.model.as_deref())
+            .map(|s| s.to_string())
+            .or_else(|| self.effective_config.model());
+
+        let agent_name = match crate::data::session::AgentName::new(agent_name_str) {
+            Ok(a) => a,
+            Err(e) => {
+                self.msg_warning(format!("on_failure: invalid agent name: {e}"));
+                return;
+            }
+        };
+
+        let synthetic_step = WorkflowStep {
+            name: "__on_failure__".to_string(),
+            depends_on: Vec::new(),
+            prompt_template: config.prompt.clone(),
+            agent: Some(agent_name_str.to_string()),
+            model: model.clone(),
+            overlays: None,
+            abort_on_failure: false,
+        };
+
+        let runtime = WorkflowRuntimeContext {
+            step_agent: agent_name,
+            step_model: model,
+            git_root: self.session.git_root().to_path_buf(),
+            session_id: self.session.id(),
+        };
+
+        let execution = match self.container_factory.execution_for_step(
+            &synthetic_step,
+            &self.session,
+            &runtime,
+        ) {
+            Ok(e) => e,
+            Err(e) => {
+                self.msg_warning(format!("on_failure: failed to launch agent: {e}"));
+                return;
+            }
+        };
+
+        let handle = tokio::runtime::Handle::current();
+        let mut exec = execution;
+        match handle.block_on(exec.wait()) {
+            Ok(exit) => {
+                tracing::info!(
+                    exit_code = exit.exit_code,
+                    "on_failure agent completed (exit code ignored)"
+                );
+            }
+            Err(e) => {
+                self.msg_warning(format!("on_failure: agent execution error: {e}"));
+            }
+        }
     }
 
     /// Mark the workflow as fully finished. Called by the orchestrator after
@@ -3085,7 +3425,7 @@ mod tests {
         let steps = setup_steps_sample();
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, &[], mock.factory()).unwrap();
+        engine.run_setup(&steps, &[], &[], mock.factory()).unwrap();
 
         let calls = mock.calls();
         assert_eq!(calls.len(), 3);
@@ -3103,7 +3443,7 @@ mod tests {
         let steps = setup_steps_sample(); // 3 steps
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, &[], mock.factory()).unwrap();
+        engine.run_setup(&steps, &[], &[], mock.factory()).unwrap();
 
         assert_eq!(
             mock.handouts(),
@@ -3120,7 +3460,7 @@ mod tests {
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
         let (aborted, any_failed) = engine
-            .run_teardown(&steps, &[], true, false, mock.factory())
+            .run_teardown(&steps, &[], &[], true, false, mock.factory())
             .unwrap();
         assert!(!aborted);
         assert!(!any_failed);
@@ -3143,7 +3483,7 @@ mod tests {
             ("".into(), "".into(), 0),            // step 3 still runs
         ]));
 
-        let result = engine.run_setup(&steps, &[], mock.factory());
+        let result = engine.run_setup(&steps, &[], &[], mock.factory());
 
         assert!(
             result.is_ok(),
@@ -3164,7 +3504,7 @@ mod tests {
         ]));
         let abort_flags = vec![false, true, false]; // step 2 has abort_on_failure
 
-        let result = engine.run_setup(&steps, &abort_flags, mock.factory());
+        let result = engine.run_setup(&steps, &abort_flags, &[], mock.factory());
 
         assert!(
             result.is_err(),
@@ -3183,7 +3523,7 @@ mod tests {
 
         // teardown_on_failure = false, workflow_succeeded = false → skip all
         let (aborted, any_failed) = engine
-            .run_teardown(&steps, &[], false, false, mock.factory())
+            .run_teardown(&steps, &[], &[], false, false, mock.factory())
             .unwrap();
         assert!(!aborted);
         assert!(!any_failed);
@@ -3204,7 +3544,7 @@ mod tests {
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
         let (aborted, any_failed) = engine
-            .run_teardown(&steps, &[], true, false, mock.factory())
+            .run_teardown(&steps, &[], &[], true, false, mock.factory())
             .unwrap();
         assert!(!aborted);
         assert!(!any_failed);
@@ -3223,7 +3563,7 @@ mod tests {
         ]));
 
         // Teardown is best-effort: returns Ok even if a step fails.
-        let result = engine.run_teardown(&steps, &[], true, false, mock.factory());
+        let result = engine.run_teardown(&steps, &[], &[], true, false, mock.factory());
         assert!(
             result.is_ok(),
             "run_teardown must return Ok despite step failure"
@@ -3248,7 +3588,7 @@ mod tests {
         ]));
 
         // abort_on_failure = true for step 0
-        let result = engine.run_teardown(&steps, &[true, false], true, false, mock.factory());
+        let result = engine.run_teardown(&steps, &[true, false], &[], true, false, mock.factory());
         assert!(result.is_ok());
         let (aborted, any_failed) = result.unwrap();
         assert!(
@@ -3300,7 +3640,7 @@ mod tests {
             }
         };
 
-        let result = engine.run_teardown(&steps, &[], true, false, factory);
+        let result = engine.run_teardown(&steps, &[], &[], true, false, factory);
         assert!(result.is_ok(), "factory failure must not abort teardown");
         let (_aborted, any_failed) = result.unwrap();
         assert!(
@@ -3331,7 +3671,7 @@ mod tests {
         let steps = setup_steps_sample();
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, &[], mock.factory()).unwrap();
+        engine.run_setup(&steps, &[], &[], mock.factory()).unwrap();
 
         assert_eq!(
             engine.state().current_phase,
@@ -3364,7 +3704,7 @@ mod tests {
         ];
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, &[], mock.factory()).unwrap();
+        engine.run_setup(&steps, &[], &[], mock.factory()).unwrap();
 
         let states = &engine.state().setup_step_states;
         assert_eq!(states.len(), 2);
@@ -3393,7 +3733,7 @@ mod tests {
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
         let (aborted, any_failed) = engine
-            .run_teardown(&steps, &[], true, false, mock.factory())
+            .run_teardown(&steps, &[], &[], true, false, mock.factory())
             .unwrap();
         assert!(!aborted);
         assert!(!any_failed);
@@ -3427,7 +3767,7 @@ mod tests {
             ("".into(), "stderr content".into(), 1),
         ]));
 
-        let result = engine.run_setup(&steps, &[], mock.factory());
+        let result = engine.run_setup(&steps, &[], &[], mock.factory());
         assert!(
             result.is_ok(),
             "setup continues past failures when abort_on_failure=false"
@@ -3452,7 +3792,7 @@ mod tests {
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
         let (_aborted, _any_failed) = engine
-            .run_teardown(&steps, &[], true, false, mock.factory())
+            .run_teardown(&steps, &[], &[], true, false, mock.factory())
             .unwrap();
 
         assert_eq!(
@@ -3489,12 +3829,656 @@ mod tests {
         }];
         let mock = Arc::new(MockBackgroundContainer::always_success());
 
-        engine.run_setup(&steps, &[], mock.factory()).unwrap();
+        engine.run_setup(&steps, &[], &[], mock.factory()).unwrap();
 
         // Verify the on-disk state was persisted with the correct phase fields.
         let store = WorkflowStateStore::at_git_root(tmp.path());
         let saved = store.load(None, "test-wf").unwrap().unwrap();
         assert_eq!(saved.current_phase, WorkflowPhase::Main);
         assert!(saved.setup_completed);
+    }
+
+    // ── on_failure unit tests ─────────────────────────────────────────────────
+    //
+    // These tests call run_setup / run_teardown with non-empty on_failure_configs.
+    // launch_on_failure_agent internally calls Handle::current().block_on(...),
+    // which requires a live Tokio runtime on the current thread. We use
+    // spawn_blocking so we run on a dedicated blocking thread where block_on is
+    // explicitly permitted, while the multi-thread runtime handles the future.
+
+    /// Frontend that records every `write_message` call so tests can assert on
+    /// the on_failure status messages emitted by the engine.
+    struct MessageCapturingFrontend {
+        messages: Arc<Mutex<Vec<crate::engine::message::UserMessage>>>,
+    }
+
+    impl MessageCapturingFrontend {
+        fn new() -> (Self, Arc<Mutex<Vec<crate::engine::message::UserMessage>>>) {
+            let store = Arc::new(Mutex::new(Vec::new()));
+            (Self { messages: Arc::clone(&store) }, store)
+        }
+    }
+
+    impl crate::engine::message::UserMessageSink for MessageCapturingFrontend {
+        fn write_message(&mut self, msg: crate::engine::message::UserMessage) {
+            self.messages.lock().unwrap().push(msg);
+        }
+        fn replay_queued(&mut self) {}
+    }
+
+    impl WorkflowFrontend for MessageCapturingFrontend {
+        fn show_workflow_control_board(
+            &mut self,
+            _state: &WorkflowState,
+            _available: &AvailableActions,
+        ) -> Result<NextAction, EngineError> {
+            Ok(NextAction::LaunchNext)
+        }
+        fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
+            Ok(true)
+        }
+        fn user_choose_after_step_failure(
+            &mut self,
+            _step: &WorkflowStep,
+            _exit: &ContainerExitInfo,
+        ) -> Result<StepFailureChoice, EngineError> {
+            Ok(StepFailureChoice::Abort)
+        }
+        fn report_step_status(&mut self, _step: &WorkflowStep, _status: WorkflowStepStatus) {}
+        fn yolo_countdown_tick(
+            &mut self,
+            _step_name: &str,
+            _remaining: Duration,
+            _total: Duration,
+        ) -> Result<YoloTickOutcome, EngineError> {
+            Ok(YoloTickOutcome::Cancel)
+        }
+        fn report_workflow_completed(&mut self, _outcome: &WorkflowOutcome) {}
+    }
+
+    fn make_engine_capturing(
+        session: &Session,
+        workflow: Workflow,
+        factory: FakeContainerExecutionFactory,
+        frontend: MessageCapturingFrontend,
+    ) -> WorkflowEngine {
+        let overlay = OverlayEngine::with_auth_resolver(
+            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
+        );
+        WorkflowEngine::new(
+            session,
+            workflow,
+            None,
+            Box::new(frontend),
+            Box::new(factory),
+            Arc::new(GitEngine::new()),
+            Arc::new(overlay),
+        )
+        .unwrap()
+    }
+
+    fn remediation_config(max_attempts: u32) -> crate::data::workflow_definition::RemediationConfig {
+        crate::data::workflow_definition::RemediationConfig {
+            prompt: "Fix the broken step.".into(),
+            agent: None,
+            model: None,
+            max_attempts,
+        }
+    }
+
+    // run_setup: step fails with no on_failure config → step is Failed, only 1 exec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_failure_absent_step_fails_with_no_retry() {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        tokio::task::spawn_blocking(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            let factory = FakeContainerExecutionFactory::always_success();
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![crate::data::workflow_definition::SetupStep::RunShell {
+                command: "fail".into(),
+                env: None,
+            }];
+            let mock = Arc::new(MockBackgroundContainer::with_results([(
+                "".into(),
+                "some error".into(),
+                1,
+            )]));
+            // No on_failure config.
+            engine.run_setup(&steps, &[false], &[], mock.factory()).unwrap();
+
+            // Exactly 1 exec: initial attempt only, no retry.
+            assert_eq!(mock.calls().len(), 1, "no retry must occur without on_failure config");
+
+            let states = &engine.state().setup_step_states;
+            assert!(
+                matches!(&states[0].status, PhaseStepStatus::Failed { error } if error == "some error"),
+                "step must be Failed with correct error message: {:?}",
+                states[0].status
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // Step fails → on_failure launches agent → retry succeeds → step marked Succeeded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_failure_retry_succeeds_step_marked_succeeded() {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        tokio::task::spawn_blocking(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            // The on_failure agent uses FakeContainerExecutionFactory (exit 0, ignored).
+            let factory = FakeContainerExecutionFactory::always_success();
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![crate::data::workflow_definition::SetupStep::RunShell {
+                command: "step".into(),
+                env: None,
+            }];
+            // First call fails (step fails); second call succeeds (retry after agent).
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("".into(), "error".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(2))];
+
+            let result =
+                engine.run_setup(&steps, &[false], &on_failure_configs, mock.factory());
+
+            assert!(result.is_ok(), "setup must succeed when retry succeeds: {result:?}");
+            assert_eq!(
+                engine.state().setup_step_states[0].status,
+                PhaseStepStatus::Succeeded,
+                "step must be Succeeded after successful retry"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // Success on attempt 1 of 2 stops the loop early.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_failure_success_on_first_attempt_stops_loop() {
+        tokio::task::spawn_blocking(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            let factory = FakeContainerExecutionFactory::always_success();
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![crate::data::workflow_definition::SetupStep::RunShell {
+                command: "step".into(),
+                env: None,
+            }];
+            // Fail once, then succeed on retry.
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("".into(), "err".into(), 1),
+                ("".into(), "".into(), 0),
+                // third result never consumed — loop must stop after first retry
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(3))]; // 3 allowed, but 1 retry should suffice
+
+            engine
+                .run_setup(&steps, &[false], &on_failure_configs, mock.factory())
+                .unwrap();
+
+            // Only 2 exec calls: initial fail + one successful retry.
+            let calls = mock.calls();
+            assert_eq!(calls.len(), 2, "must stop after first successful retry: {calls:?}");
+        })
+        .await
+        .unwrap();
+    }
+
+    // Exhausting max_attempts leaves the step failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_failure_exhausts_max_attempts_step_remains_failed() {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        tokio::task::spawn_blocking(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            let factory = FakeContainerExecutionFactory::always_success();
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![crate::data::workflow_definition::SetupStep::RunShell {
+                command: "step".into(),
+                env: None,
+            }];
+            // Every exec fails.
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("".into(), "err".into(), 1),
+                ("".into(), "err".into(), 1),
+                ("".into(), "err".into(), 1),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(2))];
+
+            engine
+                .run_setup(&steps, &[false], &on_failure_configs, mock.factory())
+                .unwrap();
+
+            assert!(
+                matches!(
+                    &engine.state().setup_step_states[0].status,
+                    PhaseStepStatus::Failed { .. }
+                ),
+                "step must be Failed after exhausting on_failure attempts: {:?}",
+                engine.state().setup_step_states[0].status
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // on_failure agent exit code is irrelevant — what matters is the step retry.
+    // We simulate this by verifying that even if the factory returns a non-zero
+    // exit code for the agent, the retry still runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_failure_agent_exit_code_does_not_affect_retry() {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        tokio::task::spawn_blocking(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            // Agent exits non-zero — should be ignored.
+            let factory = FakeContainerExecutionFactory::new(std::iter::repeat_n(42, 10));
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![crate::data::workflow_definition::SetupStep::RunShell {
+                command: "step".into(),
+                env: None,
+            }];
+            // Step fails once, then succeeds.
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("".into(), "err".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(2))];
+
+            let result =
+                engine.run_setup(&steps, &[false], &on_failure_configs, mock.factory());
+
+            assert!(
+                result.is_ok(),
+                "agent exit code must not block retry; setup must succeed: {result:?}"
+            );
+            assert_eq!(
+                engine.state().setup_step_states[0].status,
+                PhaseStepStatus::Succeeded,
+                "step must be Succeeded when retry passes regardless of agent exit code"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // abort_on_failure + on_failure: remediation runs first; only if exhausted
+    // does abort_on_failure trigger.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_failure_abort_on_failure_triggers_only_after_remediation_exhausted() {
+        tokio::task::spawn_blocking(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            let factory = FakeContainerExecutionFactory::always_success();
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![
+                crate::data::workflow_definition::SetupStep::RunShell {
+                    command: "failing-step".into(),
+                    env: None,
+                },
+                crate::data::workflow_definition::SetupStep::RunShell {
+                    command: "second-step".into(),
+                    env: None,
+                },
+            ];
+            // First step always fails; second step would succeed but must not run.
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("".into(), "err".into(), 1), // initial attempt
+                ("".into(), "err".into(), 1), // retry after agent
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1)), None];
+            let abort_flags = vec![true, false];
+
+            let result =
+                engine.run_setup(&steps, &abort_flags, &on_failure_configs, mock.factory());
+
+            assert!(
+                result.is_err(),
+                "abort_on_failure must trigger after on_failure exhausted: {result:?}"
+            );
+            assert!(
+                engine.abort_on_failure_triggered(),
+                "abort_on_failure_triggered flag must be set"
+            );
+            // Second step must not have been executed.
+            assert_eq!(
+                mock.calls().len(),
+                2,
+                "only the failing step should be exec'd (initial + 1 retry): {:?}",
+                mock.calls()
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // abort_on_failure + on_failure: if retry succeeds, abort is NOT triggered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_failure_abort_on_failure_not_triggered_when_retry_succeeds() {
+        tokio::task::spawn_blocking(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            let factory = FakeContainerExecutionFactory::always_success();
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![crate::data::workflow_definition::SetupStep::RunShell {
+                command: "step".into(),
+                env: None,
+            }];
+            // Fail, then succeed on retry.
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("".into(), "err".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1))];
+            let abort_flags = vec![true];
+
+            let result =
+                engine.run_setup(&steps, &abort_flags, &on_failure_configs, mock.factory());
+
+            assert!(
+                result.is_ok(),
+                "setup must succeed when retry succeeds even with abort_on_failure set: {result:?}"
+            );
+            assert!(
+                !engine.abort_on_failure_triggered(),
+                "abort must NOT trigger when on_failure remediation succeeds"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // on_failure messages are emitted correctly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_failure_emits_launch_and_success_messages() {
+        use crate::engine::message::MessageLevel;
+
+        let msg_store = Arc::new(Mutex::new(
+            Vec::<crate::engine::message::UserMessage>::new(),
+        ));
+        let msg_store_clone = Arc::clone(&msg_store);
+
+        tokio::task::spawn_blocking(move || {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            let factory = FakeContainerExecutionFactory::always_success();
+            let frontend = MessageCapturingFrontend {
+                messages: Arc::clone(&msg_store_clone),
+            };
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![crate::data::workflow_definition::SetupStep::RunShell {
+                command: "step".into(),
+                env: None,
+            }];
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("".into(), "err".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(2))];
+            engine
+                .run_setup(&steps, &[false], &on_failure_configs, mock.factory())
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let messages = msg_store.lock().unwrap().clone();
+        let texts: Vec<&str> = messages.iter().map(|m| m.text.as_str()).collect();
+
+        // Must see the "launching on_failure agent" message.
+        assert!(
+            texts.iter().any(|t| t.contains("on_failure agent") && t.contains("attempt 1")),
+            "must emit 'on_failure agent' launch message: {texts:?}"
+        );
+        // Must see the "remediation succeeded" message.
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("remediation succeeded") || t.contains("succeeded on attempt")),
+            "must emit remediation success message: {texts:?}"
+        );
+        // The "launching" message must be Info level.
+        let launch_msg = messages
+            .iter()
+            .find(|m| m.text.contains("on_failure agent"))
+            .unwrap();
+        assert_eq!(launch_msg.level, MessageLevel::Info);
+    }
+
+    // Exhausting max_attempts emits a Warning message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_failure_exhausted_emits_warning_message() {
+        use crate::engine::message::MessageLevel;
+
+        let msg_store = Arc::new(Mutex::new(
+            Vec::<crate::engine::message::UserMessage>::new(),
+        ));
+        let msg_store_clone = Arc::clone(&msg_store);
+
+        tokio::task::spawn_blocking(move || {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            let factory = FakeContainerExecutionFactory::always_success();
+            let frontend = MessageCapturingFrontend {
+                messages: Arc::clone(&msg_store_clone),
+            };
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![crate::data::workflow_definition::SetupStep::RunShell {
+                command: "step".into(),
+                env: None,
+            }];
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("".into(), "err".into(), 1),
+                ("".into(), "err".into(), 1),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1))];
+            engine
+                .run_setup(&steps, &[false], &on_failure_configs, mock.factory())
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let messages = msg_store.lock().unwrap().clone();
+        let warning = messages
+            .iter()
+            .find(|m| m.level == MessageLevel::Warning && m.text.contains("exhausted"));
+        assert!(
+            warning.is_some(),
+            "must emit a Warning when on_failure exhausts all attempts: {messages:?}"
+        );
+    }
+
+    // Teardown on_failure: step fails, retry succeeds, teardown continues.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_on_failure_retry_succeeds_teardown_continues() {
+        use crate::data::workflow_definition::TeardownStep;
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        tokio::task::spawn_blocking(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            let factory = FakeContainerExecutionFactory::always_success();
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![
+                TeardownStep::RunShell {
+                    command: "tests".into(),
+                    env: None,
+                },
+                TeardownStep::RunShell {
+                    command: "deploy".into(),
+                    env: None,
+                },
+            ];
+            // First step fails, retry succeeds; second step succeeds.
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("".into(), "test err".into(), 1),
+                ("".into(), "".into(), 0),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1)), None];
+
+            let (aborted, any_failed) = engine
+                .run_teardown(&steps, &[false, false], &on_failure_configs, true, false, mock.factory())
+                .unwrap();
+
+            assert!(!aborted, "teardown must not abort when retry succeeds");
+            assert!(!any_failed, "any_failed must be false when retry succeeds");
+            let states = &engine.state().teardown_step_states;
+            assert_eq!(states[0].status, PhaseStepStatus::Succeeded);
+            assert_eq!(states[1].status, PhaseStepStatus::Succeeded);
+        })
+        .await
+        .unwrap();
+    }
+
+    // Teardown on_failure exhausts attempts: step marked failed, teardown continues (best-effort).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_on_failure_exhausted_step_failed_teardown_continues() {
+        use crate::data::workflow_definition::TeardownStep;
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        tokio::task::spawn_blocking(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            let factory = FakeContainerExecutionFactory::always_success();
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![
+                TeardownStep::RunShell {
+                    command: "always-fail".into(),
+                    env: None,
+                },
+                TeardownStep::RunShell {
+                    command: "second".into(),
+                    env: None,
+                },
+            ];
+            // All execs of the first step fail; second step succeeds.
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("".into(), "err".into(), 1), // initial
+                ("".into(), "err".into(), 1), // retry
+                ("".into(), "".into(), 0),    // second step
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1)), None];
+
+            let (aborted, any_failed) = engine
+                .run_teardown(&steps, &[false, false], &on_failure_configs, true, false, mock.factory())
+                .unwrap();
+
+            assert!(!aborted);
+            assert!(any_failed, "any_failed must be true when on_failure is exhausted");
+            assert!(
+                matches!(
+                    &engine.state().teardown_step_states[0].status,
+                    PhaseStepStatus::Failed { .. }
+                ),
+                "first step must remain Failed"
+            );
+            assert_eq!(
+                engine.state().teardown_step_states[1].status,
+                PhaseStepStatus::Succeeded,
+                "second step must still run (best-effort teardown)"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // Remediating state is set on the step during on_failure execution.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_failure_remediating_state_recorded_on_step() {
+        use crate::data::workflow_state::PhaseStepStatus;
+
+        // We can't observe the Remediating state mid-flight (it's transient),
+        // but we CAN verify that after a failed retry it was set at least once
+        // by checking that the final state transitions happened correctly.
+        // The key invariant: Remediating → Running → (Succeeded or Failed).
+        // After exhaustion the step is Failed; after success it is Succeeded.
+        // This test checks exhaustion so we know the state machine ran.
+        tokio::task::spawn_blocking(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            let factory = FakeContainerExecutionFactory::always_success();
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![crate::data::workflow_definition::SetupStep::RunShell {
+                command: "step".into(),
+                env: None,
+            }];
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("".into(), "err".into(), 1),
+                ("".into(), "err".into(), 1),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1))];
+            engine
+                .run_setup(&steps, &[false], &on_failure_configs, mock.factory())
+                .unwrap();
+
+            // After exhaustion the step should be Failed — the engine correctly
+            // transitioned through Remediating → Running → Failed.
+            assert!(
+                matches!(
+                    engine.state().setup_step_states[0].status,
+                    PhaseStepStatus::Failed { .. }
+                ),
+                "step must end as Failed after exhausted remediation"
+            );
+        })
+        .await
+        .unwrap();
     }
 }

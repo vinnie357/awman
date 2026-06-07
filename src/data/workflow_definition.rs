@@ -12,6 +12,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::data::error::DataError;
 
+/// Configuration for automatic remediation when a step fails.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemediationConfig {
+    pub prompt: String,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub max_attempts: u32,
+}
+
 /// Supported workflow file formats, detected by file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowFormat {
@@ -86,6 +97,12 @@ pub enum SetupStep {
         #[serde(default)]
         env: Option<HashMap<String, String>>,
     },
+    PollCi {
+        #[serde(default)]
+        interval_secs: Option<u32>,
+        #[serde(default)]
+        max_retries: Option<u32>,
+    },
 }
 
 /// A teardown phase step — executed after the main workflow steps.
@@ -119,6 +136,12 @@ pub enum TeardownStep {
         #[serde(default)]
         branch: Option<String>,
     },
+    PollCi {
+        #[serde(default)]
+        interval_secs: Option<u32>,
+        #[serde(default)]
+        max_retries: Option<u32>,
+    },
 }
 
 /// A setup step entry with optional per-step overlays.
@@ -128,6 +151,8 @@ pub struct SetupStepEntry {
     pub overlays: Option<Vec<String>>,
     #[serde(default)]
     pub abort_on_failure: bool,
+    #[serde(default)]
+    pub on_failure: Option<RemediationConfig>,
     #[serde(flatten)]
     pub step: SetupStep,
 }
@@ -139,6 +164,8 @@ pub struct TeardownStepEntry {
     pub overlays: Option<Vec<String>>,
     #[serde(default)]
     pub abort_on_failure: bool,
+    #[serde(default)]
+    pub on_failure: Option<RemediationConfig>,
     #[serde(flatten)]
     pub step: TeardownStep,
 }
@@ -216,6 +243,28 @@ fn validate_setup_teardown_overlays(wf: &Workflow) -> Result<(), DataError> {
     Ok(())
 }
 
+fn validate_remediation_configs(wf: &Workflow) -> Result<(), DataError> {
+    for (i, entry) in wf.setup.iter().enumerate() {
+        if let Some(ref rem) = entry.on_failure {
+            if rem.max_attempts == 0 {
+                return Err(DataError::WorkflowState(format!(
+                    "setup step {i}: on_failure.max_attempts must be >= 1, got 0"
+                )));
+            }
+        }
+    }
+    for (i, entry) in wf.teardown.iter().enumerate() {
+        if let Some(ref rem) = entry.on_failure {
+            if rem.max_attempts == 0 {
+                return Err(DataError::WorkflowState(format!(
+                    "teardown step {i}: on_failure.max_attempts must be >= 1, got 0"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Workflow {
     /// Parse a workflow file's *content* given the resolved format.
     pub fn parse(content: &str, format: WorkflowFormat) -> Result<Self, DataError> {
@@ -224,6 +273,7 @@ impl Workflow {
             WorkflowFormat::Yaml => parse_yaml(content),
         }?;
         validate_setup_teardown_overlays(&wf)?;
+        validate_remediation_configs(&wf)?;
         Ok(wf)
     }
 
@@ -661,6 +711,290 @@ overlays = ["skill(*)", "skill(lint)"]
         assert_eq!(
             wf.steps[0].overlays,
             Some(vec!["skill(*)".to_string(), "skill(lint)".to_string()])
+        );
+    }
+
+    // ── PollCi deserialization ────────────────────────────────────────────────
+
+    #[test]
+    fn toml_setup_poll_ci_with_all_optional_fields() {
+        let toml = r#"
+[[step]]
+name = "s"
+prompt = "p"
+
+[[setup]]
+type = "poll_ci"
+interval_secs = 60
+max_retries = 15
+"#;
+        let wf = Workflow::parse(toml, WorkflowFormat::Toml).unwrap();
+        assert_eq!(wf.setup.len(), 1);
+        assert!(
+            matches!(
+                &wf.setup[0].step,
+                SetupStep::PollCi {
+                    interval_secs: Some(60),
+                    max_retries: Some(15)
+                }
+            ),
+            "unexpected setup step: {:?}",
+            wf.setup[0].step
+        );
+    }
+
+    #[test]
+    fn toml_setup_poll_ci_without_optional_fields_defaults_to_none() {
+        let toml = r#"
+[[step]]
+name = "s"
+prompt = "p"
+
+[[setup]]
+type = "poll_ci"
+"#;
+        let wf = Workflow::parse(toml, WorkflowFormat::Toml).unwrap();
+        assert!(
+            matches!(
+                &wf.setup[0].step,
+                SetupStep::PollCi {
+                    interval_secs: None,
+                    max_retries: None
+                }
+            ),
+            "optional fields must default to None: {:?}",
+            wf.setup[0].step
+        );
+    }
+
+    #[test]
+    fn yaml_teardown_poll_ci_with_all_optional_fields() {
+        let yaml = r#"
+steps:
+  - name: s
+    prompt: p
+teardown:
+  - type: poll_ci
+    interval_secs: 30
+    max_retries: 5
+"#;
+        let wf = Workflow::parse(yaml, WorkflowFormat::Yaml).unwrap();
+        assert_eq!(wf.teardown.len(), 1);
+        assert!(
+            matches!(
+                &wf.teardown[0].step,
+                TeardownStep::PollCi {
+                    interval_secs: Some(30),
+                    max_retries: Some(5)
+                }
+            ),
+            "unexpected teardown step: {:?}",
+            wf.teardown[0].step
+        );
+    }
+
+    #[test]
+    fn yaml_teardown_poll_ci_without_optional_fields_defaults_to_none() {
+        let yaml = r#"
+steps:
+  - name: s
+    prompt: p
+teardown:
+  - type: poll_ci
+"#;
+        let wf = Workflow::parse(yaml, WorkflowFormat::Yaml).unwrap();
+        assert!(
+            matches!(
+                &wf.teardown[0].step,
+                TeardownStep::PollCi {
+                    interval_secs: None,
+                    max_retries: None
+                }
+            ),
+            "optional fields must default to None: {:?}",
+            wf.teardown[0].step
+        );
+    }
+
+    // ── RemediationConfig deserialization ─────────────────────────────────────
+
+    #[test]
+    fn toml_on_failure_with_all_fields() {
+        let toml = r#"
+[[step]]
+name = "s"
+prompt = "p"
+
+[[teardown]]
+type = "run_shell"
+command = "cargo test"
+
+[teardown.on_failure]
+prompt = "Fix the failing tests."
+agent = "my-agent"
+model = "claude-opus-4-7"
+max_attempts = 3
+"#;
+        let wf = Workflow::parse(toml, WorkflowFormat::Toml).unwrap();
+        let rem = wf.teardown[0].on_failure.as_ref().unwrap();
+        assert_eq!(rem.prompt, "Fix the failing tests.");
+        assert_eq!(rem.agent.as_deref(), Some("my-agent"));
+        assert_eq!(rem.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(rem.max_attempts, 3);
+    }
+
+    #[test]
+    fn toml_on_failure_without_optional_agent_and_model() {
+        let toml = r#"
+[[step]]
+name = "s"
+prompt = "p"
+
+[[teardown]]
+type = "run_shell"
+command = "cargo test"
+
+[teardown.on_failure]
+prompt = "Fix the failing tests."
+max_attempts = 2
+"#;
+        let wf = Workflow::parse(toml, WorkflowFormat::Toml).unwrap();
+        let rem = wf.teardown[0].on_failure.as_ref().unwrap();
+        assert_eq!(rem.prompt, "Fix the failing tests.");
+        assert!(rem.agent.is_none(), "agent must default to None");
+        assert!(rem.model.is_none(), "model must default to None");
+        assert_eq!(rem.max_attempts, 2);
+    }
+
+    #[test]
+    fn yaml_on_failure_with_all_fields() {
+        let yaml = r#"
+steps:
+  - name: s
+    prompt: p
+setup:
+  - type: run_shell
+    command: "cargo build"
+    on_failure:
+      prompt: "Build broke, fix it."
+      agent: "build-fixer"
+      model: "claude-sonnet-4-6"
+      max_attempts: 1
+"#;
+        let wf = Workflow::parse(yaml, WorkflowFormat::Yaml).unwrap();
+        let rem = wf.setup[0].on_failure.as_ref().unwrap();
+        assert_eq!(rem.prompt, "Build broke, fix it.");
+        assert_eq!(rem.agent.as_deref(), Some("build-fixer"));
+        assert_eq!(rem.model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(rem.max_attempts, 1);
+    }
+
+    #[test]
+    fn yaml_on_failure_without_optional_fields() {
+        let yaml = r#"
+steps:
+  - name: s
+    prompt: p
+setup:
+  - type: run_shell
+    command: "cargo check"
+    on_failure:
+      prompt: "Build failed."
+      max_attempts: 2
+"#;
+        let wf = Workflow::parse(yaml, WorkflowFormat::Yaml).unwrap();
+        let rem = wf.setup[0].on_failure.as_ref().unwrap();
+        assert!(rem.agent.is_none());
+        assert!(rem.model.is_none());
+    }
+
+    #[test]
+    fn step_without_on_failure_has_none() {
+        let toml = r#"
+[[step]]
+name = "s"
+prompt = "p"
+
+[[setup]]
+type = "run_shell"
+command = "echo hi"
+"#;
+        let wf = Workflow::parse(toml, WorkflowFormat::Toml).unwrap();
+        assert!(
+            wf.setup[0].on_failure.is_none(),
+            "on_failure must be None when absent"
+        );
+    }
+
+    // ── max_attempts = 0 validation ───────────────────────────────────────────
+
+    #[test]
+    fn setup_on_failure_max_attempts_zero_is_rejected() {
+        let toml = r#"
+[[step]]
+name = "s"
+prompt = "p"
+
+[[setup]]
+type = "run_shell"
+command = "echo hi"
+
+[setup.on_failure]
+prompt = "fix"
+max_attempts = 0
+"#;
+        let err = Workflow::parse(toml, WorkflowFormat::Toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_attempts"),
+            "error must mention max_attempts: {msg}"
+        );
+        assert!(
+            msg.contains("0") || msg.contains("1"),
+            "error must mention the invalid value or the minimum: {msg}"
+        );
+    }
+
+    #[test]
+    fn teardown_on_failure_max_attempts_zero_is_rejected() {
+        let yaml = r#"
+steps:
+  - name: s
+    prompt: p
+teardown:
+  - type: run_shell
+    command: "cargo test"
+    on_failure:
+      prompt: "fix tests"
+      max_attempts: 0
+"#;
+        let err = Workflow::parse(yaml, WorkflowFormat::Yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_attempts"),
+            "error must mention max_attempts: {msg}"
+        );
+    }
+
+    #[test]
+    fn on_failure_max_attempts_one_is_valid() {
+        let toml = r#"
+[[step]]
+name = "s"
+prompt = "p"
+
+[[teardown]]
+type = "run_shell"
+command = "cargo test"
+
+[teardown.on_failure]
+prompt = "fix"
+max_attempts = 1
+"#;
+        let wf = Workflow::parse(toml, WorkflowFormat::Toml).unwrap();
+        assert_eq!(
+            wf.teardown[0].on_failure.as_ref().unwrap().max_attempts,
+            1
         );
     }
 }

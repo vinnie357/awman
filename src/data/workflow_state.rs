@@ -58,6 +58,7 @@ pub enum PhaseStepStatus {
     Running,
     Succeeded,
     Failed { error: String },
+    Remediating { attempt: u32, of: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

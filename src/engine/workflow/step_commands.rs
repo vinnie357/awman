@@ -67,6 +67,9 @@ pub fn setup_step_to_shell(step: &SetupStep) -> (String, Option<HashMap<String, 
         }
         SetupStep::RunShell { command, env } => (command.clone(), env.clone()),
         SetupStep::RunScript { path, env } => (format!("sh {}", sh_quote(path)), env.clone()),
+        SetupStep::PollCi { .. } => {
+            unreachable!("PollCi steps are handled natively by the engine, not translated to shell")
+        }
     }
 }
 
@@ -109,6 +112,9 @@ pub fn teardown_step_to_shell(step: &TeardownStep) -> (String, Option<HashMap<St
             );
             (cmd, Some(env))
         }
+        TeardownStep::PollCi { .. } => {
+            unreachable!("PollCi steps are handled natively by the engine, not translated to shell")
+        }
     }
 }
 
@@ -125,6 +131,14 @@ pub fn setup_step_description(step: &SetupStep) -> String {
         },
         SetupStep::RunShell { command, .. } => format!("run_shell: {command}"),
         SetupStep::RunScript { path, .. } => format!("run_script: {path}"),
+        SetupStep::PollCi {
+            interval_secs,
+            max_retries,
+        } => {
+            let i = interval_secs.unwrap_or(30);
+            let r = max_retries.unwrap_or(10);
+            format!("poll_ci: interval={i}s, retries={r}")
+        }
     }
 }
 
@@ -142,6 +156,14 @@ pub fn teardown_step_description(step: &TeardownStep) -> String {
             (Some(r), Some(b)) => format!("push_branch: {r} {b}"),
             _ => "push_branch".to_string(),
         },
+        TeardownStep::PollCi {
+            interval_secs,
+            max_retries,
+        } => {
+            let i = interval_secs.unwrap_or(30);
+            let r = max_retries.unwrap_or(10);
+            format!("poll_ci: interval={i}s, retries={r}")
+        }
     }
 }
 
@@ -176,6 +198,13 @@ pub fn substitute_setup_step(step: &SetupStep, ctx: Option<&WorkItemContext>) ->
         SetupStep::RunScript { path, env } => SetupStep::RunScript {
             path: sub(path, ctx),
             env: env.clone(),
+        },
+        SetupStep::PollCi {
+            interval_secs,
+            max_retries,
+        } => SetupStep::PollCi {
+            interval_secs: *interval_secs,
+            max_retries: *max_retries,
         },
     }
 }
@@ -215,6 +244,13 @@ pub fn substitute_teardown_step(
         TeardownStep::PushBranch { remote, branch } => TeardownStep::PushBranch {
             remote: sub_opt(remote, ctx),
             branch: sub_opt(branch, ctx),
+        },
+        TeardownStep::PollCi {
+            interval_secs,
+            max_retries,
+        } => TeardownStep::PollCi {
+            interval_secs: *interval_secs,
+            max_retries: *max_retries,
         },
     }
 }

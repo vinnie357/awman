@@ -108,9 +108,14 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     fn on_setup_step_output(&mut self, _line: &str) {}
     fn on_setup_step_completed(&mut self, _description: &str) {}
     fn on_setup_step_failed(&mut self, _description: &str, _exit_code: i32, _stderr: &str) {}
+    /// Step failed and an `on_failure` agent is about to run. Emitted
+    /// once per remediation attempt before the agent launches; the step
+    /// will be retried once the agent finishes.
+    fn on_setup_step_fixing(&mut self, _description: &str, _attempt: u32, _of: u32) {}
 
     fn on_teardown_step_started(&mut self, _description: &str) {}
     fn on_teardown_step_output(&mut self, _line: &str) {}
     fn on_teardown_step_completed(&mut self, _description: &str) {}
     fn on_teardown_step_failed(&mut self, _description: &str, _exit_code: i32, _stderr: &str) {}
+    fn on_teardown_step_fixing(&mut self, _description: &str, _attempt: u32, _of: u32) {}
 }
