@@ -47,6 +47,7 @@ pub struct ExecWorkflowCommandFlags {
     pub agent: Option<String>,
     pub model: Option<String>,
     pub overlay: Vec<String>,
+    pub issue_source: crate::data::issue::IssueSourceFlags,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -495,8 +496,70 @@ impl Command for ExecWorkflowCommand {
             }
         };
 
-        // 3. Load work item context when --work-item is supplied.
-        let work_item_context = if let Some(wi_str) = &self.flags.work_item {
+        // 3. Load work item context from --work-item or --issue.
+        // `_issue_temp_file` keeps the temp file alive for the duration of
+        // this function — its Drop impl deletes the file regardless of how
+        // the function exits (success, error, panic).
+        let issue_title_slug: Option<String>;
+        let _issue_temp_file: Option<IssueTempFile>;
+        let issue_overlay: Option<TypedOverlay>;
+
+        let work_item_context = if let Some(ref issue_ref) = self.flags.issue_source.issue {
+            // --issue: fetch issue and construct work item context from it.
+            let router = crate::data::issue::router::IssueSourceRouter::default();
+            match router.fetch_issue(issue_ref, &git_root_for_scope) {
+                Ok((issue, source)) => {
+                    let work_items_dir = self
+                        .session
+                        .repo_config()
+                        .work_items_dir_or_default(&git_root_for_scope);
+                    let build = match issue_source_overlay(
+                        source,
+                        &issue,
+                        &git_root_for_scope,
+                        &work_items_dir,
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!(
+                                    "exec workflow: failed to write issue temp file: {e}"
+                                ),
+                            });
+                            return Err(CommandError::Other(format!(
+                                "writing issue temp file: {e}"
+                            )));
+                        }
+                    };
+
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: format!(
+                            "exec workflow: fetched issue '{}' ({})",
+                            issue.title, issue.source_id
+                        ),
+                    });
+
+                    issue_overlay = Some(build.overlay);
+                    issue_title_slug = Some(build.slug);
+                    let number = build.number;
+                    let content = build.content;
+                    _issue_temp_file = Some(build.temp_file);
+                    Some(WorkItemContext { number, content })
+                }
+                Err(e) => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("exec workflow: failed to fetch issue: {e}"),
+                    });
+                    return Err(CommandError::Other(e.to_string()));
+                }
+            }
+        } else if let Some(wi_str) = &self.flags.work_item {
+            issue_title_slug = None;
+            _issue_temp_file = None;
+            issue_overlay = None;
             match parse_work_item_number(wi_str) {
                 Some(number) => {
                     let path = find_work_item_file(&git_root_for_scope, number);
@@ -528,9 +591,11 @@ impl Command for ExecWorkflowCommand {
                 }
             }
         } else {
+            issue_title_slug = None;
+            _issue_temp_file = None;
+            issue_overlay = None;
             None
         };
-
         // 4. Worktree prepare (if --worktree is set).
         // When a worktree is used, capture its path so the session below is
         // rooted at the worktree checkout rather than the main repo.
@@ -555,23 +620,67 @@ impl Command for ExecWorkflowCommand {
                     return Err(err);
                 }
             };
-            // When --work-item is supplied, name the worktree/branch after the
-            // work item number rather than the workflow filename.
-            let lifecycle = if let Some(ctx) = &work_item_context {
-                match WorktreeLifecycle::for_work_item(
+            // When --issue is supplied, name the worktree/branch after the issue slug.
+            // When --work-item is supplied, name after the work item number.
+            // Otherwise, name after the workflow filename.
+            let lifecycle = if let Some(ref slug) = issue_title_slug {
+                match WorktreeLifecycle::for_workflow(
                     Arc::clone(&self.engines.git_engine),
                     git_root,
-                    ctx.number,
+                    slug,
                 ) {
                     Ok(l) => l,
                     Err(e) => {
                         frontend.write_message(UserMessage {
                             level: MessageLevel::Error,
                             text: format!(
-                                "exec workflow: failed to create worktree for work item: {e}"
+                                "exec workflow: failed to create worktree for issue: {e}"
                             ),
                         });
                         return Err(e);
+                    }
+                }
+            } else if let Some(ctx) = &work_item_context {
+                if self.flags.work_item.is_some() {
+                    match WorktreeLifecycle::for_work_item(
+                        Arc::clone(&self.engines.git_engine),
+                        git_root,
+                        ctx.number,
+                    ) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!(
+                                    "exec workflow: failed to create worktree for work item: {e}"
+                                ),
+                            });
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    let name = self
+                        .flags
+                        .workflow
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("workflow")
+                        .to_string();
+                    match WorktreeLifecycle::for_workflow(
+                        Arc::clone(&self.engines.git_engine),
+                        git_root,
+                        &name,
+                    ) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            frontend.write_message(UserMessage {
+                                level: MessageLevel::Error,
+                                text: format!(
+                                    "exec workflow: failed to create worktree for workflow: {e}"
+                                ),
+                            });
+                            return Err(e);
+                        }
                     }
                 }
             } else {
@@ -652,6 +761,9 @@ impl Command for ExecWorkflowCommand {
                         return Err(e);
                     }
                 }
+            }
+            if let Some(overlay) = issue_overlay {
+                all.push(overlay);
             }
             all
         };
@@ -1103,6 +1215,10 @@ impl Command for ExecWorkflowCommand {
             return Err(err);
         }
 
+        // `_issue_temp_file`'s Drop impl removes the temp file when this
+        // function returns — covers both this success path and every early
+        // error return above.
+
         Ok(ExecWorkflowOutcome {
             workflow: workflow_path.display().to_string(),
             exit_code,
@@ -1300,6 +1416,86 @@ fn worktree_git_overlay(
         container_path: main_git_dir,
         permission: crate::engine::container::options::OverlayPermission::ReadWrite,
     }))
+}
+
+/// Guards an on-disk temp file: deleted when this value is dropped, regardless
+/// of how the surrounding scope exits (success, `?`, panic). Used for the
+/// issue overlay temp file so cleanup survives every early-return path.
+pub(crate) struct IssueTempFile {
+    path: PathBuf,
+}
+
+impl IssueTempFile {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for IssueTempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Result of `issue_source_overlay`: everything the caller needs to inject
+/// an issue-derived file into the workflow's containers, plus a Drop guard
+/// for the underlying temp file.
+pub(crate) struct IssueOverlayBuild {
+    pub temp_file: IssueTempFile,
+    pub overlay: TypedOverlay,
+    pub slug: String,
+    pub number: u32,
+    pub content: String,
+}
+
+/// Build the workflow overlay for an `Issue` produced by an `IssueSource`.
+///
+/// Writes the rendered markdown to a unique temp file (returned wrapped in
+/// `IssueTempFile` so the caller can keep it alive for the duration of the
+/// workflow) and constructs a read-only `TypedOverlay::Directory` mapping the
+/// temp file to `/workspace/<work_items_relative>/NNNN-<slug>.md` inside the
+/// container.
+///
+/// Signature takes `&dyn IssueSource` and `&Issue` — no concrete provider types.
+pub(crate) fn issue_source_overlay(
+    source: &dyn crate::data::issue::IssueSource,
+    issue: &crate::data::issue::Issue,
+    git_root: &std::path::Path,
+    work_items_dir: &std::path::Path,
+) -> std::io::Result<IssueOverlayBuild> {
+    let slug = source.title_slug(issue);
+    let content = source.format_as_markdown(issue);
+    let number = issue.numeric_id().unwrap_or(0);
+
+    let pid = std::process::id();
+    let temp_filename = format!("awman-issue-{pid}-{slug}.md");
+    let temp_path = std::env::temp_dir().join(&temp_filename);
+    std::fs::write(&temp_path, &content)?;
+    let temp_file = IssueTempFile {
+        path: temp_path.clone(),
+    };
+
+    let relative = work_items_dir
+        .strip_prefix(git_root)
+        .unwrap_or_else(|_| std::path::Path::new("aspec/work-items"));
+    let container_filename = format!("{number:04}-{slug}.md");
+    let container_path = std::path::PathBuf::from("/workspace")
+        .join(relative)
+        .join(&container_filename);
+
+    let overlay = TypedOverlay::Directory(crate::engine::overlay::DirectorySpec {
+        host: temp_path.display().to_string(),
+        container: container_path.display().to_string(),
+        permission: crate::engine::container::options::OverlayPermission::ReadOnly,
+    });
+
+    Ok(IssueOverlayBuild {
+        temp_file,
+        overlay,
+        slug,
+        number,
+        content,
+    })
 }
 
 #[cfg(test)]
@@ -1617,6 +1813,7 @@ prompt = "do something"
             agent: None,
             model: None,
             overlay: vec![],
+            issue_source: crate::data::issue::IssueSourceFlags { issue: None },
         };
         let session = {
             let resolver = crate::data::session::StaticGitRootResolver::new(tmp.path());
@@ -1677,6 +1874,7 @@ prompt = "do something"
             agent: None,
             model: None,
             overlay: vec![],
+            issue_source: crate::data::issue::IssueSourceFlags { issue: None },
         };
         assert!(!flags.worktree);
         assert!(!flags.yolo);
@@ -1699,6 +1897,7 @@ prompt = "do something"
             agent: None,
             model: None,
             overlay: vec![],
+            issue_source: crate::data::issue::IssueSourceFlags { issue: None },
         };
         assert!(flags.yolo);
         assert!(flags.worktree, "yolo must imply worktree");
@@ -1881,5 +2080,122 @@ prompt = "do something"
             !workflow_resolves_to_gemini(&wf, &session),
             "must return false when neither step, workflow, nor session resolves to gemini"
         );
+    }
+
+    // ── issue_source_overlay + IssueTempFile ─────────────────────────────────
+
+    use crate::data::issue::github::GithubIssueSource;
+    use crate::data::issue::Issue;
+
+    fn make_issue(source_id: &str, title: &str, body: &str) -> Issue {
+        Issue {
+            source_id: source_id.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+            provider: "GitHub".to_string(),
+        }
+    }
+
+    #[test]
+    fn issue_source_overlay_writes_temp_file_and_builds_directory_overlay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_root = tmp.path();
+        let work_items_dir = git_root.join("aspec").join("work-items");
+        let issue = make_issue(
+            "https://github.com/owner/repo/issues/84",
+            "Test",
+            "body",
+        );
+
+        let build = issue_source_overlay(
+            &GithubIssueSource,
+            &issue,
+            git_root,
+            &work_items_dir,
+        )
+        .expect("overlay build must succeed");
+
+        // Temp file exists and has the expected contents.
+        assert!(build.temp_file.path().exists(), "temp file must exist");
+        let on_disk = std::fs::read_to_string(build.temp_file.path()).unwrap();
+        assert_eq!(on_disk, "# Test\n\nbody");
+
+        // Slug + number derive from the issue.
+        assert_eq!(build.number, 84);
+        assert!(build.slug.contains("owner-repo-84"));
+
+        // Overlay is a ReadOnly Directory mapping the temp file to the
+        // container-side work-items path.
+        match build.overlay {
+            TypedOverlay::Directory(spec) => {
+                assert_eq!(spec.host, build.temp_file.path().display().to_string());
+                assert!(
+                    spec.container.starts_with("/workspace/aspec/work-items/"),
+                    "container path must start with /workspace/aspec/work-items/, got {}",
+                    spec.container
+                );
+                assert!(spec.container.ends_with(".md"));
+                assert!(spec.container.contains("0084-"));
+                assert_eq!(
+                    spec.permission,
+                    crate::engine::container::options::OverlayPermission::ReadOnly,
+                    "overlay must be ReadOnly"
+                );
+            }
+            other => panic!("expected TypedOverlay::Directory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn issue_temp_file_drop_deletes_underlying_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("scope-guard-test.md");
+        std::fs::write(&path, "contents").unwrap();
+        assert!(path.exists());
+        {
+            let _guard = super::IssueTempFile { path: path.clone() };
+            // Inside the scope the file still exists.
+            assert!(path.exists());
+        }
+        // After the guard is dropped the file is gone.
+        assert!(
+            !path.exists(),
+            "IssueTempFile::drop must remove the underlying file"
+        );
+    }
+
+    #[test]
+    fn issue_temp_file_filename_format_is_pid_and_slug() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_root = tmp.path();
+        let work_items_dir = git_root.join("aspec").join("work-items");
+        let issue = make_issue(
+            "https://github.com/owner/repo/issues/7",
+            "Some Title",
+            "",
+        );
+
+        let build = issue_source_overlay(
+            &GithubIssueSource,
+            &issue,
+            git_root,
+            &work_items_dir,
+        )
+        .unwrap();
+
+        let pid = std::process::id();
+        let file_name = build
+            .temp_file
+            .path()
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap()
+            .to_string();
+        assert!(
+            file_name.starts_with(&format!("awman-issue-{pid}-")),
+            "temp filename must follow awman-issue-{{pid}}-{{slug}}.md, got: {file_name}"
+        );
+        assert!(file_name.ends_with(".md"));
+        assert!(file_name.contains(&build.slug));
     }
 }

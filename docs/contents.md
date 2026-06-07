@@ -20,6 +20,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 09 | [API Mode](09-api-mode.md) | HTTP server, sessions, commands, CI/automation, auditability |
 | 10 | [Remote Mode](10-remote-mode.md) | `remote run`, `remote session`, live log streaming, TUI pickers |
 | 11 | [Architecture Overview](11-architecture-overview.md) | Four-layer design, layers 0–4, design principles, adding features |
+| 12 | [GitHub Integration](12-github-integration.md) | Fetching issues, `--issue` flag, authentication, input formats |
 | — | [Architecture (Detailed)](architecture.md) | Source layout, modules, in-depth design decisions |
 
 ---

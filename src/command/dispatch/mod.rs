@@ -365,19 +365,11 @@ impl<F: CommandFrontend> Dispatch<F> {
                 )))
             }
             ["exec", "prompt"] => {
-                let prompt = self
-                    .frontend
-                    .argument(&canonical_refs, "prompt")?
-                    .ok_or_else(|| {
-                        CommandError::missing_required_argument(&canonical_refs, "prompt")
-                    })?;
-                if prompt.trim().is_empty() {
-                    return Err(CommandError::InvalidArgumentValue {
-                        command: canonical_refs.iter().map(|s| s.to_string()).collect(),
-                        argument: "prompt".into(),
-                        reason: "prompt must not be empty".into(),
-                    });
-                }
+                let prompt = self.frontend.argument(&canonical_refs, "prompt")?;
+                let prompt = match prompt {
+                    Some(p) if p.trim().is_empty() => None,
+                    other => other,
+                };
                 let flags = read_exec_prompt_flags(&self.frontend, &canonical_refs, prompt)?;
                 Ok(BuiltCommand::ExecPrompt(ExecPromptCommand::new(
                     flags,
@@ -538,10 +530,12 @@ impl<F: CommandFrontend> Dispatch<F> {
                     .frontend
                     .flag_bool(&canonical_refs, "non-interactive")?
                     .unwrap_or(false);
+                let issue = self.frontend.flag_string(&canonical_refs, "issue")?;
                 Ok(BuiltCommand::New(NewCommand::new(
                     NewSubcommand::Spec(NewSpecFlags {
                         interview,
                         non_interactive,
+                        issue_source: crate::data::issue::IssueSourceFlags { issue },
                     }),
                     self.engines.clone(),
                     session.clone(),
@@ -764,8 +758,9 @@ fn read_chat_flags<F: CommandFrontend>(
 fn read_exec_prompt_flags<F: CommandFrontend>(
     f: &F,
     p: &[&str],
-    prompt: String,
+    prompt: Option<String>,
 ) -> Result<ExecPromptCommandFlags, CommandError> {
+    let issue = f.flag_string(p, "issue")?;
     Ok(ExecPromptCommandFlags {
         prompt,
         non_interactive: f.flag_bool(p, "non-interactive")?.unwrap_or(false),
@@ -776,6 +771,7 @@ fn read_exec_prompt_flags<F: CommandFrontend>(
         agent: f.flag_string(p, "agent")?,
         model: f.flag_string(p, "model")?,
         overlay: f.flag_strings(p, "overlay")?,
+        issue_source: crate::data::issue::IssueSourceFlags { issue },
     })
 }
 
@@ -789,9 +785,14 @@ fn read_exec_workflow_flags<F: CommandFrontend>(
         .ok_or_else(|| CommandError::missing_required_argument(p, "workflow"))?;
     let yolo = f.flag_bool(p, "yolo")?.unwrap_or(false);
     let worktree = f.flag_bool(p, "worktree")?.unwrap_or(false) || yolo;
+    let work_item = f.flag_string(p, "work-item")?;
+    let issue = f.flag_string(p, "issue")?;
+    if work_item.is_some() && issue.is_some() {
+        return Err(CommandError::mutually_exclusive(p, "work-item", "issue"));
+    }
     Ok(ExecWorkflowCommandFlags {
         workflow,
-        work_item: f.flag_string(p, "work-item")?,
+        work_item,
         non_interactive: f.flag_bool(p, "non-interactive")?.unwrap_or(false),
         plan: f.flag_bool(p, "plan")?.unwrap_or(false),
         allow_docker: f.flag_bool(p, "allow-docker")?.unwrap_or(false),
@@ -801,6 +802,7 @@ fn read_exec_workflow_flags<F: CommandFrontend>(
         agent: f.flag_string(p, "agent")?,
         model: f.flag_string(p, "model")?,
         overlay: f.flag_strings(p, "overlay")?,
+        issue_source: crate::data::issue::IssueSourceFlags { issue },
     })
 }
 
@@ -1108,15 +1110,14 @@ mod tests {
     }
 
     #[test]
-    fn build_exec_prompt_with_empty_prompt_returns_invalid_argument_value() {
+    fn build_exec_prompt_with_empty_prompt_builds_ok_when_issue_may_provide_input() {
+        // A whitespace-only prompt is normalised to None at dispatch time;
+        // final validation (prompt-or-issue required) happens at run time.
         let mut frontend = FakeCommandFrontend::new();
         frontend.args.insert("prompt".into(), "   ".into());
         let dispatch = Dispatch::new(frontend, make_session(), make_engines());
         let result = dispatch.build_command(&["exec", "prompt"]);
-        assert!(
-            matches!(result, Err(CommandError::InvalidArgumentValue { .. })),
-            "empty prompt must return InvalidArgumentValue"
-        );
+        assert!(result.is_ok(), "whitespace prompt should build OK (validation deferred to runtime)");
     }
 
     #[test]
@@ -1254,6 +1255,99 @@ mod tests {
                 );
             }
             _ => panic!("expected ExecWorkflow"),
+        }
+    }
+
+    // ── Issue flag dispatch tests ─────────────────────────────────────────────
+
+    #[test]
+    fn build_exec_workflow_issue_flag_populates_issue_source() {
+        let mut frontend = FakeCommandFrontend::new();
+        frontend
+            .strings
+            .insert("issue".into(), "owner/repo#84".into());
+        frontend
+            .paths
+            .insert("workflow".into(), std::path::PathBuf::from("/tmp/wf.toml"));
+        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let built = dispatch.build_command(&["exec", "workflow"]).unwrap();
+        match built {
+            BuiltCommand::ExecWorkflow(cmd) => {
+                assert_eq!(
+                    cmd.flags().issue_source.issue.as_deref(),
+                    Some("owner/repo#84"),
+                    "issue_source.issue must be populated from --issue flag"
+                );
+            }
+            _ => panic!("expected ExecWorkflow"),
+        }
+    }
+
+    #[test]
+    fn build_exec_workflow_issue_and_work_item_are_mutually_exclusive() {
+        let mut frontend = FakeCommandFrontend::new();
+        frontend
+            .strings
+            .insert("issue".into(), "owner/repo#84".into());
+        frontend
+            .strings
+            .insert("work-item".into(), "0084-my-item.md".into());
+        frontend
+            .paths
+            .insert("workflow".into(), std::path::PathBuf::from("/tmp/wf.toml"));
+        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let result = dispatch.build_command(&["exec", "workflow"]);
+        match result {
+            Err(CommandError::MutuallyExclusive { .. }) => {}
+            Err(other) => panic!("expected MutuallyExclusive, got {other:?}"),
+            Ok(_) => panic!("expected error for mutually exclusive flags"),
+        }
+    }
+
+    #[test]
+    fn build_exec_prompt_issue_flag_populates_issue_source() {
+        let mut frontend = FakeCommandFrontend::new();
+        frontend.strings.insert("issue".into(), "42".into());
+        // No positional prompt — that's ok at dispatch time (validated at runtime).
+        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let built = dispatch.build_command(&["exec", "prompt"]).unwrap();
+        match built {
+            BuiltCommand::ExecPrompt(cmd) => {
+                assert_eq!(
+                    cmd.flags().issue_source.issue.as_deref(),
+                    Some("42"),
+                    "issue_source.issue must be populated from --issue flag"
+                );
+            }
+            _ => panic!("expected ExecPrompt"),
+        }
+    }
+
+    #[test]
+    fn build_exec_prompt_issue_and_prompt_are_both_optional() {
+        // When only --issue is set (no positional prompt), build_command must succeed.
+        // The runtime check (at least one of prompt/issue) happens in run_with_frontend.
+        let mut frontend = FakeCommandFrontend::new();
+        frontend.strings.insert("issue".into(), "owner/repo#1".into());
+        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let result = dispatch.build_command(&["exec", "prompt"]);
+        assert!(
+            result.is_ok(),
+            "build_command must succeed when only --issue is set: {}",
+            result.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
+        );
+        match result.unwrap() {
+            BuiltCommand::ExecPrompt(cmd) => {
+                assert!(
+                    cmd.flags().prompt.is_none(),
+                    "prompt must be None when no positional argument is provided"
+                );
+                assert_eq!(
+                    cmd.flags().issue_source.issue.as_deref(),
+                    Some("owner/repo#1")
+                );
+            }
+            _ => panic!("expected ExecPrompt"),
         }
     }
 }

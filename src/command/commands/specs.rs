@@ -87,6 +87,13 @@ pub trait SpecsCommandFrontend:
         Ok(WorkItemKind::Task)
     }
 
+    /// Prompt for a summary pre-populated with `content`. The TUI implementation
+    /// renders the text box pre-filled; non-interactive frontends return the
+    /// content unmodified.
+    fn ask_spec_summary_prefilled(&mut self, content: &str) -> Result<String, CommandError> {
+        Ok(content.to_string())
+    }
+
     /// Hand back a container-side frontend for spawning the interview / amend
     /// agent. Default impl returns a no-op proxy; CLI / TUI override.
     fn container_frontend(&mut self) -> Box<dyn ContainerFrontend> {
@@ -293,6 +300,7 @@ pub(crate) async fn create_new_spec(
     session: crate::data::session::Session,
     interview: bool,
     non_interactive: bool,
+    issue_flags: crate::data::issue::IssueSourceFlags,
     frontend: &mut dyn SpecsCommandFrontend,
 ) -> Result<NewSpecOutcome, CommandError> {
     let git_root = session.git_root().to_path_buf();
@@ -332,17 +340,62 @@ pub(crate) async fn create_new_spec(
         }
     };
 
+    // Fetch issue if --issue was provided. Extract everything we need while the
+    // router is alive so we don't hold a borrow across its drop.
+    struct FetchedIssue {
+        title: String,
+        markdown: String,
+        slug: String,
+    }
+    let fetched_issue: Option<FetchedIssue> = if let Some(ref issue_ref) = issue_flags.issue {
+        let router = crate::data::issue::router::IssueSourceRouter::default();
+        match router.fetch_issue(issue_ref, &git_root) {
+            Ok((issue, source)) => {
+                let markdown = source.format_as_markdown(&issue);
+                let slug = source.title_slug(&issue);
+                let title = issue.title.clone();
+                Some(FetchedIssue {
+                    title,
+                    markdown,
+                    slug,
+                })
+            }
+            Err(e) => {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("new spec: failed to fetch issue: {e}"),
+                });
+                return Err(CommandError::Other(e.to_string()));
+            }
+        }
+    } else {
+        None
+    };
+
     let next_n = next_work_item_number(&work_items_dir);
     frontend.write_message(UserMessage {
         level: MessageLevel::Info,
         text: format!("new spec: creating work item {:04}", next_n),
     });
-    let kind = frontend.ask_spec_kind().unwrap_or(WorkItemKind::Task);
-    let title = frontend
-        .ask_spec_title()
-        .unwrap_or_else(|_| "Untitled".into());
-    let summary = frontend.ask_spec_summary().unwrap_or_default();
-    let slug = slugify(&title);
+
+    // When --issue is set, derive kind/title/summary/slug from the issue.
+    // Default kind is Task (the safe default, matching the non-issue path);
+    // the interview agent can revise it from the issue content.
+    let (kind, title, summary, slug) = if let Some(ref fi) = fetched_issue {
+        let kind = WorkItemKind::Task;
+        let title = fi.title.clone();
+        let summary = fi.markdown.clone();
+        let slug = fi.slug.clone();
+        (kind, title, summary, slug)
+    } else {
+        let kind = frontend.ask_spec_kind().unwrap_or(WorkItemKind::Task);
+        let title = frontend
+            .ask_spec_title()
+            .unwrap_or_else(|_| "Untitled".into());
+        let summary = frontend.ask_spec_summary().unwrap_or_default();
+        let slug = slugify(&title);
+        (kind, title, summary, slug)
+    };
     let filename = format!("{:04}-{slug}.md", next_n);
     let dest = work_items_dir.join(&filename);
 
@@ -381,7 +434,27 @@ pub(crate) async fn create_new_spec(
         }
     }
 
-    if interview {
+    // Determine if we should launch the interview agent.
+    // --issue only (no --interview): implicit interview with issue content.
+    // --issue + --interview: prefilled interview with editable content.
+    // --interview only: normal interview.
+    let should_interview = interview || fetched_issue.is_some();
+    let interview_summary = if let Some(ref fi) = fetched_issue {
+        if interview {
+            // --issue + --interview: let user edit the prefilled content
+            match frontend.ask_spec_summary_prefilled(&fi.markdown) {
+                Ok(edited) => edited,
+                Err(_) => fi.markdown.clone(),
+            }
+        } else {
+            // --issue only: use issue content directly
+            fi.markdown.clone()
+        }
+    } else {
+        summary.clone()
+    };
+
+    if should_interview {
         let agent = match resolve_agent(&None, &session) {
             Ok(a) => a,
             Err(e) => {
@@ -402,7 +475,7 @@ pub(crate) async fn create_new_spec(
                 return Err(CommandError::from(e));
             }
         };
-        let prompt = render_interview_prompt(next_n, kind.as_str(), &title, &summary);
+        let prompt = render_interview_prompt(next_n, kind.as_str(), &title, &interview_summary);
         let run_opts = AgentRunOptions {
             initial_prompt: Some(prompt),
             non_interactive,
@@ -461,7 +534,7 @@ pub(crate) async fn create_new_spec(
     }
 
     Ok(NewSpecOutcome {
-        interview,
+        interview: should_interview,
         created_path: Some(dest.display().to_string()),
     })
 }

@@ -19,6 +19,7 @@ use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 pub struct NewSpecFlags {
     pub interview: bool,
     pub non_interactive: bool,
+    pub issue_source: crate::data::issue::IssueSourceFlags,
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +229,7 @@ impl Command for NewCommand {
                     self.session.clone(),
                     f.interview,
                     f.non_interactive,
+                    f.issue_source,
                     frontend.as_mut(),
                 )
                 .await

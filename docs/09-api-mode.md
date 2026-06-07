@@ -145,7 +145,7 @@ awman remote run exec workflow aspec/workflows/implement-feature.toml \
 
 The `exec` subcommand group provides two commands for running agent tasks non-interactively from scripts, CI pipelines, or the API server — without a persistent session or TUI.
 
-### `awman exec prompt <prompt>`
+### `awman exec prompt [<prompt>]`
 
 Launches an agent container with a pre-supplied prompt. Behaves identically to `awman chat`, except the initial prompt is baked into the launch arguments rather than requiring a live terminal session.
 
@@ -159,20 +159,23 @@ awman exec prompt "Summarise recent changes" --non-interactive
 # Use a specific agent and model
 awman exec prompt "Refactor the auth module" --agent codex --model gpt-4o
 
+# Send a GitHub issue as the prompt
+awman exec prompt --issue 84
+
+# Prepend your own context to the issue
+awman exec prompt "Security review for: " --issue 84
+
 # Full autonomous run
 awman exec prompt "Implement caching for the API layer" --yolo --non-interactive
 ```
 
-The prompt must be non-empty. Passing an empty string exits immediately with:
-
-```
-error: prompt cannot be empty
-```
+When neither a positional prompt nor `--issue` are provided, the command exits with an error. When `--issue` is used alone, the positional prompt is optional. When both a positional prompt and `--issue` are provided, your text appears first, followed by the issue content.
 
 **Flags accepted by `exec prompt`:**
 
 | Flag | Description |
 |------|-------------|
+| `--issue <ref>` | GitHub issue number, URL, or `owner/repo#N`; see [GitHub Integration](12-github-integration.md) |
 | `--non-interactive` / `-n` | Run in print/batch mode — agent executes and exits |
 | `--plan` | Read-only analysis mode — agent cannot modify files |
 | `--allow-docker` | Mount host Docker socket into the container |
@@ -197,8 +200,11 @@ awman exec workflow ./aspec/workflows/implement-feature.md
 # Alias: exec wf
 awman exec wf ./aspec/workflows/implement-feature.md
 
-# Optionally associate a work item for template variable substitution
+# Associate a local work item for template variable substitution
 awman exec workflow ./aspec/workflows/implement-feature.md --work-item 0053
+
+# Or fetch a GitHub issue instead
+awman exec workflow ./aspec/workflows/implement-feature.md --issue 84
 
 # Non-interactive workflow run
 awman exec workflow ./aspec/workflows/review.md --non-interactive
@@ -206,21 +212,21 @@ awman exec workflow ./aspec/workflows/review.md --non-interactive
 
 `exec workflow` and `exec wf` are identical — `wf` is a short alias.
 
-**Work item template variables:** When no `--work-item` is given, prompt templates that use `{{work_item_number}}`, `{{work_item_content}}`, or `{{work_item_section:[Name]}}` are left unexpanded with a warning:
+**Work item template variables:** When no `--work-item` or `--issue` is given, prompt templates that use `{{work_item_number}}`, `{{work_item_content}}`, or `{{work_item_section:[Name]}}` are left unexpanded with a warning:
 
 ```
 warning: workflow uses {{work_item_content}} but no --work-item was provided; placeholder left unexpanded
 ```
 
-When `--work-item <N>` is provided, awman resolves the work item file from the configured work items directory and substitutes all template variables.
+When `--work-item <N>` is provided, awman resolves the work item file from the configured work items directory and substitutes all template variables. When `--issue <ref>` is provided, awman fetches the GitHub issue and substitutes the same template variables.
 
-**Workflow state files:** When no work item is given, the state file is keyed by the workflow file's name and content hash:
+**Workflow state files:** When no work item or issue is given, the state file is keyed by the workflow file's name and content hash:
 
 ```
 ~/.awman/api/<workflow-name>-<content-hash8>.state.json
 ```
 
-When a work item is given, the state file is saved to:
+When a work item or issue is given, the state file is saved to:
 
 ```
 $GITROOT/.awman/workflows/<repo-hash8>-<work-item>-<workflow-name>.json
@@ -231,6 +237,7 @@ $GITROOT/.awman/workflows/<repo-hash8>-<work-item>-<workflow-name>.json
 | Flag | Description |
 |------|-------------|
 | `--work-item <N>` / `-w <N>` | Work item number; enables template variable substitution |
+| `--issue <ref>` | GitHub issue number, URL, or `owner/repo#N`; mutually exclusive with `--work-item` |
 | `--non-interactive` / `-n` | Run each step's agent in print/batch mode |
 | `--plan` | Read-only mode for all steps |
 | `--allow-docker` | Mount host Docker socket into each step's container |

@@ -28,11 +28,14 @@ awman exec workflow aspec/workflows/implement-hard.toml
 # Run a workflow and associate a work item for template variable substitution
 awman exec workflow aspec/workflows/implement-hard.toml --work-item 0027
 
+# Run a workflow against a GitHub issue
+awman exec workflow aspec/workflows/implement-hard.toml --issue 84
+
 # Run a workflow without a work item
 awman exec workflow aspec/workflows/dependency-upgrade.toml
 ```
 
-Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution. See [API Mode](09-api-mode.md#awman-exec-workflow-path--awman-exec-wf-path) for usage in CI and scripting contexts.
+Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution, or with `--issue` to use a GitHub issue directly. See [API Mode](09-api-mode.md#awman-exec-workflow-path--awman-exec-wf-path) for usage in CI and scripting contexts. For more on GitHub integration, see [GitHub Integration](12-github-integration.md).
 
 The TUI shows a **workflow status strip** between the execution window and the command box, with one coloured box per step. After each step completes, a confirmation dialog appears — press **Enter** to advance, **q** to pause. State is saved to disk so you can resume later.
 

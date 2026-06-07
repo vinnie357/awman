@@ -646,9 +646,9 @@ const EXEC_PROMPT: CommandSpec = CommandSpec {
         name: "prompt",
         help: "The prompt text to send to the agent.",
         kind: ArgumentKind::String,
-        optional: false,
+        optional: true,
     }],
-    flags: &AGENT_RUN_FLAGS_NO_WORKTREE,
+    flags: &EXEC_PROMPT_FLAGS,
     api_allowed: true,
     subcommands: &[],
 };
@@ -960,7 +960,7 @@ const REMOTE_EXEC_WORKFLOW_KEPT: usize =
 const REMOTE_EXEC_WORKFLOW_TOTAL: usize = REMOTE_TRANSPORT_FLAGS.len() + REMOTE_EXEC_WORKFLOW_KEPT;
 
 const REMOTE_EXEC_PROMPT_KEPT: usize = count_kept(
-    &AGENT_RUN_FLAGS_NO_WORKTREE,
+    &EXEC_PROMPT_FLAGS,
     REMOTE_EXEC_EXCLUDED_FLAG_NAMES,
 );
 const REMOTE_EXEC_PROMPT_TOTAL: usize = REMOTE_TRANSPORT_FLAGS.len() + REMOTE_EXEC_PROMPT_KEPT;
@@ -993,7 +993,7 @@ const REMOTE_EXEC_WORKFLOW_FLAGS: [FlagSpec; REMOTE_EXEC_WORKFLOW_TOTAL] =
 
 const REMOTE_EXEC_PROMPT_FLAGS: [FlagSpec; REMOTE_EXEC_PROMPT_TOTAL] =
     build_remote_flags::<REMOTE_EXEC_PROMPT_TOTAL>(
-        &AGENT_RUN_FLAGS_NO_WORKTREE,
+        &EXEC_PROMPT_FLAGS,
         REMOTE_EXEC_EXCLUDED_FLAG_NAMES,
     );
 
@@ -1168,6 +1168,17 @@ const NEW_SPEC: CommandSpec = CommandSpec {
             help: "Run the interview agent in non-interactive (print) mode.",
             kind: FlagKind::Bool,
             default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "issue",
+            short: None,
+            help: "GitHub issue number, URL, or owner/repo#N to use as spec input.",
+            kind: FlagKind::OptionalString,
+            default: FlagDefault::None,
             frontends: FrontendVisibility::All,
             conflicts_with: &[],
             implies: &[],
@@ -1377,7 +1388,111 @@ const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 8] = [
     },
 ];
 
-const EXEC_WORKFLOW_FLAGS: [FlagSpec; 10] = [
+/// Agent-run flags for `exec prompt` — extends `AGENT_RUN_FLAGS_NO_WORKTREE`
+/// with `--issue`. Scoped to `exec prompt` only; `chat` retains the base set.
+const EXEC_PROMPT_FLAGS: [FlagSpec; 9] = [
+    FlagSpec {
+        long: "non-interactive",
+        short: Some('n'),
+        help: "Run the agent in non-interactive (print) mode.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "plan",
+        short: None,
+        help: "Run the agent in plan mode (read-only).",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &["yolo"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "allow-docker",
+        short: None,
+        help: "Mount the host Docker daemon socket into the agent container.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "yolo",
+        short: None,
+        help: "Enable fully autonomous mode.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &["plan"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "auto",
+        short: None,
+        help: "Enable auto permission mode.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "agent",
+        short: None,
+        help: "Agent to use (overrides .awman/config.json).",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "model",
+        short: None,
+        help: "Override the model used by the launched agent.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "overlay",
+        short: None,
+        help: "Mount a host directory into the agent container. Repeatable.",
+        kind: FlagKind::VecString,
+        default: FlagDefault::EmptyVec,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "issue",
+        short: None,
+        help: "GitHub issue number, URL, or owner/repo#N to use as the prompt.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+];
+
+const EXEC_WORKFLOW_FLAGS: [FlagSpec; 11] = [
     FlagSpec {
         long: "work-item",
         short: None,
@@ -1385,7 +1500,7 @@ const EXEC_WORKFLOW_FLAGS: [FlagSpec; 10] = [
         kind: FlagKind::OptionalString,
         default: FlagDefault::None,
         frontends: FrontendVisibility::All,
-        conflicts_with: &[],
+        conflicts_with: &["issue"],
         implies: &[],
         optional: true,
     },
@@ -1485,6 +1600,17 @@ const EXEC_WORKFLOW_FLAGS: [FlagSpec; 10] = [
         default: FlagDefault::EmptyVec,
         frontends: FrontendVisibility::All,
         conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "issue",
+        short: None,
+        help: "GitHub issue number, URL, or owner/repo#N to use as work item input.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &["work-item"],
         implies: &[],
         optional: true,
     },

@@ -108,10 +108,12 @@ pub trait IssueSource {
 
     /// Returns a hyphen-delimited, lowercase string that uniquely identifies
     /// this issue in the provider's native form. Used as the slug component of
-    /// work item filenames (e.g. `0084-owner-repo-84-short-title.md`) and git
-    /// branch names (e.g. `awman/owner-repo-84-short-title`). Must contain
-    /// only lowercase alphanumerics and hyphens, no leading or trailing
-    /// hyphens, and must be unique for a particular issue within the provider.
+    /// work item filenames (e.g. `0084-owner-repo-84-short-title.md`) and as
+    /// the workflow-name component of worktree branch names (e.g.
+    /// `awman/workflow-owner-repo-84-short-title`, following the existing
+    /// `branch_name_for_workflow` convention). Must contain only lowercase
+    /// alphanumerics and hyphens, no leading or trailing hyphens, and must
+    /// be unique for a particular issue within the provider.
     /// No default — each provider encodes its own canonical identifier form.
     fn title_slug(&self, issue: &Issue) -> String;
 
@@ -249,7 +251,7 @@ In the workflow execution path where `work_item` context is resolved:
    - Compute its path relative to `git_root` and combine with the container workspace root (`/workspace`)
    - Filename: `{NNNN}-{title_slug}.md` where NNNN = `issue.numeric_id()` zero-padded to 4 digits, or `0000` if None
 7. Add `OverlaySpec { host_path: temp_path, container_path: container_target, permission: ReadOnly }` to every container in the workflow (injected in `CommandLayerFactory::build()` alongside existing overlays)
-8. When `--worktree` is also set, use `title_slug` as the branch name component: `awman/{title_slug}` (following the existing worktree branch naming scheme, substituting the issue slug in place of the work item file slug)
+8. When `--worktree` is also set, use `title_slug` as the workflow-name component passed to the existing `WorktreeLifecycle::for_workflow` / `branch_name_for_workflow` helper, producing `awman/workflow-{title_slug}` (substituting the issue slug in place of the workflow filename slug)
 9. After workflow completion (success or error), delete the temp file via a `scopeguard` or `Drop` wrapper to guarantee cleanup
 
 The overlay builder function signature is `issue_source_overlay(source: &dyn IssueSource, issue: &Issue, ...) -> OverlaySpec` — no concrete provider types.
@@ -311,7 +313,7 @@ Add `pub mod issue;` to `src/data/mod.rs`.
 - **Very long owner or repo name**: `title_slug()` applies an overall maximum length (e.g. 100 chars); the unique identifier portion (owner/repo/number for GitHub) is prepended before the title so truncation only ever cuts the title, never the uniqueness-bearing component
 - **Title produces the same slug for two different issues**: impossible for GitHub because the number is always included; all providers must include their unique identifier before any title component — this is an explicit invariant of `title_slug()`
 - **Non-ASCII characters in title**: `slugify()` treats them as non-alphanumeric and replaces with hyphens; the resulting slug is always pure ASCII
-- **`title_slug()` result used as a git branch suffix**: the result contains only lowercase alphanumeric and hyphens, no consecutive hyphens, no leading/trailing hyphens — git-ref-safe by construction; no additional sanitization required in the branch naming path
+- **`title_slug()` result used as a git branch suffix**: the result contains only lowercase alphanumeric and hyphens, no consecutive hyphens, no leading/trailing hyphens — git-ref-safe by construction; no additional sanitization required in the branch naming path. The composed branch name is `awman/workflow-{title_slug}` (via `branch_name_for_workflow`).
 - **Future provider whose issues have non-numeric IDs**: `numeric_id()` returns `None`; `WorkItemContext::number` and the NNNN container filename prefix both fall back to `0`/`"0000"` without any special casing in the command layer; the provider's `title_slug()` encodes uniqueness via its own identifier form
 - **Two providers with overlapping `can_handle` patterns**: router returns the first match in registration order; `IssueSourceRouter::default()` documents the priority order explicitly
 - **`exec prompt` with neither positional prompt nor `--issue`**: caught in the command handler before any routing or network call; returns a `CommandError` — not a router error, since neither flag has been examined yet
@@ -333,7 +335,7 @@ Add `pub mod issue;` to `src/data/mod.rs`.
 - **Unit tests for `new spec` filename derivation**: when `--issue` is set, the generated filename is `{NNNN}-{title_slug}.md` and the user is not prompted for a title; verify `title_slug()` output drives the slug portion; combined with `--interview` is valid and prefill content reaches `render_interview_prompt`
 - **Unit tests for `exec workflow` flag parsing**: `--issue` populates `issue_source.issue`; `--issue` + `--work-item` returns a mutual-exclusion error before routing; `WorkItemContext` is populated from `Issue`; `numeric_id() = None` produces `number: 0`
 - **Integration test for workflow overlay injection**: `OverlaySpec` for the temp file appears in container options when `--issue` is used; temp file is named `awman-issue-{pid}-{title_slug}.md`; container filename is `{NNNN}-{title_slug}.md`; container path is derived correctly from the configured work-items dir
-- **Integration test for worktree branch naming**: when `--issue` and `--worktree` are both set, the created branch is `awman/{title_slug}`
+- **Integration test for worktree branch naming**: when `--issue` and `--worktree` are both set, the created branch is `awman/workflow-{title_slug}` (the `title_slug` is fed to the existing `branch_name_for_workflow` helper)
 - **Integration test for temp file cleanup**: temp file deleted after workflow completion on both success and error paths
 - **Unit tests for `exec prompt` flag parsing**: `--issue` populates `issue_source.issue`; positional `prompt` absent with `--issue` present is valid; both absent returns an error; both present constructs `{user}\n\n{issue}` with user text first
 - **Unit tests for `exec prompt` prompt construction**: only user text passes through unchanged; only issue uses `format_as_markdown` output; combined appends with double newline separator; issue with empty body produces title-only string without trailing whitespace

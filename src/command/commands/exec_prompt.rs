@@ -18,7 +18,7 @@ use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
 #[derive(Debug, Clone)]
 pub struct ExecPromptCommandFlags {
-    pub prompt: String,
+    pub prompt: Option<String>,
     pub non_interactive: bool,
     pub plan: bool,
     pub allow_docker: bool,
@@ -27,6 +27,7 @@ pub struct ExecPromptCommandFlags {
     pub agent: Option<String>,
     pub model: Option<String>,
     pub overlay: Vec<String>,
+    pub issue_source: crate::data::issue::IssueSourceFlags,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,6 +72,20 @@ async fn ensure_exec_prompt_agent_setup(
         .map_err(CommandError::from)
 }
 
+/// Build the final prompt string by combining an optional user-provided text
+/// and an optional issue markdown block. Exposed for unit testing.
+pub(crate) fn build_prompt_string(
+    user_prompt: Option<&str>,
+    issue_markdown: Option<&str>,
+) -> Option<String> {
+    match (user_prompt, issue_markdown) {
+        (Some(user), Some(issue)) => Some(format!("{user}\n\n{issue}")),
+        (Some(user), None) => Some(user.to_string()),
+        (None, Some(issue)) => Some(issue.to_string()),
+        (None, None) => None,
+    }
+}
+
 pub struct ExecPromptCommand {
     flags: ExecPromptCommandFlags,
     engines: Engines,
@@ -101,6 +116,46 @@ impl Command for ExecPromptCommand {
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
         let session = self.session;
+
+        // Validate that at least one of prompt and --issue is provided.
+        if self.flags.prompt.is_none() && self.flags.issue_source.issue.is_none() {
+            return Err(CommandError::Other(
+                "exec prompt: either a prompt argument or --issue must be provided".to_string(),
+            ));
+        }
+
+        // Resolve issue if --issue was provided.
+        let issue_markdown = if let Some(ref issue_ref) = self.flags.issue_source.issue {
+            let router = crate::data::issue::router::IssueSourceRouter::default();
+            match router.fetch_issue(issue_ref, session.git_root()) {
+                Ok((issue, source)) => {
+                    let md = source.format_as_markdown(&issue);
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: format!("exec prompt: fetched issue '{}'", issue.title),
+                    });
+                    Some(md)
+                }
+                Err(e) => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("exec prompt: failed to fetch issue: {e}"),
+                    });
+                    return Err(CommandError::Other(e.to_string()));
+                }
+            }
+        } else {
+            None
+        };
+
+        // Construct the final prompt string. The earlier validation above
+        // guarantees at least one input is present, so this cannot be None.
+        let final_prompt = build_prompt_string(
+            self.flags.prompt.as_deref(),
+            issue_markdown.as_deref(),
+        )
+        .expect("validated above: at least one of prompt or --issue must be present");
+
         let agent = match resolve_agent(&self.flags.agent, &session) {
             Ok(a) => a,
             Err(e) => {
@@ -196,7 +251,7 @@ impl Command for ExecPromptCommand {
             allow_docker: self.flags.allow_docker,
             non_interactive: self.flags.non_interactive,
             model: self.flags.model.clone(),
-            initial_prompt: Some(self.flags.prompt.clone()),
+            initial_prompt: Some(final_prompt),
             env_passthrough: if collected.env_passthrough.is_empty() {
                 None
             } else {
@@ -271,5 +326,67 @@ impl Command for ExecPromptCommand {
             agent: Some(agent.as_str().to_string()),
             exit_code,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_prompt_only_user_text() {
+        let result = build_prompt_string(Some("my prompt"), None);
+        assert_eq!(result, Some("my prompt".to_string()));
+    }
+
+    #[test]
+    fn build_prompt_only_issue_text() {
+        let result = build_prompt_string(None, Some("# Issue Title\n\nBody"));
+        assert_eq!(result, Some("# Issue Title\n\nBody".to_string()));
+    }
+
+    #[test]
+    fn build_prompt_both_user_and_issue_separated_by_double_newline() {
+        let result = build_prompt_string(Some("context"), Some("# Issue"));
+        assert_eq!(result, Some("context\n\n# Issue".to_string()));
+    }
+
+    #[test]
+    fn build_prompt_both_absent_returns_none() {
+        let result = build_prompt_string(None, None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn build_prompt_issue_with_empty_body_uses_title_only_markdown() {
+        // format_as_markdown with empty body produces "# Title Only".
+        use crate::data::issue::{Issue, IssueSource, IssueSourceError};
+        use std::path::Path;
+
+        struct FakeSource;
+        impl IssueSource for FakeSource {
+            fn provider_name(&self) -> &str { "Test" }
+            fn can_handle(&self, _: &str) -> bool { false }
+            fn fetch_issue(&self, _: &str, _: &Path) -> Result<Issue, IssueSourceError> {
+                unimplemented!()
+            }
+            fn title_slug(&self, _: &Issue) -> String { String::new() }
+        }
+        let issue = Issue {
+            source_id: String::new(),
+            title: "Title Only".into(),
+            body: String::new(),
+            provider: "Test".into(),
+        };
+        let md = FakeSource.format_as_markdown(&issue);
+        assert_eq!(md, "# Title Only");
+
+        // When used as the issue_markdown argument, no trailing whitespace.
+        let combined = build_prompt_string(Some("user text"), Some(&md));
+        assert_eq!(combined, Some("user text\n\n# Title Only".to_string()));
+
+        // When used alone, no trailing whitespace.
+        let alone = build_prompt_string(None, Some(&md));
+        assert_eq!(alone, Some("# Title Only".to_string()));
     }
 }

@@ -227,6 +227,18 @@ After creating the file, prompts for a brief summary of the work, then launches 
 
 In the TUI, a freeform text box dialog opens for the summary input. Use **Ctrl+Enter** to submit or **Esc** to cancel.
 
+### Creating a spec from a GitHub issue
+
+```sh
+awman new spec --issue 84                                                      # bare number
+awman new spec --issue prettysmartdev/awman#84                                 # owner/repo shorthand
+awman new spec --issue https://github.com/prettysmartdev/awman/issues/84      # full URL
+```
+
+Fetches the GitHub issue and launches an agent to generate a structured work item spec from its content. Combined with `--interview`, the issue description is pre-populated in the text box for editing before the agent runs.
+
+For full details on GitHub integration, authentication, and input formats, see [GitHub Integration](12-github-integration.md).
+
 ### Updating a spec after implementation
 
 ```sh
