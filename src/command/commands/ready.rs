@@ -191,7 +191,10 @@ impl Command for ReadyCommand {
 
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
-            text: "Checking Docker availability…".into(),
+            text: format!(
+                "Checking {} availability…",
+                self.engines.runtime.display_name()
+            ),
         });
 
         frontend.write_message(UserMessage {

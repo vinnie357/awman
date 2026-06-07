@@ -67,6 +67,15 @@ impl ContainerRuntime {
         self.backend.name()
     }
 
+    /// User-facing display name for the chosen backend
+    /// (e.g. `"Docker"`, `"Apple Containers"`).
+    pub fn display_name(&self) -> &'static str {
+        match self.backend.name() {
+            "apple-containers" => "Apple Containers",
+            _ => "Docker",
+        }
+    }
+
     /// Build a fully-configured `ContainerInstance` from the given options.
     pub fn build(
         &self,

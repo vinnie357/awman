@@ -210,7 +210,9 @@ impl ReadyEngine {
                 // Issue 22: Docker daemon pre-check — soft failure allows
                 // run_to_completion to surface a summary rather than aborting.
                 if !self.container_runtime.is_available() {
-                    let msg = "Docker daemon is not running. Install Docker and retry.".to_string();
+                    let runtime = self.container_runtime.display_name();
+                    let msg =
+                        format!("{runtime} is not available. Ensure {runtime} is running and retry.");
                     self.summary.base_image = StepStatus::Failed(msg.clone());
                     frontend.report_step_status("Build base image", StepStatus::Failed(msg));
                     // Bypass the `self.phase = next` assignment below to short-
@@ -264,7 +266,7 @@ impl ReadyEngine {
                 // failed and continue, so the setup task exits promptly in
                 // sandboxed test environments.
                 if !self.container_runtime.is_available() {
-                    let msg = "Docker daemon is not running.".to_string();
+                    let msg = format!("{} is not available.", self.container_runtime.display_name());
                     self.summary.agent_image = StepStatus::Failed(msg.clone());
                     frontend.report_step_status("Build agent image", StepStatus::Failed(msg));
                     return Ok({
