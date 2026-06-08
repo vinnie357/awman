@@ -160,7 +160,12 @@
       "Bash(container --help)",
       "Bash(container image *)",
       "Bash(container run *)",
-      "Bash(env)"
+      "Bash(env)",
+      "Bash(./target/debug/awman chat *)",
+      "Bash(container ls *)",
+      "Bash(container rm *)",
+      "Bash(awk 'NR==1 || /awman/')",
+      "Bash(container inspect *)"
     ]
   }
 }

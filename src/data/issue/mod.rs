@@ -9,6 +9,8 @@ pub mod router;
 use std::fmt;
 use std::path::Path;
 
+use crate::engine::message::UserMessageSink;
+
 /// Generic output of every `IssueSource`.
 #[derive(Debug, Clone)]
 pub struct Issue {
@@ -130,6 +132,18 @@ pub trait IssueSource: Send + Sync {
     /// this issue. Used as the slug component of work item filenames and git
     /// branch names.
     fn title_slug(&self, issue: &Issue) -> String;
+
+    /// Like `fetch_issue`, but writes progress messages to the sink so the
+    /// user sees which external commands or API requests are being performed.
+    /// Default: delegates to `fetch_issue` with no progress output.
+    fn fetch_issue_with_progress(
+        &self,
+        input: &str,
+        git_root: &Path,
+        _sink: &mut dyn UserMessageSink,
+    ) -> Result<Issue, IssueSourceError> {
+        self.fetch_issue(input, git_root)
+    }
 
     /// Render the issue as markdown for use in prompts and work item files.
     fn format_as_markdown(&self, issue: &Issue) -> String {

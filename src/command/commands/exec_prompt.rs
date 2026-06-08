@@ -127,7 +127,7 @@ impl Command for ExecPromptCommand {
         // Resolve issue if --issue was provided.
         let issue_markdown = if let Some(ref issue_ref) = self.flags.issue_source.issue {
             let router = crate::data::issue::router::IssueSourceRouter::default();
-            match router.fetch_issue(issue_ref, session.git_root()) {
+            match router.fetch_issue_with_progress(issue_ref, session.git_root(), &mut *frontend) {
                 Ok((issue, source)) => {
                     let md = source.format_as_markdown(&issue);
                     frontend.write_message(UserMessage {

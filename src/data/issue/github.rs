@@ -3,6 +3,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
+
 use super::{slugify, Issue, IssueSource, IssueSourceError};
 
 const OVERALL_SLUG_MAX: usize = 100;
@@ -50,6 +52,37 @@ impl IssueSource for GithubIssueSource {
         }
 
         // Fall back to REST API
+        fetch_rest_api(&owner, &repo, number, self.provider_name())
+    }
+
+    fn fetch_issue_with_progress(
+        &self,
+        input: &str,
+        git_root: &Path,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<Issue, IssueSourceError> {
+        let input = input.trim();
+        let (owner, repo, number) = parse_input(input, git_root, self.provider_name())?;
+
+        sink.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!(
+                "running: gh issue view {number} --repo {owner}/{repo} --json number,title,body,url"
+            ),
+        });
+
+        if let Some(issue) = try_gh_cli(&owner, &repo, number, self.provider_name()) {
+            return Ok(issue);
+        }
+
+        let api_url = format!(
+            "https://api.github.com/repos/{owner}/{repo}/issues/{number}"
+        );
+        sink.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!("gh CLI unavailable, falling back to REST API: GET {api_url}"),
+        });
+
         fetch_rest_api(&owner, &repo, number, self.provider_name())
     }
 
@@ -1022,5 +1055,99 @@ exit 0
             Err(IssueSourceError::RateLimited { provider }) => assert_eq!(provider, "GitHub"),
             other => panic!("429: expected RateLimited, got {other:?}"),
         }
+    }
+
+    // ── fetch_issue_with_progress tests ──────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn fetch_with_progress_emits_gh_command_message_on_success() {
+        use crate::engine::message::RecordingMessageSink;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Set up a fake git repo with a GitHub remote
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["remote", "add", "origin", "https://github.com/myorg/myrepo.git"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
+        // Prepend a fake gh to PATH that succeeds
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir(&bin_dir).unwrap();
+        let script = bin_dir.join("gh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+echo '{"number":42,"title":"Test","body":"body","url":"https://github.com/myorg/myrepo/issues/42"}'
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{orig_path}", bin_dir.display()));
+
+        let mut sink = RecordingMessageSink::new();
+        let result = GithubIssueSource.fetch_issue_with_progress("42", tmp.path(), &mut sink);
+
+        std::env::set_var("PATH", &orig_path);
+
+        assert!(result.is_ok());
+        let messages = sink.all();
+        assert!(
+            !messages.is_empty(),
+            "expected at least one progress message"
+        );
+        assert!(
+            messages[0].text.contains("gh issue view 42 --repo myorg/myrepo"),
+            "first message should describe the gh command, got: {}",
+            messages[0].text
+        );
+    }
+
+    #[test]
+    fn fetch_with_progress_emits_fallback_message_when_gh_fails() {
+        use crate::engine::message::RecordingMessageSink;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Use a full URL input so parse_input doesn't need a git remote.
+        // gh CLI will fail (the repo doesn't exist), triggering the REST
+        // fallback message. We don't need to manipulate PATH — a non-existent
+        // repo will cause gh to exit non-zero (or gh isn't installed at all).
+        let mut sink = RecordingMessageSink::new();
+        let _ = GithubIssueSource.fetch_issue_with_progress(
+            "https://github.com/nonexistent-test-org-xyz/nonexistent-repo-xyz/issues/99999",
+            tmp.path(),
+            &mut sink,
+        );
+
+        let messages = sink.all();
+        assert!(
+            messages.len() >= 2,
+            "expected at least 2 messages (gh attempt + fallback), got {}: {:?}",
+            messages.len(),
+            messages.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+        assert!(
+            messages[0].text.contains("gh issue view 99999"),
+            "first message should describe the gh command, got: {}",
+            messages[0].text
+        );
+        assert!(
+            messages[1].text.contains("falling back to REST API"),
+            "second message should describe the REST fallback, got: {}",
+            messages[1].text
+        );
     }
 }

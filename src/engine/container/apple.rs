@@ -323,6 +323,42 @@ impl ContainerBackend for AppleBackend {
     fn name(&self) -> &'static str {
         "apple-containers"
     }
+
+    fn image_home_dir(&self, tag: &str) -> Option<String> {
+        // `container image inspect` emits a JSON array of variants; the env
+        // list lives at `[0].variants[*].config.config.Env`. We pick the
+        // first variant whose env contains a non-empty `HOME=…` entry, which
+        // matches the runtime selection for single-platform images.
+        let output = Command::new("container")
+            .args(["image", "inspect", tag])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let arr: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+        let variants = arr.get(0)?.get("variants")?.as_array()?;
+        for variant in variants {
+            let env = variant
+                .get("config")
+                .and_then(|c| c.get("config"))
+                .and_then(|c| c.get("Env"))
+                .and_then(|v| v.as_array());
+            let Some(env) = env else { continue };
+            for entry in env {
+                if let Some(rest) = entry.as_str().and_then(|s| s.strip_prefix("HOME=")) {
+                    let v = rest.trim();
+                    if !v.is_empty() {
+                        return Some(v.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 struct AppleContainerInstance {
@@ -793,6 +829,16 @@ mod apple_tests {
         let handles = parse_apple_list_output(json);
         assert_eq!(handles.len(), 1);
         assert_eq!(handles[0].image_tag, "awman-myproj-claude:latest");
+    }
+
+    #[test]
+    fn image_home_dir_returns_none_for_unknown_image() {
+        // `container image inspect` exits non-zero for an unknown tag, and
+        // the helper must collapse that to `None` rather than panic — also
+        // covers the case where the `container` CLI itself isn't installed.
+        let backend = AppleBackend::new();
+        let bogus = "awman-test-image-that-does-not-exist:tag-xyz123";
+        assert!(backend.image_home_dir(bogus).is_none());
     }
 
     #[test]

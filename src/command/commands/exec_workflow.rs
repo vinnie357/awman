@@ -507,7 +507,7 @@ impl Command for ExecWorkflowCommand {
         let work_item_context = if let Some(ref issue_ref) = self.flags.issue_source.issue {
             // --issue: fetch issue and construct work item context from it.
             let router = crate::data::issue::router::IssueSourceRouter::default();
-            match router.fetch_issue(issue_ref, &git_root_for_scope) {
+            match router.fetch_issue_with_progress(issue_ref, &git_root_for_scope, &mut *frontend) {
                 Ok((issue, source)) => {
                     let work_items_dir = self
                         .session

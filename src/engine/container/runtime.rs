@@ -169,6 +169,17 @@ impl ContainerRuntime {
         Ok(())
     }
 
+    /// Read the image's baked-in `$HOME` from its config. Used by
+    /// `AgentEngine::build_options` to mount agent settings overlays at the
+    /// path the running container's user actually reads — when the
+    /// `Dockerfile.<agent>` has been changed but the image hasn't been
+    /// rebuilt, the image's User/HOME is the authority, not the Dockerfile.
+    /// Returns `None` when the image is missing or the runtime CLI is
+    /// unreachable.
+    pub fn image_home_dir(&self, tag: &str) -> Option<String> {
+        self.backend.image_home_dir(tag)
+    }
+
     /// Best-effort check whether an image tag exists locally on the runtime.
     /// Times out after 10 seconds to avoid hanging when the daemon is unresponsive.
     pub fn image_exists(&self, tag: &str) -> bool {

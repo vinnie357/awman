@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use crate::engine::message::UserMessageSink;
+
 use super::github::GithubIssueSource;
 use super::{Issue, IssueSource, IssueSourceError};
 
@@ -40,6 +42,18 @@ impl IssueSourceRouter {
     ) -> Result<(Issue, &dyn IssueSource), IssueSourceError> {
         let source = self.route(input)?;
         let issue = source.fetch_issue(input, git_root)?;
+        Ok((issue, source))
+    }
+
+    /// Like `fetch_issue`, but writes progress messages to the sink.
+    pub fn fetch_issue_with_progress(
+        &self,
+        input: &str,
+        git_root: &Path,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<(Issue, &dyn IssueSource), IssueSourceError> {
+        let source = self.route(input)?;
+        let issue = source.fetch_issue_with_progress(input, git_root, sink)?;
         Ok((issue, source))
     }
 }

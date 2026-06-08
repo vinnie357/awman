@@ -246,6 +246,36 @@ impl ContainerBackend for DockerBackend {
     fn name(&self) -> &'static str {
         "docker"
     }
+
+    fn image_home_dir(&self, tag: &str) -> Option<String> {
+        // Print one env entry per line so we can scan for `HOME=…` without
+        // parsing JSON. `docker image inspect` exits 0 even when User/Env are
+        // empty; the format expansion just produces nothing then.
+        let output = Command::new("docker")
+            .args([
+                "image",
+                "inspect",
+                "--format",
+                "{{range .Config.Env}}{{println .}}{{end}}",
+                tag,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(rest) = line.strip_prefix("HOME=") {
+                let v = rest.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        None
+    }
 }
 
 struct DockerContainerInstance {
@@ -1091,6 +1121,17 @@ mod tests {
             !argv.iter().any(|a| a.contains("bypass")),
             "yolo must not add a bypass flag"
         );
+    }
+
+    #[test]
+    fn image_home_dir_returns_none_for_unknown_image() {
+        // Missing image: `docker image inspect` exits non-zero so the helper
+        // must surface `None` rather than panic. Works regardless of whether
+        // the docker daemon is reachable, because `Command::output` errors
+        // collapse to `None` too.
+        let backend = DockerBackend::new();
+        let bogus = "awman-test-image-that-does-not-exist:tag-xyz123";
+        assert!(backend.image_home_dir(bogus).is_none());
     }
 
     #[test]

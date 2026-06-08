@@ -187,7 +187,8 @@ impl AgentEngine {
             ));
         }
 
-        let image = ImageRef::new(agent_image_tag(session.git_root(), agent.as_str()));
+        let image_tag = agent_image_tag(session.git_root(), agent.as_str());
+        let image = ImageRef::new(image_tag.clone());
         let entrypoint = agent_matrix::entrypoint_for(&matrix, run.non_interactive);
 
         let mut options = vec![
@@ -294,11 +295,22 @@ impl AgentEngine {
         ));
 
         // Overlays — agent settings + user-supplied dirs + skills.
-        // Detect non-root container user for overlay path expansion.
-        let container_home = {
-            let home = dirs::home_dir().unwrap_or_default();
-            crate::engine::overlay::detect_container_home(&home, agent.as_str(), session.git_root())
-        };
+        // Prefer the running image's baked-in `$HOME` (the actual runtime
+        // authority) over what the local `Dockerfile.<agent>` says — the
+        // two can diverge when the Dockerfile was changed but the image
+        // hasn't been rebuilt yet, in which case mounting at the
+        // Dockerfile-derived path silently breaks credential passthrough.
+        let container_home = self
+            .container_runtime
+            .image_home_dir(&image_tag)
+            .or_else(|| {
+                let home = dirs::home_dir().unwrap_or_default();
+                crate::engine::overlay::detect_container_home(
+                    &home,
+                    agent.as_str(),
+                    session.git_root(),
+                )
+            });
         let request = OverlayRequest {
             directories: run.directory_overlays.clone(),
             include_all_skills: run.include_all_skills,

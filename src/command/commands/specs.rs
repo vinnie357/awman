@@ -349,7 +349,7 @@ pub(crate) async fn create_new_spec(
     }
     let fetched_issue: Option<FetchedIssue> = if let Some(ref issue_ref) = issue_flags.issue {
         let router = crate::data::issue::router::IssueSourceRouter::default();
-        match router.fetch_issue(issue_ref, &git_root) {
+        match router.fetch_issue_with_progress(issue_ref, &git_root, frontend) {
             Ok((issue, source)) => {
                 let markdown = source.format_as_markdown(&issue);
                 let slug = source.title_slug(&issue);

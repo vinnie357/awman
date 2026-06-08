@@ -47,6 +47,17 @@ pub(super) trait ContainerBackend: Send + Sync {
     /// Static name used by `ContainerRuntime::runtime_name`.
     fn name(&self) -> &'static str;
 
+    /// Read the image's effective `$HOME` from its baked-in config. Used by
+    /// `AgentEngine::build_options` to mount agent settings overlays at the
+    /// path the running container's user actually reads — which can diverge
+    /// from the on-disk `Dockerfile.<agent>` after a Dockerfile change that
+    /// hasn't been followed by an image rebuild. Returns `None` when the
+    /// image is missing, the CLI is unreachable, or the image config has no
+    /// `HOME` env entry.
+    fn image_home_dir(&self, _tag: &str) -> Option<String> {
+        None
+    }
+
     /// CLI binary for this backend (`docker` or `container`). Default maps
     /// the well-known `name()` values; override when adding a backend whose
     /// binary differs from its name.
