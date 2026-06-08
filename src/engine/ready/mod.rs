@@ -530,6 +530,7 @@ impl ReadyEngine {
                         directory_overlays: vec![],
                         include_all_skills: false,
                         named_skills: vec![],
+                        image_tag_override: None,
                     };
                     match self.agent_engine.build_options(
                         &self.session,

@@ -325,6 +325,13 @@ impl ContainerExecutionFactory for CommandLayerFactory {
         )
         .map_err(|e| EngineError::Other(format!("overlay collection failed: {e}")))?;
 
+        // Use the original repo root for image tag derivation so worktree-
+        // based runs resolve the correct image for both the Image option AND
+        // for image_home_dir inspection (which determines overlay mount paths).
+        let correct_tag = crate::data::image_tags::agent_image_tag(
+            &self.image_git_root,
+            runtime.step_agent.as_str(),
+        );
         let run_opts = AgentRunOptions {
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
@@ -343,28 +350,12 @@ impl ContainerExecutionFactory for CommandLayerFactory {
             directory_overlays: collected.directories,
             include_all_skills: collected.include_all_skills,
             named_skills: collected.named_skills,
+            image_tag_override: Some(correct_tag),
         };
         let mut options =
             self.engines
                 .agent_engine
                 .build_options(session, &runtime.step_agent, &run_opts)?;
-
-        // Override the image tag to use the original repo root, not a worktree path.
-        let correct_tag = crate::data::image_tags::agent_image_tag(
-            &self.image_git_root,
-            runtime.step_agent.as_str(),
-        );
-        for opt in options.iter_mut() {
-            if matches!(
-                opt,
-                crate::engine::container::options::ContainerOption::Image(_)
-            ) {
-                *opt = crate::engine::container::options::ContainerOption::Image(
-                    crate::engine::container::options::ImageRef::new(correct_tag.clone()),
-                );
-                break;
-            }
-        }
 
         // Inject keychain credentials so the agent can reach its backend.
         // Mirrors the same step in `chat` and `exec_prompt`.
@@ -996,6 +987,7 @@ impl Command for ExecWorkflowCommand {
                     &cli_typed,
                     &setup_entry_overlays,
                     worktree_git_mount.as_ref(),
+                    &base_image,
                 );
 
                 // A bad overlay on ANY entry aborts the whole phase before
@@ -1086,6 +1078,7 @@ impl Command for ExecWorkflowCommand {
                         &cli_typed,
                         &teardown_entry_overlays,
                         worktree_git_mount.as_ref(),
+                        &base_image,
                     );
                     let runtime = Arc::clone(&self.engines.runtime);
                     let mount = mount_path.clone();
@@ -1286,6 +1279,7 @@ fn collect_single_entry_overlays(
     session: &Session,
     cli_typed: &[TypedOverlay],
     entry_overlays: Option<&[String]>,
+    image_tag: Option<&str>,
 ) -> Result<
     (
         Vec<crate::engine::container::options::OverlaySpec>,
@@ -1295,9 +1289,18 @@ fn collect_single_entry_overlays(
 > {
     let collected = collect_all_overlay_specs(session, cli_typed.to_vec(), entry_overlays)?;
 
-    let container_home = crate::engine::overlay::detect_home_from_dockerfile(
-        &session.git_root().join("Dockerfile.dev"),
-    );
+    // Prefer the running image's baked-in $HOME (the actual runtime
+    // authority) over what the local Dockerfile.dev says — the two can
+    // diverge when the Dockerfile was changed but the image hasn't been
+    // rebuilt yet, in which case mounting at the Dockerfile-derived path
+    // silently breaks credential passthrough.
+    let container_home = image_tag
+        .and_then(|tag| engines.runtime.image_home_dir(tag))
+        .or_else(|| {
+            crate::engine::overlay::detect_home_from_dockerfile(
+                &session.git_root().join("Dockerfile.dev"),
+            )
+        });
     let request = crate::engine::overlay::OverlayRequest {
         directories: collected.directories,
         include_all_skills: false,
@@ -1352,12 +1355,18 @@ fn resolve_phase_overlays(
     cli_typed: &[TypedOverlay],
     entries: &[Option<Vec<String>>],
     worktree_git_mount: Option<&crate::engine::container::options::OverlaySpec>,
+    image_tag: &str,
 ) -> Vec<PhaseOverlayResult> {
     entries
         .iter()
         .map(|entry| {
-            let (mut overlays, env) =
-                collect_single_entry_overlays(engines, session, cli_typed, entry.as_deref())?;
+            let (mut overlays, env) = collect_single_entry_overlays(
+                engines,
+                session,
+                cli_typed,
+                entry.as_deref(),
+                Some(image_tag),
+            )?;
             if let Some(wt) = worktree_git_mount {
                 overlays.push(wt.clone());
             }
@@ -1951,9 +1960,9 @@ prompt = "do something"
         let entry_b = vec!["env(WI0082_REVIEW_TOKEN_B)".to_string()];
 
         let (_, env_a) =
-            collect_single_entry_overlays(&engines, &session, &[], Some(&entry_a)).unwrap();
+            collect_single_entry_overlays(&engines, &session, &[], Some(&entry_a), None).unwrap();
         let (_, env_b) =
-            collect_single_entry_overlays(&engines, &session, &[], Some(&entry_b)).unwrap();
+            collect_single_entry_overlays(&engines, &session, &[], Some(&entry_b), None).unwrap();
 
         std::env::remove_var("WI0082_REVIEW_TOKEN_A");
         std::env::remove_var("WI0082_REVIEW_TOKEN_B");

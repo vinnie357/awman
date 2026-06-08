@@ -51,6 +51,11 @@ pub struct AgentRunOptions {
     pub include_all_skills: bool,
     /// Named skills to mount (when `include_all_skills` is false).
     pub named_skills: Vec<String>,
+    /// Override the image tag used for the container and for `image_home_dir`
+    /// inspection. When `Some`, this tag is used instead of deriving one from
+    /// `session.git_root()`. Needed when the session is rooted at a worktree
+    /// but the image was built from the original repo root.
+    pub image_tag_override: Option<String>,
 }
 
 #[derive(Clone)]
@@ -187,7 +192,10 @@ impl AgentEngine {
             ));
         }
 
-        let image_tag = agent_image_tag(session.git_root(), agent.as_str());
+        let image_tag = run
+            .image_tag_override
+            .clone()
+            .unwrap_or_else(|| agent_image_tag(session.git_root(), agent.as_str()));
         let image = ImageRef::new(image_tag.clone());
         let entrypoint = agent_matrix::entrypoint_for(&matrix, run.non_interactive);
 
