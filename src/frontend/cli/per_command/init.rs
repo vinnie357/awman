@@ -7,6 +7,7 @@
 use crate::data::config::repo::WorkItemsConfig;
 use crate::engine::container::frontend::ContainerFrontend;
 use crate::engine::error::EngineError;
+use crate::engine::init::frontend::DockerfileSetupDecision;
 use crate::engine::init::{InitFrontend, InitPhase, InitSummary};
 use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::step_status::StepStatus;
@@ -14,7 +15,7 @@ use crate::engine::step_status::StepStatus;
 use crate::frontend::cli::command_frontend::CliFrontend;
 use crate::frontend::cli::output::stdin_is_tty;
 
-use super::helpers::{render_summary_box, step_status_label, yes_no};
+use super::helpers::{pick_numbered, read_line, render_summary_box, step_status_label, yes_no};
 
 impl InitFrontend for CliFrontend {
     fn ask_replace_aspec(&mut self) -> Result<bool, EngineError> {
@@ -72,6 +73,44 @@ impl InitFrontend for CliFrontend {
         }))
     }
 
+    fn ask_dockerfile_setup(
+        &mut self,
+        git_root: &std::path::Path,
+    ) -> Result<DockerfileSetupDecision, EngineError> {
+        if !stdin_is_tty() {
+            return Ok(DockerfileSetupDecision::CreateNew);
+        }
+        let repo_cfg = crate::data::config::repo::RepoConfig::load(git_root)
+            .unwrap_or_default();
+        let display_path = repo_cfg
+            .dockerfile
+            .as_deref()
+            .unwrap_or("Dockerfile.dev");
+        let choice = pick_numbered(
+            &format!("No Dockerfile found at {display_path}. How would you like to proceed?"),
+            &[
+                "Create Dockerfile.dev from the built-in template (recommended)",
+                "Use an existing Dockerfile in this repo",
+                "Skip for now (configure manually in .awman/config.json)",
+            ],
+            1,
+        );
+        let path = if choice == 2 {
+            read_line("Enter the path to your Dockerfile (relative to repo root):").map(|p| {
+                if !p.is_empty() {
+                    let resolved = git_root.join(&p);
+                    if !resolved.exists() {
+                        eprintln!("awman: warning: {p} does not exist yet; saving anyway.");
+                    }
+                }
+                p
+            })
+        } else {
+            None
+        };
+        Ok(dockerfile_decision_from_input(true, choice, path))
+    }
+
     fn report_phase(&mut self, _phase: &InitPhase) {
         // InitPhase is an internal state-machine token; users see progress
         // through `report_step_status` and the final summary box.
@@ -108,5 +147,82 @@ impl InitFrontend for CliFrontend {
             format!("\n{box_str}{footer}").as_bytes(),
         );
         let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+}
+
+/// Pure decision logic for `ask_dockerfile_setup`, factored out for unit-testability.
+///
+/// `is_tty` — whether stdin is a TTY; `choice` — the 1-based numbered choice
+/// returned by `pick_numbered`; `path` — the Dockerfile path the user entered
+/// (only relevant when `choice == 2`).
+pub(crate) fn dockerfile_decision_from_input(
+    is_tty: bool,
+    choice: usize,
+    path: Option<String>,
+) -> DockerfileSetupDecision {
+    if !is_tty {
+        return DockerfileSetupDecision::CreateNew;
+    }
+    match choice {
+        2 => match path {
+            Some(p) if !p.is_empty() => DockerfileSetupDecision::UseExisting(p),
+            _ => DockerfileSetupDecision::CreateNew,
+        },
+        3 => DockerfileSetupDecision::Skip,
+        _ => DockerfileSetupDecision::CreateNew,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::dispatch::catalogue::CommandCatalogue;
+    use crate::engine::init::frontend::DockerfileSetupDecision;
+    use crate::engine::init::InitFrontend;
+
+    // ─── Non-TTY path ────────────────────────────────────────────────────────
+
+    #[test]
+    fn non_tty_stdin_returns_create_new() {
+        // Test environments never have a TTY attached to stdin, so
+        // ask_dockerfile_setup must return CreateNew immediately.
+        let cmd = CommandCatalogue::get().build_clap_command();
+        let m = cmd.try_get_matches_from(["awman", "init"]).unwrap();
+        let mut frontend = CliFrontend::new(m);
+        let result = frontend.ask_dockerfile_setup(std::path::Path::new("/tmp")).unwrap();
+        assert_eq!(result, DockerfileSetupDecision::CreateNew);
+    }
+
+    // ─── TTY decision logic (via injectable helper) ───────────────────────────
+
+    #[test]
+    fn tty_choice_1_returns_create_new() {
+        let result = dockerfile_decision_from_input(true, 1, None);
+        assert_eq!(result, DockerfileSetupDecision::CreateNew);
+    }
+
+    #[test]
+    fn tty_choice_2_with_path_returns_use_existing() {
+        let result = dockerfile_decision_from_input(
+            true,
+            2,
+            Some("docker/Dockerfile".to_string()),
+        );
+        assert_eq!(
+            result,
+            DockerfileSetupDecision::UseExisting("docker/Dockerfile".to_string())
+        );
+    }
+
+    #[test]
+    fn tty_choice_3_returns_skip() {
+        let result = dockerfile_decision_from_input(true, 3, None);
+        assert_eq!(result, DockerfileSetupDecision::Skip);
+    }
+
+    #[test]
+    fn tty_choice_2_with_empty_path_falls_back_to_create_new() {
+        let result = dockerfile_decision_from_input(true, 2, Some(String::new()));
+        assert_eq!(result, DockerfileSetupDecision::CreateNew);
     }
 }

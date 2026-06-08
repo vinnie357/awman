@@ -178,32 +178,50 @@ impl ReadyEngine {
                     });
                 }
 
-                let dockerfile_path = git_root.join("Dockerfile.dev");
+                let dockerfile_path = self
+                    .session
+                    .repo_config()
+                    .dockerfile_path_or_default(&git_root);
                 if dockerfile_path.exists() {
                     self.summary.dockerfile = StepStatus::Done;
-                    frontend.report_step_status("Check Dockerfile.dev", StepStatus::Done);
+                    frontend.report_step_status(
+                        &format!("Check {}", dockerfile_path.display()),
+                        StepStatus::Done,
+                    );
                     ReadyPhase::BuildingBaseImage
                 } else {
                     ReadyPhase::AwaitingDockerfileDecision
                 }
             }
             ReadyPhase::AwaitingDockerfileDecision => {
-                if frontend.ask_create_dockerfile()? {
+                let configured_path = self
+                    .session
+                    .repo_config()
+                    .dockerfile_path_or_default(&git_root);
+                if frontend.ask_create_dockerfile(&configured_path)? {
                     ReadyPhase::CreatingDockerfile
                 } else {
                     ReadyPhase::Failed(ReadyFailure {
                         phase: "AwaitingDockerfileDecision".into(),
-                        message: "user declined to create Dockerfile.dev".into(),
+                        message: format!(
+                            "user declined to create {}",
+                            configured_path.display()
+                        ),
                     })
                 }
             }
             ReadyPhase::CreatingDockerfile => {
-                let paths = RepoDockerfilePaths::new(&git_root);
-                let dockerfile_path = paths.project_dockerfile();
+                let dockerfile_path = self
+                    .session
+                    .repo_config()
+                    .dockerfile_path_or_default(&git_root);
                 std::fs::write(&dockerfile_path, templates::project_dockerfile_dev())
                     .map_err(|e| EngineError::io(dockerfile_path.clone(), e))?;
                 self.summary.dockerfile = StepStatus::Done;
-                frontend.report_step_status("Create Dockerfile.dev", StepStatus::Done);
+                frontend.report_step_status(
+                    &format!("Create {}", dockerfile_path.display()),
+                    StepStatus::Done,
+                );
                 ReadyPhase::BuildingBaseImage
             }
             ReadyPhase::BuildingBaseImage => {
@@ -233,7 +251,10 @@ impl ReadyEngine {
                     ReadyPhase::BuildingAgentImage
                 } else {
                     frontend.report_step_status("Build base image", StepStatus::Running);
-                    let dockerfile_path = git_root.join("Dockerfile.dev");
+                    let dockerfile_path = self
+                        .session
+                        .repo_config()
+                        .dockerfile_path_or_default(&git_root);
                     let mut sink = |line: &str| {
                         frontend.report_step_status(line, StepStatus::Running);
                     };
@@ -484,9 +505,10 @@ impl ReadyEngine {
                         );
                     }
                 }
-                // Capture a hash of Dockerfile.dev before the audit so we can
-                // detect agent-made changes in RebuildingAfterAudit.
-                let dockerfile_path = git_root.join("Dockerfile.dev");
+                let dockerfile_path = self
+                    .session
+                    .repo_config()
+                    .dockerfile_path_or_default(&git_root);
                 self.pre_audit_dockerfile_hash = dockerfile_hash(&dockerfile_path);
                 ReadyPhase::RunningAudit
             }
@@ -497,10 +519,10 @@ impl ReadyEngine {
                     self.phase = ReadyPhase::RebuildingAfterAudit;
                     return Ok(self.phase.clone());
                 }
-                // Inform the frontend whether the Dockerfile.dev still matches
-                // the bundled template — the UI can show a hint that the audit
-                // may overwrite customisations.
-                let dockerfile_path = git_root.join("Dockerfile.dev");
+                let dockerfile_path = self
+                    .session
+                    .repo_config()
+                    .dockerfile_path_or_default(&git_root);
                 if dockerfile_path.exists() {
                     let content = std::fs::read_to_string(&dockerfile_path).unwrap_or_default();
                     if !templates::dockerfile_matches_template(&content) {
@@ -575,9 +597,11 @@ impl ReadyEngine {
                 ReadyPhase::RebuildingAfterAudit
             }
             ReadyPhase::RebuildingAfterAudit => {
-                // Only rebuild when the audit ran successfully AND modified Dockerfile.dev.
                 if matches!(self.summary.audit, StepStatus::Done) {
-                    let dockerfile_path = git_root.join("Dockerfile.dev");
+                    let dockerfile_path = self
+                        .session
+                        .repo_config()
+                        .dockerfile_path_or_default(&git_root);
                     let post_hash = dockerfile_hash(&dockerfile_path);
                     let changed = match (self.pre_audit_dockerfile_hash, post_hash) {
                         (Some(pre), Some(post)) => pre != post,
@@ -710,6 +734,8 @@ mod tests {
         run_audit: bool,
         phases: Vec<ReadyPhase>,
         statuses: Vec<(String, StepStatus)>,
+        /// Path passed to the most recent `ask_create_dockerfile` call.
+        last_dockerfile_prompt_path: Option<std::path::PathBuf>,
     }
 
     impl FakeReadyFrontend {
@@ -719,6 +745,7 @@ mod tests {
                 run_audit: true,
                 phases: Vec::new(),
                 statuses: Vec::new(),
+                last_dockerfile_prompt_path: None,
             }
         }
     }
@@ -755,7 +782,11 @@ mod tests {
     }
 
     impl ReadyFrontend for FakeReadyFrontend {
-        fn ask_create_dockerfile(&mut self) -> Result<bool, EngineError> {
+        fn ask_create_dockerfile(
+            &mut self,
+            dockerfile_path: &std::path::Path,
+        ) -> Result<bool, EngineError> {
+            self.last_dockerfile_prompt_path = Some(dockerfile_path.to_path_buf());
             Ok(self.create_dockerfile)
         }
 
@@ -829,6 +860,7 @@ mod tests {
             run_audit,
             phases: Vec::new(),
             statuses: Vec::new(),
+            last_dockerfile_prompt_path: None,
         };
         (engine, frontend, tmp)
     }
@@ -913,6 +945,133 @@ mod tests {
         assert!(
             !content.is_empty(),
             "Dockerfile.dev must contain the template content"
+        );
+    }
+
+    // ─── WI-0086: configured dockerfile path in ready ─────────────────────────
+
+    /// Build a ReadyEngine rooted at `git_root` with the agent Dockerfile
+    /// pre-created so no network downloads happen during tests. Mirrors
+    /// `make_engine_and_frontend` but lets callers stage their own
+    /// `.awman/config.json` before the Session is opened (so RepoConfig is
+    /// read from disk with the test's contents).
+    fn make_engine_at(git_root: &std::path::Path) -> ReadyEngine {
+        let awman_dir = git_root.join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(awman_dir.join("Dockerfile.claude"), "FROM scratch\n").unwrap();
+        let resolver = StaticGitRootResolver::new(git_root);
+        let session = Arc::new(
+            crate::data::session::Session::open(
+                git_root.to_path_buf(),
+                &resolver,
+                SessionOpenOptions::default(),
+            )
+            .unwrap(),
+        );
+        let overlay = Arc::new(OverlayEngine::with_auth_resolver(
+            crate::data::fs::auth_paths::AuthPathResolver::at_home(git_root),
+        ));
+        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
+        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
+            overlay.clone(),
+            runtime.clone(),
+        ));
+        let options = ReadyEngineOptions {
+            agent: AgentName::new("claude").unwrap(),
+            refresh: false,
+            build: false,
+            no_cache: false,
+            allow_docker: false,
+            non_interactive: false,
+            env_passthrough: None,
+        };
+        ReadyEngine::new(
+            session,
+            Arc::new(GitEngine::new()),
+            overlay,
+            runtime,
+            agent_engine,
+            options,
+        )
+    }
+
+    #[tokio::test]
+    async fn ready_with_configured_dockerfile_reports_configured_path_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Configure a non-default dockerfile path, but do not create the file.
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join("config.json"),
+            r#"{"dockerfile":"infra/Dockerfile.base"}"#,
+        )
+        .unwrap();
+
+        let mut engine = make_engine_at(tmp.path());
+        let mut frontend = FakeReadyFrontend {
+            create_dockerfile: false, // decline so the engine fails fast
+            run_audit: false,
+            phases: Vec::new(),
+            statuses: Vec::new(),
+            last_dockerfile_prompt_path: None,
+        };
+
+        engine.step(&mut frontend).await.unwrap(); // Preflight
+        engine.step(&mut frontend).await.unwrap(); // AwaitingDockerfileDecision
+
+        let prompted = frontend
+            .last_dockerfile_prompt_path
+            .as_ref()
+            .expect("ask_create_dockerfile must be called when the configured path is missing");
+        assert_eq!(
+            prompted,
+            &tmp.path().join("infra/Dockerfile.base"),
+            "ready must surface the configured dockerfile path, not the default Dockerfile.dev"
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_with_configured_dockerfile_skips_decision_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join("config.json"),
+            r#"{"dockerfile":"infra/Dockerfile.base"}"#,
+        )
+        .unwrap();
+        // Create the configured Dockerfile so Preflight short-circuits past
+        // AwaitingDockerfileDecision.
+        let infra_dir = tmp.path().join("infra");
+        std::fs::create_dir_all(&infra_dir).unwrap();
+        std::fs::write(infra_dir.join("Dockerfile.base"), "FROM scratch\n").unwrap();
+
+        let mut engine = make_engine_at(tmp.path());
+        let mut frontend = FakeReadyFrontend {
+            create_dockerfile: false, // sentinel — if the prompt fires the engine would fail
+            run_audit: false,
+            phases: Vec::new(),
+            statuses: Vec::new(),
+            last_dockerfile_prompt_path: None,
+        };
+
+        engine.step(&mut frontend).await.unwrap(); // Preflight → BuildingBaseImage
+
+        assert!(
+            frontend.last_dockerfile_prompt_path.is_none(),
+            "ready must not prompt for Dockerfile creation when the configured path exists; \
+             got: {:?}",
+            frontend.last_dockerfile_prompt_path
+        );
+        assert!(
+            matches!(engine.summary().dockerfile, StepStatus::Done),
+            "dockerfile step must be Done when the configured path exists; got: {:?}",
+            engine.summary().dockerfile
+        );
+        assert_eq!(
+            engine.phase(),
+            &ReadyPhase::BuildingBaseImage,
+            "engine must advance directly to BuildingBaseImage after Preflight"
         );
     }
 }

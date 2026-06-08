@@ -16,6 +16,7 @@ This file is created by `awman init` and should be committed to source control. 
 {
   "agent": "claude",
   "terminal_scrollback_lines": 10000,
+  "dockerfile": "docker/Dockerfile.base",
   "yoloDisallowedTools": ["Bash", "computer"],
   "envPassthrough": ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
   "overlays": {
@@ -36,6 +37,7 @@ This file is created by `awman init` and should be committed to source control. 
 | `agent` | string | `"claude"` | Agent to use for this repository: `claude`, `codex`, `opencode`, `maki`, `gemini`, `copilot`, `crush`, or `cline` |
 | `terminal_scrollback_lines` | integer | `10000` | Number of scrollback lines in the container terminal emulator. Overrides the global value |
 | `base_image` | string | (from global or `make build` default) | Container image tag for workflow setup/teardown phases. Overrides the global value if set. Only override if you have a repo-specific custom base image. See [Workflows — Setup and Teardown](04-workflows.md#setup-and-teardown-phases) |
+| `dockerfile` | string | `Dockerfile.dev` | Path to the project base Dockerfile, relative to repo root or absolute. By default, awman looks for `Dockerfile.dev` at the repo root. Set this to use a Dockerfile at a different path (e.g., `docker/Dockerfile.base`). See [Configurable Dockerfile path](#configurable-dockerfile-path) |
 | `yoloDisallowedTools` | string array | `[]` | Tools the agent cannot use when `--yolo` is active. Overrides the global list entirely |
 | `envPassthrough` | string array | `[]` | Host environment variable names to inject into agent containers at launch. Overrides the global list entirely. See [`envPassthrough`](#envpassthrough) |
 | `overlays.skills` | boolean | false | When `true`, mount your global awman skills directory (`~/.awman/skills/`) into the agent container as its native slash commands. **Additive** with the global config; either scope setting it to `true` enables the mount. See [`overlays`](#overlays) |
@@ -47,7 +49,7 @@ This file is created by `awman init` and should be committed to source control. 
 
 ## Global config
 
-**Path:** `$HOME/.awman/config.json`
+**Path:** `$HOME/.awman/config.json` (or custom path via `AWMAN_CONFIG_HOME`, `XDG_CONFIG_HOME`, or `XDG_DATA_HOME` — see [Environment variables](#environment-variables))
 
 Applies to all projects on the machine unless overridden by a per-repo config.
 
@@ -105,6 +107,7 @@ Applies to all projects on the machine unless overridden by a per-repo config.
 | `agent` / `default_agent` | Per-repo → Global → Built-in default (`claude`) |
 | `terminal_scrollback_lines` | Per-repo → Global → Built-in default (10,000) |
 | `base_image` | Per-repo → Global → Built-in default (from `make build`) |
+| `dockerfile` | Per-repo only |
 | `yoloDisallowedTools` | Per-repo → Global → Empty list (no restriction) |
 | `envPassthrough` | Per-repo → Global → Empty list (no passthrough) |
 | `overlays.skills` | **Additive OR**: if true in global, per-repo, `AWMAN_OVERLAYS`, or `--overlay` flags, the mount is enabled |
@@ -214,6 +217,9 @@ awman config set work_items.dir docs/work-items
 
 # Set work item template for this repo
 awman config set work_items.template docs/work-items/0000-template.md
+
+# Set the project base Dockerfile path
+awman config set dockerfile docker/Dockerfile.base
 
 # Enable skills overlay for this repo
 awman config set overlays.skills true
@@ -369,6 +375,50 @@ If `work_items.dir` is already configured, the prompt is skipped silently. The r
 
 ```
 │    Work items │ ✓ configured                 │
+```
+
+---
+
+## Configurable Dockerfile path
+
+By default, awman expects your project base `Dockerfile` to be at `<git-root>/Dockerfile.dev`. If your project keeps the Dockerfile at a different path, you can configure it:
+
+```sh
+awman config set dockerfile docker/Dockerfile.base
+```
+
+Once set, awman uses the configured path for building images and detecting the container's home directory during setup. The path can be relative to the repo root (recommended) or absolute.
+
+### Dockerfile discovery during `awman init`
+
+When you run `awman init` in a repo that has no `Dockerfile.dev`, awman offers an interactive choice:
+
+```
+awman: No Dockerfile found. How would you like to proceed?
+  [1] Create Dockerfile.dev from the built-in template (recommended)
+  [2] Use an existing Dockerfile in this repo
+  [3] Skip for now (configure manually in .awman/config.json)
+Choice [1]:
+```
+
+If you choose `[2]`, you'll be prompted to enter the path to an existing Dockerfile:
+
+```
+awman: Enter the path to your Dockerfile (relative to repo root):
+```
+
+The path you provide is saved to `.awman/config.json` automatically, so subsequent `awman` commands use it without re-prompting.
+
+**Non-interactive mode:** If you run `awman init` with stdin piped (e.g., in a script or CI/CD), the tool defaults to creating `Dockerfile.dev` from the template, maintaining backward compatibility with existing automation.
+
+### Error handling
+
+If a non-default `dockerfile` path is configured but the file does not exist, `awman ready` and other commands report the exact configured path in the error message — they do not silently fall back to the default. This prevents subtle bugs where a misconfigured path goes unnoticed.
+
+Example:
+```
+error: Dockerfile not found: docker/Dockerfile.base
+Check .awman/config.json and verify the file exists.
 ```
 
 ---
@@ -581,6 +631,102 @@ Apple Containers (`container` CLI, macOS 26+) is an OCI-compatible container run
 
 - **`--allow-docker`**: Docker socket passthrough is not meaningful under Apple Containers. Passing `--allow-docker` produces a warning and the socket is not mounted. If your task needs Docker-in-container, switch to the Docker runtime.
 - **macOS only**: If `"apple-containers"` is configured on Linux or Windows, awman exits with an error at startup rather than silently falling back to Docker.
+
+---
+
+## Environment variables
+
+awman respects standard environment variables for controlling where global config and data are stored, allowing you to align awman with your system's directory structure.
+
+### Global directory paths
+
+awman stores global configuration and data (workflows, skills, worktrees, API state, etc.) in a single "home" directory. By default, this is `~/.awman/`, but you can override it using standard XDG base-directory variables or the `AWMAN_CONFIG_HOME` environment variable.
+
+| Variable | Use case | Example |
+|----------|----------|---------|
+| `AWMAN_CONFIG_HOME` | Override all global paths (legacy) | `AWMAN_CONFIG_HOME=/opt/awman awman ready` |
+| `XDG_CONFIG_HOME` | Store config under XDG config directory | `XDG_CONFIG_HOME=~/.config awman ready` → uses `~/.config/awman/config.json` |
+| `XDG_DATA_HOME` | Store data under XDG data directory | `XDG_DATA_HOME=~/.local/share awman ready` → uses `~/.local/share/awman/{…}` |
+
+### Precedence chain
+
+When determining where to place global files, awman checks in this order:
+
+1. **`AWMAN_CONFIG_HOME`** — if set, overrides *all* global paths (config, data, state) to `<AWMAN_CONFIG_HOME>`. This is a complete override for cases where you need total control. When set, XDG variables are ignored.
+2. **`XDG_CONFIG_HOME` and `XDG_DATA_HOME`** — if set and `AWMAN_CONFIG_HOME` is absent:
+   - Config files go to `$XDG_CONFIG_HOME/awman/`
+   - Data and state go to `$XDG_DATA_HOME/awman/`
+   - If only one is set, the other falls back to `~/.awman/` (e.g., if only `XDG_CONFIG_HOME` is set, data still uses `~/.awman/`)
+3. **`$HOME/.awman/`** — the default fallback when no overrides are set
+
+### XDG base-directory specification
+
+If you're unfamiliar with XDG, it's a standard for organizing user files on Linux and macOS systems. Tools that follow XDG store:
+
+- **Config** in `$XDG_CONFIG_HOME` (defaults to `~/.config`)
+- **Data** in `$XDG_DATA_HOME` (defaults to `~/.local/share`)
+- **State** in `$XDG_STATE_HOME` (defaults to `~/.local/state`)
+- **Cache** in `$XDG_CACHE_HOME` (defaults to `~/.cache`)
+
+By setting these variables in your shell profile, you consolidate all tool config and data in predictable locations instead of accumulating stray directories in your home folder.
+
+### Example configurations
+
+#### Using XDG directories with defaults
+
+```sh
+# ~/.bashrc or ~/.zshrc
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+```
+
+With these set, awman automatically uses:
+- `~/.config/awman/config.json` for global config
+- `~/.local/share/awman/` for workflows, skills, worktrees, and API state
+
+#### Using a custom global directory
+
+If you prefer a single custom directory (not following XDG):
+
+```sh
+export AWMAN_CONFIG_HOME=/opt/awman
+```
+
+This puts everything in `/opt/awman/` and takes precedence over any XDG variables.
+
+#### Per-invocation override
+
+You can also set these variables for a single command:
+
+```sh
+XDG_CONFIG_HOME=~/.config awman ready
+AWMAN_CONFIG_HOME=/tmp/awman-test awman init
+```
+
+### No migration or merging
+
+awman does **not** migrate or merge existing `~/.awman/` directories when you change these variables. If you've been using awman with the default `~/.awman/` and then set `XDG_CONFIG_HOME`, the new path starts empty:
+
+- Your workflows, skills, and worktrees remain in `~/.awman/`
+- awman ignores them and starts fresh in the new location
+- To preserve your data, move the files manually: `mv ~/.awman ~/.local/share/awman`
+
+This is intentional — awman respects your directory choice without making assumptions about migrations.
+
+### Environment variable reference
+
+| Variable | Scope | Format | Notes |
+|----------|-------|--------|-------|
+| `AWMAN_CONFIG_HOME` | All | Absolute path | Overrides config, data, and state uniformly. Takes precedence over XDG vars. |
+| `XDG_CONFIG_HOME` | Config only | Absolute path | Default: `~/.config`. awman places global config in `$XDG_CONFIG_HOME/awman/`. |
+| `XDG_DATA_HOME` | Data / State | Absolute path | Default: `~/.local/share`. awman places workflows, skills, worktrees, and API state in `$XDG_DATA_HOME/awman/`. |
+| `AWMAN_OVERLAYS` | Overlay mounting | Comma-separated list of `host:container:permission` | See [Overlays](08-overlays.md) for syntax. Merges with global and per-repo config. |
+| `AWMAN_REMOTE_ADDR` | Remote API | URL | Default remote API server address. Overrides `remote.defaultAddr` in config. |
+| `AWMAN_API_KEY` | Remote API | API key | Authentication key for `AWMAN_REMOTE_ADDR`. Overrides `remote.defaultAPIKey` in config. |
+
+### Empty or whitespace environment variables
+
+If an XDG variable is set but empty (or only whitespace), awman treats it as unset and falls back to the next option in the precedence chain. This prevents malformed paths like `//awman/` when the variable is accidentally empty.
 
 ---
 

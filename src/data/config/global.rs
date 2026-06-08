@@ -58,9 +58,29 @@ impl GlobalConfig {
     }
 
     /// Same as [`home_dir`] but reads env vars from the supplied snapshot.
+    ///
+    /// Precedence: `AWMAN_CONFIG_HOME` → `XDG_CONFIG_HOME/awman` → `$HOME/.awman`.
     pub fn home_dir_with(env: &EnvSnapshot) -> Result<PathBuf, DataError> {
         if let Some(home) = env.config_home() {
             return Ok(home);
+        }
+        if let Some(xdg) = env.xdg_config_home() {
+            return Ok(xdg.join("awman"));
+        }
+        let home = dirs::home_dir().ok_or(DataError::HomeNotFound)?;
+        Ok(home.join(GLOBAL_CONFIG_HOME_SUBDIR))
+    }
+
+    /// Resolve the global data home directory for non-config data (workflows,
+    /// skills, worktrees, API state).
+    ///
+    /// Precedence: `AWMAN_CONFIG_HOME` → `XDG_DATA_HOME/awman` → `$HOME/.awman`.
+    pub fn data_home_with(env: &EnvSnapshot) -> Result<PathBuf, DataError> {
+        if let Some(home) = env.config_home() {
+            return Ok(home);
+        }
+        if let Some(xdg) = env.xdg_data_home() {
+            return Ok(xdg.join("awman"));
         }
         let home = dirs::home_dir().ok_or(DataError::HomeNotFound)?;
         Ok(home.join(GLOBAL_CONFIG_HOME_SUBDIR))
@@ -190,5 +210,42 @@ mod tests {
         let env = isolated_env(tmp.path());
         let home = GlobalConfig::home_dir_with(&env).unwrap();
         assert_eq!(home, tmp.path());
+    }
+
+    #[test]
+    fn home_dir_with_returns_xdg_config_home_awman_when_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(
+            crate::data::config::env::XDG_CONFIG_HOME,
+            tmp.path().to_str().unwrap(),
+        )]);
+        let home = GlobalConfig::home_dir_with(&env).unwrap();
+        assert_eq!(
+            home,
+            tmp.path().join("awman"),
+            "XDG_CONFIG_HOME must produce <xdg>/awman as the config home"
+        );
+    }
+
+    #[test]
+    fn home_dir_with_awman_config_home_wins_over_xdg_config_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let xdg_dir = tmp.path().join("xdg");
+        let awman_dir = tmp.path().join("awman_override");
+        let env = EnvSnapshot::with_overrides([
+            (
+                crate::data::config::env::AWMAN_CONFIG_HOME,
+                awman_dir.to_str().unwrap(),
+            ),
+            (
+                crate::data::config::env::XDG_CONFIG_HOME,
+                xdg_dir.to_str().unwrap(),
+            ),
+        ]);
+        let home = GlobalConfig::home_dir_with(&env).unwrap();
+        assert_eq!(
+            home, awman_dir,
+            "AWMAN_CONFIG_HOME must win over XDG_CONFIG_HOME"
+        );
     }
 }

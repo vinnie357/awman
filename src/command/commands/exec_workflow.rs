@@ -1294,12 +1294,24 @@ fn collect_single_entry_overlays(
     // diverge when the Dockerfile was changed but the image hasn't been
     // rebuilt yet, in which case mounting at the Dockerfile-derived path
     // silently breaks credential passthrough.
+    let dockerfile_path = session
+        .repo_config()
+        .dockerfile_path_or_default(session.git_root());
+    // detect_home_from_dockerfile silently returns None when the file is
+    // missing — surface that as a warning so a misconfigured `dockerfile`
+    // key doesn't cause overlays to fall back to a default container home
+    // without any signal to the user.
+    if !dockerfile_path.exists() && image_tag.is_none() {
+        tracing::warn!(
+            "configured Dockerfile {} not found; container home cannot be \
+             inferred from it (falling back to overlay engine defaults)",
+            dockerfile_path.display()
+        );
+    }
     let container_home = image_tag
         .and_then(|tag| engines.runtime.image_home_dir(tag))
         .or_else(|| {
-            crate::engine::overlay::detect_home_from_dockerfile(
-                &session.git_root().join("Dockerfile.dev"),
-            )
+            crate::engine::overlay::detect_home_from_dockerfile(&dockerfile_path)
         });
     let request = crate::engine::overlay::OverlayRequest {
         directories: collected.directories,
@@ -1982,6 +1994,68 @@ prompt = "do something"
         assert!(
             !env_b.contains_key("WI0082_REVIEW_TOKEN_A"),
             "entry B's env must NOT include entry A's var (no cross-step leak); got: {env_b:?}"
+        );
+    }
+
+    // ─── WI-0086: collect_single_entry_overlays uses repo-config dockerfile ─────
+
+    /// Verify that `collect_single_entry_overlays` resolves the Dockerfile path
+    /// from `session.repo_config().dockerfile_path_or_default()`, not from a
+    /// hard-coded `git_root.join("Dockerfile.dev")`.
+    #[test]
+    fn collect_single_entry_overlays_uses_repo_config_dockerfile_path() {
+        use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+        use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Write repo config with a custom Dockerfile path.
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join("config.json"),
+            r#"{"dockerfile": "infra/Dockerfile.base"}"#,
+        )
+        .unwrap();
+
+        // Create the configured Dockerfile (not Dockerfile.dev).
+        let infra_dir = tmp.path().join("infra");
+        std::fs::create_dir_all(&infra_dir).unwrap();
+        std::fs::write(
+            infra_dir.join("Dockerfile.base"),
+            "FROM ubuntu:22.04\nUSER agent\n",
+        )
+        .unwrap();
+
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        let session = Session::open(
+            tmp.path().to_path_buf(),
+            &resolver,
+            SessionOpenOptions {
+                env: Some(env),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // The session must resolve dockerfile from repo config, not Dockerfile.dev.
+        let resolved = session
+            .repo_config()
+            .dockerfile_path_or_default(session.git_root());
+        assert_eq!(
+            resolved,
+            tmp.path().join("infra/Dockerfile.base"),
+            "session must read dockerfile path from repo config, not hard-code Dockerfile.dev"
+        );
+
+        // collect_single_entry_overlays must succeed using the configured path.
+        let engines = make_engines();
+        let result = collect_single_entry_overlays(&engines, &session, &[], None, None);
+        assert!(
+            result.is_ok(),
+            "collect_single_entry_overlays must succeed with a repo-config-resolved dockerfile path"
         );
     }
 

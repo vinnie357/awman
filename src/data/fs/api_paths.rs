@@ -39,9 +39,18 @@ impl ApiPaths {
     }
 
     /// Same as [`from_process_env`] but reads from a supplied env snapshot.
+    ///
+    /// Precedence: `AWMAN_API_ROOT` → `AWMAN_CONFIG_HOME/api` →
+    /// `XDG_DATA_HOME/awman/api` → `$HOME/.awman/api`.
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError> {
         if let Some(root) = env.api_root() {
             return Ok(Self::from_root(root));
+        }
+        if let Some(home) = env.config_home() {
+            return Ok(Self::from_root(home.join(API_SUBDIR)));
+        }
+        if let Some(xdg) = env.xdg_data_home() {
+            return Ok(Self::from_root(xdg.join("awman").join(API_SUBDIR)));
         }
         let home = dirs::home_dir().ok_or(DataError::HomeNotFound)?;
         Ok(Self::from_root(home.join(".awman").join(API_SUBDIR)))
@@ -178,5 +187,50 @@ impl ApiPaths {
     /// Create the root directory (and parents) on disk.
     pub fn ensure_root(&self) -> Result<(), DataError> {
         std::fs::create_dir_all(&self.root).map_err(|e| DataError::io(&self.root, e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::config::env::{
+        EnvSnapshot, AWMAN_API_ROOT, AWMAN_CONFIG_HOME, XDG_DATA_HOME,
+    };
+
+    #[test]
+    fn from_env_returns_xdg_data_home_awman_api_when_xdg_set() {
+        let env = EnvSnapshot::with_overrides([(XDG_DATA_HOME, "/xdg/data")]);
+        let paths = ApiPaths::from_env(&env).unwrap();
+        assert_eq!(paths.root(), std::path::Path::new("/xdg/data/awman/api"));
+    }
+
+    #[test]
+    fn from_env_awman_api_root_wins_over_xdg_data_home() {
+        let env = EnvSnapshot::with_overrides([
+            (AWMAN_API_ROOT, "/custom/api"),
+            (XDG_DATA_HOME, "/xdg/data"),
+        ]);
+        let paths = ApiPaths::from_env(&env).unwrap();
+        assert_eq!(paths.root(), std::path::Path::new("/custom/api"));
+    }
+
+    #[test]
+    fn from_env_falls_back_to_home_awman_api() {
+        // No overrides — must fall back to $HOME/.awman/api.
+        let env = EnvSnapshot::empty();
+        let paths = ApiPaths::from_env(&env).unwrap();
+        let root = paths.root();
+        assert!(
+            root.ends_with(".awman/api"),
+            "fallback root must end with .awman/api; got: {root:?}"
+        );
+    }
+
+    #[test]
+    fn from_env_awman_config_home_produces_api_subdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let paths = ApiPaths::from_env(&env).unwrap();
+        assert_eq!(paths.root(), tmp.path().join("api"));
     }
 }

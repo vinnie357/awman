@@ -8,7 +8,15 @@ use crate::engine::ready::summary::ReadySummary;
 use crate::engine::step_status::StepStatus;
 
 pub trait ReadyFrontend: UserMessageSink + Send {
-    fn ask_create_dockerfile(&mut self) -> Result<bool, EngineError>;
+    /// Called when the project Dockerfile (default `Dockerfile.dev` or the
+    /// path configured via `RepoConfig.dockerfile`) is missing.
+    ///
+    /// `dockerfile_path` is the resolved absolute path that the engine
+    /// expects the user to confirm creating.
+    fn ask_create_dockerfile(
+        &mut self,
+        dockerfile_path: &std::path::Path,
+    ) -> Result<bool, EngineError>;
     fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError>;
 
     fn report_phase(&mut self, phase: &ReadyPhase);

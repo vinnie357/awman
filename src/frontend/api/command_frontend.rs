@@ -969,6 +969,12 @@ impl InitFrontend for ApiDispatchFrontend {
     fn ask_work_items_setup(&mut self) -> Result<Option<WorkItemsConfig>, EngineError> {
         Ok(None)
     }
+    fn ask_dockerfile_setup(
+        &mut self,
+        _git_root: &std::path::Path,
+    ) -> Result<crate::engine::init::frontend::DockerfileSetupDecision, EngineError> {
+        Ok(crate::engine::init::frontend::DockerfileSetupDecision::CreateNew)
+    }
     fn report_phase(&mut self, phase: &InitPhase) {
         self.event_bus.emit(EventPayload::StatusMessage {
             phase: "init".to_string(),
@@ -994,7 +1000,10 @@ impl InitFrontend for ApiDispatchFrontend {
 // ─── ReadyFrontend ──────────────────────────────────────────────────────────
 
 impl ReadyFrontend for ApiDispatchFrontend {
-    fn ask_create_dockerfile(&mut self) -> Result<bool, EngineError> {
+    fn ask_create_dockerfile(
+        &mut self,
+        _dockerfile_path: &std::path::Path,
+    ) -> Result<bool, EngineError> {
         Ok(true)
     }
     fn ask_run_audit_on_template(&mut self) -> Result<bool, EngineError> {

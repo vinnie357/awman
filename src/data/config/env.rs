@@ -24,6 +24,12 @@ pub const AWMAN_REMOTE_SESSION: &str = "AWMAN_REMOTE_SESSION";
 /// `AWMAN_API_KEY` — API key for the remote API server.
 pub const AWMAN_API_KEY: &str = "AWMAN_API_KEY";
 
+/// `XDG_CONFIG_HOME` — XDG base directory for user-specific configuration.
+pub const XDG_CONFIG_HOME: &str = "XDG_CONFIG_HOME";
+
+/// `XDG_DATA_HOME` — XDG base directory for user-specific data files.
+pub const XDG_DATA_HOME: &str = "XDG_DATA_HOME";
+
 /// Frozen snapshot of every env var awman reads.
 ///
 /// `EnvSnapshot::from_process()` captures the current process's environment
@@ -90,10 +96,74 @@ impl EnvSnapshot {
     pub fn api_key(&self) -> Option<&str> {
         self.get(AWMAN_API_KEY)
     }
+
+    /// `XDG_CONFIG_HOME` as a `PathBuf` if set and non-empty.
+    pub fn xdg_config_home(&self) -> Option<PathBuf> {
+        self.get(XDG_CONFIG_HOME)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
+
+    /// `XDG_DATA_HOME` as a `PathBuf` if set and non-empty.
+    pub fn xdg_data_home(&self) -> Option<PathBuf> {
+        self.get(XDG_DATA_HOME)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
 }
 
 /// Namespace for capturing process-environment snapshots.
 pub struct Env;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xdg_config_home_returns_none_when_absent() {
+        let snap = EnvSnapshot::empty();
+        assert!(snap.xdg_config_home().is_none());
+    }
+
+    #[test]
+    fn xdg_config_home_returns_none_when_empty_string() {
+        let snap = EnvSnapshot::with_overrides([(XDG_CONFIG_HOME, "")]);
+        assert!(snap.xdg_config_home().is_none());
+    }
+
+    #[test]
+    fn xdg_data_home_returns_none_when_absent() {
+        let snap = EnvSnapshot::empty();
+        assert!(snap.xdg_data_home().is_none());
+    }
+
+    #[test]
+    fn xdg_data_home_returns_none_when_empty_string() {
+        let snap = EnvSnapshot::with_overrides([(XDG_DATA_HOME, "")]);
+        assert!(snap.xdg_data_home().is_none());
+    }
+
+    #[test]
+    fn env_from_process_captures_xdg_config_and_data_home() {
+        let cfg_val = "/tmp/awman-test-xdg-cfg-0086";
+        let data_val = "/tmp/awman-test-xdg-data-0086";
+        std::env::set_var(XDG_CONFIG_HOME, cfg_val);
+        std::env::set_var(XDG_DATA_HOME, data_val);
+        let snap = Env::from_process();
+        std::env::remove_var(XDG_CONFIG_HOME);
+        std::env::remove_var(XDG_DATA_HOME);
+        assert_eq!(
+            snap.xdg_config_home(),
+            Some(PathBuf::from(cfg_val)),
+            "from_process() must capture XDG_CONFIG_HOME"
+        );
+        assert_eq!(
+            snap.xdg_data_home(),
+            Some(PathBuf::from(data_val)),
+            "from_process() must capture XDG_DATA_HOME"
+        );
+    }
+}
 
 impl Env {
     /// Capture every awman-relevant env var from the current process.
@@ -108,6 +178,8 @@ impl Env {
             AWMAN_REMOTE_ADDR,
             AWMAN_REMOTE_SESSION,
             AWMAN_API_KEY,
+            XDG_CONFIG_HOME,
+            XDG_DATA_HOME,
         ];
         let mut values = HashMap::new();
         for k in keys {

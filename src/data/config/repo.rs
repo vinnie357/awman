@@ -77,6 +77,8 @@ pub struct RepoConfig {
     pub agent_stuck_timeout_secs: Option<u64>,
     #[serde(rename = "baseImage", skip_serializing_if = "Option::is_none")]
     pub base_image: Option<String>,
+    #[serde(rename = "dockerfile", skip_serializing_if = "Option::is_none")]
+    pub dockerfile: Option<String>,
 }
 
 impl RepoConfig {
@@ -155,6 +157,27 @@ impl RepoConfig {
     /// persists the change. Pass `None` to clear the block entirely.
     pub fn set_work_items_config(&mut self, cfg: Option<WorkItemsConfig>) {
         self.work_items = cfg;
+    }
+
+    /// Resolve the configured Dockerfile path relative to `git_root`.
+    /// Returns `None` when the field is absent or empty.
+    pub fn dockerfile_path(&self, git_root: &Path) -> Option<PathBuf> {
+        let df = self.dockerfile.as_deref()?;
+        if df.is_empty() {
+            return None;
+        }
+        let p = Path::new(df);
+        if p.is_absolute() {
+            Some(p.to_path_buf())
+        } else {
+            Some(git_root.join(p))
+        }
+    }
+
+    /// Resolve the configured Dockerfile path, falling back to `<git_root>/Dockerfile.dev`.
+    pub fn dockerfile_path_or_default(&self, git_root: &Path) -> PathBuf {
+        self.dockerfile_path(git_root)
+            .unwrap_or_else(|| git_root.join("Dockerfile.dev"))
     }
 }
 
@@ -335,6 +358,71 @@ mod tests {
         assert_eq!(
             original.overlays, reloaded.overlays,
             "overlays with dir() and env() expressions must round-trip correctly"
+        );
+    }
+
+    // ─── Dockerfile field ─────────────────────────────────────────────────────
+
+    #[test]
+    fn dockerfile_path_or_default_returns_dockerfile_dev_when_absent() {
+        let tmp = make_git_root();
+        let cfg = RepoConfig::default();
+        let result = cfg.dockerfile_path_or_default(tmp.path());
+        assert_eq!(result, tmp.path().join("Dockerfile.dev"));
+    }
+
+    #[test]
+    fn dockerfile_path_or_default_resolves_relative_path() {
+        let tmp = make_git_root();
+        let cfg = RepoConfig {
+            dockerfile: Some("docker/Dockerfile.base".to_string()),
+            ..Default::default()
+        };
+        let result = cfg.dockerfile_path_or_default(tmp.path());
+        assert_eq!(result, tmp.path().join("docker/Dockerfile.base"));
+    }
+
+    #[test]
+    fn dockerfile_path_or_default_uses_absolute_path_as_is() {
+        let tmp = make_git_root();
+        let cfg = RepoConfig {
+            dockerfile: Some("/abs/Dockerfile".to_string()),
+            ..Default::default()
+        };
+        let result = cfg.dockerfile_path_or_default(tmp.path());
+        assert_eq!(result, PathBuf::from("/abs/Dockerfile"));
+    }
+
+    #[test]
+    fn dockerfile_path_returns_none_when_field_absent() {
+        let tmp = make_git_root();
+        let cfg = RepoConfig::default();
+        assert!(cfg.dockerfile_path(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn dockerfile_path_returns_none_when_field_is_empty_string() {
+        let tmp = make_git_root();
+        let cfg = RepoConfig {
+            dockerfile: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(cfg.dockerfile_path(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn dockerfile_field_round_trips_through_save_and_load() {
+        let tmp = make_git_root();
+        let original = RepoConfig {
+            dockerfile: Some("docker/Dockerfile.base".to_string()),
+            ..Default::default()
+        };
+        original.save(tmp.path()).unwrap();
+        let loaded = RepoConfig::load(tmp.path()).unwrap();
+        assert_eq!(
+            loaded.dockerfile.as_deref(),
+            Some("docker/Dockerfile.base"),
+            "dockerfile field must survive a save/load round-trip unmodified"
         );
     }
 

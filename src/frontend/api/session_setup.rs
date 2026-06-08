@@ -195,7 +195,10 @@ impl UserMessageSink for SetupReadyFrontend {
 }
 
 impl ReadyFrontend for SetupReadyFrontend {
-    fn ask_create_dockerfile(&mut self) -> Result<bool, EngineError> {
+    fn ask_create_dockerfile(
+        &mut self,
+        _dockerfile_path: &std::path::Path,
+    ) -> Result<bool, EngineError> {
         Ok(true)
     }
 

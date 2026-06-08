@@ -27,7 +27,7 @@ impl WorkflowDirs {
 
     /// Same as [`from_process_env`] but reads from a supplied env snapshot.
     pub fn from_env(env: &EnvSnapshot, git_root: Option<PathBuf>) -> Result<Self, DataError> {
-        let global_home = GlobalConfig::home_dir_with(env)?;
+        let global_home = GlobalConfig::data_home_with(env)?;
         Ok(Self {
             global_home,
             git_root,

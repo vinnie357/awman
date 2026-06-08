@@ -35,6 +35,12 @@ pub struct InitEngine {
     options: InitEngineOptions,
     phase: InitPhase,
     summary: InitSummary,
+    pending_dockerfile_path: Option<String>,
+    /// Whether `.awman/config.json` existed when init started. Captured in
+    /// `Preflight` so the `UseExisting` decision can decide whether to merge
+    /// into the existing file (via `SavingDockerfileConfig`) or fold the
+    /// dockerfile field into the fresh write performed by `WritingConfig`.
+    config_existed_at_start: bool,
 }
 
 impl InitEngine {
@@ -55,6 +61,8 @@ impl InitEngine {
             options,
             phase: InitPhase::Preflight,
             summary: InitSummary::default(),
+            pending_dockerfile_path: None,
+            config_existed_at_start: false,
         }
     }
 
@@ -82,6 +90,9 @@ impl InitEngine {
             InitPhase::Preflight => {
                 let _ = self.git_engine;
                 let _ = self.overlay_engine;
+                // Snapshot before creating .awman/ so we can tell whether
+                // config.json already existed when init began.
+                self.config_existed_at_start = RepoConfig::path(&git_root).exists();
                 let awman_dir = git_root.join(".awman");
                 if let Err(e) = std::fs::create_dir_all(&awman_dir) {
                     tracing::warn!("failed to create .awman directory: {e}");
@@ -147,14 +158,50 @@ impl InitEngine {
                 InitPhase::SettingUpDockerfile
             }
             InitPhase::SettingUpDockerfile => {
-                let paths = RepoDockerfilePaths::new(&git_root);
-                let dockerfile_path = paths.project_dockerfile();
-                if !dockerfile_path.exists() {
-                    std::fs::write(&dockerfile_path, templates::project_dockerfile_dev())
-                        .map_err(|e| EngineError::io(dockerfile_path.clone(), e))?;
+                let repo_config = RepoConfig::load(&git_root).unwrap_or_default();
+                let dockerfile_path = repo_config.dockerfile_path_or_default(&git_root);
+                if dockerfile_path.exists() {
+                    self.summary.dockerfile = StepStatus::Done;
+                    InitPhase::SettingUpAgentDockerfile
+                } else {
+                    InitPhase::AwaitingDockerfileDecision
                 }
+            }
+            InitPhase::AwaitingDockerfileDecision => {
+                use crate::engine::init::frontend::DockerfileSetupDecision;
+                match frontend.ask_dockerfile_setup(&git_root)? {
+                    DockerfileSetupDecision::CreateNew => {
+                        let paths = RepoDockerfilePaths::new(&git_root);
+                        let dockerfile_path = paths.project_dockerfile();
+                        std::fs::write(&dockerfile_path, templates::project_dockerfile_dev())
+                            .map_err(|e| EngineError::io(dockerfile_path.clone(), e))?;
+                        self.summary.dockerfile = StepStatus::Done;
+                        InitPhase::SettingUpAgentDockerfile
+                    }
+                    DockerfileSetupDecision::UseExisting(path) => {
+                        self.pending_dockerfile_path = Some(path);
+                        // If config already existed at init start, merge into
+                        // it via SavingDockerfileConfig. Otherwise, let
+                        // WritingConfig fold the dockerfile field into the
+                        // single initial write (preserves the `agent` field).
+                        if self.config_existed_at_start {
+                            InitPhase::SavingDockerfileConfig
+                        } else {
+                            self.summary.dockerfile = StepStatus::Done;
+                            InitPhase::SettingUpAgentDockerfile
+                        }
+                    }
+                    DockerfileSetupDecision::Skip => {
+                        self.summary.dockerfile = StepStatus::Skipped;
+                        InitPhase::SettingUpAgentDockerfile
+                    }
+                }
+            }
+            InitPhase::SavingDockerfileConfig => {
+                let mut repo_cfg = RepoConfig::load(&git_root).unwrap_or_default();
+                repo_cfg.dockerfile = self.pending_dockerfile_path.take();
+                repo_cfg.save(&git_root)?;
                 self.summary.dockerfile = StepStatus::Done;
-                // Issue 10: Next phase creates the agent Dockerfile.
                 InitPhase::SettingUpAgentDockerfile
             }
             // Issue 10: Ensure .awman/Dockerfile.<agent> exists.
@@ -185,6 +232,7 @@ impl InitEngine {
                 if !config_path.exists() {
                     let cfg = RepoConfig {
                         agent: Some(self.options.agent.as_str().to_string()),
+                        dockerfile: self.pending_dockerfile_path.take(),
                         ..Default::default()
                     };
                     cfg.save(&git_root)?;
@@ -222,8 +270,8 @@ impl InitEngine {
                     return Ok(InitPhase::AwaitingWorkItemsDecision);
                 }
 
-                let paths = RepoDockerfilePaths::new(&git_root);
-                let dockerfile_path = paths.project_dockerfile();
+                let repo_cfg = RepoConfig::load(&git_root).unwrap_or_default();
+                let dockerfile_path = repo_cfg.dockerfile_path_or_default(&git_root);
                 let tag = project_image_tag(&git_root);
                 frontend.report_step_status("Build base image", StepStatus::Running);
                 let mut sink = |line: &str| {
@@ -240,7 +288,6 @@ impl InitEngine {
                     Ok(()) => {
                         self.summary.image_build = StepStatus::Done;
                         frontend.report_step_status("Build base image", StepStatus::Done);
-                        // Issue 11: Next phase builds the agent image.
                         InitPhase::BuildingAgentImage
                     }
                     Err(e) => {
@@ -378,9 +425,9 @@ impl InitEngine {
             // Issue 12: Post-audit image rebuild in init.
             InitPhase::RebuildingAfterAudit => {
                 if matches!(self.summary.audit, StepStatus::Done) {
-                    // Rebuild base image.
+                    let repo_cfg = RepoConfig::load(&git_root).unwrap_or_default();
+                    let dockerfile_path = repo_cfg.dockerfile_path_or_default(&git_root);
                     let paths = RepoDockerfilePaths::new(&git_root);
-                    let dockerfile_path = paths.project_dockerfile();
                     let tag = project_image_tag(&git_root);
                     frontend.report_step_status("Rebuilding after audit", StepStatus::Running);
                     let mut sink = |line: &str| {
@@ -495,6 +542,7 @@ mod tests {
         replace_aspec: bool,
         run_audit: bool,
         work_items_config: Option<WorkItemsConfig>,
+        dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision,
         phases: Vec<InitPhase>,
     }
 
@@ -504,6 +552,7 @@ mod tests {
                 replace_aspec: true,
                 run_audit: true,
                 work_items_config: Some(WorkItemsConfig::default()),
+                dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
                 phases: Vec::new(),
             }
         }
@@ -549,6 +598,13 @@ mod tests {
 
         fn ask_work_items_setup(&mut self) -> Result<Option<WorkItemsConfig>, EngineError> {
             Ok(self.work_items_config.clone())
+        }
+
+        fn ask_dockerfile_setup(
+            &mut self,
+            _git_root: &std::path::Path,
+        ) -> Result<crate::engine::init::frontend::DockerfileSetupDecision, EngineError> {
+            Ok(self.dockerfile_decision.clone())
         }
 
         fn report_phase(&mut self, phase: &InitPhase) {
@@ -630,6 +686,7 @@ mod tests {
             replace_aspec: true,
             run_audit: false,
             work_items_config: None,
+            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
         };
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
@@ -650,6 +707,7 @@ mod tests {
             replace_aspec: false,
             run_audit: false,
             work_items_config: None,
+            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
         };
         // First run.
@@ -676,6 +734,7 @@ mod tests {
             replace_aspec: false,
             run_audit: false,
             work_items_config: Some(wi_cfg),
+            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
         };
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
@@ -707,6 +766,7 @@ mod tests {
             replace_aspec: false, // aspec/ already exists — skip the prompt
             run_audit: false,
             work_items_config: Some(crate::data::config::repo::WorkItemsConfig::default()),
+            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
         };
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
@@ -747,6 +807,7 @@ mod tests {
             replace_aspec: false,
             run_audit: false,
             work_items_config: Some(crate::data::config::repo::WorkItemsConfig::default()),
+            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
         };
         let summary = engine.run_to_completion(&mut frontend).await.unwrap();
@@ -757,6 +818,165 @@ mod tests {
     }
 
     // ─── Preflight creates .awman/ ─────────────────────────────────────────────
+
+    // ─── Dockerfile setup phase tests (WI-0086) ───────────────────────────────
+
+    #[tokio::test]
+    async fn existing_dockerfile_skips_decision_phase() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Pre-create Dockerfile.dev so SettingUpDockerfile exits early.
+        std::fs::write(tmp.path().join("Dockerfile.dev"), "FROM scratch\n").unwrap();
+
+        let mut engine = make_engine(tmp.path());
+        let mut frontend = FakeInitFrontend {
+            replace_aspec: false,
+            run_audit: false,
+            work_items_config: None,
+            // Skip is a sentinel — if the engine calls ask_dockerfile_setup
+            // when it should not, the test can detect the mismatch via phases.
+            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::Skip,
+            phases: Vec::new(),
+        };
+        engine.run_to_completion(&mut frontend).await.unwrap();
+
+        assert!(
+            !frontend.phases.contains(&InitPhase::AwaitingDockerfileDecision),
+            "AwaitingDockerfileDecision must not be entered when Dockerfile.dev already exists"
+        );
+        assert!(
+            matches!(engine.summary().dockerfile, StepStatus::Done),
+            "dockerfile step must be Done when the file already existed"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_new_decision_creates_dockerfile_dev() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No Dockerfile exists — engine must ask and act on CreateNew.
+        let mut engine = make_engine(tmp.path());
+        let mut frontend = FakeInitFrontend {
+            replace_aspec: false,
+            run_audit: false,
+            work_items_config: None,
+            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
+            phases: Vec::new(),
+        };
+        let summary = engine.run_to_completion(&mut frontend).await.unwrap();
+
+        assert!(
+            matches!(summary.dockerfile, StepStatus::Done),
+            "dockerfile step must be Done after CreateNew"
+        );
+        assert!(
+            tmp.path().join("Dockerfile.dev").exists(),
+            "Dockerfile.dev must be created on disk when decision is CreateNew"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_existing_decision_sets_done_and_saves_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_engine(tmp.path());
+        let mut frontend = FakeInitFrontend {
+            replace_aspec: false,
+            run_audit: false,
+            work_items_config: None,
+            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::UseExisting(
+                "docker/Dockerfile.custom".to_string(),
+            ),
+            phases: Vec::new(),
+        };
+        let summary = engine.run_to_completion(&mut frontend).await.unwrap();
+
+        assert!(
+            matches!(summary.dockerfile, StepStatus::Done),
+            "dockerfile step must be Done after UseExisting"
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_decision_sets_skipped_and_creates_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_engine(tmp.path());
+        let mut frontend = FakeInitFrontend {
+            replace_aspec: false,
+            run_audit: false,
+            work_items_config: None,
+            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::Skip,
+            phases: Vec::new(),
+        };
+        let summary = engine.run_to_completion(&mut frontend).await.unwrap();
+
+        assert!(
+            matches!(summary.dockerfile, StepStatus::Skipped),
+            "dockerfile step must be Skipped after Skip decision"
+        );
+        assert!(
+            !tmp.path().join("Dockerfile.dev").exists(),
+            "Dockerfile.dev must not be created when decision is Skip"
+        );
+    }
+
+    #[tokio::test]
+    async fn use_existing_path_persists_to_repo_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_engine(tmp.path());
+        let mut frontend = FakeInitFrontend {
+            replace_aspec: false,
+            run_audit: false,
+            work_items_config: None,
+            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::UseExisting(
+                "docker/Dockerfile.custom".to_string(),
+            ),
+            phases: Vec::new(),
+        };
+        engine.run_to_completion(&mut frontend).await.unwrap();
+
+        let config = crate::data::config::repo::RepoConfig::load(tmp.path()).unwrap_or_default();
+        assert_eq!(
+            config.dockerfile.as_deref(),
+            Some("docker/Dockerfile.custom"),
+            "UseExisting path must be persisted to RepoConfig.dockerfile on disk"
+        );
+        assert_eq!(
+            config.agent.as_deref(),
+            Some("claude"),
+            "UseExisting flow must not lose the agent field — \
+             SavingDockerfileConfig and WritingConfig must coordinate so both fields persist"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_init_run_does_not_enter_dockerfile_decision() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // First run: CreateNew creates Dockerfile.dev.
+        let mut engine = make_engine(tmp.path());
+        let mut frontend = FakeInitFrontend {
+            replace_aspec: false,
+            run_audit: false,
+            work_items_config: None,
+            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
+            phases: Vec::new(),
+        };
+        engine.run_to_completion(&mut frontend).await.unwrap();
+        assert!(tmp.path().join("Dockerfile.dev").exists());
+
+        // Second run: Dockerfile.dev already exists — decision phase must be skipped.
+        let mut engine2 = make_engine(tmp.path());
+        let mut frontend2 = FakeInitFrontend {
+            replace_aspec: false,
+            run_audit: false,
+            work_items_config: None,
+            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::Skip,
+            phases: Vec::new(),
+        };
+        engine2.run_to_completion(&mut frontend2).await.unwrap();
+        assert!(
+            !frontend2.phases.contains(&InitPhase::AwaitingDockerfileDecision),
+            "AwaitingDockerfileDecision must not be entered on a second run when Dockerfile.dev exists"
+        );
+    }
 
     #[tokio::test]
     async fn explicit_awman_dir_created_in_preflight() {
@@ -806,6 +1026,7 @@ mod tests {
             replace_aspec: false,
             run_audit: false,
             work_items_config: None,
+            dockerfile_decision: crate::engine::init::frontend::DockerfileSetupDecision::CreateNew,
             phases: Vec::new(),
         };
         // Run only the Preflight step.

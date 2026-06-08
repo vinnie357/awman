@@ -60,6 +60,29 @@ pub fn read_multiline(prompt: &str) -> Option<String> {
     Some(lines.join("\n"))
 }
 
+/// Present a numbered menu and return the 1-based index chosen by the user.
+/// Returns `default` when stdin is not a TTY or when the input is empty/invalid.
+pub fn pick_numbered(prompt: &str, options: &[&str], default: usize) -> usize {
+    if !stdin_is_tty() {
+        return default;
+    }
+    eprintln!("awman: {prompt}");
+    for (i, opt) in options.iter().enumerate() {
+        eprintln!("  [{}] {opt}", i + 1);
+    }
+    eprint!("Choice [{}]: ", default);
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut buf = String::new();
+    if std::io::stdin().read_line(&mut buf).is_err() {
+        return default;
+    }
+    let trimmed = buf.trim();
+    if trimmed.is_empty() {
+        return default;
+    }
+    trimmed.parse::<usize>().unwrap_or(default)
+}
+
 pub fn step_status_label(status: &StepStatus) -> String {
     status.label()
 }

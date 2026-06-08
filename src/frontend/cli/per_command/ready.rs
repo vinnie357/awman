@@ -14,9 +14,15 @@ use crate::frontend::cli::command_frontend::CliFrontend;
 use super::helpers::{render_summary_box, step_status_label, yes_no};
 
 impl ReadyFrontend for CliFrontend {
-    fn ask_create_dockerfile(&mut self) -> Result<bool, EngineError> {
+    fn ask_create_dockerfile(
+        &mut self,
+        dockerfile_path: &std::path::Path,
+    ) -> Result<bool, EngineError> {
         Ok(yes_no(
-            "No Dockerfile.dev found in the project. Create one from the default template?",
+            &format!(
+                "No Dockerfile found at {}. Create one from the default template?",
+                dockerfile_path.display()
+            ),
             true,
         ))
     }

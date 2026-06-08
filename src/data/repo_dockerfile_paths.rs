@@ -1,6 +1,6 @@
 //! Per-repo Dockerfile path resolution — Layer 0.
 //!
-//! Resolves `<git_root>/.awman/Dockerfile.dev` and `<git_root>/.awman/Dockerfile.<agent>`.
+//! Resolves project and per-agent Dockerfile paths relative to `<git_root>`.
 //! Pure path computation — no I/O beyond `Path::join`.
 
 use std::path::{Path, PathBuf};
@@ -9,19 +9,36 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct RepoDockerfilePaths {
     git_root: PathBuf,
+    project_dockerfile_override: Option<PathBuf>,
 }
 
 impl RepoDockerfilePaths {
     pub fn new(git_root: impl Into<PathBuf>) -> Self {
         Self {
             git_root: git_root.into(),
+            project_dockerfile_override: None,
         }
     }
 
-    /// `<git_root>/Dockerfile.dev` — the project base image's Dockerfile.
-    /// Lives at the repo root (NOT under `.awman/`) because the user is expected
-    /// to author and version-control it.
+    /// Construct with an optional override path for the project Dockerfile.
+    /// When provided, `project_dockerfile()` returns the override instead of
+    /// the default `<git_root>/Dockerfile.dev`.
+    pub fn with_project_dockerfile(
+        git_root: impl Into<PathBuf>,
+        path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            git_root: git_root.into(),
+            project_dockerfile_override: path,
+        }
+    }
+
+    /// Project base image Dockerfile. Returns the configured override when
+    /// provided, otherwise `<git_root>/Dockerfile.dev`.
     pub fn project_dockerfile(&self) -> PathBuf {
+        if let Some(ref p) = self.project_dockerfile_override {
+            return p.clone();
+        }
         self.git_root.join("Dockerfile.dev")
     }
 
@@ -74,6 +91,21 @@ mod tests {
     #[test]
     fn project_dockerfile_at_repo_root() {
         let p = RepoDockerfilePaths::new("/r");
+        assert_eq!(p.project_dockerfile(), Path::new("/r/Dockerfile.dev"));
+    }
+
+    #[test]
+    fn project_dockerfile_returns_override_when_supplied() {
+        let p = RepoDockerfilePaths::with_project_dockerfile(
+            "/r",
+            Some(PathBuf::from("/custom/Dockerfile")),
+        );
+        assert_eq!(p.project_dockerfile(), Path::new("/custom/Dockerfile"));
+    }
+
+    #[test]
+    fn project_dockerfile_returns_default_when_no_override() {
+        let p = RepoDockerfilePaths::with_project_dockerfile("/r", None);
         assert_eq!(p.project_dockerfile(), Path::new("/r/Dockerfile.dev"));
     }
 

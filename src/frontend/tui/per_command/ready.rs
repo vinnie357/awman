@@ -11,11 +11,17 @@ use crate::frontend::tui::command_frontend::TuiCommandFrontend;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 
 impl ReadyFrontend for TuiCommandFrontend {
-    fn ask_create_dockerfile(&mut self) -> Result<bool, EngineError> {
+    fn ask_create_dockerfile(
+        &mut self,
+        dockerfile_path: &std::path::Path,
+    ) -> Result<bool, EngineError> {
         let response = self
             .ask_dialog(DialogRequest::YesNo {
                 title: "Create Dockerfile?".into(),
-                body: "No Dockerfile.dev found. Create one from the default template?".into(),
+                body: format!(
+                    "No Dockerfile found at {}. Create one from the default template?",
+                    dockerfile_path.display()
+                ),
             })
             .map_err(|e| EngineError::Other(e.to_string()))?;
         Ok(matches!(
@@ -155,7 +161,9 @@ mod tests {
             let _req = req_rx.recv().unwrap();
             resp_tx.send(DialogResponse::Yes).unwrap();
         });
-        let result = frontend.ask_create_dockerfile().unwrap();
+        let result = frontend
+            .ask_create_dockerfile(std::path::Path::new("/tmp/Dockerfile.dev"))
+            .unwrap();
         handle.join().unwrap();
         assert!(result);
     }
@@ -167,7 +175,9 @@ mod tests {
             let _req = req_rx.recv().unwrap();
             resp_tx.send(DialogResponse::No).unwrap();
         });
-        let result = frontend.ask_create_dockerfile().unwrap();
+        let result = frontend
+            .ask_create_dockerfile(std::path::Path::new("/tmp/Dockerfile.dev"))
+            .unwrap();
         handle.join().unwrap();
         assert!(!result);
     }
@@ -179,7 +189,9 @@ mod tests {
             let _req = req_rx.recv().unwrap();
             resp_tx.send(DialogResponse::Dismissed).unwrap();
         });
-        let result = frontend.ask_create_dockerfile().unwrap();
+        let result = frontend
+            .ask_create_dockerfile(std::path::Path::new("/tmp/Dockerfile.dev"))
+            .unwrap();
         handle.join().unwrap();
         assert!(!result);
     }

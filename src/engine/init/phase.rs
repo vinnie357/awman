@@ -8,6 +8,8 @@ pub enum InitPhase {
     AwaitingAspecDecision,
     CreatingAspecFolder,
     SettingUpDockerfile,
+    AwaitingDockerfileDecision,
+    SavingDockerfileConfig,
     SettingUpAgentDockerfile,
     WritingConfig,
     AwaitingAuditDecision,
