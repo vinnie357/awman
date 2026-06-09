@@ -109,8 +109,12 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             interactive_entrypoint: vec!["codex"],
             non_interactive_flag: Some("exec"),
             plan_flag: Some(&["--approval-mode", "plan"]),
-            yolo_flag: Some("--full-auto"),
-            auto_flag: None,
+            // `--full-auto` is exec-only (and deprecated); the global flag
+            // below is accepted by both interactive `codex` and `codex exec`.
+            yolo_flag: Some("--dangerously-bypass-approvals-and-sandbox"),
+            // Successor to the deprecated `--full-auto` preset: writes inside
+            // the workspace are auto-approved, escalations still prompt.
+            auto_flag: Some(&["--sandbox", "workspace-write"]),
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
@@ -297,6 +301,27 @@ mod tests {
     fn opencode_plan_unsupported() {
         let m = matrix_for("opencode").unwrap();
         assert!(m.plan_flag.is_none());
+    }
+
+    #[test]
+    fn codex_yolo_flag_is_dangerously_bypass_approvals_and_sandbox() {
+        let m = matrix_for("codex").unwrap();
+        assert_eq!(
+            m.yolo_flag,
+            Some("--dangerously-bypass-approvals-and-sandbox"),
+            "codex yolo_flag must be --dangerously-bypass-approvals-and-sandbox; \
+             --full-auto is exec-only, deprecated, and rejected by interactive codex"
+        );
+    }
+
+    #[test]
+    fn codex_auto_flag_is_sandbox_workspace_write() {
+        let m = matrix_for("codex").unwrap();
+        assert_eq!(
+            m.auto_flag,
+            Some(&["--sandbox", "workspace-write"][..]),
+            "codex auto_flag must be --sandbox workspace-write (successor to deprecated --full-auto)"
+        );
     }
 
     #[test]

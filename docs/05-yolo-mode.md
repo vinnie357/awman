@@ -49,7 +49,7 @@ The agent-specific skip-permissions flag is appended to the container entrypoint
 | Agent | Flag appended |
 |-------|--------------|
 | `claude` | `--dangerously-skip-permissions` |
-| `codex` | `--full-auto` |
+| `codex` | `--dangerously-bypass-approvals-and-sandbox` |
 | `opencode` | *(no equivalent — a warning is printed, flag omitted)* |
 | `maki` | `--yolo` |
 | `gemini` | `--yolo` |
@@ -189,7 +189,7 @@ See [Configuration](07-configuration.md) for the full config reference.
 | Agent | `--auto` flag |
 |-------|--------------|
 | `claude` | `--permission-mode auto` |
-| `codex` | `--full-auto` |
+| `codex` | `--sandbox workspace-write` |
 | `opencode` | *(no equivalent — warning printed)* |
 | `maki` | `--yolo` (maki's own flag) |
 | `gemini` | `--approval-mode=auto_edit` |
