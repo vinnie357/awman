@@ -60,7 +60,7 @@ pub trait ExecPromptCommandFrontend:
     fn set_stuck_sender(
         &mut self,
         _sender: std::sync::Arc<
-            tokio::sync::broadcast::Sender<crate::engine::container::instance::StuckEvent>,
+            tokio::sync::broadcast::Sender<crate::engine::agent_runtime::StuckEvent>,
         >,
     ) {
     }

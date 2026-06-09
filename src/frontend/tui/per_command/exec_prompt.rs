@@ -11,7 +11,7 @@ impl ExecPromptCommandFrontend for TuiCommandFrontend {
     fn set_stuck_sender(
         &mut self,
         sender: std::sync::Arc<
-            tokio::sync::broadcast::Sender<crate::engine::container::instance::StuckEvent>,
+            tokio::sync::broadcast::Sender<crate::engine::agent_runtime::StuckEvent>,
         >,
     ) {
         if let Ok(mut guard) = self.stuck_sender_shared.lock() {
