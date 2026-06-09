@@ -366,11 +366,12 @@ mod tests {
         struct FakeSource;
         impl IssueSource for FakeSource {
             fn provider_name(&self) -> &str { "Test" }
+            fn provider_prefix(&self) -> &str { "tst" }
+            fn issue_identifier(&self, _: &Issue) -> String { "0".into() }
             fn can_handle(&self, _: &str) -> bool { false }
             fn fetch_issue(&self, _: &str, _: &Path) -> Result<Issue, IssueSourceError> {
                 unimplemented!()
             }
-            fn title_slug(&self, _: &Issue) -> String { String::new() }
         }
         let issue = Issue {
             source_id: String::new(),

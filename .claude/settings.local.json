@@ -165,7 +165,9 @@
       "Bash(container ls *)",
       "Bash(container rm *)",
       "Bash(awk 'NR==1 || /awman/')",
-      "Bash(container inspect *)"
+      "Bash(container inspect *)",
+      "WebFetch(domain:developers.googleblog.com)",
+      "WebFetch(domain:charmbracelet-crush.mintlify.app)"
     ]
   }
 }

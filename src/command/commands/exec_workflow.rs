@@ -2210,7 +2210,7 @@ prompt = "do something"
 
         // Slug + number derive from the issue.
         assert_eq!(build.number, 84);
-        assert!(build.slug.contains("owner-repo-84"));
+        assert!(build.slug.starts_with("ghb84"), "slug must start with 'ghb84', got: {}", build.slug);
 
         // Overlay is a ReadOnly Directory mapping the temp file to the
         // container-side work-items path.

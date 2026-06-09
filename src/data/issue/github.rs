@@ -5,10 +5,7 @@ use std::process::Command;
 
 use crate::engine::message::{MessageLevel, UserMessage, UserMessageSink};
 
-use super::{slugify, Issue, IssueSource, IssueSourceError};
-
-const OVERALL_SLUG_MAX: usize = 100;
-const TITLE_SLUG_MAX: usize = 40;
+use super::{Issue, IssueSource, IssueSourceError};
 
 /// Hint embedded into `IssueSourceError::Unauthorized` by GitHub auth/403
 /// failures. Provider-specific text lives here, not in the trait-level enum.
@@ -20,6 +17,17 @@ pub struct GithubIssueSource;
 impl IssueSource for GithubIssueSource {
     fn provider_name(&self) -> &str {
         "GitHub"
+    }
+
+    fn provider_prefix(&self) -> &str {
+        "ghb"
+    }
+
+    fn issue_identifier(&self, issue: &Issue) -> String {
+        issue
+            .numeric_id()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "0".to_string())
     }
 
     fn can_handle(&self, input: &str) -> bool {
@@ -86,46 +94,6 @@ impl IssueSource for GithubIssueSource {
         fetch_rest_api(&owner, &repo, number, self.provider_name())
     }
 
-    fn title_slug(&self, issue: &Issue) -> String {
-        let (owner, repo, number) = parse_source_id_segments(&issue.source_id)
-            .unwrap_or_else(|| ("unknown".into(), "unknown".into(), 0u32));
-        // Slugify owner/repo separately to guarantee ASCII output (defends
-        // against pathological URL parsing producing multi-byte chars after
-        // .to_lowercase()).
-        let owner_slug = slugify(&owner, OVERALL_SLUG_MAX);
-        let repo_slug = slugify(&repo, OVERALL_SLUG_MAX);
-        let prefix = format!("{owner_slug}-{repo_slug}-{number}");
-        // Uniqueness invariant: never truncate the prefix, even if it
-        // exceeds OVERALL_SLUG_MAX. OVERALL_SLUG_MAX caps the title portion,
-        // not the slug as a whole.
-        let remaining = OVERALL_SLUG_MAX.saturating_sub(prefix.len() + 1);
-        let title_budget = TITLE_SLUG_MAX.min(remaining);
-        let title_part = if title_budget == 0 {
-            String::new()
-        } else {
-            slugify(&issue.title, title_budget)
-        };
-        if title_part.is_empty() {
-            prefix
-        } else {
-            format!("{prefix}-{title_part}")
-        }
-    }
-}
-
-/// Parse `source_id` URL to extract (owner, repo, number).
-fn parse_source_id_segments(source_id: &str) -> Option<(String, String, u32)> {
-    // Expected: https://github.com/{owner}/{repo}/issues/{number}
-    let path = source_id.strip_prefix("https://github.com/")?;
-    let segments: Vec<&str> = path.split('/').collect();
-    if segments.len() >= 4 && segments[2] == "issues" {
-        let owner = segments[0].to_lowercase();
-        let repo = segments[1].to_lowercase();
-        let number = segments[3].parse::<u32>().ok()?;
-        Some((owner, repo, number))
-    } else {
-        None
-    }
 }
 
 /// Parse user input into (owner, repo, number).
@@ -500,6 +468,33 @@ mod tests {
     }
 
     #[test]
+    fn provider_prefix_is_ghb() {
+        assert_eq!(GithubIssueSource.provider_prefix(), "ghb");
+    }
+
+    #[test]
+    fn issue_identifier_extracts_number() {
+        let issue = Issue {
+            source_id: "https://github.com/owner/repo/issues/84".into(),
+            title: String::new(),
+            body: String::new(),
+            provider: "GitHub".into(),
+        };
+        assert_eq!(GithubIssueSource.issue_identifier(&issue), "84");
+    }
+
+    #[test]
+    fn issue_identifier_non_numeric_falls_back() {
+        let issue = Issue {
+            source_id: "https://example.com/not-numeric".into(),
+            title: String::new(),
+            body: String::new(),
+            provider: "GitHub".into(),
+        };
+        assert_eq!(GithubIssueSource.issue_identifier(&issue), "0");
+    }
+
+    #[test]
     fn title_slug_standard_case() {
         let issue = Issue {
             source_id: "https://github.com/prettysmartdev/awman/issues/84".into(),
@@ -509,7 +504,7 @@ mod tests {
         };
         assert_eq!(
             GithubIssueSource.title_slug(&issue),
-            "prettysmartdev-awman-84-github-integration-part-1"
+            "ghb84-github-integration-part-1"
         );
     }
 
@@ -521,7 +516,7 @@ mod tests {
             body: String::new(),
             provider: "GitHub".into(),
         };
-        assert_eq!(GithubIssueSource.title_slug(&issue), "owner-repo-42");
+        assert_eq!(GithubIssueSource.title_slug(&issue), "ghb42");
     }
 
     #[test]
@@ -534,7 +529,7 @@ mod tests {
         };
         assert_eq!(
             GithubIssueSource.title_slug(&issue),
-            "owner-repo-1-fix-the-bug"
+            "ghb1-fix-the-bug"
         );
     }
 
@@ -547,22 +542,8 @@ mod tests {
             provider: "GitHub".into(),
         };
         let slug = GithubIssueSource.title_slug(&issue);
-        assert!(slug.starts_with("owner-repo-5-"));
+        assert!(slug.starts_with("ghb5-"));
         assert!(slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
-    }
-
-    #[test]
-    fn parse_source_id_segments_valid() {
-        let (o, r, n) =
-            parse_source_id_segments("https://github.com/Pretty/Repo/issues/42").unwrap();
-        assert_eq!(o, "pretty");
-        assert_eq!(r, "repo");
-        assert_eq!(n, 42);
-    }
-
-    #[test]
-    fn parse_source_id_segments_invalid() {
-        assert!(parse_source_id_segments("not-a-url").is_none());
     }
 
     #[test]
@@ -631,7 +612,6 @@ mod tests {
 
     #[test]
     fn title_slug_very_long_title_truncated() {
-        // 200-character title: slug must be ≤ 100 chars and must not end with '-'
         let long_title: String = "a".repeat(200);
         let issue = Issue {
             source_id: "https://github.com/o/r/issues/1".into(),
@@ -640,58 +620,17 @@ mod tests {
             provider: "GitHub".into(),
         };
         let slug = GithubIssueSource.title_slug(&issue);
+        assert!(slug.starts_with("ghb1-"), "slug must start with provider prefix and id");
         assert!(
-            slug.len() <= OVERALL_SLUG_MAX,
-            "slug length {} exceeds {OVERALL_SLUG_MAX}",
+            slug.len() <= 100,
+            "slug length {} exceeds 100",
             slug.len()
         );
         assert!(!slug.ends_with('-'), "slug must not end with '-'");
     }
 
     #[test]
-    fn title_slug_very_long_owner_repo_name() {
-        // 80-char owner — fits within OVERALL_SLUG_MAX (100), so truncation
-        // doesn't kick in but the number must still be preserved.
-        let long_owner = "a".repeat(80);
-        let issue = Issue {
-            source_id: format!(
-                "https://github.com/{long_owner}/repo/issues/84"
-            ),
-            title: "Title".into(),
-            body: String::new(),
-            provider: "GitHub".into(),
-        };
-        let slug = GithubIssueSource.title_slug(&issue);
-        // The number "84" must appear somewhere.
-        assert!(slug.contains("-84"), "issue number must be preserved in slug");
-        assert!(!slug.ends_with('-'), "slug must not end with '-'");
-    }
-
-    #[test]
-    fn title_slug_pathological_owner_keeps_number() {
-        // Owner is 150 chars — the assembled prefix alone exceeds
-        // OVERALL_SLUG_MAX, but the number and repo must still be present
-        // (uniqueness invariant: prefix is never truncated).
-        let huge_owner = "a".repeat(150);
-        let issue = Issue {
-            source_id: format!("https://github.com/{huge_owner}/repo/issues/84"),
-            title: "Some Title That Will Be Dropped".into(),
-            body: String::new(),
-            provider: "GitHub".into(),
-        };
-        let slug = GithubIssueSource.title_slug(&issue);
-        assert!(slug.contains("-repo-"), "repo segment must be preserved");
-        assert!(slug.ends_with("-84"), "issue number must be preserved at end: {slug}");
-        // The title is dropped because the prefix already exceeds the soft cap.
-        assert!(
-            !slug.contains("title"),
-            "title must be dropped when prefix exceeds soft cap: {slug}"
-        );
-    }
-
-    #[test]
     fn title_slug_malformed_source_id_falls_back() {
-        // A non-GitHub URL source_id must produce an "unknown-unknown-0" prefix.
         let issue = Issue {
             source_id: "https://example.com/not-github".into(),
             title: "Something".into(),
@@ -700,8 +639,8 @@ mod tests {
         };
         let slug = GithubIssueSource.title_slug(&issue);
         assert!(
-            slug.starts_with("unknown-unknown-0"),
-            "malformed source_id should fall back to 'unknown-unknown-0', got: {slug}"
+            slug.starts_with("ghb0"),
+            "malformed source_id should fall back to 'ghb0', got: {slug}"
         );
     }
 

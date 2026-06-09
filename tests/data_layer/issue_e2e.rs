@@ -77,8 +77,7 @@ fn e2e_github_fetch_by_short_form_real_network() {
     assert!(!issue.title.is_empty(), "issue title must not be empty");
     assert_eq!(issue.provider, "GitHub");
     let slug = source.title_slug(&issue);
-    assert!(slug.contains(TEST_OWNER));
-    assert!(slug.contains(TEST_REPO));
+    assert!(slug.starts_with("ghb"), "slug must start with GitHub provider prefix 'ghb'");
     assert!(slug.contains(&format!("{TEST_ISSUE_NUMBER}")));
     assert!(slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     let filename = format!("{:04}-{slug}.md", issue.numeric_id().unwrap_or(0));

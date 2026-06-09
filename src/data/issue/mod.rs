@@ -120,6 +120,14 @@ pub trait IssueSource: Send + Sync {
     /// Human-readable provider name, e.g. "GitHub", "Jira", "Linear".
     fn provider_name(&self) -> &str;
 
+    /// Three-character provider prefix for slugs, e.g. "ghb" for GitHub,
+    /// "jra" for Jira, "lnr" for Linear.
+    fn provider_prefix(&self) -> &str;
+
+    /// Provider-specific issue identifier as a string. For GitHub this is
+    /// the numeric issue number ("84"); for Jira it might be "PROJ-123".
+    fn issue_identifier(&self, issue: &Issue) -> String;
+
     /// Returns true if this provider can handle the given input string.
     /// Must be infallible and perform no I/O — pattern matching only.
     fn can_handle(&self, input: &str) -> bool;
@@ -128,10 +136,25 @@ pub trait IssueSource: Send + Sync {
     /// (e.g. detecting the remote URL for bare numeric refs).
     fn fetch_issue(&self, input: &str, git_root: &Path) -> Result<Issue, IssueSourceError>;
 
-    /// Returns a hyphen-delimited, lowercase string that uniquely identifies
-    /// this issue. Used as the slug component of work item filenames and git
-    /// branch names.
-    fn title_slug(&self, issue: &Issue) -> String;
+    /// Returns a hyphen-delimited, lowercase slug that uniquely identifies
+    /// this issue. Format: `{provider_prefix}{issue_id}-{truncated_title}`.
+    /// Used as the slug component of work item filenames and git branch names.
+    fn title_slug(&self, issue: &Issue) -> String {
+        let id = self.issue_identifier(issue);
+        let prefix = format!("{}{}", self.provider_prefix(), id);
+        let remaining = OVERALL_SLUG_MAX.saturating_sub(prefix.len() + 1);
+        let title_budget = TITLE_SLUG_MAX.min(remaining);
+        let title_part = if title_budget == 0 {
+            String::new()
+        } else {
+            slugify(&issue.title, title_budget)
+        };
+        if title_part.is_empty() {
+            prefix
+        } else {
+            format!("{prefix}-{title_part}")
+        }
+    }
 
     /// Like `fetch_issue`, but writes progress messages to the sink so the
     /// user sees which external commands or API requests are being performed.
@@ -160,6 +183,9 @@ pub trait IssueSource: Send + Sync {
 pub struct IssueSourceFlags {
     pub issue: Option<String>,
 }
+
+const OVERALL_SLUG_MAX: usize = 100;
+const TITLE_SLUG_MAX: usize = 40;
 
 /// Converts arbitrary text to a hyphen-delimited, lowercase slug safe for
 /// use in filenames and git branch names.
@@ -223,11 +249,12 @@ mod tests {
         struct Dummy;
         impl IssueSource for Dummy {
             fn provider_name(&self) -> &str { "Test" }
+            fn provider_prefix(&self) -> &str { "tst" }
+            fn issue_identifier(&self, _: &Issue) -> String { "0".into() }
             fn can_handle(&self, _: &str) -> bool { false }
             fn fetch_issue(&self, _: &str, _: &Path) -> Result<Issue, IssueSourceError> {
                 unimplemented!()
             }
-            fn title_slug(&self, _: &Issue) -> String { String::new() }
         }
         let issue = Issue {
             source_id: String::new(),
@@ -243,11 +270,12 @@ mod tests {
         struct Dummy;
         impl IssueSource for Dummy {
             fn provider_name(&self) -> &str { "Test" }
+            fn provider_prefix(&self) -> &str { "tst" }
+            fn issue_identifier(&self, _: &Issue) -> String { "0".into() }
             fn can_handle(&self, _: &str) -> bool { false }
             fn fetch_issue(&self, _: &str, _: &Path) -> Result<Issue, IssueSourceError> {
                 unimplemented!()
             }
-            fn title_slug(&self, _: &Issue) -> String { String::new() }
         }
         let issue = Issue {
             source_id: String::new(),
@@ -319,11 +347,12 @@ mod tests {
         struct Dummy;
         impl IssueSource for Dummy {
             fn provider_name(&self) -> &str { "Test" }
+            fn provider_prefix(&self) -> &str { "tst" }
+            fn issue_identifier(&self, _: &Issue) -> String { "0".into() }
             fn can_handle(&self, _: &str) -> bool { false }
             fn fetch_issue(&self, _: &str, _: &Path) -> Result<Issue, IssueSourceError> {
                 unimplemented!()
             }
-            fn title_slug(&self, _: &Issue) -> String { String::new() }
         }
         let issue = Issue {
             source_id: String::new(),
@@ -340,11 +369,12 @@ mod tests {
         struct Dummy;
         impl IssueSource for Dummy {
             fn provider_name(&self) -> &str { "Test" }
+            fn provider_prefix(&self) -> &str { "tst" }
+            fn issue_identifier(&self, _: &Issue) -> String { "0".into() }
             fn can_handle(&self, _: &str) -> bool { false }
             fn fetch_issue(&self, _: &str, _: &Path) -> Result<Issue, IssueSourceError> {
                 unimplemented!()
             }
-            fn title_slug(&self, _: &Issue) -> String { String::new() }
         }
         let issue = Issue {
             source_id: String::new(),
