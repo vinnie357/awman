@@ -553,6 +553,7 @@ impl ReadyEngine {
                         include_all_skills: false,
                         named_skills: vec![],
                         image_tag_override: None,
+                        ..Default::default()
                     };
                     match self.agent_engine.build_options(
                         &self.session,

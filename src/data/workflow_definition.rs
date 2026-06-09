@@ -182,6 +182,9 @@ pub struct Workflow {
     /// Optional workflow-level default model (overridden by step-level `model`).
     #[serde(default)]
     pub model: Option<String>,
+    /// Overlays applied to every agent step in this workflow.
+    #[serde(default)]
+    pub overlays: Option<Vec<String>>,
     /// Setup steps run before the first workflow step.
     #[serde(default)]
     pub setup: Vec<SetupStepEntry>,
@@ -314,6 +317,8 @@ struct TomlWorkflow {
     agent: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    overlays: Option<Vec<String>>,
     #[serde(rename = "step", alias = "steps", default)]
     steps: Vec<RawStep>,
     #[serde(default)]
@@ -334,6 +339,8 @@ struct YamlWorkflow {
     agent: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    overlays: Option<Vec<String>>,
     #[serde(default)]
     steps: Vec<RawStep>,
     #[serde(default)]
@@ -385,6 +392,7 @@ fn parse_toml(content: &str) -> Result<Workflow, DataError> {
         title,
         agent: parsed.agent,
         model: parsed.model,
+        overlays: parsed.overlays,
         steps: raw_to_steps(parsed.steps)?,
         setup: parsed.setup,
         teardown: parsed.teardown,
@@ -401,6 +409,7 @@ fn parse_yaml(content: &str) -> Result<Workflow, DataError> {
         title,
         agent: parsed.agent,
         model: parsed.model,
+        overlays: parsed.overlays,
         steps: raw_to_steps(parsed.steps)?,
         setup: parsed.setup,
         teardown: parsed.teardown,

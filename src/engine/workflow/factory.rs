@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use crate::data::session::{AgentName, Session, SessionId};
 use crate::data::workflow_definition::WorkflowStep;
 use crate::engine::container::instance::ContainerExecution;
+use crate::engine::context_prompt::WorkflowStepInfo;
 use crate::engine::error::EngineError;
 
 /// Resolved per-step runtime context (agent, model, working dir, session id).
@@ -16,6 +17,11 @@ pub struct WorkflowRuntimeContext {
     pub step_model: Option<String>,
     pub git_root: PathBuf,
     pub session_id: SessionId,
+    /// Workflow invocation UUID, used to key `context(workflow)` directories
+    /// so resumed runs reuse the same directory.
+    pub workflow_invocation_id: uuid::Uuid,
+    /// Step progression info for building the workflow context prompt.
+    pub workflow_step_info: Option<WorkflowStepInfo>,
 }
 
 /// Trait implemented by Layer 2: produce a fresh `ContainerExecution` for a

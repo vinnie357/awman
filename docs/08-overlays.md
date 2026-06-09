@@ -127,6 +127,47 @@ skill(lint), skill(review)
 
 If a named skill does not exist in `~/.awman/skills/`, awman exits with an error before launching the container. This catches typos early rather than silently failing inside the container.
 
+### `context(scope[:permission])`
+
+Grants agent containers access to a persistent context directory on the host and delivers system prompt instructions explaining the context's purpose.
+
+Context overlays combine a **directory mount** (persistent files on the host) with **system prompt injection** (agent-specific delivery of context instructions), unified into a single overlay expression. This allows agents to access both shared knowledge and per-project accumulated context.
+
+**Syntax:**
+```
+context(SCOPE[:ro|rw])
+```
+
+- `SCOPE` — one of `global`, `repo`, or `workflow`:
+  - `global` — persistent cross-project developer preferences (`~/.awman/context/global/`)
+  - `repo` — project-specific context (`~/.awman/context/repo/{owner}/{repo}/`)
+  - `workflow` — per-workflow shared workspace for multi-agent coordination (`~/.awman/context/workflow/`)
+- `permission` — optional; `ro` (read-only) or `rw` (read-write, default).
+
+**Examples:**
+```
+context(global)        # personal preferences, read-write
+context(repo)          # project context, read-write
+context(workflow:ro)   # workflow workspace, read-only
+context(global:rw)     # personal preferences, explicit read-write
+```
+
+**What happens when you use `context()`:**
+
+1. awman mounts a directory into the container so the agent can read and (if `rw`) write files there.
+2. awman injects a system prompt explaining what the context directory is, how to use it, and what files might be inside.
+3. The directory and prompt are automatically managed by awman — you don't need to create them manually.
+
+**Agent system prompt support:**
+
+Most agents natively support system prompt injection. If your agent does not (e.g. `maki`, `crush`), awman still mounts the context directory, but the agent will not be automatically notified via system prompt — you can reference the mounted directory in your prompt manually. For details, see [Context Overlays](13-context-overlays.md).
+
+**Note on `rw` vs `ro`:**
+
+- `context(global)` and `context(repo)` default to `rw` because they are designed for agents to write accumulated knowledge back for future sessions.
+- `context(workflow)` is typically `rw` so agents can share state between steps.
+- Use `:ro` for read-only access if you want to ensure agents cannot modify the context directory (e.g. in CI/CD or shared environments).
+
 ---
 
 ## Configuration sources
@@ -165,6 +206,10 @@ Skills use **union/additive** semantics:
 ### Environment variable overlays
 
 Environment variable names are deduplicated by name. If multiple sources list the same `env(VAR)`, the final result includes that variable exactly once.
+
+### Context overlays
+
+Context overlays use **union** semantics — all specified scopes are mounted and all prompts are combined. If the same scope appears in multiple sources (e.g. `context(global)` in both global config and a step's overlays), it appears exactly once in the final mount list. The combined system prompt always presents scopes in the order: global, repo, workflow (workflow last).
 
 ---
 
@@ -282,6 +327,50 @@ steps:
 
 Per-step overlays merge additively with all other sources (global, repo, `AWMAN_OVERLAYS`, flags), and take highest priority for conflict resolution.
 
+### Workflow-level overlays
+
+Workflows can specify a top-level `overlays` array that applies to every step in the workflow:
+
+**TOML example:**
+```toml
+[workflow]
+title = "Multi-step implementation"
+
+overlays = ["context(repo)", "context(workflow)"]
+
+[[step]]
+name = "plan"
+prompt_template = "Plan the implementation..."
+
+[[step]]
+name = "implement"
+prompt_template = "Implement according to the plan..."
+
+[[step]]
+name = "test"
+prompt_template = "Test the implementation..."
+```
+
+**YAML example:**
+```yaml
+title: Multi-step implementation
+overlays:
+  - "context(repo)"
+  - "context(workflow)"
+
+steps:
+  - name: plan
+    prompt_template: "Plan the implementation..."
+  
+  - name: implement
+    prompt_template: "Implement according to the plan..."
+  
+  - name: test
+    prompt_template: "Test the implementation..."
+```
+
+Workflow-level overlays apply to all steps unless overridden by step-level overlays (which take highest priority). This is useful for context overlays that you want all steps to share (e.g. `context(repo)` so every agent in the workflow has access to the project's accumulated knowledge).
+
 ### Setup and teardown steps
 
 Setup and teardown steps (the phases that run before and after workflow steps) also support overlays:
@@ -357,6 +446,32 @@ To make your custom skills available in every session:
 
 All skills you've created with `awman new skill` now appear as slash commands in every agent session.
 
+### Personal developer context
+
+To share your personal coding preferences, style rules, and past-mistake notes across all projects:
+
+**Global config** (`~/.awman/config.json`):
+```json
+{
+  "overlays": ["context(global)"]
+}
+```
+
+Create `~/.awman/context/global/` and add files documenting your preferences (e.g. `coding-style.md`, `common-mistakes.md`). Every agent you run will receive your guidance automatically via system prompt, without needing to duplicate it across project-specific `CLAUDE.md` files.
+
+### Project-specific context
+
+To give agents access to your project's accumulated architecture notes and team knowledge:
+
+**Per-repo config** (`.awman/config.json`):
+```json
+{
+  "overlays": ["context(repo)"]
+}
+```
+
+awman maintains `~/.awman/context/repo/{owner}/{repo}/` automatically. After each agent session, you can add or update files in this directory (e.g. `architecture.md`, `gotchas.md`). Future agents working on the project will be guided by this accumulated knowledge.
+
 ### Selective skills in a workflow
 
 When different steps need different skills:
@@ -430,6 +545,8 @@ Malformed overlay expressions cause the command to exit immediately with a descr
 error: malformed overlay expression (missing colon): "notvalid"
 error: 'skill()' requires an argument; use skill(*) to mount all skills or skill(name) for a specific named skill
 error: 'env(A, B)' has multiple arguments; use separate env() calls for each variable
+error: 'context()' requires a scope; use context(global), context(repo), or context(workflow)
+error: 'context(global:rx)' has invalid permission; use 'ro' or 'rw'
 ```
 
 The command does not proceed — you must fix the syntax before launching.
@@ -482,12 +599,12 @@ Given a realistic setup:
 
 **Global config** (`~/.awman/config.json`):
 ```json
-{ "overlays": ["dir(~/team-shared:/mnt/shared:ro)"] }
+{ "overlays": ["dir(~/team-shared:/mnt/shared:ro)", "context(global)"] }
 ```
 
 **Per-repo config** (`.awman/config.json`):
 ```json
-{ "overlays": ["skill(lint)"] }
+{ "overlays": ["skill(lint)", "context(repo)"] }
 ```
 
 **Environment**:
@@ -500,17 +617,21 @@ export AWMAN_OVERLAYS="env(GITHUB_TOKEN)"
 awman exec workflow workflow.toml --overlay "ssh()"
 ```
 
-**Workflow step**:
+**Workflow** (top-level):
 ```toml
+overlays = ["context(workflow)"]
+
 [[step]]
 overlays = ["skill(review)"]
 ```
 
 **Merged result for this step:**
-- Directories: `/home/alice/team-shared:/mnt/shared:ro` (from global)
-- Skills: `lint` (from repo) + `review` (from step)
+- Directories: `/home/alice/team-shared:/mnt/shared:ro` (from global config)
+- Skills: `lint` (from repo config) + `review` (from step)
 - Environment: `GITHUB_TOKEN` (from `AWMAN_OVERLAYS`)
 - SSH: `~/.ssh:~/.ssh:ro` (from CLI flag)
+- Context: `global` (from global config) + `repo` (from repo config) + `workflow` (from workflow level)
+- Combined system prompt: global context instructions, then repo context instructions, then workflow context instructions
 
 ---
 
@@ -521,6 +642,7 @@ overlays = ["skill(review)"]
 - Only use `:rw` when the task genuinely requires write access to that directory.
 - Environment variable overlays are masked in displayed commands (values shown as `***`) to avoid leaking secrets in logs.
 - SSH keys are always mounted read-only — the agent cannot modify or replace your keys, only use them for authentication.
+- **Context overlays (`rw` default):** Because `context(global)` and `context(repo)` default to read-write, agents can persist files to your host that will be automatically injected into future agent runs. This is intentional — it allows agents to accumulate and refine knowledge. Use `:ro` (e.g. `context(repo:ro)`) if you want read-only context in CI/CD or shared environments. See [Context Overlays](13-context-overlays.md) for more details on managing context.
 
 See [Security & Isolation](03-security-and-isolation.md) for additional details on container transparency and isolation.
 
@@ -552,6 +674,24 @@ If you see this warning for a path that should exist, check:
 - Is `env(VAR_NAME)` configured?
 - Is the variable set in your current shell? Try `echo $VAR_NAME`.
 - If the variable is unset on the host, it is silently absent from the container — this is not an error, by design.
+
+### Context directory not visible in container
+
+- Is `context(global)`, `context(repo)`, or `context(workflow)` configured?
+- Check the full Docker command printed before the session — it should include `-v` mounts for `/awman/context/...`.
+- The context directory is auto-created if it doesn't exist. If directory creation fails (permission denied), awman will report an error.
+
+### Agent not receiving context system prompt
+
+- Is your agent one that supports system prompt injection? Check the [Context Overlays](13-context-overlays.md) guide for which agents support native injection.
+- For agents that support it (e.g. `claude`), is `context(...)` configured?
+- If your agent doesn't support native injection (e.g. `maki`), the context directory is still mounted; reference it manually in your prompt.
+
+### Context files not being updated
+
+- Is the context overlay `rw` (read-write)? By default they are `rw`, but check your config.
+- The context directory is writable by agents. Files written by one session will be visible to the next session.
+- If you want to prevent agents from modifying context, use `:ro` (e.g. `context(repo:ro)`).
 
 ---
 

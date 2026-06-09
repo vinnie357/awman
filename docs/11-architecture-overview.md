@@ -181,4 +181,4 @@ This scans all imports and fails if a lower layer imports from a higher layer. I
 
 ---
 
-[← Remote Mode](10-remote-mode.md)
+[← Remote Mode](10-remote-mode.md) · [GitHub Integration →](12-github-integration.md)

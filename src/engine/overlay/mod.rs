@@ -30,6 +30,25 @@ pub const CLAUDE_DENYLIST: &[&str] = &[
     "paste-cache",
 ];
 
+/// Scope for a context overlay — lives here in Layer 1 so both the engine
+/// (Layer 1) and command (Layer 2) layers can reference it without an
+/// upward dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextScope {
+    Global,
+    Repo,
+    Workflow,
+}
+
+/// A resolved context-directory overlay (host path already ensured-to-exist).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextOverlay {
+    pub scope: ContextScope,
+    pub host_path: PathBuf,
+    pub container_path: PathBuf,
+    pub permission: OverlayPermission,
+}
+
 /// Description of "overlays I want for this command, with these flags".
 #[derive(Debug, Default, Clone)]
 pub struct OverlayRequest {
@@ -47,6 +66,8 @@ pub struct OverlayRequest {
     pub yolo: bool,
     /// Override container `$HOME` (defaults to `/root`).
     pub container_home: Option<String>,
+    /// Context-directory overlays (global/repo/workflow).
+    pub context_overlays: Vec<ContextOverlay>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +202,17 @@ impl OverlayEngine {
                     insert_or_merge(&mut by_key, key, spec);
                 }
             }
+        }
+
+        // 4. Context-directory overlays.
+        for ctx in &request.context_overlays {
+            let spec = OverlaySpec {
+                host_path: ctx.host_path.clone(),
+                container_path: ctx.container_path.clone(),
+                permission: ctx.permission,
+            };
+            let key = OverlayPathResolver::conflict_key(&spec.host_path);
+            insert_or_merge(&mut by_key, key, spec);
         }
 
         let mut out: Vec<OverlaySpec> = by_key.into_values().collect();
@@ -1409,6 +1441,7 @@ mod tests {
             agent: None,
             yolo: false,
             container_home: None,
+            context_overlays: vec![],
         };
         let overlays = engine.build_overlays(&session, &request).unwrap();
         // The two entries sharing the same canonicalized host path must collapse.
@@ -1892,6 +1925,7 @@ mod tests {
             agent: None,
             yolo: false,
             container_home: None,
+            context_overlays: vec![],
         };
 
         let overlays = engine.build_overlays(&session, &request).unwrap();
@@ -1935,6 +1969,141 @@ mod tests {
         assert!(
             settings.get("permissionMode").is_none(),
             "permissionMode must NOT be set when yolo=false"
+        );
+    }
+
+    // ─── WI-0087: context overlay mounts ──────────────────────────────────────
+
+    fn make_session(session_root: &std::path::Path) -> crate::data::session::Session {
+        use crate::data::session::{SessionOpenOptions, StaticGitRootResolver};
+        let resolver = StaticGitRootResolver::new(session_root);
+        crate::data::session::Session::open(
+            session_root.to_path_buf(),
+            &resolver,
+            SessionOpenOptions::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn build_overlays_context_overlay_produces_expected_container_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_engine(tmp.path());
+        let session_tmp = tempfile::tempdir().unwrap();
+        let session = make_session(session_tmp.path());
+
+        // Host path for the context dir (doesn't need to exist for context overlays).
+        let ctx_host = tmp.path().join("context").join("global");
+
+        let request = OverlayRequest {
+            context_overlays: vec![ContextOverlay {
+                scope: ContextScope::Global,
+                host_path: ctx_host,
+                container_path: std::path::PathBuf::from("/awman/context/global"),
+                permission: crate::engine::container::options::OverlayPermission::ReadWrite,
+            }],
+            ..Default::default()
+        };
+
+        let specs = engine.build_overlays(&session, &request).unwrap();
+        let ctx_spec = specs.iter().find(|s| {
+            s.container_path == std::path::PathBuf::from("/awman/context/global")
+        });
+        assert!(
+            ctx_spec.is_some(),
+            "build_overlays must produce an OverlaySpec with container path \
+             /awman/context/global; got {specs:?}"
+        );
+        assert_eq!(
+            ctx_spec.unwrap().permission,
+            crate::engine::container::options::OverlayPermission::ReadWrite,
+        );
+    }
+
+    #[test]
+    fn build_overlays_context_overlay_repo_scope_container_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_engine(tmp.path());
+        let session_tmp = tempfile::tempdir().unwrap();
+        let session = make_session(session_tmp.path());
+
+        let ctx_host = tmp.path().join("context").join("repo").join("org").join("myrepo");
+
+        let request = OverlayRequest {
+            context_overlays: vec![ContextOverlay {
+                scope: ContextScope::Repo,
+                host_path: ctx_host,
+                container_path: std::path::PathBuf::from("/awman/context/repo"),
+                permission: crate::engine::container::options::OverlayPermission::ReadOnly,
+            }],
+            ..Default::default()
+        };
+
+        let specs = engine.build_overlays(&session, &request).unwrap();
+        let ctx_spec = specs
+            .iter()
+            .find(|s| s.container_path == std::path::PathBuf::from("/awman/context/repo"));
+        assert!(
+            ctx_spec.is_some(),
+            "build_overlays must produce an OverlaySpec with container path \
+             /awman/context/repo; got {specs:?}"
+        );
+        assert_eq!(
+            ctx_spec.unwrap().permission,
+            crate::engine::container::options::OverlayPermission::ReadOnly,
+        );
+    }
+
+    #[test]
+    fn build_overlays_context_overlay_collides_with_user_dir_most_restrictive_wins() {
+        // A context overlay (ReadOnly) sharing a host path with a user dir(ReadWrite)
+        // must merge to ReadOnly.
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_engine(tmp.path());
+        let session_tmp = tempfile::tempdir().unwrap();
+        let session = make_session(session_tmp.path());
+
+        // Shared host directory (must exist for the user dir overlay path check).
+        let shared_host = tmp.path().join("shared");
+        std::fs::create_dir_all(&shared_host).unwrap();
+        let shared_host_str = shared_host.to_str().unwrap().to_string();
+
+        let request = OverlayRequest {
+            directories: vec![DirectorySpec {
+                host: shared_host_str,
+                container: "/app/data".to_string(),
+                permission: crate::engine::container::options::OverlayPermission::ReadWrite,
+            }],
+            context_overlays: vec![ContextOverlay {
+                scope: ContextScope::Global,
+                host_path: shared_host.clone(),
+                container_path: std::path::PathBuf::from("/awman/context/global"),
+                permission: crate::engine::container::options::OverlayPermission::ReadOnly,
+            }],
+            ..Default::default()
+        };
+
+        let specs = engine.build_overlays(&session, &request).unwrap();
+
+        // Both map to the same canonicalized host path, so they must merge to one entry.
+        let shared_canon = shared_host
+            .canonicalize()
+            .unwrap_or_else(|_| shared_host.clone());
+        let matching: Vec<_> = specs
+            .iter()
+            .filter(|s| s.host_path == shared_canon)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "user dir + context overlay with same host path must merge to one entry; \
+             got {specs:?}"
+        );
+        assert_eq!(
+            matching[0].permission,
+            crate::engine::container::options::OverlayPermission::ReadOnly,
+            "ReadOnly must win over ReadWrite (most-restrictive); got {:?}",
+            matching[0].permission
         );
     }
 }

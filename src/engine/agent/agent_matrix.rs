@@ -18,6 +18,28 @@ pub const SUPPORTED_AGENTS: &[&str] = &[
     "antigravity",
 ];
 
+/// How awman injects the combined context system prompt into an agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemPromptMode {
+    /// Append to default system prompt by mounting the prompt as a file and
+    /// referencing it with a CLI flag (e.g. claude `--append-system-prompt-file <path>`).
+    Append,
+    /// Append to default system prompt by passing it inline as `<key>=<text>`
+    /// to a CLI flag (e.g. codex `--config developer_instructions=<text>`).
+    AppendInline { key: &'static str },
+    /// Replace default system prompt with inline text (destructive; preamble
+    /// prepended). Used by agents like cline `--system <text>`.
+    Replace,
+    /// File-based: write AGENTS.md into context dir.
+    AgentsMd,
+    /// Env var pointing to a file.
+    EnvFile { var: &'static str },
+    /// Extra workspace dir flag (agy --add-dir) + AGENTS.md.
+    AddDir { flag: &'static str },
+    /// Not supported.
+    Unsupported,
+}
+
 /// Per-agent metadata used by `AgentEngine::build_options`.
 #[derive(Debug, Clone)]
 pub struct AgentMatrix {
@@ -49,6 +71,10 @@ pub struct AgentMatrix {
     /// stdin without losing state. The wiring on the Docker side keeps the
     /// spawned subprocess's stdin alive for re-injection.
     pub supports_stdin_injection: bool,
+    /// How context system prompts are delivered to this agent.
+    pub system_prompt_delivery: SystemPromptMode,
+    /// CLI flag for system prompt delivery (e.g. `--append-system-prompt-file`).
+    pub system_prompt_flag: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,6 +101,8 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             allowed_tools_flag: Some("--allowedTools"),
             model_flag: ModelFlagDelivery::SpaceArg,
             supports_stdin_injection: false,
+            system_prompt_delivery: SystemPromptMode::Append,
+            system_prompt_flag: Some("--append-system-prompt-file"),
         },
         "codex" => AgentMatrix {
             agent: "codex",
@@ -87,6 +115,11 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
             supports_stdin_injection: false,
+            // codex takes the system prompt as `--config developer_instructions=<text>`.
+            system_prompt_delivery: SystemPromptMode::AppendInline {
+                key: "developer_instructions",
+            },
+            system_prompt_flag: Some("--config"),
         },
         "opencode" => AgentMatrix {
             agent: "opencode",
@@ -99,6 +132,8 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
             supports_stdin_injection: false,
+            system_prompt_delivery: SystemPromptMode::AgentsMd,
+            system_prompt_flag: None,
         },
         "maki" => AgentMatrix {
             agent: "maki",
@@ -111,6 +146,8 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
             supports_stdin_injection: false,
+            system_prompt_delivery: SystemPromptMode::Unsupported,
+            system_prompt_flag: None,
         },
         "gemini" => AgentMatrix {
             agent: "gemini",
@@ -123,6 +160,8 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
             supports_stdin_injection: false,
+            system_prompt_delivery: SystemPromptMode::EnvFile { var: "GEMINI_SYSTEM_MD" },
+            system_prompt_flag: None,
         },
         "copilot" => AgentMatrix {
             agent: "copilot",
@@ -135,6 +174,8 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
             supports_stdin_injection: false,
+            system_prompt_delivery: SystemPromptMode::EnvFile { var: "COPILOT_CUSTOM_INSTRUCTIONS_DIRS" },
+            system_prompt_flag: None,
         },
         "crush" => AgentMatrix {
             agent: "crush",
@@ -147,6 +188,8 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
             supports_stdin_injection: false,
+            system_prompt_delivery: SystemPromptMode::Unsupported,
+            system_prompt_flag: None,
         },
         "cline" => AgentMatrix {
             agent: "cline",
@@ -159,6 +202,8 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
             supports_stdin_injection: false,
+            system_prompt_delivery: SystemPromptMode::Replace,
+            system_prompt_flag: Some("--system"),
         },
         "antigravity" => AgentMatrix {
             // Verified against `agy --help` (v1.0.x). Flags actually accepted:
@@ -185,6 +230,8 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::Unsupported,
             supports_stdin_injection: false,
+            system_prompt_delivery: SystemPromptMode::AddDir { flag: "--add-dir" },
+            system_prompt_flag: None,
         },
         other => {
             return Err(EngineError::Other(format!(
@@ -294,6 +341,118 @@ mod tests {
             m.interactive_entrypoint,
             vec!["agy"],
             "antigravity interactive_entrypoint must be [\"agy\"]"
+        );
+    }
+
+    // ─── WI-0087: system prompt delivery matrix ────────────────────────────────
+
+    #[test]
+    fn all_supported_agents_have_valid_system_prompt_delivery() {
+        for agent in SUPPORTED_AGENTS {
+            let m = matrix_for(agent).expect("matrix must exist for all SUPPORTED_AGENTS");
+            // Just constructing the matrix (above) validates no panic.
+            // Additionally verify the delivery is a valid variant by matching it.
+            let _valid = match &m.system_prompt_delivery {
+                SystemPromptMode::Append
+                | SystemPromptMode::AppendInline { .. }
+                | SystemPromptMode::Replace
+                | SystemPromptMode::AgentsMd
+                | SystemPromptMode::EnvFile { .. }
+                | SystemPromptMode::AddDir { .. }
+                | SystemPromptMode::Unsupported => true,
+            };
+        }
+    }
+
+    #[test]
+    fn codex_system_prompt_delivery_is_append_inline_with_developer_instructions() {
+        let m = matrix_for("codex").unwrap();
+        assert!(
+            matches!(
+                m.system_prompt_delivery,
+                SystemPromptMode::AppendInline { key: "developer_instructions" }
+            ),
+            "codex must use AppendInline {{ key: developer_instructions }}; got {:?}",
+            m.system_prompt_delivery
+        );
+        assert_eq!(
+            m.system_prompt_flag,
+            Some("--config"),
+            "codex system_prompt_flag must be --config"
+        );
+    }
+
+    #[test]
+    fn claude_system_prompt_delivery_is_append() {
+        let m = matrix_for("claude").unwrap();
+        assert_eq!(
+            m.system_prompt_delivery,
+            SystemPromptMode::Append,
+            "claude must use Append delivery"
+        );
+        assert_eq!(
+            m.system_prompt_flag,
+            Some("--append-system-prompt-file"),
+            "claude system_prompt_flag must be --append-system-prompt-file"
+        );
+    }
+
+    #[test]
+    fn maki_system_prompt_delivery_is_unsupported() {
+        let m = matrix_for("maki").unwrap();
+        assert_eq!(
+            m.system_prompt_delivery,
+            SystemPromptMode::Unsupported,
+            "maki must use Unsupported delivery"
+        );
+        assert!(
+            m.system_prompt_flag.is_none(),
+            "maki must have no system_prompt_flag"
+        );
+    }
+
+    #[test]
+    fn cline_system_prompt_delivery_is_replace() {
+        let m = matrix_for("cline").unwrap();
+        assert_eq!(
+            m.system_prompt_delivery,
+            SystemPromptMode::Replace,
+            "cline must use Replace delivery"
+        );
+        assert_eq!(
+            m.system_prompt_flag,
+            Some("--system"),
+            "cline system_prompt_flag must be --system"
+        );
+    }
+
+    #[test]
+    fn crush_system_prompt_delivery_is_unsupported() {
+        let m = matrix_for("crush").unwrap();
+        assert_eq!(
+            m.system_prompt_delivery,
+            SystemPromptMode::Unsupported,
+            "crush must use Unsupported delivery"
+        );
+    }
+
+    #[test]
+    fn antigravity_system_prompt_delivery_is_add_dir() {
+        let m = matrix_for("antigravity").unwrap();
+        assert!(
+            matches!(m.system_prompt_delivery, SystemPromptMode::AddDir { flag: "--add-dir" }),
+            "antigravity must use AddDir {{ flag: \"--add-dir\" }}; got {:?}",
+            m.system_prompt_delivery
+        );
+    }
+
+    #[test]
+    fn opencode_system_prompt_delivery_is_agents_md() {
+        let m = matrix_for("opencode").unwrap();
+        assert_eq!(
+            m.system_prompt_delivery,
+            SystemPromptMode::AgentsMd,
+            "opencode must use AgentsMd delivery"
         );
     }
 }

@@ -14,7 +14,7 @@ use crate::data::workflow_definition::WorkflowStep;
 
 /// Current schema version for persisted `WorkflowState`. Bumped when the
 /// on-disk shape changes incompatibly.
-pub const WORKFLOW_STATE_SCHEMA_VERSION: u32 = 3;
+pub const WORKFLOW_STATE_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StepState {
@@ -71,6 +71,10 @@ pub struct PhaseStepState {
 pub struct WorkflowState {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
+    /// Unique identifier for this workflow invocation. Persisted so resumed
+    /// runs reuse the same id (and the same `context(workflow)` directory).
+    #[serde(default = "default_invocation_id")]
+    pub invocation_id: uuid::Uuid,
     pub workflow_name: String,
     pub workflow_hash: String,
     #[serde(default)]
@@ -98,6 +102,10 @@ fn default_schema_version() -> u32 {
     0
 }
 
+fn default_invocation_id() -> uuid::Uuid {
+    uuid::Uuid::new_v4()
+}
+
 impl WorkflowState {
     /// Construct a fresh state for a workflow that is about to run for the first time.
     pub fn new(
@@ -122,6 +130,7 @@ impl WorkflowState {
             .collect();
         Self {
             schema_version: WORKFLOW_STATE_SCHEMA_VERSION,
+            invocation_id: uuid::Uuid::new_v4(),
             workflow_name,
             workflow_hash: hash,
             work_item,

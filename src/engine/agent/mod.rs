@@ -13,7 +13,7 @@ use crate::data::session::{AgentName, Session};
 use crate::engine::container::options::{ContainerOption, EnvVar, ImageRef, PlanMode, YoloMode};
 use crate::engine::container::ContainerRuntime;
 use crate::engine::error::EngineError;
-use crate::engine::overlay::{DirectorySpec, OverlayEngine, OverlayRequest};
+use crate::engine::overlay::{ContextOverlay, DirectorySpec, OverlayEngine, OverlayRequest};
 use crate::engine::step_status::StepStatus;
 
 pub mod agent_matrix;
@@ -56,12 +56,20 @@ pub struct AgentRunOptions {
     /// `session.git_root()`. Needed when the session is rooted at a worktree
     /// but the image was built from the original repo root.
     pub image_tag_override: Option<String>,
+    /// Combined, pre-rendered system-prompt text (from `ContextPromptBuilder`).
+    pub system_prompt: Option<String>,
+    /// Resolved context-directory overlays for this run.
+    pub context_overlays: Vec<ContextOverlay>,
 }
 
 #[derive(Clone)]
 pub struct AgentEngine {
     overlay_engine: Arc<OverlayEngine>,
     container_runtime: Arc<ContainerRuntime>,
+    /// Temp files backing file/env-file system-prompt delivery. Retained as
+    /// RAII guards so the files live as long as this engine instance and are
+    /// removed on drop — no `/tmp` leakage.
+    prompt_tempfiles: Arc<std::sync::Mutex<Vec<tempfile::NamedTempFile>>>,
 }
 
 impl AgentEngine {
@@ -72,6 +80,7 @@ impl AgentEngine {
         Self {
             overlay_engine,
             container_runtime,
+            prompt_tempfiles: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -325,10 +334,21 @@ impl AgentEngine {
             named_skills: run.named_skills.clone(),
             agent: Some(agent.clone()),
             yolo: matches!(run.yolo, Some(YoloMode::Enabled)),
-            container_home,
+            container_home: container_home.clone(),
+            context_overlays: run.context_overlays.clone(),
         };
         for spec in self.overlay_engine.build_overlays(session, &request)? {
             options.push(ContainerOption::Overlay(spec));
+        }
+
+        // System prompt delivery (context overlays).
+        if let Some(ref prompt_text) = run.system_prompt {
+            self.emit_system_prompt_options(
+                &matrix,
+                prompt_text,
+                &run.context_overlays,
+                &mut options,
+            )?;
         }
 
         // Default working dir for the agent container.
@@ -337,6 +357,123 @@ impl AgentEngine {
         )));
 
         Ok(options)
+    }
+
+    /// Emit the `ContainerOption` variants for system-prompt delivery, consulting
+    /// the agent matrix for the correct delivery mechanism.
+    fn emit_system_prompt_options(
+        &self,
+        matrix: &agent_matrix::AgentMatrix,
+        prompt_text: &str,
+        context_overlays: &[ContextOverlay],
+        options: &mut Vec<ContainerOption>,
+    ) -> Result<(), EngineError> {
+        use agent_matrix::SystemPromptMode;
+
+        match &matrix.system_prompt_delivery {
+            SystemPromptMode::Append => {
+                let flag = matrix
+                    .system_prompt_flag
+                    .unwrap_or("--append-system-prompt-file");
+                let (host_path, container_path) = self.write_prompt_temp_file(prompt_text)?;
+                options.push(ContainerOption::SystemPromptFile {
+                    host_path,
+                    container_path,
+                    flag: flag.to_string(),
+                });
+            }
+            SystemPromptMode::AppendInline { key } => {
+                let flag = matrix.system_prompt_flag.unwrap_or("--config");
+                options.push(ContainerOption::SystemPromptInline {
+                    flag: flag.to_string(),
+                    text: format!("{key}={prompt_text}"),
+                });
+            }
+            SystemPromptMode::Replace => {
+                let flag = matrix.system_prompt_flag.unwrap_or("--system");
+                let preamble = format!(
+                    "You are {}, an AI coding assistant. Use your full capabilities \
+                     and all available tools to complete the task.\n\n",
+                    matrix.agent
+                );
+                options.push(ContainerOption::SystemPromptInline {
+                    flag: flag.to_string(),
+                    text: format!("{preamble}{prompt_text}"),
+                });
+            }
+            SystemPromptMode::AgentsMd => {
+                for ctx in context_overlays {
+                    plant_agents_md(&ctx.host_path, prompt_text);
+                }
+            }
+            SystemPromptMode::EnvFile { var } => {
+                let (host_path, container_path) = self.write_prompt_temp_file(prompt_text)?;
+                options.push(ContainerOption::SystemPromptEnvFile {
+                    env_var: var.to_string(),
+                    host_path,
+                    container_path,
+                });
+            }
+            SystemPromptMode::AddDir { flag } => {
+                for ctx in context_overlays {
+                    plant_agents_md(&ctx.host_path, prompt_text);
+                    options.push(ContainerOption::AgentAddDir {
+                        flag: flag.to_string(),
+                        container_path: ctx.container_path.clone(),
+                    });
+                }
+            }
+            SystemPromptMode::Unsupported => {
+                // The user-facing warning is emitted in `resolve_context_overlays`
+                // (it has access to a UserMessageSink); here we just skip emitting
+                // any system-prompt option.
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the system prompt text to a temp file and return (host_path, container_path).
+    /// The temp file is retained on the engine's RAII guard so it lives as
+    /// long as the engine and is cleaned up on drop.
+    fn write_prompt_temp_file(
+        &self,
+        text: &str,
+    ) -> Result<(std::path::PathBuf, std::path::PathBuf), EngineError> {
+        use std::io::Write as _;
+        let mut tmp = tempfile::Builder::new()
+            .prefix("awman-ctx-prompt-")
+            .suffix(".md")
+            .tempfile()
+            .map_err(|e| EngineError::io(std::path::PathBuf::from("/tmp"), e))?;
+        tmp.write_all(text.as_bytes())
+            .map_err(|e| EngineError::io(tmp.path(), e))?;
+        let host_path = tmp.path().to_path_buf();
+        let container_path =
+            std::path::PathBuf::from("/tmp").join(host_path.file_name().unwrap_or_default());
+        if let Ok(mut guard) = self.prompt_tempfiles.lock() {
+            guard.push(tmp);
+        }
+        Ok((host_path, container_path))
+    }
+}
+
+/// Write `AGENTS.md` into a context dir, skipping the write when the existing
+/// content already matches. Logs (and silently moves on) when the write fails
+/// e.g. because the host directory is read-only.
+fn plant_agents_md(host_dir: &std::path::Path, prompt_text: &str) {
+    let agents_md = host_dir.join("AGENTS.md");
+    if let Ok(existing) = std::fs::read_to_string(&agents_md) {
+        if existing == prompt_text {
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(&agents_md, prompt_text) {
+        tracing::warn!(
+            path = %agents_md.display(),
+            error = %e,
+            "context overlay: failed to plant AGENTS.md (host dir read-only?); \
+             agent will not be automatically notified about the context directory"
+        );
     }
 }
 
@@ -859,5 +996,200 @@ mod tests {
         // At minimum there should be some status activity.
         // (We assert the engine completed without panicking — that's the
         // key invariant for this scenario.)
+    }
+
+    // ─── WI-0087: build_options single emitter ────────────────────────────────
+
+    #[test]
+    fn build_options_claude_with_context_global_emits_overlay_at_container_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+
+        // Context dir host path (need not exist — context overlays bypass the
+        // host-existence check in resolve_user_overlay).
+        let ctx_host = tmp.path().join("context").join("global");
+
+        let run = AgentRunOptions {
+            context_overlays: vec![crate::engine::overlay::ContextOverlay {
+                scope: crate::engine::overlay::ContextScope::Global,
+                host_path: ctx_host,
+                container_path: std::path::PathBuf::from("/awman/context/global"),
+                permission: crate::engine::container::options::OverlayPermission::ReadWrite,
+            }],
+            ..Default::default()
+        };
+
+        let opts = engine.build_options(&session, &agent, &run).unwrap();
+
+        let has_ctx_overlay = opts.iter().any(|o| {
+            if let ContainerOption::Overlay(spec) = o {
+                spec.container_path == std::path::PathBuf::from("/awman/context/global")
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_ctx_overlay,
+            "build_options must emit ContainerOption::Overlay for /awman/context/global; \
+             got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_options_claude_with_system_prompt_emits_system_prompt_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+
+        let ctx_host = tmp.path().join("context").join("global");
+
+        let run = AgentRunOptions {
+            system_prompt: Some("Test context prompt.".to_string()),
+            context_overlays: vec![crate::engine::overlay::ContextOverlay {
+                scope: crate::engine::overlay::ContextScope::Global,
+                host_path: ctx_host,
+                container_path: std::path::PathBuf::from("/awman/context/global"),
+                permission: crate::engine::container::options::OverlayPermission::ReadWrite,
+            }],
+            ..Default::default()
+        };
+
+        let opts = engine.build_options(&session, &agent, &run).unwrap();
+
+        let prompt_file_opt = opts.iter().find(|o| {
+            matches!(o, ContainerOption::SystemPromptFile { .. })
+        });
+        assert!(
+            prompt_file_opt.is_some(),
+            "build_options must emit ContainerOption::SystemPromptFile for claude; \
+             got {opts:?}"
+        );
+        if let Some(ContainerOption::SystemPromptFile { flag, .. }) = prompt_file_opt {
+            assert_eq!(
+                flag, "--append-system-prompt-file",
+                "claude system prompt flag must be --append-system-prompt-file"
+            );
+        }
+    }
+
+    #[test]
+    fn build_options_no_system_prompt_option_without_system_prompt_input() {
+        // When system_prompt is None, no SystemPromptFile option must be emitted.
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+
+        let run = AgentRunOptions {
+            system_prompt: None,
+            ..Default::default()
+        };
+
+        let opts = engine.build_options(&session, &agent, &run).unwrap();
+
+        let has_prompt_file = opts
+            .iter()
+            .any(|o| matches!(o, ContainerOption::SystemPromptFile { .. }));
+        assert!(
+            !has_prompt_file,
+            "no SystemPromptFile option must be emitted when system_prompt is None; \
+             got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_options_maki_with_system_prompt_does_not_emit_system_prompt_file() {
+        // maki has Unsupported delivery; no SystemPromptFile must appear.
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("maki").unwrap();
+
+        let run = AgentRunOptions {
+            system_prompt: Some("Test prompt.".to_string()),
+            ..Default::default()
+        };
+
+        let opts = engine.build_options(&session, &agent, &run).unwrap();
+
+        let has_prompt_file = opts
+            .iter()
+            .any(|o| matches!(o, ContainerOption::SystemPromptFile { .. }));
+        assert!(
+            !has_prompt_file,
+            "maki must not emit SystemPromptFile (Unsupported delivery); got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_options_cline_emits_inline_system_prompt_with_preamble() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("cline").unwrap();
+        let run = AgentRunOptions {
+            system_prompt: Some("Test prompt body.".to_string()),
+            ..Default::default()
+        };
+        let opts = engine.build_options(&session, &agent, &run).unwrap();
+        let inline = opts
+            .iter()
+            .find_map(|o| {
+                if let ContainerOption::SystemPromptInline { flag, text } = o {
+                    Some((flag.clone(), text.clone()))
+                } else {
+                    None
+                }
+            })
+            .expect("cline must emit SystemPromptInline");
+        assert_eq!(inline.0, "--system", "cline flag must be --system");
+        assert!(
+            inline.1.starts_with("You are cline,"),
+            "cline replace mode must prepend baseline preamble; got: {}",
+            inline.1
+        );
+        assert!(
+            inline.1.contains("Test prompt body."),
+            "cline inline must contain the prompt body; got: {}",
+            inline.1
+        );
+        // No SystemPromptFile should be emitted for cline.
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, ContainerOption::SystemPromptFile { .. })),
+            "cline must not emit SystemPromptFile; got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_options_codex_emits_inline_developer_instructions_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("codex").unwrap();
+        let run = AgentRunOptions {
+            system_prompt: Some("Codex test body.".to_string()),
+            ..Default::default()
+        };
+        let opts = engine.build_options(&session, &agent, &run).unwrap();
+        let inline = opts
+            .iter()
+            .find_map(|o| {
+                if let ContainerOption::SystemPromptInline { flag, text } = o {
+                    Some((flag.clone(), text.clone()))
+                } else {
+                    None
+                }
+            })
+            .expect("codex must emit SystemPromptInline (config key=value)");
+        assert_eq!(inline.0, "--config", "codex flag must be --config");
+        assert!(
+            inline.1.starts_with("developer_instructions="),
+            "codex inline must use key=value form; got: {}",
+            inline.1
+        );
+        assert!(
+            inline.1.contains("Codex test body."),
+            "codex inline must contain the prompt body; got: {}",
+            inline.1
+        );
     }
 }

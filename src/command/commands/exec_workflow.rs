@@ -13,7 +13,8 @@ use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
 use crate::command::commands::worktree_lifecycle::{WorktreeLifecycle, WorktreeLifecycleFrontend};
 use crate::command::commands::Command;
 use crate::command::commands::{
-    collect_all_overlay_specs, parse_overlay_list, warn_legacy_config, TypedOverlay,
+    collect_all_overlay_specs, parse_overlay_list, resolve_context_overlays, warn_legacy_config,
+    TypedOverlay,
 };
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
@@ -304,6 +305,8 @@ struct CommandLayerFactory {
     /// The original repository git root (not the worktree). Used for image tag
     /// derivation so worktree-based runs use the correct project image.
     image_git_root: PathBuf,
+    /// Workflow-level overlays applied to every step.
+    workflow_overlays: Option<Vec<String>>,
 }
 
 impl ContainerExecutionFactory for CommandLayerFactory {
@@ -321,9 +324,24 @@ impl ContainerExecutionFactory for CommandLayerFactory {
         let collected = collect_all_overlay_specs(
             session,
             self.cli_typed_overlays.clone(),
+            self.workflow_overlays.as_deref(),
             step.overlays.as_deref(),
         )
         .map_err(|e| EngineError::Other(format!("overlay collection failed: {e}")))?;
+
+        // Resolve context overlays.
+        let (context_overlays, system_prompt) = {
+            let mut guard = self.shared.lock().unwrap();
+            resolve_context_overlays(
+                &collected.context_overlays,
+                session,
+                &runtime.step_agent,
+                Some(runtime.workflow_invocation_id),
+                runtime.workflow_step_info.as_ref(),
+                guard.as_mut(),
+            )
+            .map_err(|e| EngineError::Other(format!("context overlay resolution failed: {e}")))?
+        };
 
         // Use the original repo root for image tag derivation so worktree-
         // based runs resolve the correct image for both the Image option AND
@@ -351,6 +369,9 @@ impl ContainerExecutionFactory for CommandLayerFactory {
             include_all_skills: collected.include_all_skills,
             named_skills: collected.named_skills,
             image_tag_override: Some(correct_tag),
+            system_prompt,
+            context_overlays,
+            ..Default::default()
         };
         let mut options =
             self.engines
@@ -471,6 +492,12 @@ impl Command for ExecWorkflowCommand {
             emit_gemini_deprecation_warning(frontend.as_mut());
             gemini_warning_emitted = true;
         }
+
+        // Warn (don't error) when context(workflow) appears in a setup or
+        // teardown step's overlays — workflow step progression state is not
+        // available during those phases, so the dynamic prompt fields will
+        // be empty.
+        warn_context_workflow_in_phase(&workflow, frontend.as_mut());
         let _ = gemini_warning_emitted;
 
         // 2. Resolve mount scope — confirm with the user when cwd differs from git root.
@@ -905,6 +932,7 @@ impl Command for ExecWorkflowCommand {
                 cli_typed_overlays: cli_typed.clone(),
                 work_item_context,
                 image_git_root: git_root_for_scope.clone(),
+                workflow_overlays: workflow.overlays.clone(),
             };
             let mut engine = match WorkflowEngine::resume(
                 &session,
@@ -1237,6 +1265,49 @@ fn emit_gemini_deprecation_warning(sink: &mut dyn UserMessageSink) {
     });
 }
 
+/// Emit a Warning for each setup/teardown entry that names `context(workflow)`
+/// in its overlay list. Workflow step progression state is not available
+/// during those phases, so the dynamic prompt fields will be empty.
+fn warn_context_workflow_in_phase(workflow: &Workflow, sink: &mut dyn UserMessageSink) {
+    fn mentions_context_workflow(overlay: &str) -> bool {
+        let t = overlay.trim();
+        t.starts_with("context(workflow")
+            && t[..t.len().min(20)].contains("workflow")
+    }
+    for (i, entry) in workflow.setup.iter().enumerate() {
+        if let Some(overlays) = &entry.overlays {
+            for o in overlays {
+                if mentions_context_workflow(o) {
+                    sink.write_message(UserMessage {
+                        level: MessageLevel::Warning,
+                        text: format!(
+                            "setup step {i}: '{o}': context(workflow) in setup steps has \
+                             no workflow step progress to surface yet; the dynamic prompt \
+                             will reflect a setup phase only."
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    for (i, entry) in workflow.teardown.iter().enumerate() {
+        if let Some(overlays) = &entry.overlays {
+            for o in overlays {
+                if mentions_context_workflow(o) {
+                    sink.write_message(UserMessage {
+                        level: MessageLevel::Warning,
+                        text: format!(
+                            "teardown step {i}: '{o}': context(workflow) in teardown steps \
+                             runs after the main workflow has finished; the dynamic prompt \
+                             may not reflect live step progression."
+                        ),
+                    });
+                }
+            }
+        }
+    }
+}
+
 /// True if any step in the workflow will resolve to the `gemini` agent under
 /// the same precedence the workflow engine uses (`step.agent` >
 /// `workflow.agent` > session default).
@@ -1287,7 +1358,7 @@ fn collect_single_entry_overlays(
     ),
     CommandError,
 > {
-    let collected = collect_all_overlay_specs(session, cli_typed.to_vec(), entry_overlays)?;
+    let collected = collect_all_overlay_specs(session, cli_typed.to_vec(), None, entry_overlays)?;
 
     // Prefer the running image's baked-in $HOME (the actual runtime
     // authority) over what the local Dockerfile.dev says — the two can
@@ -1320,6 +1391,7 @@ fn collect_single_entry_overlays(
         agent: None,
         yolo: false,
         container_home,
+        context_overlays: Vec::new(),
     };
     let overlay_specs = engines
         .overlay_engine
@@ -2111,6 +2183,7 @@ prompt = "do something"
             setup: vec![],
             teardown: vec![],
             teardown_on_failure: false,
+            overlays: None,
         }
     }
 

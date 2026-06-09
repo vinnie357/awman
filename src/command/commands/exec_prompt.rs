@@ -7,7 +7,8 @@ use crate::command::commands::agent_auth::AgentAuthFrontend;
 use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::MountScopeFrontend;
 use crate::command::commands::{
-    collect_all_overlay_specs, parse_overlay_list, resolve_agent, warn_legacy_config, Command,
+    collect_all_overlay_specs, parse_overlay_list, resolve_agent, resolve_context_overlays,
+    warn_legacy_config, Command,
 };
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
@@ -201,7 +202,7 @@ impl Command for ExecPromptCommand {
             }
             all
         };
-        let collected = collect_all_overlay_specs(&session, cli_typed, None)?;
+        let collected = collect_all_overlay_specs(&session, cli_typed, None, None)?;
 
         // Emit deprecation warnings for legacy config fields.
         warn_legacy_config(&session, frontend.as_mut());
@@ -244,6 +245,15 @@ impl Command for ExecPromptCommand {
             }
         };
 
+        let (context_overlays, system_prompt) = resolve_context_overlays(
+            &collected.context_overlays,
+            &session,
+            &agent,
+            None,
+            None,
+            frontend.as_mut(),
+        )?;
+
         let run_opts = AgentRunOptions {
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
@@ -260,6 +270,8 @@ impl Command for ExecPromptCommand {
             directory_overlays: collected.directories,
             include_all_skills: collected.include_all_skills,
             named_skills: collected.named_skills,
+            system_prompt,
+            context_overlays,
             ..Default::default()
         };
 

@@ -169,6 +169,31 @@ pub enum ContainerOption {
     AllowedToolsFlag(String),
     /// Keep the container after exit (do not pass `--rm`).
     KeepContainer,
+    /// System prompt delivered via a file mount + CLI flag (e.g.
+    /// `--append-system-prompt-file <container_path>`).
+    SystemPromptFile {
+        host_path: PathBuf,
+        container_path: PathBuf,
+        flag: String,
+    },
+    /// System prompt delivered via an env var pointing to a mounted file
+    /// (e.g. `GEMINI_SYSTEM_MD=<container_path>`).
+    SystemPromptEnvFile {
+        env_var: String,
+        host_path: PathBuf,
+        container_path: PathBuf,
+    },
+    /// System prompt delivered as inline text via a CLI flag (e.g.
+    /// `--system <text>` for cline).
+    SystemPromptInline {
+        flag: String,
+        text: String,
+    },
+    /// Extra workspace dir for the agent (e.g. `--add-dir <container_path>`).
+    AgentAddDir {
+        flag: String,
+        container_path: PathBuf,
+    },
 }
 
 /// Resolved option bag — all options merged into a single struct that the
@@ -202,6 +227,10 @@ pub struct ResolvedContainerOptions {
     pub disallowed_tools_flag: Option<String>,
     pub allowed_tools_flag: Option<String>,
     pub remove_on_exit: bool,
+    pub system_prompt_file: Option<(PathBuf, PathBuf, String)>,
+    pub system_prompt_env_file: Option<(String, PathBuf, PathBuf)>,
+    pub system_prompt_inline: Option<(String, String)>,
+    pub agent_add_dirs: Vec<(String, PathBuf)>,
 }
 
 impl ResolvedContainerOptions {
@@ -253,6 +282,18 @@ impl ResolvedContainerOptions {
             ContainerOption::DisallowedToolsFlag(v) => self.disallowed_tools_flag = Some(v),
             ContainerOption::AllowedToolsFlag(v) => self.allowed_tools_flag = Some(v),
             ContainerOption::KeepContainer => self.remove_on_exit = false,
+            ContainerOption::SystemPromptFile { host_path, container_path, flag } => {
+                self.system_prompt_file = Some((host_path, container_path, flag));
+            }
+            ContainerOption::SystemPromptEnvFile { env_var, host_path, container_path } => {
+                self.system_prompt_env_file = Some((env_var, host_path, container_path));
+            }
+            ContainerOption::SystemPromptInline { flag, text } => {
+                self.system_prompt_inline = Some((flag, text));
+            }
+            ContainerOption::AgentAddDir { flag, container_path } => {
+                self.agent_add_dirs.push((flag, container_path));
+            }
         }
         Ok(())
     }

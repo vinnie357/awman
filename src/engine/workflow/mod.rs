@@ -480,11 +480,14 @@ impl WorkflowEngine {
             "workflow_engine resolved step parameters"
         );
 
+        let workflow_step_info = self.build_workflow_step_info(&step.name);
         let runtime = WorkflowRuntimeContext {
             step_agent: resolved_agent.clone(),
             step_model: resolved_model.clone(),
             git_root: self.session.git_root().to_path_buf(),
             session_id: self.session.id(),
+            workflow_invocation_id: self.state.invocation_id,
+            workflow_step_info,
         };
 
         self.frontend.report_step_interactive_launch(
@@ -1356,6 +1359,51 @@ impl WorkflowEngine {
         self.effective_config.model()
     }
 
+    fn build_workflow_step_info(
+        &self,
+        current_step_name: &str,
+    ) -> Option<crate::engine::context_prompt::WorkflowStepInfo> {
+        use crate::engine::context_prompt::{WorkflowStepInfo as CtxStepInfo, WorkflowStepState};
+
+        let title = self
+            .workflow
+            .title
+            .clone()
+            .unwrap_or_else(|| "Untitled Workflow".to_string());
+        let total = self.workflow.steps.len();
+        let mut current_index = 0;
+        let mut steps = Vec::with_capacity(total);
+
+        for (i, step) in self.workflow.steps.iter().enumerate() {
+            let state = if step.name == current_step_name {
+                current_index = i;
+                WorkflowStepState::InProgress
+            } else {
+                match self.state.status_of(&step.name) {
+                    Some(StepState::Succeeded) => WorkflowStepState::Completed,
+                    Some(StepState::Running { .. }) => WorkflowStepState::InProgress,
+                    _ => WorkflowStepState::Pending,
+                }
+            };
+            steps.push((step.name.clone(), state));
+        }
+
+        let work_item_number = self.work_item_context.as_ref().map(|c| c.number);
+        let work_item_title = self.work_item_context.as_ref().and_then(|c| {
+            c.content.lines().next().map(|l| l.trim().to_string())
+        });
+
+        Some(CtxStepInfo {
+            workflow_title: title,
+            current_step_name: current_step_name.to_string(),
+            current_step_index: current_index,
+            total_steps: total,
+            steps,
+            work_item_number,
+            work_item_title,
+        })
+    }
+
     fn persist(&self) -> Result<(), EngineError> {
         self.state_store
             .save(&self.state)
@@ -1867,6 +1915,8 @@ impl WorkflowEngine {
             step_model: model,
             git_root: self.session.git_root().to_path_buf(),
             session_id: self.session.id(),
+            workflow_invocation_id: self.state.invocation_id,
+            workflow_step_info: None,
         };
 
         let execution = match self.container_factory.execution_for_step(
@@ -2131,6 +2181,7 @@ mod tests {
             setup: Vec::new(),
             teardown: Vec::new(),
             teardown_on_failure: false,
+            overlays: None,
         }
     }
 

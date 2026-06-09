@@ -61,12 +61,22 @@ pub enum SkillSpec {
     Named(String),
 }
 
-/// A parsed overlay expression: directory mount, skill, or env passthrough.
+pub use crate::engine::overlay::ContextScope;
+
+/// A parsed context overlay specification (scope + permission).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextOverlaySpec {
+    pub scope: ContextScope,
+    pub permission: crate::engine::container::options::OverlayPermission,
+}
+
+/// A parsed overlay expression: directory mount, skill, env passthrough, or context.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedOverlay {
     Directory(crate::engine::overlay::DirectorySpec),
     Skill(SkillSpec),
     Env(String),
+    Context(ContextOverlaySpec),
 }
 
 /// Aggregated overlay information after collecting from all sources.
@@ -76,6 +86,7 @@ pub struct CollectedOverlays {
     pub include_all_skills: bool,
     pub named_skills: Vec<String>,
     pub env_passthrough: Vec<String>,
+    pub context_overlays: Vec<ContextOverlaySpec>,
 }
 
 /// Parse a user-supplied overlay spec string in the form
@@ -221,8 +232,40 @@ fn parse_single_typed_overlay(expr: &str) -> Result<TypedOverlay, String> {
             }
             Ok(TypedOverlay::Env(args.to_string()))
         }
+        "context" => {
+            if args.is_empty() {
+                return Err("context() requires a scope argument: context(global), context(repo), or context(workflow)".to_string());
+            }
+            let parts: Vec<&str> = args.splitn(2, ':').collect();
+            let scope_str = parts[0].trim();
+            let scope = match scope_str {
+                "global" => ContextScope::Global,
+                "repo" => ContextScope::Repo,
+                "workflow" => ContextScope::Workflow,
+                other => {
+                    return Err(format!(
+                        "unknown context scope '{other}' in '{expr}'; \
+                         supported scopes: global, repo, workflow"
+                    ));
+                }
+            };
+            let permission = if let Some(perm_str) = parts.get(1).map(|s| s.trim()) {
+                match perm_str {
+                    "ro" => crate::engine::container::options::OverlayPermission::ReadOnly,
+                    "rw" => crate::engine::container::options::OverlayPermission::ReadWrite,
+                    other => {
+                        return Err(format!(
+                            "unknown permission '{other}' in '{expr}'; expected 'ro' or 'rw'"
+                        ));
+                    }
+                }
+            } else {
+                crate::engine::container::options::OverlayPermission::ReadWrite
+            };
+            Ok(TypedOverlay::Context(ContextOverlaySpec { scope, permission }))
+        }
         _ => Err(format!(
-            "unknown overlay type '{tag}' in '{expr}'; supported types: dir, skill, ssh, env"
+            "unknown overlay type '{tag}' in '{expr}'; supported types: dir, skill, ssh, env, context"
         )),
     }
 }
@@ -284,6 +327,7 @@ fn parse_dir_overlay_args(
 pub fn collect_all_overlay_specs(
     session: &crate::data::session::Session,
     cli_typed_overlays: Vec<TypedOverlay>,
+    workflow_overlays: Option<&[String]>,
     step_overlays: Option<&[String]>,
 ) -> Result<CollectedOverlays, crate::command::error::CommandError> {
     let ec = session.effective_config();
@@ -291,6 +335,7 @@ pub fn collect_all_overlay_specs(
     let mut include_all_skills = false;
     let mut named_skills: Vec<String> = Vec::new();
     let mut env_passthrough: Vec<String> = Vec::new();
+    let mut context_overlays: Vec<ContextOverlaySpec> = Vec::new();
 
     let mut process_typed = |typed: TypedOverlay| match typed {
         TypedOverlay::Directory(spec) => dirs.push(spec),
@@ -303,6 +348,11 @@ pub fn collect_all_overlay_specs(
         TypedOverlay::Env(var) => {
             if !env_passthrough.contains(&var) {
                 env_passthrough.push(var);
+            }
+        }
+        TypedOverlay::Context(spec) => {
+            if !context_overlays.iter().any(|c| c.scope == spec.scope) {
+                context_overlays.push(spec);
             }
         }
     };
@@ -355,7 +405,22 @@ pub fn collect_all_overlay_specs(
         process_typed(typed);
     }
 
-    // 5. Per-step overlays (highest priority).
+    // 5. Workflow-level overlays (between CLI and step).
+    if let Some(wf_strs) = workflow_overlays {
+        for s in wf_strs {
+            let parsed = parse_overlay_list(s).map_err(|reason| {
+                crate::command::error::CommandError::InvalidOverlaySpec {
+                    spec: s.clone(),
+                    reason,
+                }
+            })?;
+            for typed in parsed {
+                process_typed(typed);
+            }
+        }
+    }
+
+    // 6. Per-step overlays (highest priority).
     if let Some(step_strs) = step_overlays {
         for s in step_strs {
             let parsed = parse_overlay_list(s).map_err(|reason| {
@@ -375,7 +440,154 @@ pub fn collect_all_overlay_specs(
         include_all_skills,
         named_skills,
         env_passthrough,
+        context_overlays,
     })
+}
+
+/// Resolve `ContextOverlaySpec`s into `ContextOverlay`s (host paths ensured-to-exist)
+/// and build the combined system prompt. Used by `chat`, `exec_prompt`, and
+/// `exec_workflow`.
+///
+/// `workflow_step_info` is `Some` when running inside a multi-step workflow
+/// (provides step progress for the prompt); `None` for chat / exec_prompt.
+///
+/// `workflow_invocation_id` keys the workflow context directory. Inside a
+/// workflow, pass `WorkflowState::invocation_id` so resumed runs reuse the same
+/// dir. For `chat`/`exec prompt`, pass `None` and the session UUID is used as
+/// a stable per-session fallback.
+///
+/// `agent` is used to emit `Warning`/`Info` `UserMessage`s when the agent's
+/// system-prompt delivery is degraded (`Replace`) or unsupported.
+pub fn resolve_context_overlays(
+    specs: &[ContextOverlaySpec],
+    session: &crate::data::session::Session,
+    agent: &crate::data::session::AgentName,
+    workflow_invocation_id: Option<uuid::Uuid>,
+    workflow_step_info: Option<&crate::engine::context_prompt::WorkflowStepInfo>,
+    sink: &mut dyn crate::engine::message::UserMessageSink,
+) -> Result<(Vec<crate::engine::overlay::ContextOverlay>, Option<String>), crate::command::error::CommandError> {
+    use crate::data::fs::ContextDirResolver;
+    use crate::engine::agent::agent_matrix::{matrix_for, SystemPromptMode};
+    use crate::engine::context_prompt::ContextPromptBuilder;
+    use crate::engine::message::{MessageLevel, UserMessage};
+    use crate::engine::overlay::ContextOverlay;
+
+    if specs.is_empty() {
+        return Ok((vec![], None));
+    }
+
+    let resolver = ContextDirResolver::from_process_env()
+        .map_err(|e| crate::command::error::CommandError::Other(format!("context dir resolver: {e}")))?;
+
+    let mut overlays = Vec::new();
+    let mut builder = ContextPromptBuilder::new();
+    let mut saw_repo_fallback: Option<std::path::PathBuf> = None;
+
+    for spec in specs {
+        let (host_path, container_path) = match spec.scope {
+            ContextScope::Global => {
+                let p = resolver.global_dir();
+                (p, std::path::PathBuf::from("/awman/context/global"))
+            }
+            ContextScope::Repo => {
+                let p = resolver.repo_dir(session.git_root());
+                // Detect the `_local/...` fallback so we can surface an Info
+                // message naming the resolved dir.
+                if let Some(suffix) = p.iter().rev().nth(1).and_then(|c| c.to_str()) {
+                    if suffix == "_local" {
+                        saw_repo_fallback = Some(p.clone());
+                    }
+                }
+                (p, std::path::PathBuf::from("/awman/context/repo"))
+            }
+            ContextScope::Workflow => {
+                let uuid = workflow_invocation_id
+                    .unwrap_or_else(|| session.id().as_uuid());
+                let p = resolver.workflow_dir(uuid);
+                (p, std::path::PathBuf::from("/awman/context/workflow"))
+            }
+        };
+
+        if let Err(e) = ContextDirResolver::ensure_exists(&host_path) {
+            sink.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: format!("context overlay: failed to create directory {}: {e}", host_path.display()),
+            });
+            continue;
+        }
+
+        overlays.push(ContextOverlay {
+            scope: spec.scope,
+            host_path,
+            container_path,
+            permission: spec.permission,
+        });
+
+        match spec.scope {
+            ContextScope::Global => {
+                builder = builder.with_global();
+            }
+            ContextScope::Repo => {
+                builder = builder.with_repo();
+            }
+            ContextScope::Workflow => {
+                if let Some(info) = workflow_step_info {
+                    builder = builder.with_workflow(info);
+                } else {
+                    sink.write_message(UserMessage {
+                        level: MessageLevel::Info,
+                        text: "context(workflow) is most useful inside a workflow; \
+                               workflow state will be empty"
+                            .to_string(),
+                    });
+                    builder = builder.with_workflow_oneshot();
+                }
+            }
+        }
+    }
+
+    if let Some(path) = saw_repo_fallback {
+        sink.write_message(UserMessage {
+            level: MessageLevel::Info,
+            text: format!(
+                "context(repo): no git remote configured; using local fallback directory {}",
+                path.display()
+            ),
+        });
+    }
+
+    // Surface agent-compatibility warnings now that we know context overlays
+    // will be active for this run.
+    if let Ok(matrix) = matrix_for(agent.as_str()) {
+        match &matrix.system_prompt_delivery {
+            SystemPromptMode::Replace => {
+                sink.write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text: format!(
+                        "context overlay: '{}' replaces the default system prompt with the \
+                         context instructions; a baseline preamble is prepended but you may \
+                         see degraded tool-use guidance.",
+                        agent.as_str()
+                    ),
+                });
+            }
+            SystemPromptMode::Unsupported => {
+                sink.write_message(UserMessage {
+                    level: MessageLevel::Warning,
+                    text: format!(
+                        "context() overlay mounted for '{}' but system prompt injection is \
+                         not supported for this agent; the agent will not be automatically \
+                         notified about the context directory.",
+                        agent.as_str()
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let prompt = builder.build();
+    Ok((overlays, prompt))
 }
 
 /// Emit deprecation warnings for legacy `envPassthrough` config fields.
@@ -609,7 +821,7 @@ mod collect_overlay_specs_tests {
             EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
-        let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
+        let collected = collect_all_overlay_specs(&session, vec![], None, None).unwrap();
         assert!(
             collected.include_all_skills,
             "skills must be enabled from repo config"
@@ -629,7 +841,7 @@ mod collect_overlay_specs_tests {
         global_config.save_with(&env).unwrap();
         let session = open_session(git_tmp.path(), env);
 
-        let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
+        let collected = collect_all_overlay_specs(&session, vec![], None, None).unwrap();
         assert!(
             collected.include_all_skills,
             "skills must be enabled from global config"
@@ -645,7 +857,7 @@ mod collect_overlay_specs_tests {
         ]);
         let session = open_session(tmp.path(), env);
 
-        let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
+        let collected = collect_all_overlay_specs(&session, vec![], None, None).unwrap();
         assert!(
             collected.include_all_skills,
             "skills must be enabled when AWMAN_OVERLAYS contains skill(*)"
@@ -659,7 +871,7 @@ mod collect_overlay_specs_tests {
         let session = open_session(tmp.path(), env);
 
         let collected =
-            collect_all_overlay_specs(&session, vec![TypedOverlay::Skill(SkillSpec::All)], None)
+            collect_all_overlay_specs(&session, vec![TypedOverlay::Skill(SkillSpec::All)], None, None)
                 .unwrap();
         assert!(
             collected.include_all_skills,
@@ -673,7 +885,7 @@ mod collect_overlay_specs_tests {
         let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
         let session = open_session(tmp.path(), env);
 
-        let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
+        let collected = collect_all_overlay_specs(&session, vec![], None, None).unwrap();
         assert!(
             !collected.include_all_skills,
             "skills must be disabled when no source sets it"
@@ -696,7 +908,7 @@ mod collect_overlay_specs_tests {
         // Repo config has no overlays; no CLI TypedOverlay::Skill.
         let session = open_session(git_tmp.path(), env);
 
-        let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
+        let collected = collect_all_overlay_specs(&session, vec![], None, None).unwrap();
         assert!(
             collected.include_all_skills,
             "a single source (global config) must be sufficient to enable skills (additive OR)"
@@ -712,7 +924,7 @@ mod collect_overlay_specs_tests {
         ]);
         let session = open_session(tmp.path(), env);
 
-        let collected = collect_all_overlay_specs(&session, vec![], None).unwrap();
+        let collected = collect_all_overlay_specs(&session, vec![], None, None).unwrap();
         assert_eq!(collected.env_passthrough, vec!["GH_TOKEN", "AWS_PROFILE"]);
     }
 
@@ -727,7 +939,7 @@ mod collect_overlay_specs_tests {
         ]);
         let session = open_session(tmp.path(), env);
 
-        let result = collect_all_overlay_specs(&session, vec![], None);
+        let result = collect_all_overlay_specs(&session, vec![], None, None);
         assert!(result.is_err(), "malformed AWMAN_OVERLAYS must return Err");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -745,7 +957,7 @@ mod collect_overlay_specs_tests {
         let cli_overlays = vec![TypedOverlay::Skill(SkillSpec::All)];
         let step_overlays = vec!["skill(foo)".to_string()];
         let collected =
-            collect_all_overlay_specs(&session, cli_overlays, Some(&step_overlays)).unwrap();
+            collect_all_overlay_specs(&session, cli_overlays, None, Some(&step_overlays)).unwrap();
 
         assert!(
             collected.include_all_skills,
@@ -772,7 +984,7 @@ mod collect_overlay_specs_tests {
         let session = open_session(git_tmp.path(), env);
 
         let step_overlays = vec!["skill(bar)".to_string()];
-        let collected = collect_all_overlay_specs(&session, vec![], Some(&step_overlays)).unwrap();
+        let collected = collect_all_overlay_specs(&session, vec![], None, Some(&step_overlays)).unwrap();
 
         assert!(
             !collected.include_all_skills,
@@ -803,7 +1015,7 @@ mod collect_overlay_specs_tests {
             EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
         let session = open_session(git_tmp.path(), env);
 
-        let result = collect_all_overlay_specs(&session, vec![], None);
+        let result = collect_all_overlay_specs(&session, vec![], None, None);
         assert!(result.is_err(), "skills() in repo config must return Err");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -821,7 +1033,7 @@ mod collect_overlay_specs_tests {
         ]);
         let session = open_session(tmp.path(), env);
 
-        let result = collect_all_overlay_specs(&session, vec![], None);
+        let result = collect_all_overlay_specs(&session, vec![], None, None);
         assert!(
             result.is_err(),
             "skills(foo) in AWMAN_OVERLAYS must return Err"
@@ -845,7 +1057,7 @@ mod collect_overlay_specs_tests {
         let ssh_typed = parse_overlay_list("ssh()").unwrap().remove(0);
         let step_overlays = vec!["ssh()".to_string()];
         let collected =
-            collect_all_overlay_specs(&session, vec![ssh_typed], Some(&step_overlays)).unwrap();
+            collect_all_overlay_specs(&session, vec![ssh_typed], None, Some(&step_overlays)).unwrap();
 
         let ssh_entries: Vec<_> = collected
             .directories
@@ -880,7 +1092,7 @@ mod collect_overlay_specs_tests {
         let session = open_session(git_tmp.path(), env);
 
         let step_overlays = vec!["env(MY_TOKEN)".to_string()];
-        let collected = collect_all_overlay_specs(&session, vec![], Some(&step_overlays)).unwrap();
+        let collected = collect_all_overlay_specs(&session, vec![], None, Some(&step_overlays)).unwrap();
 
         let count = collected
             .env_passthrough
@@ -909,7 +1121,7 @@ mod collect_overlay_specs_tests {
         let session = open_session(git_tmp.path(), env);
 
         let step_overlays = vec!["env(STEP_VAR)".to_string()];
-        let collected = collect_all_overlay_specs(&session, vec![], Some(&step_overlays)).unwrap();
+        let collected = collect_all_overlay_specs(&session, vec![], None, Some(&step_overlays)).unwrap();
 
         assert!(
             collected.env_passthrough.contains(&"REPO_VAR".to_string()),
@@ -1077,5 +1289,281 @@ mod overlay_spec_tests {
     fn parse_overlay_spec_empty_host_returns_error() {
         let result = parse_overlay_spec(":/container/path");
         assert!(result.is_err(), "must error for empty host path");
+    }
+}
+
+// ─── WI-0087: context() overlay parsing ──────────────────────────────────────
+
+#[cfg(test)]
+mod context_parser_tests {
+    use super::*;
+    use crate::engine::container::options::OverlayPermission;
+    use crate::engine::overlay::ContextScope;
+
+    fn parse_context(input: &str) -> Result<(ContextScope, OverlayPermission), String> {
+        let result = parse_overlay_list(input)?;
+        assert_eq!(result.len(), 1, "expected exactly 1 overlay; got {result:?}");
+        match &result[0] {
+            TypedOverlay::Context(spec) => Ok((spec.scope, spec.permission)),
+            other => Err(format!("expected TypedOverlay::Context, got {other:?}")),
+        }
+    }
+
+    #[test]
+    fn context_global_default_rw() {
+        let (scope, perm) = parse_context("context(global)").unwrap();
+        assert_eq!(scope, ContextScope::Global);
+        assert_eq!(perm, OverlayPermission::ReadWrite);
+    }
+
+    #[test]
+    fn context_repo_default_rw() {
+        let (scope, perm) = parse_context("context(repo)").unwrap();
+        assert_eq!(scope, ContextScope::Repo);
+        assert_eq!(perm, OverlayPermission::ReadWrite);
+    }
+
+    #[test]
+    fn context_workflow_default_rw() {
+        let (scope, perm) = parse_context("context(workflow)").unwrap();
+        assert_eq!(scope, ContextScope::Workflow);
+        assert_eq!(perm, OverlayPermission::ReadWrite);
+    }
+
+    #[test]
+    fn context_global_ro_explicit() {
+        let (scope, perm) = parse_context("context(global:ro)").unwrap();
+        assert_eq!(scope, ContextScope::Global);
+        assert_eq!(perm, OverlayPermission::ReadOnly);
+    }
+
+    #[test]
+    fn context_workflow_rw_explicit() {
+        let (scope, perm) = parse_context("context(workflow:rw)").unwrap();
+        assert_eq!(scope, ContextScope::Workflow);
+        assert_eq!(perm, OverlayPermission::ReadWrite);
+    }
+
+    #[test]
+    fn context_repo_ro() {
+        let (scope, perm) = parse_context("context(repo:ro)").unwrap();
+        assert_eq!(scope, ContextScope::Repo);
+        assert_eq!(perm, OverlayPermission::ReadOnly);
+    }
+
+    // ─── Error cases ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn context_missing_scope_returns_error() {
+        let err = parse_overlay_list("context()").unwrap_err();
+        assert!(
+            err.contains("scope") || err.contains("requires"),
+            "error must explain context() requires a scope; got: {err}"
+        );
+    }
+
+    #[test]
+    fn context_unknown_scope_returns_error() {
+        let err = parse_overlay_list("context(unknown)").unwrap_err();
+        assert!(
+            err.contains("unknown"),
+            "error must identify the unknown scope value; got: {err}"
+        );
+        // Must mention the supported scopes.
+        assert!(
+            err.contains("global") || err.contains("scope"),
+            "error must name supported scopes; got: {err}"
+        );
+    }
+
+    #[test]
+    fn context_bad_permission_returns_error() {
+        // context(global:rx) — 'rx' is not a valid permission
+        let err = parse_overlay_list("context(global:rx)").unwrap_err();
+        assert!(
+            err.contains("rx") || err.contains("permission"),
+            "error must mention the bad permission 'rx'; got: {err}"
+        );
+    }
+
+    #[test]
+    fn context_too_many_parts_returns_error() {
+        // context(global:ro:extra) — the ':'-split yields "ro:extra" as perm
+        let err = parse_overlay_list("context(global:ro:extra)").unwrap_err();
+        assert!(
+            err.contains("ro:extra") || err.contains("permission"),
+            "error must identify the malformed permission segment; got: {err}"
+        );
+    }
+}
+
+// ─── WI-0087: collect_all_overlay_specs with context overlays ─────────────────
+
+#[cfg(test)]
+mod context_collect_0087_tests {
+    use super::*;
+    use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+    use crate::data::config::global::GlobalConfig;
+    use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+    use crate::engine::overlay::ContextScope;
+
+    fn open_session(git_root: &std::path::Path, env: EnvSnapshot) -> Session {
+        let resolver = StaticGitRootResolver::new(git_root);
+        let opts = SessionOpenOptions {
+            flags: Default::default(),
+            env: Some(env),
+            available_agents: None,
+        };
+        Session::open(git_root.to_path_buf(), &resolver, opts).unwrap()
+    }
+
+    #[test]
+    fn context_global_from_global_config_appears_in_context_overlays() {
+        let git_tmp = tempfile::tempdir().unwrap();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let global_config = GlobalConfig {
+            overlays: Some(vec!["context(global)".to_string()]),
+            ..Default::default()
+        };
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        global_config.save_with(&env).unwrap();
+        let session = open_session(git_tmp.path(), env);
+
+        let collected = collect_all_overlay_specs(&session, vec![], None, None).unwrap();
+        assert_eq!(
+            collected.context_overlays.len(),
+            1,
+            "one context overlay expected; got {:?}",
+            collected.context_overlays
+        );
+        assert_eq!(collected.context_overlays[0].scope, ContextScope::Global);
+    }
+
+    #[test]
+    fn context_global_deduplicates_when_in_global_config_and_step() {
+        // context(global) in both global config and step overlays → exactly one entry.
+        let git_tmp = tempfile::tempdir().unwrap();
+        let cfg_tmp = tempfile::tempdir().unwrap();
+        let global_config = GlobalConfig {
+            overlays: Some(vec!["context(global)".to_string()]),
+            ..Default::default()
+        };
+        let env =
+            EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, cfg_tmp.path().to_str().unwrap())]);
+        global_config.save_with(&env).unwrap();
+        let session = open_session(git_tmp.path(), env);
+
+        let step_overlays = vec!["context(global)".to_string()];
+        let collected =
+            collect_all_overlay_specs(&session, vec![], None, Some(&step_overlays)).unwrap();
+
+        let global_count = collected
+            .context_overlays
+            .iter()
+            .filter(|c| c.scope == ContextScope::Global)
+            .count();
+        assert_eq!(
+            global_count, 1,
+            "context(global) from two sources must deduplicate to one entry; \
+             got {:?}",
+            collected.context_overlays
+        );
+    }
+
+    #[test]
+    fn workflow_level_context_global_applies_to_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let session = open_session(tmp.path(), env);
+
+        let workflow_overlays = vec!["context(global)".to_string()];
+        let collected =
+            collect_all_overlay_specs(&session, vec![], Some(&workflow_overlays), None).unwrap();
+
+        assert_eq!(
+            collected.context_overlays.len(),
+            1,
+            "workflow-level context(global) must appear in context_overlays; \
+             got {:?}",
+            collected.context_overlays
+        );
+        assert_eq!(collected.context_overlays[0].scope, ContextScope::Global);
+    }
+
+    #[test]
+    fn workflow_and_step_context_union_produces_two_entries() {
+        // Workflow-level context(repo) + step-level context(global) → two entries.
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let session = open_session(tmp.path(), env);
+
+        let workflow_overlays = vec!["context(repo)".to_string()];
+        let step_overlays = vec!["context(global)".to_string()];
+        let collected = collect_all_overlay_specs(
+            &session,
+            vec![],
+            Some(&workflow_overlays),
+            Some(&step_overlays),
+        )
+        .unwrap();
+
+        assert_eq!(
+            collected.context_overlays.len(),
+            2,
+            "workflow-level context(repo) + step-level context(global) must \
+             produce two distinct context overlay specs; got {:?}",
+            collected.context_overlays
+        );
+        let has_repo = collected
+            .context_overlays
+            .iter()
+            .any(|c| c.scope == ContextScope::Repo);
+        let has_global = collected
+            .context_overlays
+            .iter()
+            .any(|c| c.scope == ContextScope::Global);
+        assert!(has_repo, "Repo scope must be present");
+        assert!(has_global, "Global scope must be present");
+    }
+
+    #[test]
+    fn step_context_workflow_does_not_override_workflow_level() {
+        // Step-level context(workflow) + workflow-level context(global) → two entries (union).
+        let tmp = tempfile::tempdir().unwrap();
+        let env = EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, tmp.path().to_str().unwrap())]);
+        let session = open_session(tmp.path(), env);
+
+        let workflow_overlays = vec!["context(global)".to_string()];
+        let step_overlays = vec!["context(workflow)".to_string()];
+        let collected = collect_all_overlay_specs(
+            &session,
+            vec![],
+            Some(&workflow_overlays),
+            Some(&step_overlays),
+        )
+        .unwrap();
+
+        assert_eq!(
+            collected.context_overlays.len(),
+            2,
+            "union semantics: both workflow-level and step-level context scopes \
+             must be present; got {:?}",
+            collected.context_overlays
+        );
+        assert!(
+            collected
+                .context_overlays
+                .iter()
+                .any(|c| c.scope == ContextScope::Global),
+            "Global scope from workflow level must be present"
+        );
+        assert!(
+            collected
+                .context_overlays
+                .iter()
+                .any(|c| c.scope == ContextScope::Workflow),
+            "Workflow scope from step level must be present"
+        );
     }
 }

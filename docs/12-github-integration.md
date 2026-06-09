@@ -366,3 +366,7 @@ awman new spec --issue linear/issue/abc-123  # Linear
 
 No changes to the CLI or command structure are needed — just register the new provider in the router.
 
+---
+
+[← Architecture Overview](11-architecture-overview.md) · [Context Overlays →](13-context-overlays.md)
+

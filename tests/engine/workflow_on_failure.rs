@@ -54,6 +54,7 @@ fn minimal_workflow() -> Workflow {
         setup: vec![],
         teardown: vec![],
         teardown_on_failure: false,
+        overlays: None,
     }
 }
 

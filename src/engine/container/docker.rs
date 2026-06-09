@@ -691,6 +691,28 @@ pub(super) fn build_run_argv(
         args.push(format!("{}m", mem.0));
     }
 
+    // System prompt file: Docker-side mount (before the image arg).
+    if let Some((host_path, container_path, _flag)) = &options.system_prompt_file {
+        args.push("-v".into());
+        args.push(format!(
+            "{}:{}:ro",
+            host_path.display(),
+            container_path.display(),
+        ));
+    }
+
+    // System prompt env file: Docker-side mount + env var (before the image arg).
+    if let Some((env_var, host_path, container_path)) = &options.system_prompt_env_file {
+        args.push("-v".into());
+        args.push(format!(
+            "{}:{}:ro",
+            host_path.display(),
+            container_path.display(),
+        ));
+        args.push("-e".into());
+        args.push(format!("{}={}", env_var, container_path.display()));
+    }
+
     // The image is the final positional arg.
     args.push(image.0.clone());
 
@@ -737,6 +759,24 @@ pub(super) fn build_run_argv(
                 args.push(s.clone());
             }
         }
+    }
+
+    // System prompt file: agent-side CLI flag (after the image/entrypoint).
+    if let Some((_host_path, container_path, flag)) = &options.system_prompt_file {
+        args.push(flag.clone());
+        args.push(container_path.display().to_string());
+    }
+
+    // System prompt inline: pass the flag + text as agent argv.
+    if let Some((flag, text)) = &options.system_prompt_inline {
+        args.push(flag.clone());
+        args.push(text.clone());
+    }
+
+    // Agent add-dir flags.
+    for (flag, container_path) in &options.agent_add_dirs {
+        args.push(flag.clone());
+        args.push(container_path.display().to_string());
     }
 
     // Interactive + seeded prompt: pass the prompt as the final positional arg

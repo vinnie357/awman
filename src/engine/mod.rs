@@ -11,6 +11,7 @@
 pub mod agent;
 pub mod auth;
 pub mod container;
+pub mod context_prompt;
 pub mod error;
 pub mod git;
 pub mod init;

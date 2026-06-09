@@ -8,7 +8,8 @@ use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
 use crate::command::commands::Command;
 use crate::command::commands::{
-    collect_all_overlay_specs, parse_overlay_list, resolve_agent, warn_legacy_config,
+    collect_all_overlay_specs, parse_overlay_list, resolve_agent, resolve_context_overlays,
+    warn_legacy_config,
 };
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
@@ -138,7 +139,7 @@ impl Command for ChatCommand {
             }
             all
         };
-        let collected = collect_all_overlay_specs(&session, cli_typed, None)?;
+        let collected = collect_all_overlay_specs(&session, cli_typed, None, None)?;
 
         // Emit deprecation warnings for legacy config fields.
         warn_legacy_config(&session, frontend.as_mut());
@@ -190,7 +191,17 @@ impl Command for ChatCommand {
             }
         };
 
-        // 5. Build the run options from flags + credentials.
+        // 5. Resolve context overlays.
+        let (context_overlays, system_prompt) = resolve_context_overlays(
+            &collected.context_overlays,
+            &session,
+            &agent,
+            None,
+            None,
+            frontend.as_mut(),
+        )?;
+
+        // 6. Build the run options from flags + credentials.
         let mut run_opts = AgentRunOptions {
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
@@ -206,6 +217,8 @@ impl Command for ChatCommand {
             directory_overlays: collected.directories,
             include_all_skills: collected.include_all_skills,
             named_skills: collected.named_skills,
+            system_prompt,
+            context_overlays,
             ..Default::default()
         };
         let env_overrides = credentials.env_vars.clone();
