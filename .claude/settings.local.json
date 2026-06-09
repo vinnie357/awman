@@ -173,7 +173,11 @@
       "WebFetch(domain:rivet.dev)",
       "WebFetch(domain:www.ajeetraina.com)",
       "WebFetch(domain:www.infoworld.com)",
-      "WebFetch(domain:news.ycombinator.com)"
+      "WebFetch(domain:news.ycombinator.com)",
+      "WebFetch(domain:codex.danielvaughan.com)",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:thenewstack.io)",
+      "WebFetch(domain:emirb.github.io)"
     ]
   }
 }
