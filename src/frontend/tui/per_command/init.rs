@@ -102,7 +102,6 @@ impl InitFrontend for TuiCommandFrontend {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::engine::init::frontend::DockerfileSetupDecision;
     use crate::engine::init::InitFrontend;
     use crate::frontend::tui::command_frontend::TuiCommandFrontend;

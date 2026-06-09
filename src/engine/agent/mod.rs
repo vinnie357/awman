@@ -1024,7 +1024,7 @@ mod tests {
 
         let has_ctx_overlay = opts.iter().any(|o| {
             if let ContainerOption::Overlay(spec) = o {
-                spec.container_path == std::path::PathBuf::from("/awman/context/global")
+                spec.container_path == std::path::Path::new("/awman/context/global")
             } else {
                 false
             }

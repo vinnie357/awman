@@ -1,0 +1,55 @@
+{
+  "schema_version": 4,
+  "invocation_id": "09f01090-ff90-4f59-90d6-3111c215eb29",
+  "workflow_name": "Implement Hard Feature Workflow",
+  "workflow_hash": "68b5108bc8e791517685b2f5098eea777f0f28ffd7b4b8a0b882dff4dbe73708",
+  "work_item": 88,
+  "step_states": {
+    "docs": "Succeeded",
+    "tests": "Succeeded",
+    "review": "Succeeded",
+    "implement": "Succeeded"
+  },
+  "completed_steps": [
+    "implement",
+    "docs",
+    "tests",
+    "review"
+  ],
+  "current_step_index": null,
+  "started_at": "2026-06-09T13:07:01.121198Z",
+  "updated_at": "2026-06-09T13:52:53.525027Z",
+  "steps": [
+    {
+      "name": "implement",
+      "depends_on": [],
+      "model": "claude-opus-4-6"
+    },
+    {
+      "name": "tests",
+      "depends_on": [
+        "implement"
+      ]
+    },
+    {
+      "name": "docs",
+      "depends_on": [
+        "implement"
+      ],
+      "model": "claude-haiku-4-5"
+    },
+    {
+      "name": "review",
+      "depends_on": [
+        "docs",
+        "tests"
+      ],
+      "model": "claude-opus-4-7"
+    }
+  ],
+  "current_phase": "Done",
+  "setup_completed": false,
+  "teardown_completed": false,
+  "setup_step_states": [],
+  "teardown_step_states": []
+}

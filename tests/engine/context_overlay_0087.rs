@@ -4,9 +4,7 @@
 //! exec_prompt + context(global) pipeline, workflow overlay merging, and the
 //! context(workflow) dynamic prompt step-progression markers.
 
-use awman::command::commands::{
-    collect_all_overlay_specs, ContextOverlaySpec, ContextScope, TypedOverlay,
-};
+use awman::command::commands::{collect_all_overlay_specs, ContextScope};
 use awman::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
 use awman::data::fs::ContextDirResolver;
 use awman::data::session::{AgentName, Session, SessionOpenOptions, StaticGitRootResolver};
@@ -77,7 +75,7 @@ fn exec_prompt_context_global_emits_overlay_at_awman_context_global() {
     // Must have a context directory mount at /awman/context/global.
     let has_ctx_overlay = opts.iter().any(|o| {
         if let ContainerOption::Overlay(spec) = o {
-            spec.container_path == PathBuf::from("/awman/context/global")
+            spec.container_path == std::path::Path::new("/awman/context/global")
         } else {
             false
         }

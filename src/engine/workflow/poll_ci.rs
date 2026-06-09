@@ -734,8 +734,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn real_git_run_poll_ci_loop_exhausts_max_retries_returns_error() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         if !std::process::Command::new("git")
             .arg("--version")
             .stdout(std::process::Stdio::null())
@@ -797,8 +795,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn real_git_run_poll_ci_loop_succeeds_on_first_poll() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         if !std::process::Command::new("git")
             .arg("--version")
             .stdout(std::process::Stdio::null())
@@ -849,8 +845,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn real_git_run_poll_ci_loop_fails_when_ci_failed() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         if !std::process::Command::new("git")
             .arg("--version")
             .stdout(std::process::Stdio::null())

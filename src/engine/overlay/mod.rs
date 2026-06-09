@@ -2007,7 +2007,7 @@ mod tests {
 
         let specs = engine.build_overlays(&session, &request).unwrap();
         let ctx_spec = specs.iter().find(|s| {
-            s.container_path == std::path::PathBuf::from("/awman/context/global")
+            s.container_path == std::path::Path::new("/awman/context/global")
         });
         assert!(
             ctx_spec.is_some(),
@@ -2042,7 +2042,7 @@ mod tests {
         let specs = engine.build_overlays(&session, &request).unwrap();
         let ctx_spec = specs
             .iter()
-            .find(|s| s.container_path == std::path::PathBuf::from("/awman/context/repo"));
+            .find(|s| s.container_path == std::path::Path::new("/awman/context/repo"));
         assert!(
             ctx_spec.is_some(),
             "build_overlays must produce an OverlaySpec with container path \

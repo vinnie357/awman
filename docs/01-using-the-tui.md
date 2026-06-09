@@ -224,13 +224,35 @@ When the container window is visible and maximized, almost all keyboard input is
 | **Esc** | Forwarded to the agent (`\x1b`) — for vim, fzf, REPLs, and other interactive programs |
 | **Tab / Shift+Tab** | Forwarded to the agent |
 | **Ctrl+M** | Toggle: minimize the container window (agent keeps running) |
-| Mouse scroll | Scroll terminal scrollback (5 lines per tick) |
-| Mouse drag | Select text (highlighted with inverted colours) |
+| Mouse scroll | Sent to agent (if it has mouse tracking enabled), or scroll terminal scrollback (5 lines per tick) |
+| Mouse drag | Select text (highlighted with inverted colours) — always under awman's control |
 | **Ctrl+Y** | Copy the current selection to clipboard (ANSI stripped) |
 
 > **Note on Ctrl+M:** `Ctrl+M` produces the same byte (`\r`) as carriage return in many terminals. awman intercepts Ctrl+M before it reaches the agent, so agents cannot receive a raw `\r` from this key combination. In practice this is not a problem — agents use Enter (which produces `\r\n` or `\n`) for line input, not Ctrl+M.
 
-Scrollback holds up to 10,000 lines by default. While scrolled, the title bar shows `↑ scrollback (N / M lines)` where `N` is your current offset and `M` is the total depth. Scroll back to the bottom to return to the live view.
+#### Mouse scroll behavior
+
+awman forwards mouse scroll events to the agent when all of these conditions are true:
+- The agent has enabled mouse tracking (via escape sequences like `CSI ? 1000 h`)
+- You are viewing the live output (scrolled to the bottom)
+- You are not holding **Shift**
+
+This allows agents with scrollable components (file listings, diff panels, log viewers) to handle scroll events natively.
+
+**Escape hatches for scrollback navigation:**
+
+If an agent has mouse tracking enabled, you can still access awman's scrollback history in two ways:
+
+1. **Shift+Scroll** — Always scrolls awman's scrollback, regardless of agent mouse tracking. Useful when you want to review earlier output while the agent's TUI has mouse-active components.
+2. **Scroll up while in scrollback** — Once you scroll back (moving away from live output), ALL scroll events go to awman's scrollback until you scroll back to the bottom, which returns you to live mode and resumes forwarding to the agent.
+
+This mirrors tmux's copy-mode behavior: scrolling enters historical view, reaching the bottom exits it.
+
+**Text selection always under awman's control:**
+
+Mouse click, drag, and drag-release events are never forwarded to the agent. They always perform awman's native text selection, ensuring you can always select and copy text from the container overlay, even when the agent has mouse tracking enabled.
+
+Scrollback holds up to 10,000 lines by default. While scrolled, the title bar shows `↑ scrollback (N / M lines)` where `N` is your current offset and `M` is the total depth.
 
 **Ctrl+Y** with no active selection forwards the key to the agent instead of copying.
 
@@ -470,6 +492,10 @@ For workflow tabs, awman goes further: the [workflow control board](04-workflows
 | Lightweight step-confirm | **Enter** | Advance to next step |
 | Lightweight step-confirm | **Esc** | Pause workflow |
 | Lightweight step-confirm | **Ctrl+W** | Open full control board |
+
+---
+
+For detailed information on mouse interaction with agents that have mouse tracking enabled, see [Mouse & TUI Agents](14-mouse-and-tui-agents.md).
 
 ---
 

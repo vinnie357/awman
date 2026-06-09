@@ -115,6 +115,32 @@ impl EnvSnapshot {
 /// Namespace for capturing process-environment snapshots.
 pub struct Env;
 
+impl Env {
+    /// Capture every awman-relevant env var from the current process.
+    ///
+    /// Reads are limited to the known constants above so that the snapshot
+    /// is deterministic and minimal.
+    pub fn from_process() -> EnvSnapshot {
+        let keys = [
+            AWMAN_CONFIG_HOME,
+            AWMAN_API_ROOT,
+            AWMAN_OVERLAYS,
+            AWMAN_REMOTE_ADDR,
+            AWMAN_REMOTE_SESSION,
+            AWMAN_API_KEY,
+            XDG_CONFIG_HOME,
+            XDG_DATA_HOME,
+        ];
+        let mut values = HashMap::new();
+        for k in keys {
+            if let Ok(v) = std::env::var(k) {
+                values.insert(k.to_string(), v);
+            }
+        }
+        EnvSnapshot { values }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,31 +188,5 @@ mod tests {
             Some(PathBuf::from(data_val)),
             "from_process() must capture XDG_DATA_HOME"
         );
-    }
-}
-
-impl Env {
-    /// Capture every awman-relevant env var from the current process.
-    ///
-    /// Reads are limited to the known constants above so that the snapshot
-    /// is deterministic and minimal.
-    pub fn from_process() -> EnvSnapshot {
-        let keys = [
-            AWMAN_CONFIG_HOME,
-            AWMAN_API_ROOT,
-            AWMAN_OVERLAYS,
-            AWMAN_REMOTE_ADDR,
-            AWMAN_REMOTE_SESSION,
-            AWMAN_API_KEY,
-            XDG_CONFIG_HOME,
-            XDG_DATA_HOME,
-        ];
-        let mut values = HashMap::new();
-        for k in keys {
-            if let Ok(v) = std::env::var(k) {
-                values.insert(k.to_string(), v);
-            }
-        }
-        EnvSnapshot { values }
     }
 }

@@ -22,6 +22,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 11 | [Architecture Overview](11-architecture-overview.md) | Four-layer design, layers 0–4, design principles, adding features |
 | 12 | [GitHub Integration](12-github-integration.md) | Fetching issues, `--issue` flag, authentication, input formats |
 | 13 | [Context Overlays](13-context-overlays.md) | Persistent context, system prompts, global/repo/workflow scopes, worked examples |
+| 14 | [Mouse & TUI Agents](14-mouse-and-tui-agents.md) | Scroll forwarding, text selection, agent mouse tracking, scrollback interaction |
 | — | [Architecture (Detailed)](architecture.md) | Source layout, modules, in-depth design decisions |
 
 ---

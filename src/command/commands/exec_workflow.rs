@@ -371,7 +371,6 @@ impl ContainerExecutionFactory for CommandLayerFactory {
             image_tag_override: Some(correct_tag),
             system_prompt,
             context_overlays,
-            ..Default::default()
         };
         let mut options =
             self.engines

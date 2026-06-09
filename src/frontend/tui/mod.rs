@@ -37,6 +37,7 @@ pub mod container_view;
 pub mod dialogs;
 pub mod hints;
 pub mod keymap;
+mod mouse;
 pub mod per_command;
 pub mod pty;
 pub mod render;
@@ -605,8 +606,10 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
 
 fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
     match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            // Workflow strip scroll.
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let is_up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+
+            // Workflow strip scroll takes priority.
             if let Some(strip_rect) = app.active_tab().last_strip_rect {
                 if mouse.row >= strip_rect.y
                     && mouse.row < strip_rect.y + strip_rect.height
@@ -614,46 +617,30 @@ fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
                     && mouse.column < strip_rect.x + strip_rect.width
                 {
                     let tab = app.active_tab_mut();
-                    tab.workflow_strip_scroll_offset =
-                        tab.workflow_strip_scroll_offset.saturating_sub(1);
+                    if is_up {
+                        tab.workflow_strip_scroll_offset =
+                            tab.workflow_strip_scroll_offset.saturating_sub(1);
+                    } else {
+                        tab.workflow_strip_scroll_offset += 1;
+                    }
                     return;
                 }
             }
+
             let tab = app.active_tab_mut();
             if tab.container_window_state == ContainerWindowState::Maximized {
-                // Cap to the actual scrollback buffer depth so the user
-                // can scroll the full configured history (5000 lines by
-                // default). vt100-ctt 0.17 uses `saturating_sub` in
-                // `visible_rows()`, so offsets > screen height are safe
-                // (the panic in vt100 0.15.2 is fixed upstream).
-                let max_scroll = {
-                    let screen = tab.vt100_parser.screen_mut();
-                    screen.set_scrollback(usize::MAX);
-                    let depth = screen.scrollback();
-                    screen.set_scrollback(0);
-                    depth
-                };
-                tab.container_scroll_offset = (tab.container_scroll_offset + 5).min(max_scroll);
-            } else {
+                let agent_wants_mouse = tab.vt100_parser.screen().mouse_protocol_mode()
+                    != vt100::MouseProtocolMode::None;
+                let at_live_view = tab.container_scroll_offset == 0;
+                let shift_held = mouse.modifiers.contains(KeyModifiers::SHIFT);
+
+                if agent_wants_mouse && at_live_view && !shift_held {
+                    mouse::forward_mouse_scroll_to_pty(tab, &mouse);
+                } else {
+                    mouse::handle_container_scroll(tab, is_up);
+                }
+            } else if is_up {
                 tab.scroll_offset = tab.scroll_offset.saturating_add(5);
-            }
-        }
-        MouseEventKind::ScrollDown => {
-            // Workflow strip scroll.
-            if let Some(strip_rect) = app.active_tab().last_strip_rect {
-                if mouse.row >= strip_rect.y
-                    && mouse.row < strip_rect.y + strip_rect.height
-                    && mouse.column >= strip_rect.x
-                    && mouse.column < strip_rect.x + strip_rect.width
-                {
-                    let tab = app.active_tab_mut();
-                    tab.workflow_strip_scroll_offset += 1;
-                    return;
-                }
-            }
-            let tab = app.active_tab_mut();
-            if tab.container_window_state == ContainerWindowState::Maximized {
-                tab.container_scroll_offset = tab.container_scroll_offset.saturating_sub(5);
             } else {
                 tab.scroll_offset = tab.scroll_offset.saturating_sub(5);
             }
@@ -2519,6 +2506,265 @@ mod tests {
             app.active_tab().workflow_strip_scroll_offset,
             0,
             "scrolling up at offset=0 must not underflow"
+        );
+    }
+
+    // ─── Mouse passthrough (WI-0088) ──────────────────────────────────────────
+
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
+
+    fn make_mouse_event(kind: MouseEventKind, col: u16, row: u16, mods: KeyModifiers) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: mods,
+        }
+    }
+
+    /// Set the active tab to Maximized with a known inner area and a wired
+    /// PTY stdin channel, then return the receiving end for assertions.
+    fn setup_container_tab(
+        app: &mut App,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let tab = app.active_tab_mut();
+        tab.container_window_state =
+            crate::frontend::tui::tabs::ContainerWindowState::Maximized;
+        // inner area starting at (5, 3) with size 80×24
+        tab.container_inner_area = Some(Rect::new(5, 3, 80, 24));
+        tab.container_stdin_tx = Some(tx);
+        rx
+    }
+
+    // Pure `encode_mouse_scroll` unit tests live in `super::mouse::tests`.
+
+    // ── Forwarding decision: mode None → awman scrollback ────────────────────
+
+    #[test]
+    fn scroll_with_no_mouse_mode_does_not_forward_to_pty() {
+        let mut app = make_app();
+        let mut rx = setup_container_tab(&mut app);
+        // vt100 parser has no mouse tracking (default None)
+        // coords inside inner_area = Rect::new(5, 3, 80, 24)
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 20, 10, KeyModifiers::NONE),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "scroll with no mouse mode must not forward to PTY"
+        );
+    }
+
+    // ── Forwarding decision: shift held → awman scrollback (escape hatch) ────
+
+    #[test]
+    fn scroll_shift_held_does_not_forward_to_pty() {
+        let mut app = make_app();
+        let mut rx = setup_container_tab(&mut app);
+        // Enable mouse tracking so agent_wants_mouse = true
+        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h");
+        app.active_tab_mut().container_scroll_offset = 0;
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 20, 10, KeyModifiers::SHIFT),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "Shift+scroll must not forward to PTY even when agent tracks mouse"
+        );
+    }
+
+    // ── Forwarding decision: in scrollback → awman scrollback ────────────────
+
+    #[test]
+    fn scroll_in_scrollback_does_not_forward_to_pty() {
+        let mut app = make_app();
+        let mut rx = setup_container_tab(&mut app);
+        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h");
+        app.active_tab_mut().container_scroll_offset = 10; // user is scrolled back
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 20, 10, KeyModifiers::NONE),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "scroll while in scrollback must not forward to PTY"
+        );
+    }
+
+    // ── Forwarding decision: live view + agent mouse → forward to PTY ─────────
+
+    #[test]
+    fn scroll_at_live_view_with_mouse_tracking_forwards_to_pty() {
+        let mut app = make_app();
+        let mut rx = setup_container_tab(&mut app);
+        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h");
+        app.active_tab_mut().container_scroll_offset = 0;
+
+        // coords (20, 10) are inside inner_area = Rect::new(5, 3, 80, 24)
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 20, 10, KeyModifiers::NONE),
+        );
+        let data = rx
+            .try_recv()
+            .expect("PTY must receive scroll bytes when agent wants mouse at live view");
+        assert!(!data.is_empty());
+    }
+
+    // ── Scroll outside inner area is discarded ────────────────────────────────
+
+    #[test]
+    fn scroll_outside_inner_area_is_discarded() {
+        let mut app = make_app();
+        let mut rx = setup_container_tab(&mut app);
+        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h");
+        app.active_tab_mut().container_scroll_offset = 0;
+
+        let before_offset = app.active_tab().container_scroll_offset;
+
+        // col=0 is left of inner_area (starts at col=5) — should be discarded
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 0, 10, KeyModifiers::NONE),
+        );
+        assert!(rx.try_recv().is_err(), "scroll on left border must be discarded");
+        assert_eq!(
+            app.active_tab().container_scroll_offset,
+            before_offset,
+            "discarded scroll must not change container_scroll_offset"
+        );
+
+        // row=0 is above inner_area (starts at row=3) — should be discarded
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 20, 0, KeyModifiers::NONE),
+        );
+        assert!(rx.try_recv().is_err(), "scroll above inner area must be discarded");
+
+        // inner_area right edge is exclusive at col 5+80=85 — must be discarded
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 85, 10, KeyModifiers::NONE),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "scroll on right border (col == inner.x + inner.width) must be discarded"
+        );
+
+        // inner_area bottom edge is exclusive at row 3+24=27 — must be discarded
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 20, 27, KeyModifiers::NONE),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "scroll on bottom border (row == inner.y + inner.height) must be discarded"
+        );
+
+        // Confirm we still forward when the event lands at the last valid
+        // inside-cell — guards against off-by-one in the >= comparisons.
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 84, 26, KeyModifiers::NONE),
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "scroll at the last inside cell (col 84, row 26) must still be forwarded"
+        );
+    }
+
+    // ── Coordinate translation subtracts inner area origin ────────────────────
+
+    #[test]
+    fn scroll_coordinate_translation_subtracts_inner_origin() {
+        let mut app = make_app();
+        let mut rx = setup_container_tab(&mut app);
+        // SGR encoding: ESC[<button;col+1;row+1M — easy to verify exact coords.
+        // inner_area = Rect::new(5, 3, 80, 24)
+        app.active_tab_mut().vt100_parser.process(b"\x1b[?1006h"); // SGR encoding
+        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h"); // enable mouse mode
+        app.active_tab_mut().container_scroll_offset = 0;
+
+        // Terminal coords (10, 6) → vt_col = 10-5 = 5, vt_row = 6-3 = 3
+        // SGR output: ESC[<64;6;4M (col+1=6, row+1=4)
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 10, 6, KeyModifiers::NONE),
+        );
+        let data = rx.try_recv().expect("PTY must receive scroll bytes");
+        let seq = String::from_utf8(data).unwrap();
+        assert_eq!(
+            seq, "\x1b[<64;6;4M",
+            "SGR sequence must use translated vt coords (5,3 → col+1=6, row+1=4)"
+        );
+    }
+
+    // ── Click/drag events are never forwarded to PTY ──────────────────────────
+
+    #[test]
+    fn click_down_not_forwarded_to_pty_even_when_agent_tracks_mouse() {
+        let mut app = make_app();
+        let mut rx = setup_container_tab(&mut app);
+        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h");
+        app.active_tab_mut().container_scroll_offset = 0;
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                20,
+                10,
+                KeyModifiers::NONE,
+            ),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "mouse Down must never be forwarded to PTY"
+        );
+        // Text selection should be started instead
+        assert!(
+            app.active_tab().mouse_selection.is_some(),
+            "mouse Down must start text selection"
+        );
+    }
+
+    #[test]
+    fn click_drag_not_forwarded_to_pty_even_when_agent_tracks_mouse() {
+        let mut app = make_app();
+        let mut rx = setup_container_tab(&mut app);
+        app.active_tab_mut().vt100_parser.process(b"\x1b[?1000h");
+        app.active_tab_mut().container_scroll_offset = 0;
+
+        // Prime the selection so Drag has something to update
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                20,
+                10,
+                KeyModifiers::NONE,
+            ),
+        );
+        let _ = rx.try_recv(); // drain any spurious data
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                22,
+                11,
+                KeyModifiers::NONE,
+            ),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "mouse Drag must never be forwarded to PTY"
         );
     }
 }
