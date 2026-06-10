@@ -371,6 +371,9 @@ fn handle_key_event(app: &mut App, key: crossterm::event::KeyEvent) {
         Action::CycleContainerWindow => {
             let tab = app.active_tab_mut();
             tab.container_window_state = tab.container_window_state.cycle();
+            // Selection coords are relative to the window the drag started
+            // in; cycling swaps which window owns selections, so drop it.
+            tab.mouse_selection = None;
             if tab.container_window_state != ContainerWindowState::Hidden {
                 if let Ok(size) = crossterm::terminal::size() {
                     let (cols, rows) = compute_container_inner_size(size.0, size.1);
@@ -654,41 +657,74 @@ fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            let dialog_open = app.active_dialog.is_some();
             let tab = app.active_tab_mut();
-            if tab.container_window_state != ContainerWindowState::Maximized {
-                return;
+            if tab.container_window_state == ContainerWindowState::Maximized {
+                let inner = match tab.container_inner_area {
+                    Some(r) => r,
+                    None => return,
+                };
+                // Only start a selection if the click landed inside the vt100
+                // grid (not on the border).
+                if mouse.column < inner.x
+                    || mouse.row < inner.y
+                    || mouse.column >= inner.x + inner.width
+                    || mouse.row >= inner.y + inner.height
+                {
+                    return;
+                }
+                let vt_col = mouse.column - inner.x;
+                let vt_row = mouse.row - inner.y;
+                let scroll = tab.container_scroll_offset;
+                let snapshot = capture_vt100_snapshot(&mut tab.vt100_parser, scroll);
+                tab.mouse_selection = Some(tabs::TextSelection {
+                    start_col: vt_col,
+                    start_row: vt_row,
+                    end_col: vt_col,
+                    end_row: vt_row,
+                    snapshot,
+                });
+            } else {
+                // Execution window selection — available whenever the
+                // container overlay isn't covering it (Hidden or Minimized).
+                // Dialogs render on top of the window, so a click on one must
+                // not start a selection in the text underneath.
+                if dialog_open {
+                    return;
+                }
+                let inner = match tab.exec_inner_area {
+                    Some(r) => r,
+                    None => return,
+                };
+                if mouse.column < inner.x
+                    || mouse.row < inner.y
+                    || mouse.column >= inner.x + inner.width
+                    || mouse.row >= inner.y + inner.height
+                {
+                    return;
+                }
+                if tab.exec_window_grid.is_empty() {
+                    return;
+                }
+                let col = mouse.column - inner.x;
+                let row = mouse.row - inner.y;
+                tab.mouse_selection = Some(tabs::TextSelection {
+                    start_col: col,
+                    start_row: row,
+                    end_col: col,
+                    end_row: row,
+                    snapshot: tab.exec_window_grid.clone(),
+                });
             }
-            let inner = match tab.container_inner_area {
-                Some(r) => r,
-                None => return,
-            };
-            // Only start a selection if the click landed inside the vt100
-            // grid (not on the border).
-            if mouse.column < inner.x
-                || mouse.row < inner.y
-                || mouse.column >= inner.x + inner.width
-                || mouse.row >= inner.y + inner.height
-            {
-                return;
-            }
-            let vt_col = mouse.column - inner.x;
-            let vt_row = mouse.row - inner.y;
-            let scroll = tab.container_scroll_offset;
-            let snapshot = capture_vt100_snapshot(&mut tab.vt100_parser, scroll);
-            tab.mouse_selection = Some(tabs::TextSelection {
-                start_col: vt_col,
-                start_row: vt_row,
-                end_col: vt_col,
-                end_row: vt_row,
-                snapshot,
-            });
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             let tab = app.active_tab_mut();
-            if tab.container_window_state != ContainerWindowState::Maximized {
-                return;
-            }
-            let inner = match tab.container_inner_area {
+            let inner = if tab.container_window_state == ContainerWindowState::Maximized {
+                tab.container_inner_area
+            } else {
+                tab.exec_inner_area
+            };
+            let inner = match inner {
                 Some(r) => r,
                 None => return,
             };
@@ -2894,6 +2930,221 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "mouse Drag must never be forwarded to PTY"
+        );
+    }
+
+    // ─── Execution window text selection ──────────────────────────────────────
+
+    /// Give the active tab a published execution-window inner area and a
+    /// visible text grid, as the renderer would each frame.
+    fn setup_exec_tab(app: &mut App, state: crate::frontend::tui::tabs::ContainerWindowState) {
+        let tab = app.active_tab_mut();
+        tab.container_window_state = state;
+        // inner area starting at (1, 4) with size 40×10
+        tab.exec_inner_area = Some(Rect::new(1, 4, 40, 10));
+        tab.exec_window_grid = vec![vec!["x".to_string(); 40]; 10];
+    }
+
+    #[test]
+    fn exec_click_starts_selection_when_container_hidden() {
+        let mut app = make_app();
+        setup_exec_tab(
+            &mut app,
+            crate::frontend::tui::tabs::ContainerWindowState::Hidden,
+        );
+
+        // Terminal coords (11, 6) → exec col = 11-1 = 10, row = 6-4 = 2
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                11,
+                6,
+                KeyModifiers::NONE,
+            ),
+        );
+        let sel = app
+            .active_tab()
+            .mouse_selection
+            .as_ref()
+            .expect("click inside the execution window must start a selection");
+        assert_eq!((sel.start_col, sel.start_row), (10, 2));
+        assert_eq!(
+            sel.snapshot.len(),
+            10,
+            "selection must snapshot the published exec window grid"
+        );
+    }
+
+    #[test]
+    fn exec_click_starts_selection_when_container_minimized() {
+        let mut app = make_app();
+        setup_exec_tab(
+            &mut app,
+            crate::frontend::tui::tabs::ContainerWindowState::Minimized,
+        );
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                11,
+                6,
+                KeyModifiers::NONE,
+            ),
+        );
+        assert!(
+            app.active_tab().mouse_selection.is_some(),
+            "selection must also work while the container is minimized"
+        );
+    }
+
+    #[test]
+    fn exec_click_outside_inner_area_does_not_start_selection() {
+        let mut app = make_app();
+        setup_exec_tab(
+            &mut app,
+            crate::frontend::tui::tabs::ContainerWindowState::Hidden,
+        );
+
+        // (0, 0) is on the chrome, outside Rect::new(1, 4, 40, 10).
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                0,
+                0,
+                KeyModifiers::NONE,
+            ),
+        );
+        assert!(app.active_tab().mouse_selection.is_none());
+    }
+
+    #[test]
+    fn exec_click_with_empty_grid_does_not_start_selection() {
+        let mut app = make_app();
+        setup_exec_tab(
+            &mut app,
+            crate::frontend::tui::tabs::ContainerWindowState::Hidden,
+        );
+        app.active_tab_mut().exec_window_grid = Vec::new();
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                11,
+                6,
+                KeyModifiers::NONE,
+            ),
+        );
+        assert!(
+            app.active_tab().mouse_selection.is_none(),
+            "no selection without a rendered grid to snapshot"
+        );
+    }
+
+    #[test]
+    fn exec_click_with_dialog_open_does_not_start_selection() {
+        let mut app = make_app();
+        setup_exec_tab(
+            &mut app,
+            crate::frontend::tui::tabs::ContainerWindowState::Hidden,
+        );
+        app.active_dialog = Some(Dialog::QuitConfirm);
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                11,
+                6,
+                KeyModifiers::NONE,
+            ),
+        );
+        assert!(
+            app.active_tab().mouse_selection.is_none(),
+            "a click on a dialog must not select text underneath it"
+        );
+    }
+
+    #[test]
+    fn exec_drag_extends_selection() {
+        let mut app = make_app();
+        setup_exec_tab(
+            &mut app,
+            crate::frontend::tui::tabs::ContainerWindowState::Hidden,
+        );
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                11,
+                6,
+                KeyModifiers::NONE,
+            ),
+        );
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(
+                MouseEventKind::Drag(MouseButton::Left),
+                15,
+                8,
+                KeyModifiers::NONE,
+            ),
+        );
+        let sel = app.active_tab().mouse_selection.as_ref().unwrap();
+        assert_eq!((sel.start_col, sel.start_row), (10, 2));
+        assert_eq!((sel.end_col, sel.end_row), (14, 4));
+    }
+
+    #[test]
+    fn exec_copy_selection_uses_grid_snapshot() {
+        let mut app = make_app();
+        setup_exec_tab(
+            &mut app,
+            crate::frontend::tui::tabs::ContainerWindowState::Hidden,
+        );
+        let grid = vec![
+            vec!["h".into(), "i".into(), " ".into()],
+            vec!["y".into(), "o".into(), " ".into()],
+        ];
+        app.active_tab_mut().mouse_selection = Some(crate::frontend::tui::tabs::TextSelection {
+            start_col: 0,
+            start_row: 0,
+            end_col: 1,
+            end_row: 1,
+            snapshot: grid,
+        });
+        let text =
+            super::extract_selection_text(app.active_tab().mouse_selection.as_ref().unwrap());
+        assert_eq!(text, "hi\nyo");
+    }
+
+    #[test]
+    fn cycle_container_window_clears_selection() {
+        let mut app = make_app();
+        setup_exec_tab(
+            &mut app,
+            crate::frontend::tui::tabs::ContainerWindowState::Hidden,
+        );
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                11,
+                6,
+                KeyModifiers::NONE,
+            ),
+        );
+        assert!(app.active_tab().mouse_selection.is_some());
+
+        press_key(&mut app, KeyCode::Char('m'), KeyModifiers::CONTROL);
+        assert!(
+            app.active_tab().mouse_selection.is_none(),
+            "cycling the container window must drop a selection — its coords \
+             are relative to the window it started in"
         );
     }
 }

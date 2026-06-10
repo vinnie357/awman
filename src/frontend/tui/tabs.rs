@@ -137,20 +137,22 @@ pub struct YoloState {
 
 /// Mouse text selection.
 ///
-/// Coordinates are stored in vt100 cell space (0-based against the parser
-/// grid), not raw terminal coords. The renderer publishes
-/// `Tab::container_inner_area` so `handle_mouse_event` can subtract the
-/// overlay's screen offset before recording these.
+/// Coordinates are stored in window cell space (0-based against the window
+/// the selection started in — the maximized container's vt100 grid or the
+/// execution window's inner area), not raw terminal coords. The renderer
+/// publishes `Tab::container_inner_area` / `Tab::exec_inner_area` so
+/// `handle_mouse_event` can subtract the window's screen offset before
+/// recording these.
 #[derive(Debug, Clone)]
 pub struct TextSelection {
     pub start_col: u16,
     pub start_row: u16,
     pub end_col: u16,
     pub end_row: u16,
-    /// Snapshot of the vt100 grid at selection-start time. Each cell is the
-    /// printable contents of that position (or `" "` for empties), so the
-    /// copied text reflects what the user *saw* when they started the drag,
-    /// not the grid's current values (which mutate with live PTY output).
+    /// Snapshot of the window's text grid at selection-start time. Each cell
+    /// is the printable contents of that position (or `" "` for empties), so
+    /// the copied text reflects what the user *saw* when they started the
+    /// drag, not the window's current values (which mutate with live output).
     pub snapshot: Vec<Vec<String>>,
 }
 
@@ -196,6 +198,17 @@ pub struct Tab {
     /// the renderer. Used by the mouse handler to translate raw terminal
     /// coords into vt100 cell coords.
     pub container_inner_area: Option<Rect>,
+    /// Inner content rect of the execution window, refreshed each frame by
+    /// the renderer while the container overlay is not Maximized. Used by
+    /// the mouse handler to translate raw terminal coords into execution
+    /// window cell coords when starting a text selection there.
+    pub exec_inner_area: Option<Rect>,
+    /// Visible text grid of the execution window, refreshed each frame by
+    /// the renderer while the container overlay is not Maximized. Cloned
+    /// into `TextSelection::snapshot` at selection-start so the copied text
+    /// reflects what the user saw (the window content shifts as new
+    /// status-log lines arrive).
+    pub exec_window_grid: Vec<Vec<String>>,
     /// Shared workflow view state. The engine's `WorkflowFrontend` impl
     /// writes here on `report_workflow_progress` / `report_step_status`;
     /// the renderer reads from here when drawing the workflow strip.
@@ -289,6 +302,8 @@ impl Tab {
             container_info: None,
             last_container_summary: None,
             container_inner_area: None,
+            exec_inner_area: None,
+            exec_window_grid: Vec::new(),
             workflow_state: Arc::new(Mutex::new(None)),
             yolo_state: Arc::new(Mutex::new(None)),
             yolo_cancel_flag: Arc::new(AtomicBool::new(false)),

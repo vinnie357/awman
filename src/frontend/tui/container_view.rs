@@ -259,15 +259,7 @@ fn render_vt100_screen(
     let screen_rows = screen_rows as usize;
     let screen_cols = screen_cols as usize;
 
-    let norm_sel = selection.map(|s| {
-        let start = (s.start_row, s.start_col);
-        let end = (s.end_row, s.end_col);
-        if start.0 < end.0 || (start.0 == end.0 && start.1 <= end.1) {
-            (start, end)
-        } else {
-            (end, start)
-        }
-    });
+    let norm_sel = selection.map(normalize_selection);
 
     for row in 0..rows.min(screen_rows) {
         let mut col = 0;
@@ -319,8 +311,27 @@ fn render_vt100_screen(
     }
 }
 
+/// Normalize a selection into `((start_row, start_col), (end_row, end_col))`
+/// with start ≤ end, regardless of drag direction.
+/// Shared with the execution window's selection highlight in `render.rs`.
+pub(crate) fn normalize_selection(s: &TextSelection) -> ((u16, u16), (u16, u16)) {
+    let start = (s.start_row, s.start_col);
+    let end = (s.end_row, s.end_col);
+    if start.0 < end.0 || (start.0 == end.0 && start.1 <= end.1) {
+        (start, end)
+    } else {
+        (end, start)
+    }
+}
+
+/// Whether the cell at `(row, col)` falls inside the normalized selection.
+/// Shared with the execution window's selection highlight in `render.rs`.
 #[inline]
-fn cell_in_selection(norm_sel: Option<((u16, u16), (u16, u16))>, row: u16, col: u16) -> bool {
+pub(crate) fn cell_in_selection(
+    norm_sel: Option<((u16, u16), (u16, u16))>,
+    row: u16,
+    col: u16,
+) -> bool {
     let Some(((sr, sc), (er, ec))) = norm_sel else {
         return false;
     };

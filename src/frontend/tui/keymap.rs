@@ -117,6 +117,9 @@ fn map_command_box_key(key: KeyEvent, ctrl: bool, shift: bool) -> Action {
     match key.code {
         KeyCode::Enter if ctrl || shift => Action::InsertNewline,
         KeyCode::Enter => Action::SubmitCommand,
+        // Yank an execution-window mouse selection without moving focus
+        // (no-op when no selection exists).
+        KeyCode::Char('y') if ctrl => Action::CopySelection,
         KeyCode::BackTab => Action::AutocompletePrev,
         KeyCode::Tab if shift => Action::AutocompletePrev,
         KeyCode::Tab => Action::AutocompleteNext,
@@ -490,6 +493,15 @@ mod tests {
             FocusContext::ExecutionWindow,
         );
         assert_eq!(action, Action::ToggleStatusLog);
+    }
+
+    #[test]
+    fn ctrl_y_in_command_box_copies_selection() {
+        let action = map_key(
+            key(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            FocusContext::CommandBox,
+        );
+        assert_eq!(action, Action::CopySelection);
     }
 
     #[test]

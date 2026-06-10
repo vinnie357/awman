@@ -78,6 +78,8 @@ Mouse click, drag, and release events always perform text selection under awman'
 
 **Note:** If you have an active selection and press **Ctrl+Y**, the selection is copied. If you have no selection and press **Ctrl+Y**, the key is forwarded to the agent instead.
 
+The same select-then-**Ctrl+Y** flow also works in the execution window whenever the container window is hidden or minimized — see [Using the TUI](02-using-the-tui.md#selecting-and-copying-text).
+
 ---
 
 ## Coordinate translation

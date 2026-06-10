@@ -207,18 +207,42 @@ fn render_tab_bar(app: &App, area: Rect, frame: &mut Frame) {
 /// Body content:
 /// - Idle (and the status log is empty): a 3-line welcome stub in DarkGray.
 /// - Otherwise: the status log entries, colored per level, with `Wrap{trim:false}`.
-fn render_execution_window(app: &App, area: Rect, frame: &mut Frame) {
+///
+/// While the container overlay is not Maximized the window's text is mouse-
+/// selectable: an active selection is highlighted with `Modifier::REVERSED`,
+/// the copy hint is shown on the bottom border, and the inner rect plus the
+/// visible text grid are published on the tab so `handle_mouse_event` can
+/// start/extend selections (mirrors `render_container_maximized`).
+fn render_execution_window(app: &mut App, area: Rect, frame: &mut Frame) {
     let tab = app.active_tab();
     let focused = app.focus == Focus::ExecutionWindow;
     let border_color = window_border_color(&tab.execution_phase, focused);
     let title = phase_label(&tab.execution_phase);
 
-    let block = Block::default()
+    let container_maximized = tab.container_window_state == ContainerWindowState::Maximized;
+    // A selection only belongs to this window while the container overlay
+    // isn't covering it; when Maximized the selection is the overlay's.
+    let selection = if container_maximized {
+        None
+    } else {
+        tab.mouse_selection.clone()
+    };
+
+    let mut block = Block::default()
         .title(title)
         .title_alignment(Alignment::Left)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color));
+    if selection.is_some() {
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                " CTRL-Y to copy/yank text ",
+                Style::default().fg(Color::Yellow),
+            ))
+            .alignment(Alignment::Center),
+        );
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -228,10 +252,6 @@ fn render_execution_window(app: &App, area: Rect, frame: &mut Frame) {
         .lock()
         .map(|d| d.is_some())
         .unwrap_or(false);
-    if has_dashboard {
-        render_status_dashboard(tab, inner, frame);
-        return;
-    }
 
     let log_empty = tab
         .status_log
@@ -239,7 +259,9 @@ fn render_execution_window(app: &App, area: Rect, frame: &mut Frame) {
         .map(|log| log.is_empty())
         .unwrap_or(true);
 
-    if matches!(tab.execution_phase, ExecutionPhase::Idle) && log_empty {
+    if has_dashboard {
+        render_status_dashboard(tab, inner, frame);
+    } else if matches!(tab.execution_phase, ExecutionPhase::Idle) && log_empty {
         // Three-line welcome stub matching old awman exactly.
         let lines = vec![
             Line::from(""),
@@ -256,6 +278,67 @@ fn render_execution_window(app: &App, area: Rect, frame: &mut Frame) {
     } else {
         render_output_content(tab, inner, frame);
     }
+
+    if let Some(ref sel) = selection {
+        apply_selection_highlight(frame.buffer_mut(), inner, sel);
+    }
+
+    // Publish the inner rect and visible text grid for the mouse handler.
+    // When Maximized the overlay covers this window, so clear the rect to
+    // keep clicks from starting an execution-window selection underneath.
+    let grid = if container_maximized {
+        Vec::new()
+    } else {
+        capture_buffer_grid(frame.buffer_mut(), inner)
+    };
+    let tab = app.active_tab_mut();
+    tab.exec_inner_area = if container_maximized {
+        None
+    } else {
+        Some(inner)
+    };
+    tab.exec_window_grid = grid;
+}
+
+/// Overlay `Modifier::REVERSED` on the cells of an active selection.
+/// Selection coordinates are relative to `area` (the window's inner rect).
+fn apply_selection_highlight(buf: &mut Buffer, area: Rect, sel: &tabs::TextSelection) {
+    let norm = Some(container_view::normalize_selection(sel));
+    for row in 0..area.height {
+        for col in 0..area.width {
+            if container_view::cell_in_selection(norm, row, col) {
+                if let Some(cell) = buf.cell_mut((area.x + col, area.y + row)) {
+                    cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
+    }
+}
+
+/// Snapshot the rendered cell contents of `area` from the frame buffer into
+/// a grid of per-cell strings (empty cells become `" "`), the same shape
+/// `capture_vt100_snapshot` produces for the container overlay. Reading back
+/// the buffer guarantees the copied text matches what was displayed,
+/// including ratatui's word wrapping.
+fn capture_buffer_grid(buf: &Buffer, area: Rect) -> Vec<Vec<String>> {
+    (0..area.height)
+        .map(|row| {
+            (0..area.width)
+                .map(|col| {
+                    buf.cell((area.x + col, area.y + row))
+                        .map(|c| {
+                            let s = c.symbol();
+                            if s.is_empty() {
+                                " ".to_string()
+                            } else {
+                                s.to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| " ".to_string())
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Render the status-log lines into the execution window.
@@ -1646,7 +1729,74 @@ fn render_config_show(state: &dialogs::ConfigShowState, area: Rect, frame: &mut 
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_middle;
+    use super::{apply_selection_highlight, capture_buffer_grid, truncate_middle};
+    use crate::frontend::tui::tabs::TextSelection;
+    use ratatui::prelude::*;
+
+    #[test]
+    fn capture_buffer_grid_reads_cell_symbols() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 5));
+        buf.set_string(2, 1, "abcd", Style::default());
+        buf.set_string(2, 2, "ef", Style::default());
+
+        let grid = capture_buffer_grid(&buf, Rect::new(2, 1, 4, 2));
+        assert_eq!(grid.len(), 2);
+        assert_eq!(grid[0], vec!["a", "b", "c", "d"]);
+        assert_eq!(grid[1], vec!["e", "f", " ", " "], "empties become spaces");
+    }
+
+    #[test]
+    fn apply_selection_highlight_reverses_selected_cells_only() {
+        let area = Rect::new(2, 1, 4, 2);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 5));
+        // Cells (1,0)..=(2,0) relative to area → screen (3,1)..=(4,1).
+        let sel = TextSelection {
+            start_col: 1,
+            start_row: 0,
+            end_col: 2,
+            end_row: 0,
+            snapshot: Vec::new(),
+        };
+        apply_selection_highlight(&mut buf, area, &sel);
+
+        let reversed = |x: u16, y: u16| {
+            buf.cell((x, y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        };
+        assert!(reversed(3, 1));
+        assert!(reversed(4, 1));
+        assert!(!reversed(2, 1), "cell before selection start");
+        assert!(!reversed(5, 1), "cell after selection end");
+        assert!(!reversed(3, 2), "row below selection");
+    }
+
+    #[test]
+    fn apply_selection_highlight_normalizes_backward_drag() {
+        let area = Rect::new(0, 0, 6, 3);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 3));
+        // Dragged up-left: start after end.
+        let sel = TextSelection {
+            start_col: 2,
+            start_row: 1,
+            end_col: 4,
+            end_row: 0,
+            snapshot: Vec::new(),
+        };
+        apply_selection_highlight(&mut buf, area, &sel);
+
+        let reversed = |x: u16, y: u16| {
+            buf.cell((x, y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED)
+        };
+        assert!(reversed(4, 0), "normalized start cell");
+        assert!(reversed(2, 1), "normalized end cell");
+        assert!(!reversed(3, 0), "cell before normalized start");
+        assert!(!reversed(3, 1), "cell after normalized end");
+    }
 
     #[test]
     fn long_path_truncated_with_middle_ellipsis() {

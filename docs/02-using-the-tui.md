@@ -171,6 +171,15 @@ When the window is selected (press **↑** from the command box to select it):
 | Mouse scroll | Scroll at any time |
 | **Esc** | Return focus to command box |
 
+### Selecting and copying text
+
+Execution window text is mouse-selectable whenever the container window is hidden or minimized (when the container window is maximized, it owns text selection instead — see below):
+
+1. **Click and drag** to highlight text (shown with inverted colors)
+2. **Ctrl+Y** to copy the selection to clipboard
+
+While a selection is active, a ` CTRL-Y to copy/yank text ` hint appears on the window's bottom border — the same flow as the container window. The selection captures the text as displayed when you started dragging, so output arriving mid-selection doesn't change what gets copied. Toggling the container window with **Ctrl+M** clears any active selection.
+
 ### Status log
 
 awman itself writes informational messages — not agent output, but messages from awman about what it is doing — into a per-tab **status log**. Examples include "container started", "worktree created", "auth token accepted", and error messages from failed commands.
