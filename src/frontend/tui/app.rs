@@ -18,15 +18,23 @@ use crate::frontend::tui::dialogs::{Dialog, DialogRequest, DialogResponse};
 use crate::frontend::tui::tabs::{ExecutionPhase, Tab};
 use crate::frontend::tui::text_edit::TextEdit;
 
-/// Pull the `--agent` value out of a parsed command box input, falling back
-/// to "Claude" (the default agent) when the flag is absent.
+/// Resolve the agent name shown in the container overlay title, using the
+/// same precedence as the engine (`resolve_agent`): explicit `--agent` flag,
+/// then the session's configured default agent, then "claude".
 /// Used to seed `ContainerInfo.agent_display_name`.
-fn agent_name_from_parsed(parsed: &ParsedCommandBoxInput) -> String {
+fn agent_name_from_parsed(parsed: &ParsedCommandBoxInput, session: &Session) -> String {
     use crate::command::dispatch::parsed_input::FlagValue;
-    if let Some(FlagValue::String(s)) = parsed.flags.get("agent") {
-        return s.clone();
+    let flag = match parsed.flags.get("agent") {
+        Some(FlagValue::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    match crate::command::commands::resolve_agent(&flag, session) {
+        Ok(name) => name.into_string(),
+        // resolve_agent only fails on a malformed flag value; the dispatch
+        // layer will reject the command with a proper error, so the title
+        // fallback here is cosmetic.
+        Err(_) => flag.unwrap_or_else(|| "claude".to_string()),
     }
-    "Claude".to_string()
 }
 
 /// UI focus target.
@@ -159,6 +167,9 @@ impl App {
         );
         tab.container_scroll_offset = 0;
         tab.mouse_selection = None;
+        tab.agent_alt_screen = false;
+        tab.agent_alternate_scroll = false;
+        tab.region_scroll.reset();
         tab.last_container_summary = None;
 
         // Clear previous workflow state so the strip resets for the new command.
@@ -243,7 +254,7 @@ impl App {
         tab.dialog_response_tx = Some(dialog_resp_tx);
 
         let command_name = parsed.path.join(" ");
-        let agent_display = agent_name_from_parsed(&parsed);
+        let agent_display = agent_name_from_parsed(&parsed, &tab.session);
 
         // Pre-populate ContainerInfo so the overlay title bar can show the
         // command name and elapsed time even before the engine reports the
@@ -690,6 +701,56 @@ mod tests {
             tab,
             rt.handle().clone(),
         )
+    }
+
+    // ── agent_name_from_parsed ───────────────────────────────────────────────
+
+    fn make_parsed(flags: Vec<(&str, FlagValue)>) -> ParsedCommandBoxInput {
+        ParsedCommandBoxInput {
+            path: vec!["chat".to_string()],
+            flags: flags.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            arguments: std::collections::BTreeMap::new(),
+        }
+    }
+
+    use crate::command::dispatch::parsed_input::FlagValue;
+
+    #[test]
+    fn agent_name_uses_explicit_agent_flag() {
+        let session = make_test_session();
+        let parsed = make_parsed(vec![("agent", FlagValue::String("codex".into()))]);
+        assert_eq!(agent_name_from_parsed(&parsed, &session), "codex");
+    }
+
+    #[test]
+    fn agent_name_uses_session_default_agent_when_flag_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        let session = Session::open(
+            tmp.path().to_path_buf(),
+            &resolver,
+            SessionOpenOptions {
+                flags: crate::data::config::FlagConfig {
+                    agent: Some("codex".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let parsed = make_parsed(vec![]);
+        assert_eq!(
+            agent_name_from_parsed(&parsed, &session),
+            "codex",
+            "title must reflect the configured default agent, not a hardcoded name"
+        );
+    }
+
+    #[test]
+    fn agent_name_falls_back_to_claude_without_config() {
+        let session = make_test_session();
+        let parsed = make_parsed(vec![]);
+        assert_eq!(agent_name_from_parsed(&parsed, &session), "claude");
     }
 
     // ── update_suggestions ────────────────────────────────────────────────────

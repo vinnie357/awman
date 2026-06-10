@@ -214,6 +214,22 @@ pub struct Tab {
     pub workflow_strip_scroll_offset: usize,
     pub last_strip_rect: Option<Rect>,
     pub mouse_selection: Option<TextSelection>,
+    /// Whether the agent has requested the alternate screen buffer. Tracked
+    /// here (not via the vt100 parser) because `drain_container_output`
+    /// strips alternate-screen sequences before the parser sees them, so
+    /// `screen().alternate_screen()` always reports `false`.
+    pub agent_alt_screen: bool,
+    /// Whether the agent has enabled "alternate scroll" mode (DECSET 1007).
+    /// Agents like codex never enable real mouse tracking; they expect the
+    /// terminal to translate wheel events into arrow keys while the
+    /// alternate screen is active. The vt100 parser ignores mode 1007, so
+    /// it is tracked here from the raw PTY output.
+    pub agent_alternate_scroll: bool,
+    /// Emulates scrollback for top-anchored scroll regions (codex's inline
+    /// history insertion) that the vt100 parser would otherwise discard.
+    /// All container output is funneled through it on its way to
+    /// `vt100_parser`; reset alongside the parser.
+    pub region_scroll: crate::frontend::tui::region_scroll::RegionScrollEmulator,
     pub workflow_agent_fallbacks: HashMap<String, String>,
     pub is_remote: bool,
     pub output_lines: Vec<String>,
@@ -283,6 +299,9 @@ impl Tab {
             workflow_strip_scroll_offset: 0,
             last_strip_rect: None,
             mouse_selection: None,
+            agent_alt_screen: false,
+            agent_alternate_scroll: false,
+            region_scroll: crate::frontend::tui::region_scroll::RegionScrollEmulator::new(),
             workflow_agent_fallbacks: HashMap::new(),
             is_remote: false,
             output_lines: Vec::new(),
@@ -351,6 +370,9 @@ impl Tab {
         );
         self.last_container_summary = None;
         self.mouse_selection = None;
+        self.agent_alt_screen = false;
+        self.agent_alternate_scroll = false;
+        self.region_scroll.reset();
         self.container_info = Some(ContainerInfo {
             agent_display_name,
             container_name,
@@ -491,12 +513,22 @@ impl Tab {
                 );
                 self.container_scroll_offset = 0;
                 self.mouse_selection = None;
+                self.agent_alt_screen = false;
+                self.agent_alternate_scroll = false;
+                self.region_scroll.reset();
             }
 
             let mut received_any = false;
             while let Ok(bytes) = rx.try_recv() {
                 let filtered = strip_alternate_screen_sequences(&bytes);
-                self.vt100_parser.process(&filtered);
+                if let Some(on) = filtered.alt_screen {
+                    self.agent_alt_screen = on;
+                }
+                if let Some(on) = filtered.alternate_scroll {
+                    self.agent_alternate_scroll = on;
+                }
+                self.region_scroll
+                    .process(&mut self.vt100_parser, &filtered.bytes);
                 received_any = true;
             }
             if received_any && self.container_window_state == ContainerWindowState::Hidden {
@@ -547,6 +579,9 @@ impl Tab {
         self.container_inner_area = None;
         self.mouse_selection = None;
         self.container_scroll_offset = 0;
+        self.agent_alt_screen = false;
+        self.agent_alternate_scroll = false;
+        self.region_scroll.reset();
         self.stuck = false;
         self.stuck_rx = None;
     }
@@ -771,6 +806,19 @@ pub fn compute_tab_bar_width(num_tabs: usize, area_width: u16, max_natural_conte
     }
 }
 
+/// Output of [`strip_alternate_screen_sequences`]: the filtered bytes plus
+/// the last private-mode toggles observed in the chunk (if any), so the tab
+/// can track terminal state the vt100 parser never sees (alternate screen,
+/// which is stripped) or ignores (alternate scroll, mode 1007).
+struct StrippedOutput {
+    bytes: Vec<u8>,
+    /// Last alternate-screen toggle in the chunk: `Some(true)` = entered,
+    /// `Some(false)` = left, `None` = no toggle seen.
+    alt_screen: Option<bool>,
+    /// Last alternate-scroll (DECSET/DECRST 1007) toggle in the chunk.
+    alternate_scroll: Option<bool>,
+}
+
 /// Strip DEC Private Mode Set/Reset sequences that toggle the alternate
 /// screen buffer.  Agents running inside the container (e.g. Claude Code
 /// in TUI mode) send these, which switches the vt100 parser to an
@@ -782,38 +830,55 @@ pub fn compute_tab_bar_width(num_tabs: usize, area_width: u16, max_natural_conte
 ///   ESC[?1049h / ESC[?1049l   (alternate screen + save/restore cursor)
 ///   ESC[?47h   / ESC[?47l     (alternate screen, legacy)
 ///   ESC[?1047h / ESC[?1047l   (alternate screen, xterm)
-fn strip_alternate_screen_sequences(input: &[u8]) -> Vec<u8> {
-    const SEQS: &[&[u8]] = &[
-        b"\x1b[?1049h",
-        b"\x1b[?1049l",
-        b"\x1b[?47h",
-        b"\x1b[?47l",
-        b"\x1b[?1047h",
-        b"\x1b[?1047l",
-    ];
+///
+/// Additionally *observes* (without stripping) the alternate-scroll mode:
+///   ESC[?1007h / ESC[?1007l   (wheel → arrow keys while on alt screen)
+///
+/// Both observations are reported in [`StrippedOutput`] so the tab can
+/// reconstruct the agent's intended terminal state.
+fn strip_alternate_screen_sequences(input: &[u8]) -> StrippedOutput {
+    const ALT_ON: &[&[u8]] = &[b"\x1b[?1049h", b"\x1b[?47h", b"\x1b[?1047h"];
+    const ALT_OFF: &[&[u8]] = &[b"\x1b[?1049l", b"\x1b[?47l", b"\x1b[?1047l"];
+    const ALT_SCROLL_ON: &[u8] = b"\x1b[?1007h";
+    const ALT_SCROLL_OFF: &[u8] = b"\x1b[?1007l";
 
     let mut out = Vec::with_capacity(input.len());
+    let mut alt_screen = None;
+    let mut alternate_scroll = None;
     let mut i = 0;
     while i < input.len() {
         if input[i] == 0x1b {
-            let mut matched = false;
-            for seq in SEQS {
-                if input[i..].starts_with(seq) {
-                    i += seq.len();
-                    matched = true;
-                    break;
-                }
+            if let Some(seq) = ALT_ON.iter().find(|s| input[i..].starts_with(s)) {
+                alt_screen = Some(true);
+                i += seq.len();
+                continue;
             }
-            if !matched {
-                out.push(input[i]);
-                i += 1;
+            if let Some(seq) = ALT_OFF.iter().find(|s| input[i..].starts_with(s)) {
+                alt_screen = Some(false);
+                i += seq.len();
+                continue;
             }
-        } else {
-            out.push(input[i]);
-            i += 1;
+            if input[i..].starts_with(ALT_SCROLL_ON) {
+                alternate_scroll = Some(true);
+                out.extend_from_slice(ALT_SCROLL_ON);
+                i += ALT_SCROLL_ON.len();
+                continue;
+            }
+            if input[i..].starts_with(ALT_SCROLL_OFF) {
+                alternate_scroll = Some(false);
+                out.extend_from_slice(ALT_SCROLL_OFF);
+                i += ALT_SCROLL_OFF.len();
+                continue;
+            }
         }
+        out.push(input[i]);
+        i += 1;
     }
-    out
+    StrippedOutput {
+        bytes: out,
+        alt_screen,
+        alternate_scroll,
+    }
 }
 
 #[cfg(test)]
@@ -1194,54 +1259,157 @@ mod tests {
     fn strip_alt_screen_removes_1049h() {
         let input = b"hello\x1b[?1049hworld";
         let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out, b"helloworld");
+        assert_eq!(out.bytes, b"helloworld");
+        assert_eq!(out.alt_screen, Some(true));
     }
 
     #[test]
     fn strip_alt_screen_removes_1049l() {
         let input = b"\x1b[?1049lafter";
         let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out, b"after");
+        assert_eq!(out.bytes, b"after");
+        assert_eq!(out.alt_screen, Some(false));
     }
 
     #[test]
     fn strip_alt_screen_removes_47h_and_47l() {
         let input = b"a\x1b[?47hb\x1b[?47lc";
         let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out, b"abc");
+        assert_eq!(out.bytes, b"abc");
+        // Last toggle in the chunk wins.
+        assert_eq!(out.alt_screen, Some(false));
     }
 
     #[test]
     fn strip_alt_screen_removes_1047h() {
         let input = b"\x1b[?1047hx";
         let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out, b"x");
+        assert_eq!(out.bytes, b"x");
+        assert_eq!(out.alt_screen, Some(true));
     }
 
     #[test]
     fn strip_alt_screen_preserves_other_escapes() {
         let input = b"\x1b[31mred\x1b[0m";
         let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out, input.to_vec());
+        assert_eq!(out.bytes, input.to_vec());
+        assert_eq!(out.alt_screen, None);
+        assert_eq!(out.alternate_scroll, None);
     }
 
     #[test]
     fn strip_alt_screen_passthrough_no_sequences() {
         let input = b"plain text without escapes";
         let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out, input.to_vec());
+        assert_eq!(out.bytes, input.to_vec());
+        assert_eq!(out.alt_screen, None);
+        assert_eq!(out.alternate_scroll, None);
     }
 
     #[test]
     fn strip_alt_screen_empty_input() {
         let out = strip_alternate_screen_sequences(b"");
-        assert!(out.is_empty());
+        assert!(out.bytes.is_empty());
+        assert_eq!(out.alt_screen, None);
+        assert_eq!(out.alternate_scroll, None);
     }
 
     #[test]
     fn strip_alt_screen_consecutive_sequences() {
         let input = b"\x1b[?1049h\x1b[?1049l";
         let out = strip_alternate_screen_sequences(input);
-        assert!(out.is_empty());
+        assert!(out.bytes.is_empty());
+        assert_eq!(out.alt_screen, Some(false));
+    }
+
+    #[test]
+    fn strip_observes_alternate_scroll_enable_without_stripping() {
+        // codex's alt-screen entry: CSI ?1049h then CSI ?1007h. The 1049
+        // must be stripped, the 1007 observed but left in the stream.
+        let input = b"\x1b[?1049h\x1b[?1007h";
+        let out = strip_alternate_screen_sequences(input);
+        assert_eq!(out.bytes, b"\x1b[?1007h");
+        assert_eq!(out.alt_screen, Some(true));
+        assert_eq!(out.alternate_scroll, Some(true));
+    }
+
+    #[test]
+    fn strip_observes_alternate_scroll_disable() {
+        // codex's alt-screen exit: CSI ?1007l then CSI ?1049l.
+        let input = b"\x1b[?1007l\x1b[?1049l";
+        let out = strip_alternate_screen_sequences(input);
+        assert_eq!(out.bytes, b"\x1b[?1007l");
+        assert_eq!(out.alt_screen, Some(false));
+        assert_eq!(out.alternate_scroll, Some(false));
+    }
+
+    #[test]
+    fn drain_container_output_tracks_alt_screen_and_alternate_scroll() {
+        let mut tab = make_tab();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tab.container_stdout_rx = Some(rx);
+
+        tx.send(b"\x1b[?1049h\x1b[?1007h".to_vec()).unwrap();
+        tab.drain_container_output();
+        assert!(tab.agent_alt_screen, "1049h must set agent_alt_screen");
+        assert!(
+            tab.agent_alternate_scroll,
+            "1007h must set agent_alternate_scroll"
+        );
+
+        tx.send(b"\x1b[?1007l\x1b[?1049l".to_vec()).unwrap();
+        tab.drain_container_output();
+        assert!(!tab.agent_alt_screen, "1049l must clear agent_alt_screen");
+        assert!(
+            !tab.agent_alternate_scroll,
+            "1007l must clear agent_alternate_scroll"
+        );
+    }
+
+    #[test]
+    fn codex_inline_history_insertion_lands_in_scrollback() {
+        // Reproduces codex's inline-viewport history insertion
+        // (codex-rs/tui/src/insert_history.rs): a scroll region anchored at
+        // the top of the screen ending above the inline viewport, the cursor
+        // parked on the region's bottom row, and one "\r\n" + line per
+        // history entry. Each newline scrolls the region; the rows pushed
+        // off the top of the screen must accumulate in vt100 scrollback so
+        // mouse-wheel scrollback has something to show. Relies on the
+        // RegionScrollEmulator in the drain pipeline (vt100 alone discards
+        // these rows).
+        let mut tab = make_tab(); // 24x80 parser
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tab.container_stdout_rx = Some(rx);
+        // Steady-state: the overlay is already open and the parser sized
+        // (start_container). Skips drain's auto-open branch, which would
+        // resize the parser to the host terminal mid-test.
+        tab.container_window_state = ContainerWindowState::Maximized;
+
+        // Viewport occupies the bottom 6 rows (0-based top = row 18), so the
+        // scroll region is 1-based rows 1..18.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x1b[1;18r"); // DECSTBM, top-anchored
+        bytes.extend_from_slice(b"\x1b[18;1H"); // cursor to region bottom
+        for i in 0..30 {
+            bytes.extend_from_slice(format!("\r\nhistory line {i}").as_bytes());
+        }
+        bytes.extend_from_slice(b"\x1b[r"); // reset region
+        tx.send(bytes).unwrap();
+        tab.drain_container_output();
+
+        let screen = tab.vt100_parser.screen_mut();
+        screen.set_scrollback(usize::MAX);
+        let depth = screen.scrollback();
+        assert!(
+            depth >= 12,
+            "30 lines through an 18-row region must overflow into scrollback \
+             (got depth {depth})"
+        );
+        let scrolled_back = screen.contents();
+        screen.set_scrollback(0);
+        assert!(
+            scrolled_back.contains("history line 0"),
+            "earliest history line must be reachable in scrollback"
+        );
     }
 }

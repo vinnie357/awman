@@ -40,6 +40,7 @@ pub mod keymap;
 mod mouse;
 pub mod per_command;
 pub mod pty;
+mod region_scroll;
 pub mod render;
 pub mod tabs;
 pub mod text_edit;
@@ -631,11 +632,18 @@ fn handle_mouse_event(app: &mut App, mouse: crossterm::event::MouseEvent) {
             if tab.container_window_state == ContainerWindowState::Maximized {
                 let agent_wants_mouse = tab.vt100_parser.screen().mouse_protocol_mode()
                     != vt100::MouseProtocolMode::None;
+                // Agents like codex never enable mouse tracking; they pair
+                // the alternate screen with alternate-scroll mode (DECSET
+                // 1007) and expect the terminal to translate wheel events
+                // into arrow keys. awman plays the terminal's role here.
+                let agent_wants_alt_scroll = tab.agent_alt_screen && tab.agent_alternate_scroll;
                 let at_live_view = tab.container_scroll_offset == 0;
                 let shift_held = mouse.modifiers.contains(KeyModifiers::SHIFT);
 
                 if agent_wants_mouse && at_live_view && !shift_held {
                     mouse::forward_mouse_scroll_to_pty(tab, &mouse);
+                } else if agent_wants_alt_scroll && at_live_view && !shift_held {
+                    mouse::forward_alt_scroll_to_pty(tab, &mouse);
                 } else {
                     mouse::handle_container_scroll(tab, is_up);
                 }
@@ -2686,6 +2694,117 @@ mod tests {
         assert!(
             rx.try_recv().is_ok(),
             "scroll at the last inside cell (col 84, row 26) must still be forwarded"
+        );
+    }
+
+    // ── Alternate scroll (DECSET 1007, e.g. codex) → arrow keys to PTY ────────
+
+    #[test]
+    fn scroll_with_alternate_scroll_mode_forwards_arrow_keys() {
+        let mut app = make_app();
+        let mut rx = setup_container_tab(&mut app);
+        // codex-style: alternate screen + alternate scroll, NO mouse tracking.
+        let tab = app.active_tab_mut();
+        tab.agent_alt_screen = true;
+        tab.agent_alternate_scroll = true;
+        tab.container_scroll_offset = 0;
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 20, 10, KeyModifiers::NONE),
+        );
+        let data = rx
+            .try_recv()
+            .expect("PTY must receive arrow keys when alternate scroll is active");
+        assert_eq!(data, b"\x1b[A\x1b[A\x1b[A");
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollDown, 20, 10, KeyModifiers::NONE),
+        );
+        let data = rx.try_recv().expect("scroll down must also forward");
+        assert_eq!(data, b"\x1b[B\x1b[B\x1b[B");
+    }
+
+    #[test]
+    fn alternate_scroll_without_alt_screen_scrolls_awman_scrollback() {
+        // codex's inline (non-alt-screen) chat view: 1007 may linger from a
+        // previous overlay, but with the alt screen off the wheel must go to
+        // awman's own scrollback — mirroring real terminal behavior, where
+        // alternate scroll only applies while the alternate screen is active.
+        let mut app = make_app();
+        let mut rx = setup_container_tab(&mut app);
+        let tab = app.active_tab_mut();
+        tab.agent_alt_screen = false;
+        tab.agent_alternate_scroll = true;
+        tab.container_scroll_offset = 0;
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 20, 10, KeyModifiers::NONE),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "alternate scroll without alt screen must not forward to PTY"
+        );
+    }
+
+    #[test]
+    fn alternate_scroll_shift_held_scrolls_awman_scrollback() {
+        let mut app = make_app();
+        let mut rx = setup_container_tab(&mut app);
+        let tab = app.active_tab_mut();
+        tab.agent_alt_screen = true;
+        tab.agent_alternate_scroll = true;
+        tab.container_scroll_offset = 0;
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 20, 10, KeyModifiers::SHIFT),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "Shift+scroll escape hatch must also apply to alternate scroll"
+        );
+    }
+
+    #[test]
+    fn alternate_scroll_respects_application_cursor_mode() {
+        let mut app = make_app();
+        let mut rx = setup_container_tab(&mut app);
+        let tab = app.active_tab_mut();
+        tab.agent_alt_screen = true;
+        tab.agent_alternate_scroll = true;
+        tab.vt100_parser.process(b"\x1b[?1h"); // DECCKM: application cursor keys
+        tab.container_scroll_offset = 0;
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 20, 10, KeyModifiers::NONE),
+        );
+        let data = rx.try_recv().expect("PTY must receive arrow keys");
+        assert_eq!(data, b"\x1bOA\x1bOA\x1bOA");
+    }
+
+    #[test]
+    fn mouse_tracking_takes_precedence_over_alternate_scroll() {
+        let mut app = make_app();
+        let mut rx = setup_container_tab(&mut app);
+        let tab = app.active_tab_mut();
+        tab.agent_alt_screen = true;
+        tab.agent_alternate_scroll = true;
+        tab.vt100_parser.process(b"\x1b[?1000h"); // real mouse tracking too
+        tab.container_scroll_offset = 0;
+
+        super::handle_mouse_event(
+            &mut app,
+            make_mouse_event(MouseEventKind::ScrollUp, 20, 10, KeyModifiers::NONE),
+        );
+        let data = rx.try_recv().expect("PTY must receive bytes");
+        assert_eq!(
+            &data[..3],
+            b"\x1b[M",
+            "agent with real mouse tracking must get mouse encoding, not arrows"
         );
     }
 

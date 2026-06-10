@@ -21,6 +21,14 @@ When an agent enables mouse tracking via escape sequences (e.g., `CSI ? 1000 h` 
 
 Modern terminal applications (tmux, less, vim plugins, custom TUIs) often enable mouse tracking to support scrolling within panes, file listings, or code diffs. When running these inside awman, you can interact with them naturally using your mouse.
 
+### Alternate scroll mode (wheel → arrow keys)
+
+Some TUIs never enable real mouse tracking — instead they enable **alternate scroll mode** (`CSI ? 1007 h`) together with the alternate screen, and expect the terminal to translate mouse wheel events into Up/Down arrow key presses. The codex CLI's transcript and diff viewers work this way.
+
+awman plays the terminal's role here: while the agent has the alternate screen and alternate scroll mode active, each wheel tick is delivered to the agent as three arrow key presses (matching common terminal behavior). The same rules as regular scroll forwarding apply — you must be at the live view, and Shift+Scroll still forces awman's own scrollback.
+
+When the agent leaves the alternate screen (e.g., codex returns to its inline chat view), wheel events go back to awman's scrollback, just as they would scroll the terminal's own history in a standalone terminal. awman fills that role faithfully: inline-viewport agents push their chat history "off the top of the screen" using terminal scroll regions, and awman captures those lines into the container scrollback — so scrolling up in codex's chat view walks back through the conversation, exactly as it would in iTerm2 or kitty.
+
 ---
 
 ## Scroll forwarding
@@ -110,6 +118,8 @@ Code assistants running as TUIs (e.g., Claude Code in interactive mode) may enab
 
 Scroll to interact with the agent's UI, Shift+Scroll to return to awman's history, text selection works as always.
 
+Assistants that use alternate scroll mode instead of mouse tracking (e.g., codex's transcript pager opened with **Ctrl+T**, or its diff viewer) also scroll naturally — awman converts your wheel events into the arrow keys they expect. In codex's regular inline chat view, the wheel scrolls awman's own history, which includes the full chat transcript codex has emitted.
+
 ### tmux and GNU Screen
 
 When running tmux or Screen inside awman:
@@ -138,6 +148,7 @@ For example, running `vim` inside the agent (which typically enables mouse suppo
 - Some require a flag or configuration (e.g., `less -S` for horizontal scrolling)
 - Some only enable it in specific contexts (e.g., vim inside tmux)
 - Some don't use mouse tracking at all (e.g., cli cat, echo, traditional shell commands)
+- Some use alternate scroll mode rather than mouse tracking (e.g., codex) — awman supports this too, but only while the application's full-screen view is active
 
 **Verify:** While the agent is running, check awman's console or logs to confirm the mouse protocol is active. You can also try Shift+Scroll to confirm awman's scrollback still works — if it does, awman is correctly distinguishing between agent and non-agent scroll events.
 

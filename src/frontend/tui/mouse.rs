@@ -57,6 +57,51 @@ pub(super) fn forward_mouse_scroll_to_pty(tab: &mut Tab, mouse: &MouseEvent) {
     }
 }
 
+/// Forward a scroll event as arrow-key presses for agents using
+/// "alternate scroll" mode (DECSET 1007) — e.g. codex — which never enable
+/// real mouse tracking and instead rely on the terminal translating wheel
+/// events into cursor keys while the alternate screen is active. awman
+/// plays the terminal's role here. Events that land outside
+/// `container_inner_area` (on the overlay border) are discarded, matching
+/// `forward_mouse_scroll_to_pty`.
+pub(super) fn forward_alt_scroll_to_pty(tab: &mut Tab, mouse: &MouseEvent) {
+    let inner = match tab.container_inner_area {
+        Some(r) => r,
+        None => return,
+    };
+
+    if mouse.column < inner.x
+        || mouse.row < inner.y
+        || mouse.column >= inner.x + inner.width
+        || mouse.row >= inner.y + inner.height
+    {
+        return;
+    }
+
+    let application_cursor = tab.vt100_parser.screen().application_cursor();
+
+    if let Some(bytes) = encode_alt_scroll(mouse.kind, application_cursor) {
+        if let Some(ref tx) = tab.container_stdin_tx {
+            let _ = tx.send(bytes);
+        }
+    }
+}
+
+/// Encode a wheel tick as arrow-key presses for alternate-scroll mode:
+/// three presses per tick (the de-facto terminal convention for wheel →
+/// cursor-key translation), in application form (`ESC O A/B`) when DECCKM
+/// is set, normal form (`ESC [ A/B`) otherwise.
+pub(super) fn encode_alt_scroll(kind: MouseEventKind, application_cursor: bool) -> Option<Vec<u8>> {
+    let arrow: &[u8] = match (kind, application_cursor) {
+        (MouseEventKind::ScrollUp, false) => b"\x1b[A",
+        (MouseEventKind::ScrollUp, true) => b"\x1bOA",
+        (MouseEventKind::ScrollDown, false) => b"\x1b[B",
+        (MouseEventKind::ScrollDown, true) => b"\x1bOB",
+        _ => return None,
+    };
+    Some(arrow.repeat(3))
+}
+
 /// Encode a scroll event into the escape sequence the agent expects.
 ///
 /// Mouse button codes: scroll-up = 64, scroll-down = 65 (X10 convention).
@@ -255,5 +300,37 @@ mod tests {
             vt100::MouseProtocolEncoding::Sgr,
         );
         assert!(result.is_none(), "non-scroll kind must return None");
+    }
+
+    // ── encode_alt_scroll (alternate scroll mode, DECSET 1007) ────────────────
+
+    #[test]
+    fn encode_alt_scroll_up_normal_cursor_keys() {
+        let bytes = encode_alt_scroll(MouseEventKind::ScrollUp, false).unwrap();
+        assert_eq!(bytes, b"\x1b[A\x1b[A\x1b[A");
+    }
+
+    #[test]
+    fn encode_alt_scroll_down_normal_cursor_keys() {
+        let bytes = encode_alt_scroll(MouseEventKind::ScrollDown, false).unwrap();
+        assert_eq!(bytes, b"\x1b[B\x1b[B\x1b[B");
+    }
+
+    #[test]
+    fn encode_alt_scroll_up_application_cursor_keys() {
+        // DECCKM set → SS3-prefixed arrows.
+        let bytes = encode_alt_scroll(MouseEventKind::ScrollUp, true).unwrap();
+        assert_eq!(bytes, b"\x1bOA\x1bOA\x1bOA");
+    }
+
+    #[test]
+    fn encode_alt_scroll_down_application_cursor_keys() {
+        let bytes = encode_alt_scroll(MouseEventKind::ScrollDown, true).unwrap();
+        assert_eq!(bytes, b"\x1bOB\x1bOB\x1bOB");
+    }
+
+    #[test]
+    fn encode_alt_scroll_non_scroll_kind_returns_none() {
+        assert!(encode_alt_scroll(MouseEventKind::Moved, false).is_none());
     }
 }
