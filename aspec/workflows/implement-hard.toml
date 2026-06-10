@@ -2,8 +2,16 @@ title = "Implement Hard Feature Workflow"
 overlays = ["context(workflow)"]
 
 [[step]]
+name = "review-plan"
+agent = "codex"
+prompt = """
+Review the implementation plan for work item {{work_item_number}} for correctness, adherence to the grand architecture, design, security, quality, test coverage, and clarity. Address any issues you find, editing only the work item's markdown and nothing else. Do not change the functionality or spirit of the work item, only address concrete problems that would affect code quality, correctness, or security.
+"""
+
+[[step]]
 name = "implement"
-model = "claude-fable-5"
+depends_on = ["review-plan"]
+model = "claude-opus-4-8"
 prompt = """
 Implement work item {{work_item_number}}, adhering strongly to its implementation plan. Iterate until the work item is comprehensively implemented, the build succeeds, and all existing tests pass. DO NOT write any new tests yet, just fix any you break. New tests will be implemented in the next step. Do not write or change any docs yet, that will happen in a future step.
 
@@ -31,9 +39,9 @@ Write comprehensive documentation for work item {{work_item_number}}, following 
 [[step]]
 name = "review"
 depends_on = ["docs", "tests"]
-agent = "codex"
+model = "claude-fable-5"
 prompt = """
-Review the changes made for work item {{work_item_number}} in the previous steps for correctness, completeness, security, and style. Suggest improvements if needed, but ask before changing anything. Ensure all edge cases are considered:
+Review the changes made for work item {{work_item_number}} in the previous steps for correctness, completeness, security, and style. Address major issues or gaps automatically, but you MUST ask me for clarification if anything is unclear or if there are diverging possible solutions or spec mismatches. Then suggest minor improvements/nits if needed for my approval. Ensure all edge cases are considered:
 
 {{work_item_section:[Edge Case Considerations]}}
 
