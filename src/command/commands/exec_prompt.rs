@@ -128,13 +128,6 @@ impl Command for ExecPromptCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        // Agent execution under a sandbox-class runtime lands in WI 0090;
-        // until then the stub surfaces NotImplemented instead of panicking
-        // or silently falling back to Docker.
-        self.engines
-            .require_container_runtime()
-            .map_err(CommandError::from)?;
-
         let session = self.session;
 
         // Validate that at least one of prompt and --issue is provided.
@@ -224,23 +217,36 @@ impl Command for ExecPromptCommand {
         // Emit deprecation warnings for legacy config fields.
         warn_legacy_config(&session, frontend.as_mut());
 
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: "Checking agent availability…".into(),
-        });
-        if let Err(e) = ensure_exec_prompt_agent_setup(
-            self.engines.agent_engine.as_ref(),
-            &session,
-            &agent,
-            &mut frontend,
-        )
-        .await
-        {
+        // The Dockerfile + image setup is container-paradigm only; sandbox
+        // runtimes get their per-agent kits from `awman ready` instead.
+        if self.engines.runtime.capabilities().kit_declarative {
             frontend.write_message(UserMessage {
-                level: MessageLevel::Error,
-                text: format!("exec prompt: agent setup failed: {e}"),
+                level: MessageLevel::Info,
+                text: format!(
+                    "exec prompt: {} runtime active — using the agent kit prepared by \
+                     `awman ready` (no image build needed)",
+                    self.engines.runtime.display_name()
+                ),
             });
-            return Err(e);
+        } else {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "Checking agent availability…".into(),
+            });
+            if let Err(e) = ensure_exec_prompt_agent_setup(
+                self.engines.agent_engine.as_ref(),
+                &session,
+                &agent,
+                &mut frontend,
+            )
+            .await
+            {
+                frontend.write_message(UserMessage {
+                    level: MessageLevel::Error,
+                    text: format!("exec prompt: agent setup failed: {e}"),
+                });
+                return Err(e);
+            }
         }
 
         frontend.write_message(UserMessage {
@@ -292,43 +298,36 @@ impl Command for ExecPromptCommand {
             ..Default::default()
         };
 
-        let mut options = match self
-            .engines
-            .agent_engine
-            .build_options(&session, &agent, &run_opts)
-        {
+        let resolved = match self.engines.agent_engine.resolve_agent_options(
+            &session,
+            &agent,
+            &run_opts,
+            &credentials.env_vars,
+            self.engines.runtime.as_ref(),
+        ) {
             Ok(o) => o,
             Err(e) => {
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Error,
-                    text: format!("exec prompt: failed to build container options: {e}"),
+                    text: format!("exec prompt: failed to build agent options: {e}"),
                 });
                 return Err(CommandError::from(e));
             }
         };
-        if !credentials.env_vars.is_empty() {
-            options.push(
-                crate::engine::container::options::ContainerOption::AgentCredentials {
-                    env_vars: credentials.env_vars,
-                },
-            );
-        }
 
-        let instance = match crate::engine::agent_runtime::ResolvedAgentOptions::container(options)
-            .and_then(|o| self.engines.runtime.build(o))
-        {
+        let instance = match self.engines.runtime.build(resolved) {
             Ok(i) => i,
             Err(e) => {
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Error,
-                    text: format!("exec prompt: failed to build container: {e}"),
+                    text: format!("exec prompt: failed to build agent: {e}"),
                 });
                 return Err(CommandError::from(e));
             }
         };
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
-            text: "Launching agent container…".into(),
+            text: format!("Launching agent ({})…", self.engines.runtime.display_name()),
         });
         frontend.set_pty_active(true);
         let container_frontend = frontend.container_frontend_for_pty();
@@ -339,7 +338,7 @@ impl Command for ExecPromptCommand {
                 frontend.replay_queued();
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Error,
-                    text: format!("exec prompt: container launch failed: {e}"),
+                    text: format!("exec prompt: agent launch failed: {e}"),
                 });
                 return Err(CommandError::from(e));
             }

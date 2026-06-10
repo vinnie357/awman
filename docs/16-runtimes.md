@@ -62,7 +62,7 @@ Apple Containers is a macOS-native runtime that runs each agent in a lightweight
 
 This runtime is **experimental**. The `-experimental` suffix in the config string is intentional and durable: `sbx` itself has open known bugs as of June 2026 and its per-VM API is partly undocumented. The suffix will be removed in a future work item once both `sbx` and awman's integration have stabilized.
 
-**Current status:** in this release, `awman ready` fully prepares the sbx runtime — it emits kits, registers credentials, and validates the result. Routing `awman chat`, `awman exec`, and workflows through sbx ships in an upcoming release; until then those commands report that they do not yet support the sandbox runtime. The sandbox lifecycle described below applies once that routing lands.
+**Current status:** `awman ready`, `awman chat`, `awman exec`, and `awman exec workflow` all work end-to-end under `docker-sbx-experimental`. Run `awman ready` once to prepare the runtime, then use `awman chat` and `awman exec` exactly as you would with any other runtime.
 
 ### Platform support
 
@@ -188,7 +188,7 @@ awman status               # shows awman-managed sandboxes across all runtimes
 sbx ls                     # shows all sandboxes including non-awman ones
 ```
 
-**Sandbox naming:** awman names sandboxes `awman-<worktree-hash>-<agent>`. The hash is derived from the worktree's absolute path so the same worktree always produces the same name. Multi-agent workflows create one sandbox per agent with distinct names.
+**Sandbox naming:** awman names sandboxes `awman-<worktree-hash>-<agent>`. The hash is derived from the worktree's absolute path so the same worktree always produces the same name. Multi-agent workflows create one persistent sandbox per agent per worktree. When a workflow step runs, awman reuses the existing sandbox for that agent if one exists (restart, no reinstall), or creates a new one on first use. All steps that share the same agent share one sandbox — the per-agent install cost is paid once per worktree regardless of how many workflow steps use that agent.
 
 ### Credentials
 
@@ -208,7 +208,28 @@ Supported services and the environment variables awman maps to them:
 
 Credentials are piped to `sbx secret set` via stdin — they never appear in process listings or log output. If awman cannot find a required credential, it warns at launch time rather than silently starting a sandbox that will fail.
 
-Non-credential config (model selection, mode flags, system prompts, tool lists) is written to `<workspace>/.awman/session.json` before each launch. The startup script inside the VM reads this file and configures the agent accordingly. Credential values are never written to `session.json`.
+Non-credential config (model selection, mode flags, system prompts, tool lists) is written to `<workspace>/.awman/session.json` before each launch and read by the startup script inside the VM. Credential values are never written to `session.json`.
+
+### Session config and seeded prompts
+
+How awman delivers a seeded prompt (e.g., from `awman exec prompt --agent claude "fix the bug"`) depends on the kit kind:
+
+| Kit kind | Prompt delivery |
+|---|---|
+| `kind: mixin` (`claude`, `codex`, `gemini`, `copilot`, `opencode`) | Written into the agent's stdin at launch (typed ahead for interactive sessions, piped for `--non-interactive`) |
+| `kind: agent` (`antigravity`, `crush`, `maki`, `cline`) | Appended as a positional argument at launch |
+
+Mixin kits launch their agent through Docker's built-in sandbox template, so awman cannot put the prompt on the command line — stdin injection is the single delivery path. The prompt is also recorded in `session.json` and staged by the startup script at `~/.awman/seeded-prompt.txt` inside the VM for reference, but that copy is informational, not a second delivery.
+
+Mixin startup scripts consume these `session.json` fields where the agent supports them natively:
+
+- `model` — sets the agent's default model
+- `system_prompt_inline.text` — applies an inline system prompt via the agent's native config
+- `allowed_tools` / `disallowed_tools` — configures tool allow/deny lists
+
+If a mixin agent cannot express a field through its native config, awman prints a warning at launch time rather than silently dropping the setting. `kind: agent` kits do not consume these fields from `session.json` — configuration is delivered entirely through launch arguments. (`antigravity` delivers system prompts through extra directory mounts under the container runtimes; those mounts don't exist under sbx, so awman warns that the system prompt was not applied.)
+
+No prompt is delivered twice: mixin kits use stdin; `kind: agent` kits use positional arguments; neither path uses both.
 
 ### Supported agents
 
@@ -228,17 +249,15 @@ All nine awman agents are supported under `docker-sbx-experimental`:
 
 ### Known limitations
 
-**`awman chat` / `awman exec` routing:** not yet wired to sbx in this release — see "Current status" above. `awman ready` is fully supported; agent-launching commands report a clear error under this runtime until routing ships.
-
 **Platform:** macOS arm64 and Windows x86_64 only. Linux is blocked until docker/sbx-releases#51 is fixed upstream. Intel Macs are not supported.
 
 **Networking:** all traffic goes through an HTTP/HTTPS proxy. Raw TCP, UDP, and ICMP are blocked. This means SSH-based git remotes, database connections, and other raw-socket protocols do not work inside the VM by default. Agents that need npm, pip, or curl to reach the internet will work; agents that need to SSH into a server will not.
 
 **No per-resource stats:** `awman status` and the TUI stats panel show sandbox running/stopped state from `sbx ls`, but cannot report per-sandbox CPU or memory usage. The `docker stats`-style live resource view is unavailable for sbx sandboxes.
 
-**`--allow-docker`:** Docker-in-Docker is always on inside an sbx sandbox (each VM has a private Docker daemon). The `--allow-docker` flag (which mounts the host daemon socket into Docker containers) is a no-op under sbx — it is silently ignored.
+**`--allow-docker`:** Docker-in-Docker is always on inside an sbx sandbox (each VM has a private Docker daemon). The `--allow-docker` flag (which mounts the host daemon socket into Docker containers) is a no-op under sbx — it is ignored (noted in the debug log).
 
-**Overlays with paths outside the workspace:** the VM can only see paths that are virtiofs-mounted at sandbox creation. Overlays that reference directories outside the workspace (e.g., `dir(~/reference:/mnt/reference:ro)`) are not supported and will produce a clear error.
+**Directory overlays, skills, and context mounts:** the VM can only see the workspace, which is virtiofs-mounted at sandbox creation. `dir(...)` overlays, skill mounts (`--include-all-skills` / `skill(...)`), and context directory mounts (`context(...)`) cannot be honored — awman warns at launch and continues without them. For `context(...)`, the rendered system prompt text is still delivered to the agent; only the directory mount is skipped.
 
 **Port mappings:** if a workflow binds a port inside the sandbox, that port mapping is lost when the sandbox stops. Port-based workflows must keep the sandbox running continuously.
 

@@ -27,7 +27,6 @@ if [ "$SCHEMA_VERSION" != "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Agent-specific config rendering for codex is minimal.
 # env_config entries are written to $HOME/.awman/env.sh (sourceable).
 # ---------------------------------------------------------------------------
 mkdir -p "$HOME/.awman"
@@ -41,6 +40,47 @@ jq -r '
   to_entries[] |
   "export \(.key)=\(.value|@sh)"
 ' "$SESSION_FILE" >> "$ENV_SH" || true
+
+# ---------------------------------------------------------------------------
+# Dynamic session fields codex can express natively.
+# ---------------------------------------------------------------------------
+mkdir -p "$HOME/.codex"
+
+# Model → ~/.codex/config.toml. The awman-managed line is rewritten on each
+# startup; other config.toml content is preserved.
+MODEL="$(jq -r '.model // empty' "$SESSION_FILE")"
+if [ -n "$MODEL" ]; then
+  CONFIG_TOML="$HOME/.codex/config.toml"
+  touch "$CONFIG_TOML"
+  # Drop any prior awman-managed model line, then append the current one.
+  grep -v '^model = .* # awman-managed$' "$CONFIG_TOML" > "$CONFIG_TOML.tmp" || true
+  mv "$CONFIG_TOML.tmp" "$CONFIG_TOML"
+  printf 'model = "%s" # awman-managed\n' "$MODEL" >> "$CONFIG_TOML"
+fi
+
+# System prompt → developer instructions. The container path delivers this as
+# `--config developer_instructions=<text>`; the native, mixin-safe equivalent is
+# codex's home AGENTS.md, which is always read as developer guidance.
+SYS_PROMPT="$(jq -r '.system_prompt_inline.text // empty' "$SESSION_FILE")"
+if [ -n "$SYS_PROMPT" ]; then
+  # `.system_prompt_inline.text` for codex is "developer_instructions=<text>";
+  # strip the key prefix so only the prompt body lands in AGENTS.md.
+  printf '%s\n' "${SYS_PROMPT#developer_instructions=}" > "$HOME/.codex/AGENTS.md"
+fi
+
+# Tool allow/deny lists are not expressible through codex config — warn rather
+# than silently drop them.
+if [ "$(jq -r '((.allowed_tools // []) + (.disallowed_tools // [])) | length' "$SESSION_FILE")" != "0" ]; then
+  echo "awman: codex does not support allow/deny tool lists via config; ignoring them." >&2
+fi
+
+# Seeded prompt — staged for reference. Delivery happens host-side: awman
+# writes the prompt into the agent's stdin at launch (mixin kits cannot take
+# it positionally through Docker's built-in template).
+SEEDED="$(jq -r '.seeded_prompt // empty' "$SESSION_FILE")"
+if [ -n "$SEEDED" ]; then
+  printf '%s' "$SEEDED" > "$HOME/.awman/seeded-prompt.txt"
+fi
 
 # Write a marker file so external tooling can confirm config was applied.
 cp "$SESSION_FILE" "$HOME/.awman/session-applied.json"

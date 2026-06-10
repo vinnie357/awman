@@ -89,13 +89,6 @@ impl Command for ChatCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        // Agent execution under a sandbox-class runtime lands in WI 0090;
-        // until then the stub surfaces NotImplemented instead of panicking
-        // or silently falling back to Docker.
-        self.engines
-            .require_container_runtime()
-            .map_err(CommandError::from)?;
-
         // 1. Resolve the agent: --agent flag wins over the repo / global default.
         let session = self.session;
         let agent = match resolve_agent(&self.flags.agent, &session) {
@@ -163,28 +156,41 @@ impl Command for ChatCommand {
         // Emit deprecation warnings for legacy config fields.
         warn_legacy_config(&session, frontend.as_mut());
 
-        // 3. Ensure the agent is available (Dockerfile + image present, build
-        //    if missing). Runs before PTY activation so any download/build
-        //    progress streams to the user terminal directly.
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: "Checking agent availability…".into(),
-        });
-        match ensure_agent_setup(
-            self.engines.agent_engine.as_ref(),
-            &session,
-            &agent,
-            &mut frontend,
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(e) => {
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("chat: agent setup failed: {e}"),
-                });
-                return Err(e);
+        // 3. Ensure the agent is available. The Dockerfile + image setup is
+        //    container-paradigm only; kit-declarative (sandbox) runtimes get
+        //    their per-agent kits from `awman ready`, and a missing kit
+        //    surfaces as a clear error at launch. Runs before PTY activation
+        //    so any download/build progress streams to the user terminal.
+        if self.engines.runtime.capabilities().kit_declarative {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: format!(
+                    "chat: {} runtime active — using the agent kit prepared by `awman ready` \
+                     (no image build needed)",
+                    self.engines.runtime.display_name()
+                ),
+            });
+        } else {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Info,
+                text: "Checking agent availability…".into(),
+            });
+            match ensure_agent_setup(
+                self.engines.agent_engine.as_ref(),
+                &session,
+                &agent,
+                &mut frontend,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("chat: agent setup failed: {e}"),
+                    });
+                    return Err(e);
+                }
             }
         }
 
@@ -221,7 +227,7 @@ impl Command for ChatCommand {
         )?;
 
         // 6. Build the run options from flags + credentials.
-        let mut run_opts = AgentRunOptions {
+        let run_opts = AgentRunOptions {
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),
@@ -240,41 +246,34 @@ impl Command for ChatCommand {
             context_overlays,
             ..Default::default()
         };
-        let env_overrides = credentials.env_vars.clone();
 
-        // 6. Build the container options through AgentEngine.
-        let mut options = match self
-            .engines
-            .agent_engine
-            .build_options(&session, &agent, &run_opts)
-        {
+        // 6. Build the paradigm-appropriate options through AgentEngine's
+        //    centralized cross-paradigm mapper (container vs sandbox), folding in
+        //    resolved credentials.
+        let resolved = match self.engines.agent_engine.resolve_agent_options(
+            &session,
+            &agent,
+            &run_opts,
+            &credentials.env_vars,
+            self.engines.runtime.as_ref(),
+        ) {
             Ok(o) => o,
             Err(e) => {
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Error,
-                    text: format!("chat: failed to build container options: {e}"),
+                    text: format!("chat: failed to build agent options: {e}"),
                 });
                 return Err(CommandError::from(e));
             }
         };
-        if !env_overrides.is_empty() {
-            options.push(
-                crate::engine::container::options::ContainerOption::AgentCredentials {
-                    env_vars: env_overrides,
-                },
-            );
-        }
-        let _ = &mut run_opts; // silence unused-mut lint when no fields mutate later
 
-        // 7. Build the container instance.
-        let instance = match crate::engine::agent_runtime::ResolvedAgentOptions::container(options)
-            .and_then(|o| self.engines.runtime.build(o))
-        {
+        // 7. Build the agent instance.
+        let instance = match self.engines.runtime.build(resolved) {
             Ok(i) => i,
             Err(e) => {
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Error,
-                    text: format!("chat: failed to build container instance: {e}"),
+                    text: format!("chat: failed to build agent instance: {e}"),
                 });
                 return Err(CommandError::from(e));
             }
@@ -283,7 +282,7 @@ impl Command for ChatCommand {
         // 8. Run with PTY-active gating.
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
-            text: "Launching agent container…".into(),
+            text: format!("Launching agent ({})…", self.engines.runtime.display_name()),
         });
         frontend.set_pty_active(true);
         let container_frontend = frontend.container_frontend_for_pty();
@@ -294,7 +293,7 @@ impl Command for ChatCommand {
                 frontend.replay_queued();
                 frontend.write_message(UserMessage {
                     level: MessageLevel::Error,
-                    text: format!("chat: failed to launch container: {e}"),
+                    text: format!("chat: failed to launch agent: {e}"),
                 });
                 return Err(CommandError::from(e));
             }

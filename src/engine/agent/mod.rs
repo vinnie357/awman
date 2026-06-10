@@ -10,10 +10,14 @@ use crate::data::config::effective::EffectiveConfig;
 use crate::data::image_tags::{agent_image_tag, project_image_tag};
 use crate::data::repo_dockerfile_paths::RepoDockerfilePaths;
 use crate::data::session::{AgentName, Session};
-use crate::engine::container::options::{ContainerOption, EnvVar, ImageRef, PlanMode, YoloMode};
+use crate::engine::agent_runtime::{AgentRuntimeEngine, ResolvedAgentOptions};
+use crate::engine::container::options::{
+    ContainerOption, EnvLiteral, EnvVar, ImageRef, PlanMode, YoloMode,
+};
 use crate::engine::container::ContainerRuntime;
 use crate::engine::error::EngineError;
 use crate::engine::overlay::{ContextOverlay, DirectorySpec, OverlayEngine, OverlayRequest};
+use crate::engine::sandbox::options::SandboxOption;
 use crate::engine::step_status::StepStatus;
 
 pub mod agent_matrix;
@@ -359,6 +363,163 @@ impl AgentEngine {
         Ok(options)
     }
 
+    /// Cross-paradigm option builder. Maps a single `AgentRunOptions` (the same
+    /// flag/config inputs the container path consumes) into the
+    /// `ResolvedAgentOptions` variant matching the active runtime's paradigm,
+    /// branching on `AgentRuntimeEngine::capabilities()` rather than on concrete
+    /// runtime types. Resolved credential env-vars are folded in as the
+    /// paradigm-appropriate option so each command no longer hand-builds its own
+    /// option list.
+    ///
+    /// - container-class runtimes → `ResolvedAgentOptions::Container`
+    /// - sandbox-class (kit-declarative) runtimes → `ResolvedAgentOptions::Sandbox`
+    ///
+    /// Credential **values** only ever reach the runtime as `AgentCredentials`;
+    /// for the sandbox paradigm they are routed to `sbx secret set` by the dsbx
+    /// driver and never written to `session.json`.
+    pub fn resolve_agent_options(
+        &self,
+        session: &Session,
+        agent: &AgentName,
+        run: &AgentRunOptions,
+        credential_env_vars: &[(String, String)],
+        runtime: &dyn AgentRuntimeEngine,
+    ) -> Result<ResolvedAgentOptions, EngineError> {
+        if runtime.capabilities().kit_declarative {
+            let mut options = self.build_sandbox_options(session, agent, run)?;
+            if !credential_env_vars.is_empty() {
+                options.push(SandboxOption::AgentCredentials {
+                    env_vars: credential_env_vars.to_vec(),
+                });
+            }
+            Ok(ResolvedAgentOptions::sandbox(options))
+        } else {
+            let mut options = self.build_options(session, agent, run)?;
+            if !credential_env_vars.is_empty() {
+                options.push(ContainerOption::AgentCredentials {
+                    env_vars: credential_env_vars.to_vec(),
+                });
+            }
+            ResolvedAgentOptions::container(options)
+        }
+    }
+
+    /// Build the `SandboxOption` list for launching an agent under a
+    /// sandbox-class runtime. Mirrors `build_options` (same agent matrix, same
+    /// up-front validation) but emits sandbox-paradigm options: a kit selector
+    /// instead of an image ref, a workspace dir instead of arbitrary mounts, and
+    /// system prompts delivered inline via `session.json` rather than via
+    /// host-file mounts (sandbox VMs see only the workspace).
+    pub fn build_sandbox_options(
+        &self,
+        session: &Session,
+        agent: &AgentName,
+        run: &AgentRunOptions,
+    ) -> Result<Vec<SandboxOption>, EngineError> {
+        let matrix = agent_matrix::matrix_for(agent.as_str())?;
+
+        // Parity validation with the container path so a sandbox-configured user
+        // gets the same up-front errors for unsupported mode combinations.
+        if matches!(run.plan, Some(PlanMode::Enabled)) && matrix.plan_flag.is_none() {
+            return Err(EngineError::PlanModeUnsupported {
+                agent: agent.as_str().to_string(),
+            });
+        }
+        if matches!(run.plan, Some(PlanMode::Enabled))
+            && matches!(run.yolo, Some(YoloMode::Enabled))
+        {
+            return Err(EngineError::ConflictingOptions(
+                "plan and yolo modes are mutually exclusive".into(),
+            ));
+        }
+
+        let mut options = vec![
+            SandboxOption::AgentId(agent.as_str().to_string()),
+            SandboxOption::WorkspaceDir(session.git_root().to_path_buf()),
+            SandboxOption::Interactive(!run.non_interactive),
+        ];
+
+        // Seeded prompt — recorded in session.json exactly once. For `kind: agent`
+        // kits the dsbx launcher appends it positionally; for `kind: mixin` kits
+        // the apply script renders it from session.json. The driver never does
+        // both, so the prompt is delivered exactly once.
+        if let Some(prompt) = run.initial_prompt.as_ref() {
+            options.push(SandboxOption::SeededPrompt(prompt.clone()));
+        }
+
+        // Model.
+        if let Some(model) = run.model.as_deref() {
+            let flag = agent_matrix::model_flag_for(&matrix, model)?;
+            options.push(SandboxOption::Model { flag });
+        }
+
+        // Tool allow/deny lists.
+        if !run.allowed_tools.is_empty() {
+            options.push(SandboxOption::AllowedTools(run.allowed_tools.clone()));
+        }
+        if !run.disallowed_tools.is_empty() {
+            options.push(SandboxOption::DisallowedTools(
+                run.disallowed_tools.clone(),
+            ));
+        }
+
+        // Env passthrough. Credential-class names are filtered out of the
+        // workspace-readable session.json by `DSbxSessionConfig`; non-sensitive
+        // names reach the apply script.
+        let env_pass = run.env_passthrough.as_deref().unwrap_or(&[]);
+        for name in env_pass {
+            options.push(SandboxOption::EnvPassthrough(EnvVar(name.clone())));
+        }
+
+        // Per-agent static env vars (mirrors the container path).
+        if agent.as_str() == "copilot" {
+            options.push(SandboxOption::EnvLiteral(EnvLiteral {
+                key: "COPILOT_OFFLINE".into(),
+                value: "true".into(),
+            }));
+        }
+
+        // Every sandbox has a private DinD daemon, so the host-socket mount
+        // `--allow-docker` requests is meaningless here (same trace as ready).
+        if run.allow_docker {
+            tracing::debug!("--allow-docker is a no-op under sbx (private DinD is always on)");
+        }
+
+        // Host-directory mounts cannot be honored: the VM sees only the
+        // virtiofs-mounted workspace. Record each requested-but-unmountable
+        // feature as a note; `run_interactive` surfaces them as warnings.
+        for dir in &run.directory_overlays {
+            options.push(SandboxOption::UnsupportedNote(format!(
+                "directory overlay '{}' cannot be mounted into the sandbox VM \
+                 (only the workspace is visible); continuing without it",
+                dir.host
+            )));
+        }
+        if run.include_all_skills || !run.named_skills.is_empty() {
+            options.push(SandboxOption::UnsupportedNote(
+                "skill mounts (--include-all-skills / skill(...) overlays) are not \
+                 supported under the sandbox runtime; continuing without them"
+                    .into(),
+            ));
+        }
+        if !run.context_overlays.is_empty() {
+            options.push(SandboxOption::UnsupportedNote(
+                "context directories cannot be mounted into the sandbox VM; the \
+                 rendered system prompt text is still delivered, but /awman/context \
+                 paths will not exist inside the sandbox"
+                    .into(),
+            ));
+        }
+
+        // System prompt — delivered inline via session.json so no host-file
+        // mount is required (the sandbox VM can only see the workspace).
+        if let Some(ref prompt_text) = run.system_prompt {
+            emit_sandbox_system_prompt_options(&matrix, prompt_text, &mut options);
+        }
+
+        Ok(options)
+    }
+
     /// Emit the `ContainerOption` variants for system-prompt delivery, consulting
     /// the agent matrix for the correct delivery mechanism.
     fn emit_system_prompt_options(
@@ -454,6 +615,80 @@ impl AgentEngine {
             guard.push(tmp);
         }
         Ok((host_path, container_path))
+    }
+}
+
+/// Emit the `SandboxOption` for system-prompt delivery. Unlike the container
+/// path — which can mount a host file or set an env-file path — the sandbox VM
+/// only sees the workspace, so every text-bearing delivery mode is collapsed to
+/// `SystemPromptInline`: the prompt text travels in `session.json` and the
+/// mixin apply script renders it into the agent's native config. `AddDir`
+/// (extra mounted dirs) cannot be expressed and records an `UnsupportedNote`;
+/// `Unsupported` stays a documented no-op (warned upstream).
+fn emit_sandbox_system_prompt_options(
+    matrix: &agent_matrix::AgentMatrix,
+    prompt_text: &str,
+    options: &mut Vec<SandboxOption>,
+) {
+    use agent_matrix::SystemPromptMode;
+
+    match &matrix.system_prompt_delivery {
+        SystemPromptMode::Append => {
+            options.push(SandboxOption::SystemPromptInline {
+                flag: matrix
+                    .system_prompt_flag
+                    .unwrap_or("--append-system-prompt")
+                    .to_string(),
+                text: prompt_text.to_string(),
+            });
+        }
+        SystemPromptMode::AppendInline { key } => {
+            options.push(SandboxOption::SystemPromptInline {
+                flag: matrix.system_prompt_flag.unwrap_or("--config").to_string(),
+                text: format!("{key}={prompt_text}"),
+            });
+        }
+        SystemPromptMode::Replace => {
+            let preamble = format!(
+                "You are {}, an AI coding assistant. Use your full capabilities \
+                 and all available tools to complete the task.\n\n",
+                matrix.agent
+            );
+            options.push(SandboxOption::SystemPromptInline {
+                flag: matrix.system_prompt_flag.unwrap_or("--system").to_string(),
+                text: format!("{preamble}{prompt_text}"),
+            });
+        }
+        SystemPromptMode::EnvFile { var } => {
+            // The mixin apply script materializes the text into a VM-local file
+            // and points `var` at it; the flag slot carries the env-var name.
+            options.push(SandboxOption::SystemPromptInline {
+                flag: var.to_string(),
+                text: prompt_text.to_string(),
+            });
+        }
+        SystemPromptMode::AgentsMd => {
+            // No CLI flag exists for this mode; the mixin apply script reads
+            // the inline text from session.json and stages it in the VM.
+            options.push(SandboxOption::SystemPromptInline {
+                flag: String::new(),
+                text: prompt_text.to_string(),
+            });
+        }
+        SystemPromptMode::AddDir { .. } => {
+            // AddDir plants AGENTS.md into extra mounted directories, which
+            // do not exist under the sandbox runtime — warn, don't drop.
+            options.push(SandboxOption::UnsupportedNote(format!(
+                "agent '{}' delivers system prompts via extra directory mounts, \
+                 which are unavailable under the sandbox runtime; the system \
+                 prompt was not applied",
+                matrix.agent
+            )));
+        }
+        SystemPromptMode::Unsupported => {
+            // Documented no-op — the user-facing warning is emitted by
+            // `resolve_context_overlays`, same as the container path.
+        }
     }
 }
 
@@ -1191,5 +1426,665 @@ mod tests {
             "codex inline must contain the prompt body; got: {}",
             inline.1
         );
+    }
+
+    // ─── WI-0091: build_sandbox_options ───────────────────────────────────────
+
+    #[test]
+    fn build_sandbox_options_emits_agent_id_workspace_dir_and_interactive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &AgentRunOptions::default())
+            .unwrap();
+        assert!(
+            opts.iter()
+                .any(|o| matches!(o, SandboxOption::AgentId(id) if id == "claude")),
+            "AgentId(\"claude\") must be present; got {opts:?}"
+        );
+        assert!(
+            opts.iter().any(|o| matches!(o, SandboxOption::WorkspaceDir(_))),
+            "WorkspaceDir must be present; got {opts:?}"
+        );
+        assert!(
+            opts.iter().any(|o| matches!(o, SandboxOption::Interactive(_))),
+            "Interactive must be present; got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_interactive_false_when_non_interactive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions { non_interactive: true, ..Default::default() };
+        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let interactive_val = opts
+            .iter()
+            .find_map(|o| {
+                if let SandboxOption::Interactive(v) = o {
+                    Some(*v)
+                } else {
+                    None
+                }
+            })
+            .expect("Interactive option must be present");
+        assert!(!interactive_val, "Interactive must be false for non_interactive=true");
+    }
+
+    #[test]
+    fn build_sandbox_options_seeded_prompt_appears_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            initial_prompt: Some("do something useful".into()),
+            ..Default::default()
+        };
+        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let prompt_count = opts
+            .iter()
+            .filter(|o| matches!(o, SandboxOption::SeededPrompt(_)))
+            .count();
+        assert_eq!(
+            prompt_count, 1,
+            "SeededPrompt must appear exactly once; got {prompt_count} times in {opts:?}"
+        );
+        let prompt_val = opts
+            .iter()
+            .find_map(|o| {
+                if let SandboxOption::SeededPrompt(p) = o {
+                    Some(p.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            prompt_val, "do something useful",
+            "SeededPrompt must carry the original prompt text"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_model_flag_emitted_for_claude() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            model: Some("claude-opus-4-8".into()),
+            ..Default::default()
+        };
+        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        assert!(
+            opts.iter().any(|o| matches!(o, SandboxOption::Model { .. })),
+            "Model option must be present when run.model is Some; got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_allowed_tools_emitted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            allowed_tools: vec!["Bash".into(), "Read".into()],
+            ..Default::default()
+        };
+        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let found = opts.iter().any(|o| {
+            if let SandboxOption::AllowedTools(tools) = o {
+                tools.contains(&"Bash".to_string()) && tools.contains(&"Read".to_string())
+            } else {
+                false
+            }
+        });
+        assert!(found, "AllowedTools must contain the requested tools; got {opts:?}");
+    }
+
+    #[test]
+    fn build_sandbox_options_disallowed_tools_emitted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            disallowed_tools: vec!["Write".into()],
+            ..Default::default()
+        };
+        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let found = opts.iter().any(|o| {
+            if let SandboxOption::DisallowedTools(tools) = o {
+                tools.contains(&"Write".to_string())
+            } else {
+                false
+            }
+        });
+        assert!(found, "DisallowedTools must contain the requested tools; got {opts:?}");
+    }
+
+    #[test]
+    fn build_sandbox_options_env_passthrough_emitted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            env_passthrough: Some(vec!["LOG_LEVEL".into(), "DEBUG".into()]),
+            ..Default::default()
+        };
+        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let pass_names: Vec<_> = opts
+            .iter()
+            .filter_map(|o| {
+                if let SandboxOption::EnvPassthrough(v) = o {
+                    Some(v.0.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            pass_names.contains(&"LOG_LEVEL".to_string()),
+            "LOG_LEVEL must appear in EnvPassthrough; got {pass_names:?}"
+        );
+        assert!(
+            pass_names.contains(&"DEBUG".to_string()),
+            "DEBUG must appear in EnvPassthrough; got {pass_names:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_copilot_has_static_offline_env_literal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("copilot").unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &AgentRunOptions::default())
+            .unwrap();
+        let has_offline = opts.iter().any(|o| {
+            if let SandboxOption::EnvLiteral(lit) = o {
+                lit.key == "COPILOT_OFFLINE" && lit.value == "true"
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_offline,
+            "copilot must have COPILOT_OFFLINE=true EnvLiteral; got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_plan_yolo_conflict_rejected_parity_with_container_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            plan: Some(crate::engine::container::options::PlanMode::Enabled),
+            yolo: Some(crate::engine::container::options::YoloMode::Enabled),
+            ..Default::default()
+        };
+        let result = engine.build_sandbox_options(&session, &agent, &run);
+        assert!(
+            matches!(result, Err(EngineError::ConflictingOptions(_))),
+            "plan + yolo must be rejected as ConflictingOptions (parity with container path); \
+             got {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_plan_mode_unsupported_agent_rejected_parity_with_container_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        // opencode does not support plan mode (same as in build_options test).
+        let agent = crate::data::session::AgentName::new("opencode").unwrap();
+        let run = AgentRunOptions {
+            plan: Some(crate::engine::container::options::PlanMode::Enabled),
+            ..Default::default()
+        };
+        let result = engine.build_sandbox_options(&session, &agent, &run);
+        assert!(
+            matches!(result, Err(EngineError::PlanModeUnsupported { .. })),
+            "PlanModeUnsupported must be returned for opencode (parity with container path); \
+             got {result:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_system_prompt_emitted_as_inline_for_claude() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            system_prompt: Some("focus on performance".into()),
+            ..Default::default()
+        };
+        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        assert!(
+            opts.iter().any(|o| matches!(o, SandboxOption::SystemPromptInline { .. })),
+            "SystemPromptInline must be present for claude system_prompt; got {opts:?}"
+        );
+        // No file-based delivery — sandbox VMs don't have arbitrary host mounts.
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, SandboxOption::SystemPromptFile { .. })),
+            "SystemPromptFile must NOT appear for claude in sandbox mode; got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_opencode_system_prompt_emitted_as_inline() {
+        // opencode's container delivery mode is AgentsMd (file planting) —
+        // under sbx the text must still travel inline so the apply script can
+        // surface it instead of silently dropping it.
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("opencode").unwrap();
+        let run = AgentRunOptions {
+            system_prompt: Some("focus on tests".into()),
+            ..Default::default()
+        };
+        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let inline = opts
+            .iter()
+            .find_map(|o| {
+                if let SandboxOption::SystemPromptInline { text, .. } = o {
+                    Some(text.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("opencode system prompt must be emitted inline under sbx");
+        assert_eq!(inline, "focus on tests");
+    }
+
+    #[test]
+    fn build_sandbox_options_antigravity_system_prompt_becomes_unsupported_note() {
+        // antigravity delivers system prompts via --add-dir mounts, which do
+        // not exist under sbx — must warn (note), never drop silently.
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("antigravity").unwrap();
+        let run = AgentRunOptions {
+            system_prompt: Some("focus on tests".into()),
+            ..Default::default()
+        };
+        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        assert!(
+            opts.iter().any(|o| matches!(
+                o,
+                SandboxOption::UnsupportedNote(n) if n.contains("system prompt")
+            )),
+            "antigravity system prompt must surface as an UnsupportedNote; got {opts:?}"
+        );
+        assert!(
+            !opts
+                .iter()
+                .any(|o| matches!(o, SandboxOption::SystemPromptInline { .. })),
+            "antigravity must not emit an inline system prompt under sbx; got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_directory_overlays_become_unsupported_notes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            directory_overlays: vec![crate::engine::overlay::DirectorySpec {
+                host: "~/reference".into(),
+                container: "/mnt/reference".into(),
+                permission: crate::engine::container::options::OverlayPermission::ReadOnly,
+            }],
+            ..Default::default()
+        };
+        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        assert!(
+            opts.iter().any(|o| matches!(
+                o,
+                SandboxOption::UnsupportedNote(n)
+                    if n.contains("~/reference") && n.contains("cannot be mounted")
+            )),
+            "dir overlay must surface as an UnsupportedNote naming the host path; got {opts:?}"
+        );
+    }
+
+    #[test]
+    fn build_sandbox_options_skills_become_unsupported_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        for run in [
+            AgentRunOptions { include_all_skills: true, ..Default::default() },
+            AgentRunOptions { named_skills: vec!["review".into()], ..Default::default() },
+        ] {
+            let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+            assert!(
+                opts.iter().any(|o| matches!(
+                    o,
+                    SandboxOption::UnsupportedNote(n) if n.contains("skill")
+                )),
+                "skill mounts must surface as an UnsupportedNote; got {opts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_sandbox_options_context_overlays_become_unsupported_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            context_overlays: vec![crate::engine::overlay::ContextOverlay {
+                scope: crate::engine::overlay::ContextScope::Repo,
+                host_path: tmp.path().join("ctx"),
+                container_path: std::path::PathBuf::from("/awman/context/repo"),
+                permission: crate::engine::container::options::OverlayPermission::ReadWrite,
+            }],
+            ..Default::default()
+        };
+        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        assert!(
+            opts.iter().any(|o| matches!(
+                o,
+                SandboxOption::UnsupportedNote(n) if n.contains("context")
+            )),
+            "context dirs must surface as an UnsupportedNote; got {opts:?}"
+        );
+    }
+
+    // ─── WI-0091: resolve_agent_options parity tests ─────────────────────────
+
+    /// A minimal `AgentRuntimeEngine` stub for option-construction parity
+    /// tests. Does not implement build() — only capabilities() is exercised.
+    struct FakeRuntime {
+        caps: crate::engine::agent_runtime::Capabilities,
+    }
+
+    impl FakeRuntime {
+        fn sandbox() -> Self {
+            use crate::engine::agent_runtime::{Capabilities, DindSupport};
+            Self {
+                caps: Capabilities {
+                    arbitrary_env_vars: false,
+                    arbitrary_host_mounts: false,
+                    cpu_limits: false,
+                    per_resource_stats: false,
+                    persistent_lifecycle: true,
+                    kit_declarative: true,
+                    dind: DindSupport::Always,
+                    host_paths_visible: false,
+                    session_label_supported: false,
+                },
+            }
+        }
+
+        fn container() -> Self {
+            use crate::engine::agent_runtime::{Capabilities, DindSupport};
+            Self {
+                caps: Capabilities {
+                    arbitrary_env_vars: true,
+                    arbitrary_host_mounts: true,
+                    cpu_limits: true,
+                    per_resource_stats: true,
+                    persistent_lifecycle: false,
+                    kit_declarative: false,
+                    dind: DindSupport::OnRequest,
+                    host_paths_visible: true,
+                    session_label_supported: true,
+                },
+            }
+        }
+    }
+
+    impl crate::engine::agent_runtime::AgentRuntimeEngine for FakeRuntime {
+        fn runtime_name(&self) -> &'static str {
+            if self.caps.kit_declarative {
+                "fake-sbx"
+            } else {
+                "fake-container"
+            }
+        }
+        fn display_name(&self) -> &'static str {
+            "Fake Runtime"
+        }
+        fn capabilities(&self) -> &crate::engine::agent_runtime::Capabilities {
+            &self.caps
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn build(
+            &self,
+            _: crate::engine::agent_runtime::ResolvedAgentOptions,
+        ) -> Result<Box<dyn crate::engine::agent_runtime::AgentInstance>, EngineError> {
+            unimplemented!(
+                "FakeRuntime: build() is not exercised by option-construction parity tests"
+            )
+        }
+        fn list_running(
+            &self,
+            _: &crate::data::session::Session,
+        ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
+            Ok(vec![])
+        }
+        fn list_running_all(
+            &self,
+        ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
+            Ok(vec![])
+        }
+        fn stats(
+            &self,
+            _: &crate::data::session::AgentHandle,
+        ) -> Result<crate::engine::agent_runtime::AgentStats, EngineError> {
+            Ok(crate::engine::agent_runtime::AgentStats {
+                name: "fake".into(),
+                cpu_percent: 0.0,
+                memory_mb: 0.0,
+            })
+        }
+        fn stop(&self, _: &crate::data::session::AgentHandle) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn exec_args(
+            &self,
+            _: &str,
+            _: &str,
+            _: &[&str],
+            _: &[(&str, &str)],
+        ) -> Vec<String> {
+            vec![]
+        }
+        fn cli_binary(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    #[test]
+    fn resolve_agent_options_sandbox_runtime_yields_sandbox_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let fake_sbx = FakeRuntime::sandbox();
+        let result =
+            engine.resolve_agent_options(&session, &agent, &AgentRunOptions::default(), &[], &fake_sbx);
+        assert!(
+            matches!(result, Ok(crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(_))),
+            "kit_declarative runtime must yield Sandbox variant; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_options_container_runtime_yields_container_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let fake_container = FakeRuntime::container();
+        let result = engine.resolve_agent_options(
+            &session,
+            &agent,
+            &AgentRunOptions::default(),
+            &[],
+            &fake_container,
+        );
+        assert!(
+            matches!(
+                result,
+                Ok(crate::engine::agent_runtime::ResolvedAgentOptions::Container(_))
+            ),
+            "non-kit_declarative runtime must yield Container variant; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_options_credentials_become_agent_credentials_in_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let fake_sbx = FakeRuntime::sandbox();
+        let creds = vec![("ANTHROPIC_API_KEY".to_string(), "sk-secret".to_string())];
+        let result = engine
+            .resolve_agent_options(&session, &agent, &AgentRunOptions::default(), &creds, &fake_sbx)
+            .unwrap();
+        if let crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(resolved) = result {
+            assert!(
+                resolved.agent_credentials.contains(&("ANTHROPIC_API_KEY".into(), "sk-secret".into())),
+                "credential must appear in agent_credentials; got {:?}",
+                resolved.agent_credentials
+            );
+        } else {
+            panic!("expected Sandbox variant");
+        }
+    }
+
+    #[test]
+    fn resolve_agent_options_credentials_never_in_env_passthrough_or_env_literal_in_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let fake_sbx = FakeRuntime::sandbox();
+        let creds = vec![("ANTHROPIC_API_KEY".to_string(), "sk-secret".to_string())];
+        let run = AgentRunOptions {
+            // Put the same key in env_passthrough — it must still only end up in
+            // agent_credentials, not in env_passthrough in the resolved bag.
+            env_passthrough: Some(vec!["ANTHROPIC_API_KEY".into()]),
+            ..Default::default()
+        };
+        let result = engine
+            .resolve_agent_options(&session, &agent, &run, &creds, &fake_sbx)
+            .unwrap();
+        if let crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(resolved) = result {
+            // Credentials from `creds` must not appear as EnvPassthrough env var
+            // values in the session config (they are filtered by DSbxSessionConfig).
+            // The agent_credentials field must carry the credential pair.
+            assert!(
+                resolved.agent_credentials.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"),
+                "ANTHROPIC_API_KEY must appear in agent_credentials; got {:?}",
+                resolved.agent_credentials
+            );
+        } else {
+            panic!("expected Sandbox variant");
+        }
+    }
+
+    #[test]
+    fn resolve_agent_options_same_agent_model_tools_intent_in_both_paradigms() {
+        // For a fixed set of flags, the sandbox and container variants must
+        // carry the same agent, model, and tool intent.
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            model: Some("claude-sonnet-4-6".into()),
+            allowed_tools: vec!["Bash".into()],
+            disallowed_tools: vec!["Write".into()],
+            initial_prompt: Some("implement feature X".into()),
+            non_interactive: true,
+            ..Default::default()
+        };
+
+        let sbx_result = engine
+            .resolve_agent_options(&session, &agent, &run, &[], &FakeRuntime::sandbox())
+            .unwrap();
+        let ctr_result = engine
+            .resolve_agent_options(&session, &agent, &run, &[], &FakeRuntime::container())
+            .unwrap();
+
+        // Both must successfully build.
+        let sbx_opts = match sbx_result {
+            crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(r) => r,
+            other => panic!("expected Sandbox, got {other:?}"),
+        };
+        let ctr_opts = match ctr_result {
+            crate::engine::agent_runtime::ResolvedAgentOptions::Container(r) => r,
+            other => panic!("expected Container, got {other:?}"),
+        };
+
+        // Agent id.
+        assert_eq!(sbx_opts.agent_id, "claude", "sandbox agent_id must be claude");
+
+        // Seeded prompt is present in sandbox.
+        assert_eq!(
+            sbx_opts.seeded_prompt.as_deref(),
+            Some("implement feature X"),
+            "sandbox seeded_prompt must carry the prompt"
+        );
+
+        // Model present in both.
+        assert!(sbx_opts.model.is_some(), "sandbox model must be set");
+        assert!(ctr_opts.model.is_some(), "container model must be set");
+
+        // Tool lists present in both.
+        assert!(
+            sbx_opts.allowed_tools.contains(&"Bash".to_string()),
+            "sandbox allowed_tools must contain Bash"
+        );
+        assert!(
+            sbx_opts.disallowed_tools.contains(&"Write".to_string()),
+            "sandbox disallowed_tools must contain Write"
+        );
+        assert!(
+            ctr_opts.allowed_tools.contains(&"Bash".to_string()),
+            "container allowed_tools must contain Bash"
+        );
+        assert!(
+            ctr_opts.disallowed_tools.contains(&"Write".to_string()),
+            "container disallowed_tools must contain Write"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_options_seeded_prompt_in_sandbox_exactly_once() {
+        // The prompt must appear in SeededPrompt exactly once, regardless of
+        // system prompt or other options (no double-delivery).
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, session) = make_agent_engine(tmp.path());
+        let agent = crate::data::session::AgentName::new("claude").unwrap();
+        let run = AgentRunOptions {
+            initial_prompt: Some("run the tests".into()),
+            system_prompt: Some("You are a helpful assistant.".into()),
+            ..Default::default()
+        };
+        let result = engine
+            .resolve_agent_options(&session, &agent, &run, &[], &FakeRuntime::sandbox())
+            .unwrap();
+        if let crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(resolved) = result {
+            assert_eq!(
+                resolved.seeded_prompt.as_deref(),
+                Some("run the tests"),
+                "seeded_prompt must carry the user's prompt text"
+            );
+            // system_prompt_inline is from the system prompt, not the user prompt.
+            // They are distinct fields — seeded_prompt is the user task prompt.
+            if let Some((_, text)) = &resolved.system_prompt_inline {
+                assert!(
+                    !text.contains("run the tests"),
+                    "system_prompt_inline must not contain the user seeded_prompt text: {text}"
+                );
+            }
+        } else {
+            panic!("expected Sandbox variant");
+        }
     }
 }

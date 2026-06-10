@@ -13,7 +13,7 @@ pub mod naming;
 pub mod options;
 pub mod runtime;
 
-pub use naming::generate_sandbox_name;
+pub use naming::{generate_sandbox_name, sandbox_name_for};
 pub use options::{ResolvedSandboxOptions, SandboxOption};
 pub use runtime::SandboxRuntime;
 

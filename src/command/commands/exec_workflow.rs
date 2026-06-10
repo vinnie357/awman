@@ -372,29 +372,25 @@ impl AgentExecutionFactory for CommandLayerFactory {
             system_prompt,
             context_overlays,
         };
-        let mut options =
-            self.engines
-                .agent_engine
-                .build_options(session, &runtime.step_agent, &run_opts)?;
-
-        // Inject keychain credentials so the agent can reach its backend.
-        // Mirrors the same step in `chat` and `exec_prompt`.
-        if let Ok(credentials) = self
+        // Resolve keychain credentials so the agent can reach its backend.
+        // Mirrors the same step in `chat` and `exec_prompt`. The centralized
+        // builder folds them into the paradigm-appropriate option (container
+        // env vars, or — under sbx — `sbx secret set` registration).
+        let credential_env_vars = self
             .engines
             .auth_engine
             .resolve_agent_auth(session, &runtime.step_agent)
-        {
-            if !credentials.env_vars.is_empty() {
-                options.push(
-                    crate::engine::container::options::ContainerOption::AgentCredentials {
-                        env_vars: credentials.env_vars,
-                    },
-                );
-            }
-        }
+            .map(|c| c.env_vars)
+            .unwrap_or_default();
 
-        let options = crate::engine::agent_runtime::ResolvedAgentOptions::container(options)?;
-        let instance = self.engines.runtime.build(options)?;
+        let resolved = self.engines.agent_engine.resolve_agent_options(
+            session,
+            &runtime.step_agent,
+            &run_opts,
+            &credential_env_vars,
+            self.engines.runtime.as_ref(),
+        )?;
+        let instance = self.engines.runtime.build(resolved)?;
         let proxy = AgentFrontendProxy(Arc::clone(&self.shared));
         instance.run_with_frontend(Box::new(proxy))
     }
@@ -431,13 +427,6 @@ impl Command for ExecWorkflowCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
-        // Agent execution under a sandbox-class runtime lands in WI 0090;
-        // until then the stub surfaces NotImplemented instead of panicking
-        // or silently falling back to Docker.
-        self.engines
-            .require_container_runtime()
-            .map_err(CommandError::from)?;
-
         // Resolve the workflow path relative to the session's working
         // directory so that relative paths work regardless of where the
         // awman process was originally launched.

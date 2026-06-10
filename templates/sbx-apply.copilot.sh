@@ -27,7 +27,6 @@ if [ "$SCHEMA_VERSION" != "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Agent-specific config rendering for copilot is minimal.
 # env_config entries are written to $HOME/.awman/env.sh (sourceable).
 # ---------------------------------------------------------------------------
 mkdir -p "$HOME/.awman"
@@ -41,6 +40,36 @@ jq -r '
   to_entries[] |
   "export \(.key)=\(.value|@sh)"
 ' "$SESSION_FILE" >> "$ENV_SH" || true
+
+# ---------------------------------------------------------------------------
+# Dynamic session fields copilot can express natively.
+# ---------------------------------------------------------------------------
+
+# System prompt → a custom-instructions directory referenced by
+# COPILOT_CUSTOM_INSTRUCTIONS_DIRS (the container path's EnvFile mechanism).
+SYS_PROMPT="$(jq -r '.system_prompt_inline.text // empty' "$SESSION_FILE")"
+if [ -n "$SYS_PROMPT" ]; then
+  INSTR_DIR="$HOME/.awman/copilot-instructions"
+  mkdir -p "$INSTR_DIR"
+  printf '%s\n' "$SYS_PROMPT" > "$INSTR_DIR/awman-context.md"
+  printf 'export COPILOT_CUSTOM_INSTRUCTIONS_DIRS=%q\n' "$INSTR_DIR" >> "$ENV_SH"
+fi
+
+# Model and tool allow/deny lists are not expressible through a mixin-safe
+# copilot config file — warn rather than silently drop them.
+if [ -n "$(jq -r '.model // empty' "$SESSION_FILE")" ]; then
+  echo "awman: copilot has no mixin-safe config for --model; ignoring the model override." >&2
+fi
+if [ "$(jq -r '((.allowed_tools // []) + (.disallowed_tools // [])) | length' "$SESSION_FILE")" != "0" ]; then
+  echo "awman: copilot does not support allow/deny tool lists via config; ignoring them." >&2
+fi
+
+# Seeded prompt — staged for reference; awman delivers it via the agent's
+# stdin at launch.
+SEEDED="$(jq -r '.seeded_prompt // empty' "$SESSION_FILE")"
+if [ -n "$SEEDED" ]; then
+  printf '%s' "$SEEDED" > "$HOME/.awman/seeded-prompt.txt"
+fi
 
 # Write a marker file so external tooling can confirm config was applied.
 cp "$SESSION_FILE" "$HOME/.awman/session-applied.json"

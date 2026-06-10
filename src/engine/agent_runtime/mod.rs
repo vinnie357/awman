@@ -60,6 +60,15 @@ impl ResolvedAgentOptions {
         let resolved = ResolvedContainerOptions::resolve(options)?;
         Ok(ResolvedAgentOptions::Container(resolved))
     }
+
+    /// Resolve a sandbox option list into the `Sandbox` variant. The sandbox
+    /// option bag never conflicts (last-writer-wins on `ingest`), so this is
+    /// infallible — the `Result` signature mirrors `container()` for symmetry.
+    pub fn sandbox(
+        options: impl IntoIterator<Item = crate::engine::sandbox::options::SandboxOption>,
+    ) -> Self {
+        ResolvedAgentOptions::Sandbox(ResolvedSandboxOptions::resolve(options))
+    }
 }
 
 /// What every agent runtime must support. The cross-paradigm trait surface

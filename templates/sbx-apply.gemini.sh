@@ -27,7 +27,6 @@ if [ "$SCHEMA_VERSION" != "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Agent-specific config rendering for gemini is minimal.
 # env_config entries are written to $HOME/.awman/env.sh (sourceable).
 # ---------------------------------------------------------------------------
 mkdir -p "$HOME/.awman"
@@ -41,6 +40,44 @@ jq -r '
   to_entries[] |
   "export \(.key)=\(.value|@sh)"
 ' "$SESSION_FILE" >> "$ENV_SH" || true
+
+# ---------------------------------------------------------------------------
+# Dynamic session fields gemini can express natively.
+# ---------------------------------------------------------------------------
+mkdir -p "$HOME/.gemini"
+
+# Model → ~/.gemini/settings.json (merged into any existing settings).
+MODEL="$(jq -r '.model // empty' "$SESSION_FILE")"
+if [ -n "$MODEL" ]; then
+  SETTINGS="$HOME/.gemini/settings.json"
+  EXISTING='{}'
+  if [ -f "$SETTINGS" ]; then
+    EXISTING="$(jq '.' "$SETTINGS" 2>/dev/null || echo '{}')"
+  fi
+  jq -n --argjson base "$EXISTING" --arg model "$MODEL" \
+    '$base + { model: $model }' > "$SETTINGS"
+fi
+
+# System prompt → file referenced by GEMINI_SYSTEM_MD (the container path's
+# EnvFile delivery mechanism). Write the file and export the env var.
+SYS_PROMPT="$(jq -r '.system_prompt_inline.text // empty' "$SESSION_FILE")"
+if [ -n "$SYS_PROMPT" ]; then
+  SYS_FILE="$HOME/.gemini/system.md"
+  printf '%s\n' "$SYS_PROMPT" > "$SYS_FILE"
+  printf 'export GEMINI_SYSTEM_MD=%q\n' "$SYS_FILE" >> "$ENV_SH"
+fi
+
+# Tool allow/deny lists are not expressible through gemini config — warn.
+if [ "$(jq -r '((.allowed_tools // []) + (.disallowed_tools // [])) | length' "$SESSION_FILE")" != "0" ]; then
+  echo "awman: gemini does not support allow/deny tool lists via config; ignoring them." >&2
+fi
+
+# Seeded prompt — staged for reference; awman delivers it via the agent's
+# stdin at launch.
+SEEDED="$(jq -r '.seeded_prompt // empty' "$SESSION_FILE")"
+if [ -n "$SEEDED" ]; then
+  printf '%s' "$SEEDED" > "$HOME/.awman/seeded-prompt.txt"
+fi
 
 # Write a marker file so external tooling can confirm config was applied.
 cp "$SESSION_FILE" "$HOME/.awman/session-applied.json"

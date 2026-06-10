@@ -222,3 +222,251 @@ fn detect_sbx_unsupported_platform() {
         assert_eq!(rt.engine().runtime_name(), "docker-sbx-experimental");
     }
 }
+
+// ─── WI-0091: exec prompt end-to-end (env-gated) ────────────────────────────
+
+/// `awman exec prompt` with `runtime: "docker-sbx-experimental"` must NOT
+/// return a `NotImplemented` ("does not yet route to the sandbox runtime")
+/// error. The command may fail for other reasons (agent unavailable, sbx
+/// not authenticated, etc.) — those are NOT what we're testing here.
+///
+/// Gate: `AWMAN_TEST_SBX=1` on macOS arm64.
+#[test]
+fn exec_prompt_non_interactive_sbx_does_not_return_not_implemented() {
+    if !sbx_guard() {
+        return;
+    }
+    if !sbx_on_path() {
+        eprintln!("sbx not on PATH; skipping exec_prompt sbx test");
+        return;
+    }
+
+    let tmp_root = tempfile::tempdir().unwrap();
+    let tmp_config = tempfile::tempdir().unwrap();
+
+    // Minimal git repo so Session can open properly.
+    std::process::Command::new("git")
+        .args(["init", tmp_root.path().to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git init must succeed");
+
+    let config_content = r#"{"runtime":"docker-sbx-experimental","default_agent":"claude"}"#;
+    std::fs::write(tmp_config.path().join("config.json"), config_content).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
+        .args(["exec", "prompt", "--agent", "claude", "--non-interactive", "hello from test"])
+        .current_dir(tmp_root.path())
+        .env("AWMAN_CONFIG_HOME", tmp_config.path())
+        .output()
+        .expect("awman binary must be executable");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}{stderr}");
+
+    assert!(
+        !combined.contains("does not yet route to the sandbox runtime"),
+        "exec prompt must not return NotImplemented for sbx runtime;\n\
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+    // The Docker image setup must not run under sbx (WI 0091): a failure here
+    // means the command died in `ensure_available` before the sandbox launch.
+    assert!(
+        !combined.contains("agent setup failed") && !combined.contains("project image"),
+        "exec prompt under sbx must skip the container image setup;\n\
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+    // The launch path must actually be reached (the command may still fail
+    // later, e.g. missing credentials — that is not what this test checks).
+    assert!(
+        combined.contains("Launching agent ("),
+        "exec prompt under sbx must reach the launch step;\n\
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// A two-step workflow against the sbx runtime must not error with
+/// `NotImplemented` and must reuse the same sandbox per agent across steps
+/// (sandbox name is deterministic per workspace+agent, so the second step
+/// restarts the existing sandbox rather than creating a new one).
+///
+/// Reuse is verified structurally: `awman exec workflow` runs both steps
+/// without error and `sbx ls` reports at most one sandbox with the
+/// deterministic name for the test workspace after the run.
+///
+/// Gate: `AWMAN_TEST_SBX=1` on macOS arm64.
+#[test]
+fn workflow_two_step_sbx_does_not_error_with_not_implemented() {
+    if !sbx_guard() {
+        return;
+    }
+    if !sbx_on_path() {
+        eprintln!("sbx not on PATH; skipping workflow sbx test");
+        return;
+    }
+
+    let tmp_root = tempfile::tempdir().unwrap();
+    let tmp_config = tempfile::tempdir().unwrap();
+
+    // Minimal git repo.
+    std::process::Command::new("git")
+        .args(["init", tmp_root.path().to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git init must succeed");
+
+    let config_content = r#"{"runtime":"docker-sbx-experimental","default_agent":"claude"}"#;
+    std::fs::write(tmp_config.path().join("config.json"), config_content).unwrap();
+
+    // Minimal two-step workflow: both steps use the same agent (claude) so
+    // they share one sandbox. NB: the step field is `prompt`, not
+    // `prompt_template` (the parser is deny_unknown_fields).
+    let workflow_yaml = r#"steps:
+  - name: step1
+    prompt: "hello from step 1"
+  - name: step2
+    depends_on:
+      - step1
+    prompt: "hello from step 2"
+"#;
+    let workflow_path = tmp_root.path().join("test_workflow.yml");
+    std::fs::write(&workflow_path, workflow_yaml).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
+        .args([
+            "exec",
+            "workflow",
+            workflow_path.to_str().unwrap(),
+        ])
+        .current_dir(tmp_root.path())
+        .env("AWMAN_CONFIG_HOME", tmp_config.path())
+        .output()
+        .expect("awman binary must be executable");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{stdout}{stderr}");
+
+    // The routing gate must not fire — the gate was removed in WI 0091.
+    assert!(
+        !combined.contains("does not yet route to the sandbox runtime"),
+        "exec workflow must not return NotImplemented for sbx runtime;\n\
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+    // The workflow file itself must parse — a load failure means this test
+    // never exercised the routing at all.
+    assert!(
+        !combined.contains("failed to load workflow"),
+        "the test workflow file must parse;\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    // Verify sandbox reuse: both steps map to ONE deterministic sandbox name,
+    // computed with the same production helper awman itself uses
+    // (`sandbox_name_for` — FNV-1a worktree hash). `sbx ls` must list that
+    // name at most once.
+    use awman::engine::sandbox::sandbox_name_for;
+    // Canonicalize the tempdir like Session does for the git root (macOS
+    // tempdirs live behind the /var -> /private/var symlink).
+    let workspace = std::fs::canonicalize(tmp_root.path()).unwrap();
+    let expected_name = sandbox_name_for(&workspace, "claude");
+
+    let ls_out = std::process::Command::new("sbx").arg("ls").output().ok();
+    let ls_bytes = ls_out.as_ref().map(|o| o.stdout.as_slice()).unwrap_or(&[]);
+    let ls_text = String::from_utf8_lossy(ls_bytes);
+    let matching: Vec<_> = ls_text
+        .lines()
+        .filter(|l| l.contains(&expected_name))
+        .collect();
+    assert!(
+        matching.len() <= 1,
+        "at most one sandbox with name '{expected_name}' must exist (reuse, not duplicate);\
+         \nsbx ls output: {ls_text}"
+    );
+
+    // Clean up the sandbox created by this test (best-effort).
+    let _ = std::process::Command::new("sbx")
+        .args(["rm", &expected_name])
+        .status();
+}
+
+/// Runtime switching on a real launch path (WI 0091 extension of WI 0090's
+/// detection-only switching test): the same workspace is exec'd under Docker,
+/// then sbx, then Docker again. Each run must engage its own paradigm's launch
+/// path — the Docker runs go through the container image setup, the sbx run
+/// skips it and uses the kit — with no state leaking between runs.
+///
+/// The Docker runs may fail (no project image built in the temp repo); what
+/// matters is WHICH path each run takes, not whether the agent comes up.
+///
+/// Gate: `AWMAN_TEST_SBX=1` on macOS arm64.
+#[test]
+fn runtime_switching_docker_sbx_docker_real_launch_paths() {
+    if !sbx_guard() {
+        return;
+    }
+    if !sbx_on_path() {
+        eprintln!("sbx not on PATH; skipping runtime switching test");
+        return;
+    }
+
+    let tmp_root = tempfile::tempdir().unwrap();
+    let tmp_config = tempfile::tempdir().unwrap();
+    std::process::Command::new("git")
+        .args(["init", tmp_root.path().to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git init must succeed");
+
+    let run_with_runtime = |runtime: &str| -> String {
+        let config = format!(r#"{{"runtime":"{runtime}","default_agent":"claude"}}"#);
+        std::fs::write(tmp_config.path().join("config.json"), config).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
+            .args(["exec", "prompt", "--agent", "claude", "--non-interactive", "ping"])
+            .current_dir(tmp_root.path())
+            .env("AWMAN_CONFIG_HOME", tmp_config.path())
+            .output()
+            .expect("awman binary must be executable");
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+
+    // 1. Docker: must take the container setup path, never the kit path.
+    let docker_first = run_with_runtime("docker");
+    assert!(
+        docker_first.contains("Checking agent availability…"),
+        "docker run must engage the container image setup; output: {docker_first}"
+    );
+    assert!(
+        !docker_first.contains("using the agent kit"),
+        "docker run must not take the sandbox kit path; output: {docker_first}"
+    );
+
+    // 2. sbx: must skip image setup and take the kit path.
+    let sbx_run = run_with_runtime("docker-sbx-experimental");
+    assert!(
+        sbx_run.contains("using the agent kit"),
+        "sbx run must take the kit path (image setup skipped); output: {sbx_run}"
+    );
+    assert!(
+        !sbx_run.contains("Checking agent availability…"),
+        "sbx run must not engage the container image setup; output: {sbx_run}"
+    );
+
+    // 3. Docker again: behavior identical to step 1 — no sbx state leaked.
+    let docker_again = run_with_runtime("docker");
+    assert!(
+        docker_again.contains("Checking agent availability…"),
+        "second docker run must engage the container image setup; output: {docker_again}"
+    );
+    assert!(
+        !docker_again.contains("using the agent kit"),
+        "second docker run must not take the sandbox kit path; output: {docker_again}"
+    );
+}

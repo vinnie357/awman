@@ -27,7 +27,7 @@ use crate::engine::sandbox::dsbx::auth;
 use crate::engine::sandbox::dsbx::io_bridge;
 use crate::engine::sandbox::dsbx::session_config::DSbxSessionConfig;
 use crate::engine::sandbox::dsbx::spawn::{SbxCommand, SBX_BIN};
-use crate::engine::sandbox::naming::generate_sandbox_name;
+use crate::engine::sandbox::naming::sandbox_name_for;
 use crate::engine::sandbox::options::ResolvedSandboxOptions;
 
 #[derive(Debug, Default)]
@@ -163,27 +163,9 @@ fn require_agent(opts: &ResolvedSandboxOptions) -> Result<String, EngineError> {
 /// Resolve the deterministic sandbox name. Uses a caller-supplied name when
 /// present, otherwise derives `awman-<worktree-hash>-<agent>`.
 fn resolve_sandbox_name(opts: &ResolvedSandboxOptions) -> String {
-    opts.sandbox_name.clone().unwrap_or_else(|| {
-        generate_sandbox_name(&worktree_hash(&opts.workspace_dir), &opts.agent_id)
-    })
-}
-
-/// Short deterministic hash of a worktree path — same inputs always produce
-/// the same value, so a later invocation finds the existing sandbox.
-///
-/// FNV-1a rather than `DefaultHasher`: the std hasher's algorithm is not
-/// guaranteed stable across Rust releases, and the name must survive awman
-/// upgrades or the persistent sandbox (and its one-time install cost) would
-/// be silently orphaned.
-fn worktree_hash(workspace: &Path) -> String {
-    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-    let mut hash = FNV_OFFSET;
-    for byte in workspace.to_string_lossy().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    format!("{:08x}", hash & 0xffff_ffff)
+    opts.sandbox_name
+        .clone()
+        .unwrap_or_else(|| sandbox_name_for(&opts.workspace_dir, &opts.agent_id))
 }
 
 /// Recover the agent name from a `awman-<hash>-<agent>` sandbox name.
@@ -319,6 +301,9 @@ pub(in crate::engine::sandbox) fn run_interactive(
     for text in withheld_env_warnings(&options) {
         warn(&mut *frontend, text);
     }
+    for note in &options.unsupported_notes {
+        warn(&mut *frontend, format!("sbx: {note}"));
+    }
 
     // 3. Register credentials with `sbx secret set` (announced + redacted).
     auth::inject_credentials(&options.agent_credentials, &mut *frontend)?;
@@ -351,10 +336,26 @@ pub(in crate::engine::sandbox) fn run_interactive(
     );
 
     let io = frontend.take_io();
+    let seed = stdin_seed(&agent, &options);
     if io.initial_size.is_some() {
-        spawn_pty_bridged(name, argv, started_at, handle, io)
+        spawn_pty_bridged(name, argv, seed, started_at, handle, io)
     } else {
-        spawn_piped(name, argv, options.seeded_prompt.clone(), started_at, handle, io)
+        spawn_piped(name, argv, seed, started_at, handle, io)
+    }
+}
+
+/// The seeded prompt to write into the launch's stdin, or `None`.
+///
+/// `kind: agent` kits already carry the prompt as a positional launch arg
+/// (`append_seeded_positional`), so writing it to stdin too would deliver it
+/// twice. `kind: mixin` kits launch via Docker's built-in template — the
+/// apply script can only stage the prompt, not deliver it — so stdin
+/// injection is their single delivery path (PTY type-ahead when interactive,
+/// piped stdin otherwise).
+fn stdin_seed(agent: &str, options: &ResolvedSandboxOptions) -> Option<String> {
+    match kit_kind_for(agent) {
+        SbxKitKind::Agent => None,
+        SbxKitKind::Mixin => options.seeded_prompt.clone(),
     }
 }
 
@@ -436,6 +437,7 @@ fn append_seeded_positional(argv: &mut Vec<String>, agent: &str, options: &Resol
 fn spawn_pty_bridged(
     name: String,
     argv: Vec<String>,
+    seeded: Option<String>,
     started_at: chrono::DateTime<Utc>,
     handle: AgentHandle,
     io: crate::engine::agent_runtime::frontend::AgentIo,
@@ -461,6 +463,14 @@ fn spawn_pty_bridged(
         .slave
         .spawn_command(cmd)
         .map_err(|e| EngineError::Sandbox(format!("spawn sbx via pty: {e}")))?;
+
+    // Mixin seeded prompt: queue it on the stdin channel before the bridge
+    // starts. The PTY delivers it as type-ahead input — the agent reads it
+    // (with the trailing \r as Enter) once it starts accepting input.
+    if let Some(prompt) = seeded {
+        let _ = io.stdin_tx.send(prompt.into_bytes());
+        let _ = io.stdin_tx.send(b"\r".to_vec());
+    }
 
     let (master_arc, bridge) = io_bridge::bridge_pty(io, pair)?;
 
@@ -604,6 +614,7 @@ impl ExecutionBackend for DSbxExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::sandbox::naming::worktree_hash;
     use crate::engine::sandbox::options::SandboxOption;
 
     fn opts(list: Vec<SandboxOption>) -> ResolvedSandboxOptions {
@@ -1000,6 +1011,103 @@ mod tests {
                     && m.text.contains("not supported")
             }),
             "must produce a Warning about unsupported CPU limits; messages: {:?}",
+            *msgs
+        );
+    }
+
+    // ─── WI-0091: stdin seed routing (prompt delivered exactly once) ──────
+
+    #[test]
+    fn stdin_seed_present_for_mixin_kits_only() {
+        let prompt = "fix the bug";
+        for agent in ["claude", "codex", "gemini", "copilot", "opencode"] {
+            let o = opts(vec![
+                SandboxOption::AgentId(agent.into()),
+                SandboxOption::SeededPrompt(prompt.into()),
+            ]);
+            assert_eq!(
+                stdin_seed(agent, &o).as_deref(),
+                Some(prompt),
+                "mixin {agent}: stdin is the only delivery path, seed must be present"
+            );
+        }
+        for agent in ["antigravity", "crush", "maki", "cline"] {
+            let o = opts(vec![
+                SandboxOption::AgentId(agent.into()),
+                SandboxOption::SeededPrompt(prompt.into()),
+            ]);
+            assert_eq!(
+                stdin_seed(agent, &o),
+                None,
+                "agent-kit {agent}: prompt is positional, stdin seed would deliver it twice"
+            );
+        }
+    }
+
+    #[test]
+    fn stdin_seed_none_without_prompt() {
+        let o = opts(vec![SandboxOption::AgentId("claude".into())]);
+        assert_eq!(stdin_seed("claude", &o), None);
+    }
+
+    // ─── WI-0091: unsupported-feature notes surfaced as warnings ──────────
+
+    #[test]
+    fn unsupported_notes_produce_warnings_in_run_interactive() {
+        use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
+        use crate::engine::agent_runtime::frontend::{
+            AgentFrontend, AgentIo, AgentProgress, AgentStatus,
+        };
+        use std::sync::{Arc, Mutex};
+
+        let messages: Arc<Mutex<Vec<UserMessage>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct RecordingFrontend {
+            messages: Arc<Mutex<Vec<UserMessage>>>,
+        }
+        impl UserMessageSink for RecordingFrontend {
+            fn write_message(&mut self, msg: UserMessage) {
+                self.messages.lock().unwrap().push(msg);
+            }
+            fn replay_queued(&mut self) {}
+        }
+        impl AgentFrontend for RecordingFrontend {
+            fn report_status(&mut self, _: AgentStatus) {}
+            fn report_progress(&mut self, _: AgentProgress) {}
+            fn take_io(&mut self) -> AgentIo {
+                let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
+                let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
+                let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+                AgentIo {
+                    stdout,
+                    stderr,
+                    stdin_tx,
+                    stdin_rx,
+                    resize: None,
+                    initial_size: None,
+                }
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let frontend = Box::new(RecordingFrontend { messages: messages.clone() });
+        let options = ResolvedSandboxOptions::resolve(vec![
+            SandboxOption::AgentId("claude".into()),
+            SandboxOption::WorkspaceDir(tmp.path().to_path_buf()),
+            SandboxOption::UnsupportedNote(
+                "skill mounts are not supported under the sandbox runtime".into(),
+            ),
+        ]);
+        // run_interactive will fail (sbx not installed) but the warning is
+        // written before the spawn attempt.
+        let _ = run_interactive(options, frontend);
+
+        let msgs = messages.lock().unwrap();
+        assert!(
+            msgs.iter().any(|m| {
+                m.level == MessageLevel::Warning && m.text.contains("skill mounts")
+            }),
+            "unsupported notes must surface as warnings before launch; messages: {:?}",
             *msgs
         );
     }

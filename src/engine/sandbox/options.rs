@@ -65,6 +65,11 @@ pub enum SandboxOption {
     },
     /// Keep the sandbox after the agent exits (persistent lifecycle).
     KeepAfterExit,
+    /// A user-facing note about a requested feature the sandbox runtime cannot
+    /// honor (skill mounts, directory overlays, context-dir mounts, …).
+    /// Surfaced as a Warning by `run_interactive` before launch, alongside the
+    /// CPU-limit and withheld-env warnings. Never written to `session.json`.
+    UnsupportedNote(String),
 }
 
 /// Resolved option bag — all options merged into a single struct that the
@@ -99,6 +104,9 @@ pub struct ResolvedSandboxOptions {
     pub allowed_tools: Vec<String>,
     pub model: Option<ModelFlagForm>,
     pub keep_after_exit: bool,
+    /// User-facing warnings about requested-but-unsupported features, surfaced
+    /// by `run_interactive` before launch.
+    pub unsupported_notes: Vec<String>,
 }
 
 impl ResolvedSandboxOptions {
@@ -150,6 +158,7 @@ impl ResolvedSandboxOptions {
             SandboxOption::AllowedTools(v) => self.allowed_tools.extend(v),
             SandboxOption::Model { flag } => self.model = Some(flag),
             SandboxOption::KeepAfterExit => self.keep_after_exit = true,
+            SandboxOption::UnsupportedNote(v) => self.unsupported_notes.push(v),
         }
     }
 }

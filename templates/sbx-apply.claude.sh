@@ -27,10 +27,34 @@ if [ "$SCHEMA_VERSION" != "1" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Claude-specific config: write $HOME/.claude/settings.json
+# Claude-specific config: write $HOME/.claude/settings.json, merging the
+# passthrough agent_settings.claude block with the dynamic session fields
+# claude can express natively (model and allow/deny tool permissions).
 # ---------------------------------------------------------------------------
 mkdir -p "$HOME/.claude"
-jq -r '.agent_settings.claude // {}' "$SESSION_FILE" > "$HOME/.claude/settings.json"
+
+MODEL="$(jq -r '.model // empty' "$SESSION_FILE")"
+jq -n \
+  --argjson base "$(jq '.agent_settings.claude // {}' "$SESSION_FILE")" \
+  --arg model "$MODEL" \
+  --argjson allowed "$(jq -c '.allowed_tools // []' "$SESSION_FILE")" \
+  --argjson disallowed "$(jq -c '.disallowed_tools // []' "$SESSION_FILE")" '
+  $base
+  + (if $model != "" then { model: $model } else {} end)
+  + (if ($allowed | length) > 0 or ($disallowed | length) > 0 then
+       { permissions: (($base.permissions // {})
+         + (if ($allowed | length) > 0 then { allow: $allowed } else {} end)
+         + (if ($disallowed | length) > 0 then { deny: $disallowed } else {} end)) }
+     else {} end)
+' > "$HOME/.claude/settings.json"
+
+# System prompt → global memory file (claude reads $HOME/.claude/CLAUDE.md).
+# The container path uses --append-system-prompt-file; the closest native,
+# mixin-launch-safe equivalent is the global memory file.
+SYS_PROMPT="$(jq -r '.system_prompt_inline.text // empty' "$SESSION_FILE")"
+if [ -n "$SYS_PROMPT" ]; then
+  printf '%s\n' "$SYS_PROMPT" > "$HOME/.claude/CLAUDE.md"
+fi
 
 # ---------------------------------------------------------------------------
 # Write env_config entries to $HOME/.awman/env.sh (sourceable).
@@ -49,5 +73,13 @@ jq -r '
   to_entries[] |
   "export \(.key)=\(.value|@sh)"
 ' "$SESSION_FILE" >> "$ENV_SH" || true
+
+# Seeded prompt — staged for reference. Delivery happens host-side: awman
+# writes the prompt into the agent's stdin at launch (mixin kits cannot take
+# it positionally through Docker's built-in template).
+SEEDED="$(jq -r '.seeded_prompt // empty' "$SESSION_FILE")"
+if [ -n "$SEEDED" ]; then
+  printf '%s' "$SEEDED" > "$HOME/.awman/seeded-prompt.txt"
+fi
 
 echo "awman: claude session config applied from $SESSION_FILE."
