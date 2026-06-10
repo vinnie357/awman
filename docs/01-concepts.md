@@ -4,15 +4,15 @@ This page is the mental model for awman: what runs where, what the moving pieces
 
 ---
 
-## Why containers?
+## Why isolated environments?
 
-An agent running directly on your machine can touch your home directory, SSH keys, credentials, and anything else your user account can. awman never does that. Every agent session runs in a container that sees only your project directory (mounted read-write so the agent can edit code) plus whatever you explicitly add. Credentials are injected per-session, SSH keys stay out unless you opt in, and the container is discarded when the session ends.
+An agent running directly on your machine can touch your home directory, SSH keys, credentials, and anything else your user account can. awman never does that. Every agent session runs in an isolated environment — a Docker container, an Apple VM, or a Docker Sandbox microVM — that sees only your project directory plus whatever you explicitly add. Credentials are injected per-session, SSH keys stay out unless you opt in, and the environment is stopped or removed when the session ends.
 
-This is what makes autonomous operation ([Yolo Mode](06-yolo-mode.md)) reasonable: the blast radius of a bad agent decision is the container and the mounted project, nothing else. See [Security & Isolation](04-security-and-isolation.md) for the full model.
+This is what makes autonomous operation ([Yolo Mode](06-yolo-mode.md)) reasonable: the blast radius of a bad agent decision is the container or VM and the mounted project, nothing else. See [Security & Isolation](04-security-and-isolation.md) for the full model, and [Runtimes](16-runtimes.md) for the difference between container-based and microVM-based isolation.
 
-## The two-layer image system
+## The two-layer image system (Docker and Apple Containers)
 
-awman builds two Docker images per project:
+For the Docker and Apple Containers runtimes, awman builds two images per project:
 
 | File | Image | Contains |
 |------|-------|----------|
@@ -20,6 +20,8 @@ awman builds two Docker images per project:
 | `.awman/Dockerfile.{agent}` | `awman-{project}-{agent}:latest` | The agent tooling, layered on top (`FROM awman-{project}:latest`) |
 
 The split means you can update project tooling without touching the agent setup, and switch agents without rebuilding your project environment. Both files come from templates: the **agent audit** (run during `awman init` or via `awman ready --refresh`) launches an agent to inspect your codebase and fill `Dockerfile.dev` with the tools your project actually needs; agent Dockerfiles are maintained by awman and rarely need editing. Commit both files.
+
+For the Docker Sandboxes runtime, agent environments are set up using **kit YAML specs** instead of Dockerfiles. awman generates per-agent kit files at `~/.awman/kits/<agent>/` when you run `awman ready`. No custom image build or registry push is required. See [Runtimes](16-runtimes.md#docker-sandboxes-experimental).
 
 ## Agents
 

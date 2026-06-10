@@ -124,7 +124,7 @@ This work item must not change any user-observable behavior of the `docker` or `
 - **`display_name()` and `cli_binary()` arms for the new backend are added before any wildcard `_ =>` arm**, but the existing arms keep their order and contents. Adding sbx must not change what `runtime_name() == "docker"` callers see.
 - **`is_available()` for sbx must not call `docker info`.** The existing Docker `is_available()` continues to call `docker info`; the sbx variant probes `sbx ls`. The two probes are independent — having sbx installed must not break the Docker check, and vice versa.
 - **Existing label, name, and filter conventions are unchanged.** The Docker backend continues filtering on `label=awman=true` and `name=awman-`. The Apple backend continues using its existing JSON parsing. The sbx backend uses a distinct name pattern (`awman-<worktree-hash>-<agent>`) that shares the `awman-` prefix for human-recognizability but does not collide with Docker container IDs because the two daemons see disjoint resources.
-- **Existing `generate_container_name()` is not changed.** The sbx name generator is added as `generate_sbx_sandbox_name(worktree_hash, agent)`, a separate function. Docker and Apple paths keep calling the unchanged `generate_container_name()`.
+- **Existing `generate_container_name()` is not changed.** The sbx name generator is the WI 0089 helper `generate_sandbox_name(worktree_hash, agent)` in `src/engine/sandbox/naming.rs`. Docker and Apple paths keep calling the unchanged `generate_container_name()`.
 
 The verification gate for non-interference is: after this work item ships, running the full existing test suite with `cargo test` on every supported platform (macOS arm64, macOS x86_64, Linux, Windows) must produce identical results to the pre-change suite, modulo the new sbx-specific tests that are added.
 
@@ -223,7 +223,7 @@ Verification before starting Phase 2: run `awman exec --runtime docker-sbx-exper
 
 ### Phase 2 — Kit emission
 
-The kit emitter generates a `spec.yaml` (plus optional `files/` directory) per agent at `awman ready` time. Kits live at `$HOME/.awman/kits/<agent>/` and are regenerated on every `awman ready` so they reflect the current per-agent config and credentials.
+The kit emitter generates a `spec.yaml` (plus optional `files/` directory) per agent at `awman ready` time. Kits live at `$HOME/.awman/kits/<agent>/` and are regenerated on every `awman ready` so they reflect the current per-agent config and credential mappings. Credential values are never written into kit files.
 
 **File layout**: paths resolved through Layer 0 (`src/data/fs/`):
 - `$HOME/.awman/kits/<agent>/spec.yaml` — the kit manifest
@@ -296,7 +296,7 @@ The existing `agent_dockerfile_for()` and `project_dockerfile_dev()` functions i
 
 If the project ever adds a remote template-download path for the Dockerfiles (analogous to `download_aspec_tarball` in `src/data/network/`), the sbx kit templates plug into the same mechanism with the same naming convention. They are not a separate distribution surface.
 
-**Module location for the emitter**: `src/engine/sandbox/dsbx/kit.rs`, `pub(super)`. Provides `DSbxKitEmitter` with methods like `emit_for_agent(&self, agent: &AgentSpec, dest: &Path) -> Result<(), EngineError>`. Called from the Layer 2 `ReadyCommand` for the sbx runtime. The emitter:
+**Module location for the emitter**: `src/engine/sandbox/dsbx/kit.rs`, `pub(super)`. Provides `DSbxKitEmitter` with methods like `emit_for_agent(&self, agent: &AgentSpec, dest: &Path) -> Result<(), EngineError>`. Called from the Layer 1 ready engine's sbx-specific ready phases; `ReadyCommand` only selects and invokes the ready engine through the normal Layer 2 command path. The emitter:
 1. Reads the embedded kit YAML template via `sbx_kit_template_for(agent)`.
 2. Substitutes per-installation values (awman version, base image tag, any per-agent flags).
 3. Writes the rendered `spec.yaml` to `<dest>/spec.yaml`.
@@ -330,12 +330,12 @@ The option type used by `DSbxBackend` is `ResolvedSandboxOptions` (defined in WI
 | `agent_id` | Selects the kit at `$HOME/.awman/kits/<agent_id>/`. |
 | `entrypoint_override` | For `kind: agent` kits: baked into `agent.entrypoint.run` at kit emission. For `kind: mixin`: must match the built-in's entrypoint; mismatches force `kind: agent` (see Phase 0 #6). |
 | `workspace_dir` | Passed as `--workspace-dir` to `sbx run`; the VM mounts it at the identical absolute path. |
-| `extra_overlays` | Workspace-rooted overlays are a no-op (workspace is already mounted); non-workspace overlays are stored in `session.json` for the startup script to fabricate file copies inside the VM, or rejected with a clear error if the source path cannot be reached from the workspace. |
-| `env_passthrough` | Service-mapped vars go to `sbx secret set`; unmapped vars are written to `session.json` and applied inside the VM by the startup script. |
-| `env_literal` | Written to `session.json`; startup script exports them inside the VM. Sensitive values must follow the existing masking pattern. |
+| `extra_overlays` | Workspace-rooted overlays are a no-op (workspace is already mounted). Non-workspace overlays cannot be referenced directly from inside the VM; the host side must either materialize allowed file contents into a workspace-owned staging path under `.awman/` before launch and reference that staged path in `session.json`, or reject the overlay with a clear error. Do not serialize arbitrary outside-workspace file contents into `session.json`. |
+| `env_passthrough` | Service-mapped credential vars go to `sbx secret set`; non-sensitive config vars may be written to `session.json` and applied inside the VM by the startup script. Unmapped credential-class vars are warned and withheld rather than written to the workspace. |
+| `env_literal` | Non-sensitive literals may be written to `session.json` for the startup script to export. Credential-class literals are routed through `sbx secret set` / proxy management when recognized, and otherwise warned/rejected rather than written to the workspace. |
 | `seeded_prompt` | Written to `session.json`; startup script appends it as a positional arg to the agent's launch (for `kind: agent`) or invokes the agent via `sbx exec` with the prompt (for `kind: mixin`). |
 | `interactive` | Determines whether to use `sbx run` (attach) or `sbx create` (background). |
-| `sandbox_name` | Used as `--name <name>`. Always populated by `DSbxBackend` via `generate_sbx_sandbox_name(worktree_hash, agent)` if the caller did not pre-set it. |
+| `sandbox_name` | Used as `--name <name>`. Always populated by `DSbxBackend` via `generate_sandbox_name(worktree_hash, agent)` if the caller did not pre-set it. |
 | `memory_gb` | `--memory <n>g` on `sbx run`. |
 | `cpu_limit` | Not supported by sbx; emit a warning and continue. |
 | `agent_settings` | Written to `session.json` for the startup script to apply inside the VM. Replaces the Docker-runtime pattern of mounting `~/.<agent>/` directly. |
@@ -359,7 +359,7 @@ Note the absence of an `image` field: sandboxes do not take an image ref at run 
 
 **`SandboxBackend::exec_args()`**: argv for `sbx exec -it <name> <entrypoint…>` with `COLUMNS` and `LINES` env injected per Phase 0 #3. Returned as `Vec<String>` so the caller (`SandboxRuntime`) can spawn the binary identified by `cli_binary()`.
 
-**Image-introspection methods**: `SandboxBackend` does not expose `image_home_dir()` or `image_exists()` — these are container-paradigm concerns that don't exist for sandboxes. `SandboxRuntime` does not declare them in its trait surface. (If a caller in Layer 2 needs the in-VM home dir, it gets it from the kit emitter's per-agent template metadata, not from the backend.)
+**Image-introspection methods**: `SandboxBackend` does not expose `image_home_dir()` or `image_exists()` — these are container-paradigm concerns that don't exist for sandboxes. `SandboxRuntime` does not declare them in its trait surface. If Layer 2 needs sandbox metadata such as an in-VM home directory, that metadata must be exposed through the WI 0089 `AgentRuntimeEngine` surface or a Layer 0 data table, not by reaching into `DSbxKitEmitter` or any `pub(super)` sandbox internals.
 
 **Background ops on `SandboxBackend`**: the `SandboxBackend` trait (defined in WI 0089) declares background operations directly in sandbox terms — there are no `default_*` Docker-shaped fallbacks because sandboxes don't share Docker's argv shape. The methods `DSbxBackend` implements:
 - `start_background(workspace, agent_id, kit_dir, env, overlays) -> Result<SandboxId, EngineError>` → `sbx create --kit <kit-dir> --name <generated> --workspace-dir <workdir> <agent>`.
@@ -387,7 +387,7 @@ Service mapping:
 | `GROQ_API_KEY` | `groq` |
 | `MISTRAL_API_KEY` | `mistral` |
 
-Unmapped credentials are not silent failures: emit a warning naming the variable, suggest `sbx secret set-custom` or kit-level `environment.proxyManaged`. Unmapped credentials are written to `session.json` so the in-VM startup script can `export` them if appropriate.
+Unmapped credentials are not silent failures: emit a warning naming the variable and suggest kit-level `environment.proxyManaged` or a future explicit custom-secret mapping. Credential-class values must not be written to `session.json`; if an unmapped variable is truly non-sensitive configuration, handle it through the normal `env_passthrough` / `env_literal` path. When classification is ambiguous, prefer not passing the value and surface the warning.
 
 **Integration point**: called from `DSbxSandboxInstance::run_with_frontend()` before spawning the sbx subprocess — the same pattern Docker/Apple backends use for side-effecting work. Not from `DSbxBackend::build()`.
 
@@ -422,7 +422,7 @@ The writer **must not** include any credential values (those go through `sbx_aut
 
 **Sandbox naming**: `awman-<worktree-hash>-<agent>` where `<worktree-hash>` is derived from the worktree's absolute path (the same hash used by `generate_container_name()` today, but augmented with the agent name so multi-agent workflows can run concurrent sandboxes against the same worktree). Naming is **deterministic per (worktree, agent)** so subsequent invocations find and restart the existing sandbox.
 
-**`generate_container_name()`** — extend with a new `generate_sbx_sandbox_name(worktree_hash: &str, agent: &str) -> String` helper. Existing callers keep the current behavior; sbx callers use the new helper.
+**`generate_container_name()`** — do not extend or modify it. Sandbox callers use the WI 0089 helper `generate_sandbox_name(worktree_hash: &str, agent: &str) -> String` from `src/engine/sandbox/naming.rs`; existing container callers keep the current behavior.
 
 **Lifecycle:**
 - First `awman chat <agent>` against a worktree → `sbx run --kit … --name awman-<hash>-<agent> --workspace-dir <wt> <agent>`. Install runs (one-time per worktree+agent), startup runs, agent attaches.
@@ -431,7 +431,7 @@ The writer **must not** include any credential values (those go through `sbx_aut
 - `awman destroy <worktree>` or equivalent teardown → `sbx rm awman-<hash>-<agent>` for each agent that has a sandbox against this worktree. Also clears the persistent volume.
 - `awman ready --no-cache` → `sbx rm` all awman sandboxes that use the affected agent kit, then re-emit the kit. Next launch re-runs install.
 
-**Naming collisions**: if a non-awman sbx sandbox already holds the deterministic name, surface a clear error (`Sandbox 'awman-…' already exists but was not created by awman; run 'sbx rm <name>' if you want awman to take it over`). Do not silently overwrite.
+**Naming collisions**: sbx exposes no ownership metadata (no labels; the `sbx ls --json` schema is unverified), so a true "was this created by awman?" check is unimplementable today. The exact deterministic name `awman-<hash>-<agent>` is therefore the de-facto ownership marker: an existing sandbox with that exact name is treated as awman's and restarted (history note: developer accepted this at review). Awman never overwrites or removes a sandbox whose name it did not generate; if sbx later grows ownership metadata, revisit and add the explicit non-awman error.
 
 **Workflow concurrency**: a multi-agent workflow on one worktree creates one sandbox per agent (deterministic, distinct names). Concurrent workflows on different worktrees use different worktree hashes so they don't collide.
 
@@ -478,7 +478,7 @@ User docs must cover:
 
 - **Stale kit on disk**: if `awman ready` was last run against an older awman version, the kit on disk may use an outdated startup script schema. The startup script's `schema_version` check catches this — fail loudly and instruct the user to re-run `awman ready`.
 - **Kit validation failure**: `sbx kit validate` errors are surfaced verbatim with the kit path. Don't try to auto-correct; fail loudly.
-- **Install command failures**: a non-zero exit from any `commands.install` step fails sandbox creation. Awman wraps the failure in `EngineError::Container` with the kit name and step description. The user can re-run with `awman ready --no-cache` to force a clean kit re-emit + sandbox `sbx rm` to clear the half-installed state.
+- **Install command failures**: a non-zero exit from any `commands.install` step fails sandbox creation. Awman wraps the failure in `EngineError::Sandbox` with the kit name and step description. The user can re-run with `awman ready --no-cache` to force a clean kit re-emit + sandbox `sbx rm` to clear the half-installed state.
 - **Install command network failures**: ephemeral failures (npm, curl) are not retried by sbx. Per-agent install scripts in `commands.install` should include retry loops where appropriate (cf. Docker's Pi kit, which does `i < 5` retries on npm install).
 - **Kit drift after upstream template update**: if Docker updates `docker/sandbox-templates:claude-code-docker` (e.g., new entrypoint default), existing sandboxes keep the old template; only newly-created ones pick up the new version. Document this; `awman ready --refresh-templates` or `sbx rm` is the user-facing fix.
 
@@ -488,8 +488,8 @@ User docs must cover:
 - **`sbx secret set` subprocess error**: treat as launch-blocking. Surface a clear error message and the exact `sbx secret set` command the user can run manually to diagnose.
 - **Credential rotation**: because `inject_credentials()` runs at every launch, rotated keys are picked up automatically.
 - **`AgentSettingsPassthrough` with a host path outside the workspace**: handled via the `session.json` channel. The startup script renders the equivalent in-VM config from the serialized settings. Do not error or warn for this case under sbx — the channel is functional, just different from the Docker mount approach.
-- **`EnvPassthrough` for non-service env vars**: written to `session.json`. The startup script `export`s them inside the VM. Document which env vars are credential-class (and thus go through `sbx secret set`) vs config-class (and go through `session.json`).
-- **`EnvLiteral` with sensitive values**: awman's existing masking applies on the host side. Inside the VM, the values land in `session.json` (workspace-readable) and `export`-ed by the startup script — equivalent exposure surface to today's `-e KEY=VALUE` Docker pattern.
+- **`EnvPassthrough` for non-service env vars**: non-sensitive config-class values may be written to `session.json`, and the startup script `export`s them inside the VM. Document which env vars are credential-class (and thus go through `sbx secret set` or proxy management) vs config-class (and can go through `session.json`).
+- **`EnvLiteral` with sensitive values**: do not write credential-class literals to `session.json`, because it is workspace-readable. Route recognized secrets through `sbx secret set` / proxy management; reject or warn on unrecognized sensitive literals rather than silently downgrading them to workspace config. Non-sensitive literals may still use `session.json`.
 
 ### Networking and `--allow-docker`
 
@@ -505,7 +505,7 @@ User docs must cover:
 
 ### Lifecycle
 
-- **Sandbox naming collisions**: deterministic naming + ownership-check error if a non-awman sandbox holds the name. See Phase 6.
+- **Sandbox naming collisions**: deterministic naming; an exact `awman-<hash>-<agent>` name match is treated as awman-owned (sbx provides no ownership metadata to check). See Phase 6.
 - **Stopped vs. removed sandboxes**: `sbx stop` preserves state across awman invocations; `sbx rm` is reserved for worktree destruction or explicit user cleanup.
 - **`sbx reset` danger**: awman never invokes `sbx reset`; this command nukes all sandboxes and the image cache.
 - **Port mappings lost on stop**: documented limitation; port-based workflows must keep the sandbox running.
@@ -528,10 +528,10 @@ User docs must cover:
 - **Argv construction (`DSbxSandboxInstance::run_with_frontend()`)**: for each `ResolvedSandboxOptions` shape (first launch vs restart), verify the generated `sbx run` argv is correct. No live sbx binary needed.
 - **Unsupported option handling**: `Cpu` produces a warning, `AllowDocker` produces a debug trace; neither errors.
 - **Platform guard in `AgentRuntimeEngine::detect`**: `"docker-sbx-experimental"` returns `BackendUnsupportedOnPlatform` on Linux and x86_64 macOS.
-- **Auto-auth service mapping**: every credential in the mapping table has expected behavior; an unmapped credential produces a warning (not an error) and is written to `session.json`.
+- **Auto-auth service mapping**: every credential in the mapping table has expected behavior; an unmapped credential produces a warning (not an error) and is not written to `session.json` unless it has been explicitly classified as non-sensitive configuration.
 - **Auto-auth credential not found**: clear warning, not a panic, when a required key is absent from keychain and environment.
 - **Auto-auth stdin pipe — no argv leakage**: verify `sbx secret set` is invoked with the credential piped via stdin, never argv or env.
-- **Naming determinism**: `generate_sbx_sandbox_name(worktree_hash, agent)` produces the same name for the same inputs across invocations.
+- **Naming determinism**: `generate_sandbox_name(worktree_hash, agent)` produces the same name for the same inputs across invocations.
 - **Subprocess announcement**: every code path that spawns an `sbx` subprocess emits an Info-level sink message containing the full argv before the spawn (use a mock sink and a stubbed spawn helper; no live sbx binary needed).
 - **Subprocess output publication**: stdout lines from a (stubbed) `sbx` invocation arrive on the sink at Info level and stderr lines at Warning level; on non-zero exit the failure message includes the argv and captured stderr.
 - **Secret-value redaction on the sink**: the announcement for `sbx secret set` names the service but never contains the credential value, and a stubbed `sbx secret set` that echoes its stdin back does not leak the value to the sink (masking applies).
@@ -602,7 +602,7 @@ Before opening the implementation PR, the implementing agent must self-verify ea
 - [ ] `make test` passes on the local machine after the change (modulo the new sbx-gated tests).
 - [ ] Running `awman ready` with `runtime: "docker"` produces byte-identical `.awman/Dockerfile.*` contents to a pre-change checkout.
 - [ ] Running `awman ready` with no `runtime` set in config produces byte-identical behavior to today (defaults to Docker).
-- [ ] `awman exec --runtime docker-sbx-experimental` no longer returns `EngineError::NotImplemented` — it actually runs (replacing the WI 0089 stub behavior).
+- [ ] `awman exec --runtime docker-sbx-experimental` no longer returns `EngineError::NotImplemented` — it actually runs (replacing the WI 0089 stub behavior). **Deferred to WI 0091** (developer decision at review): WI 0090's change-set scopes Layer 2 out, so `awman ready` works end-to-end under sbx while `awman chat`/`exec` routing — and mixin seeded-prompt consumption in the apply scripts — land in `0091-sbx-layer2-routing.md`. Until then those commands return a clear "this command does not yet route to the sandbox runtime" error.
 
 **No-alias invariants** (carried forward from WI 0089's standard):
 

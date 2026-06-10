@@ -172,17 +172,17 @@ An empty repo list actively overrides a non-empty global list. To stop overridin
 
 ## Runtimes
 
-The global `runtime` key selects how agent containers run:
+The global `runtime` key selects how agent processes are isolated from your host machine:
 
 | Value | Platform | Notes |
 |-------|----------|-------|
 | `docker` (default) | Linux, macOS, Windows | Standard Docker; ephemeral containers torn down when the session ends |
-| `apple-containers` | macOS only | Native `container` CLI; same user experience as Docker. On Linux/Windows this value is an error, not a silent fallback. `--allow-docker` is not supported under this runtime |
-| `docker-sbx-experimental` | Experimental | Docker Sandboxes (persistent microVMs). The value is recognized but operations are not yet implemented and return clear errors |
+| `apple-containers` | macOS 26+ only | Native `container` CLI; same user experience as Docker. On Linux/Windows this value is an error, not a silent fallback. `--allow-docker` is not supported under this runtime |
+| `docker-sbx-experimental` | macOS arm64, Windows x86_64 | Docker Sandboxes (persistent microVMs per session; hypervisor-grade isolation). Requires the `sbx` CLI and a Docker account. Linux is blocked by an upstream virtiofs bug. See [Runtimes](16-runtimes.md) |
 
 An unrecognized value (e.g. a typo) logs a warning and falls back to `docker`.
 
-`awman ready` validates the configured runtime before any other check and reports which one is active.
+`awman ready` validates the configured runtime before any other check and reports which one is active. For full details on platform support, setup, credential registration, and the persistent-sandbox lifecycle see [Runtimes](16-runtimes.md).
 
 ---
 

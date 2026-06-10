@@ -284,6 +284,68 @@ mod tests {
         assert_eq!(rt.engine().runtime_name(), "docker");
     }
 
+    // ─── Runtime switching (host-side, no live sbx needed) ───────────────────
+    //
+    // Mutate GlobalConfig::runtime between values and re-detect. Each detection
+    // must return a runtime whose runtime_name() matches the config — no state
+    // leaks between calls.
+
+    #[test]
+    fn default_runtime_resolves_to_docker() {
+        let cfg = GlobalConfig::default();
+        assert!(cfg.runtime.is_none(), "default GlobalConfig must have no runtime set");
+        let rt = detect(&cfg).unwrap();
+        assert_eq!(
+            rt.engine().runtime_name(),
+            "docker",
+            "default config must resolve to Docker"
+        );
+        assert!(rt.container_runtime().is_some());
+        assert!(rt.sandbox_runtime().is_none());
+    }
+
+    #[test]
+    fn runtime_switching_docker_to_sandbox_and_back() {
+        let docker_cfg = GlobalConfig { runtime: Some("docker".into()), ..Default::default() };
+        let sbx_cfg = GlobalConfig {
+            runtime: Some("docker-sbx-experimental".into()),
+            ..Default::default()
+        };
+        let docker_again = GlobalConfig { runtime: Some("docker".into()), ..Default::default() };
+
+        // Step 1: docker → ContainerRuntime
+        let rt1 = detect(&docker_cfg).unwrap();
+        assert_eq!(rt1.engine().runtime_name(), "docker");
+        assert!(rt1.container_runtime().is_some());
+        assert!(rt1.sandbox_runtime().is_none());
+
+        // Step 2: sbx → SandboxRuntime (or BackendUnsupportedOnPlatform on Linux/x86)
+        let rt2 = detect(&sbx_cfg);
+        if cfg!(target_os = "linux") || cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            assert!(matches!(rt2, Err(EngineError::BackendUnsupportedOnPlatform { .. })));
+        } else {
+            let rt2 = rt2.unwrap();
+            assert_eq!(rt2.engine().runtime_name(), "docker-sbx-experimental");
+            assert!(rt2.sandbox_runtime().is_some());
+            assert!(rt2.container_runtime().is_none());
+        }
+
+        // Step 3: back to docker — no state leak from sbx detection
+        let rt3 = detect(&docker_again).unwrap();
+        assert_eq!(rt3.engine().runtime_name(), "docker");
+        assert!(rt3.container_runtime().is_some());
+        assert!(rt3.sandbox_runtime().is_none());
+    }
+
+    #[test]
+    fn unknown_runtime_string_falls_back_to_docker_not_sbx() {
+        // "blarg" must not accidentally select sbx or any other runtime.
+        let cfg = GlobalConfig { runtime: Some("blarg".into()), ..Default::default() };
+        let rt = detect(&cfg).unwrap();
+        assert_eq!(rt.engine().runtime_name(), "docker");
+        assert_ne!(rt.engine().runtime_name(), "docker-sbx-experimental");
+    }
+
     // ─── Option-variant mismatch via ContainerRuntime ─────────────────────────
 
     #[test]

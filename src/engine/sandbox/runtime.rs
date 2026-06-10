@@ -45,13 +45,17 @@ impl SandboxRuntime {
         if cfg!(target_os = "linux") {
             return Err(EngineError::BackendUnsupportedOnPlatform {
                 backend: "docker-sbx-experimental".into(),
-                platform: "linux".into(),
+                platform: "linux — blocked until the Docker Sandboxes virtiofs \
+                           file-creation bug (sbx-releases Issue #51) is fixed upstream"
+                    .into(),
             });
         }
         if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
             return Err(EngineError::BackendUnsupportedOnPlatform {
                 backend: "docker-sbx-experimental".into(),
-                platform: "macos (x86_64)".into(),
+                platform: "macos (x86_64) — Docker Sandboxes requires Apple Silicon \
+                           (arm64). Intel Macs are not supported"
+                    .into(),
             });
         }
         Ok(Self {
@@ -77,9 +81,11 @@ impl AgentRuntimeEngine for SandboxRuntime {
     }
 
     fn is_available(&self) -> bool {
+        // Probes `sbx ls` (per WI 0090): a missing binary and a logged-out
+        // session both make the runtime unusable, and `sbx ls` fails for both.
         use std::process::Stdio;
         let child = std::process::Command::new(self.backend.cli_binary())
-            .arg("version")
+            .arg("ls")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
@@ -96,10 +102,9 @@ impl AgentRuntimeEngine for SandboxRuntime {
 
     fn build(&self, options: ResolvedAgentOptions) -> Result<Box<dyn AgentInstance>, EngineError> {
         match options {
-            ResolvedAgentOptions::Sandbox(opts) => Ok(Box::new(SandboxAgentInstance {
-                backend: Arc::clone(&self.backend),
-                options: opts,
-            })),
+            ResolvedAgentOptions::Sandbox(opts) => {
+                Ok(Box::new(SandboxAgentInstance { options: opts }))
+            }
             other => Err(EngineError::OptionVariantMismatch {
                 runtime: self.runtime_name().to_string(),
                 got: other.paradigm(),
@@ -126,14 +131,27 @@ impl AgentRuntimeEngine for SandboxRuntime {
 
     fn exec_args(
         &self,
-        _agent_id: &str,
+        agent_id: &str,
         _working_dir: &str,
-        _entrypoint: &[&str],
-        _env_vars: &[(&str, &str)],
+        entrypoint: &[&str],
+        env_vars: &[(&str, &str)],
     ) -> Vec<String> {
-        // Exec/re-attach argv shape is defined by WI 0090. Unreachable while
-        // the backend is stubbed: no sandbox can be running.
-        Vec::new()
+        // `sbx exec -it [--env K=V…] <sandbox-name> <entrypoint…>`.
+        //
+        // `agent_id` carries the deterministic sandbox name for re-attach.
+        // Per Phase 0 #3 (Issue #63), the caller passes COLUMNS/LINES through
+        // `env_vars` so TUI apps inside the VM see a real terminal size; they
+        // are emitted as `--env` like any other variable. The kit's default
+        // working directory is the mounted workspace, so `working_dir` needs
+        // no translation here.
+        let mut args = vec!["exec".to_string(), "-it".to_string()];
+        for (k, v) in env_vars {
+            args.push("--env".to_string());
+            args.push(format!("{k}={v}"));
+        }
+        args.push(agent_id.to_string());
+        args.extend(entrypoint.iter().map(|s| s.to_string()));
+        args
     }
 
     fn cli_binary(&self) -> &'static str {
@@ -144,7 +162,6 @@ impl AgentRuntimeEngine for SandboxRuntime {
 /// Configured-but-not-running sandbox agent — the sandbox tier's half of the
 /// two-step build/run pattern.
 struct SandboxAgentInstance {
-    backend: Arc<dyn SandboxBackend>,
     options: ResolvedSandboxOptions,
 }
 
@@ -166,13 +183,11 @@ impl AgentInstance for SandboxAgentInstance {
 
     fn run_with_frontend(
         self: Box<Self>,
-        _frontend: Box<dyn AgentFrontend>,
+        frontend: Box<dyn AgentFrontend>,
     ) -> Result<AgentExecution, EngineError> {
-        // Stubbed: `start_sandbox` returns NotImplemented until WI 0090.
-        let _id = self.backend.start_sandbox(&self.options)?;
-        Err(EngineError::NotImplemented(
-            "SandboxAgentInstance::run_with_frontend is stubbed; see work-item 0090 for the implementation",
-        ))
+        // The interactive launch (session config, credential injection, kit
+        // selection, PTY-bridged `sbx run`) lives in the dsbx driver.
+        super::dsbx::run_interactive(self.options, frontend)
     }
 }
 
@@ -191,7 +206,14 @@ mod tests {
             match SandboxRuntime::dsbx() {
                 Err(EngineError::BackendUnsupportedOnPlatform { backend, platform }) => {
                     assert_eq!(backend, "docker-sbx-experimental");
-                    assert_eq!(platform, "linux");
+                    assert!(
+                        platform.starts_with("linux"),
+                        "platform should name linux, got: {platform}"
+                    );
+                    assert!(
+                        platform.contains("Issue #51"),
+                        "platform should explain the upstream blocker, got: {platform}"
+                    );
                 }
                 Err(e) => panic!("expected BackendUnsupportedOnPlatform on linux, got: {e:?}"),
                 Ok(_) => panic!("dsbx() must fail on linux"),
@@ -212,6 +234,10 @@ mod tests {
                     assert!(
                         platform.contains("x86_64"),
                         "platform should mention x86_64, got: {platform}"
+                    );
+                    assert!(
+                        platform.contains("Apple Silicon"),
+                        "platform should explain the arm64 requirement, got: {platform}"
                     );
                 }
                 Err(e) => {

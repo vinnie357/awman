@@ -92,17 +92,18 @@ pub struct Engines {
 }
 
 impl Engines {
-    /// The container-paradigm runtime handle, or — while the active runtime
-    /// is the stubbed sandbox tier — the `NotImplemented` error WI 0090
-    /// resolves. Container-paradigm flows (agent setup, image builds,
-    /// background containers) call this instead of unwrapping
-    /// `container_runtime` so a sandbox-configured user gets an actionable
-    /// error, never a panic or a silent Docker fallback.
+    /// The container-paradigm runtime handle, or — when the active runtime is
+    /// sandbox-class — a `NotImplemented` error. Container-paradigm flows
+    /// (agent setup, image builds, background containers) call this instead
+    /// of unwrapping `container_runtime` so a sandbox-configured user gets an
+    /// actionable error, never a panic or a silent Docker fallback.
     pub fn require_container_runtime(&self) -> Result<&Arc<ContainerRuntime>, EngineError> {
         self.container_runtime
             .as_ref()
             .ok_or(EngineError::NotImplemented(
-                "docker-sbx-experimental is not yet implemented — track work-item 0090",
+                "this command does not yet route to the sandbox runtime \
+                 (docker-sbx-experimental); set runtime to \"docker\" or \
+                 \"apple-containers\" to use it here",
             ))
     }
 }

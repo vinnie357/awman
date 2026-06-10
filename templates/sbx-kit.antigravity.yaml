@@ -1,0 +1,37 @@
+# awman-generated Docker Sandbox kit — agent: antigravity (kind: agent)
+# Rendered by DSbxKitEmitter at `awman ready`. Do not edit by hand inside a kit
+# directory; edit the template and re-run `awman ready`.
+# awman version: {{AWMAN_VERSION}}
+kind: agent
+agent:
+  image: docker/sandbox-templates:shell-docker
+  entrypoint:
+    run:
+      - agy
+  persistence: persistent
+network:
+  allowedDomains:
+    - generativelanguage.googleapis.com
+    - registry.npmjs.org
+credentials:
+  sources:
+    GEMINI_API_KEY: google
+environment:
+  proxyManaged:
+    - GEMINI_API_KEY
+memory: |
+  This sandbox is orchestrated by awman {{AWMAN_VERSION}} using the
+  Docker Sandboxes (experimental) runtime. Per-launch configuration is read
+  from ${WORKDIR}/.awman/session.json by the startup script.
+commands:
+  install:
+    - |
+      n=0
+      until [ "$n" -ge 5 ]; do
+        npm i -g @google/antigravity-cli && break
+        n=$((n+1))
+        echo "antigravity install attempt $n failed; retrying..." >&2
+        sleep 3
+      done
+  startup:
+    - bash /home/agent/.awman/apply-session-config.sh

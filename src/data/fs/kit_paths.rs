@@ -1,0 +1,106 @@
+//! Filesystem-resolution for host-global Docker Sandbox (`sbx`) kit
+//! directories.
+//!
+//! sbx kits are host-global (one per agent under `$HOME/.awman/kits/<agent>/`),
+//! unlike the per-repo `.awman/Dockerfile.<agent>` files used by the Docker and
+//! Apple runtimes. Resolving these paths is a Layer 0 concern; emitting the kit
+//! contents (rendering `spec.yaml`, copying the startup script) is Layer 1.
+
+use std::path::{Path, PathBuf};
+
+use crate::data::config::global::GlobalConfig;
+use crate::data::error::DataError;
+
+/// Resolves host-global kit directory paths for the sbx runtime.
+#[derive(Debug, Clone)]
+pub struct SandboxKitPaths {
+    /// The resolved `$HOME/.awman` (or `$AWMAN_CONFIG_HOME`) directory.
+    home: PathBuf,
+}
+
+impl SandboxKitPaths {
+    /// Construct a resolver rooted at the supplied awman home directory.
+    pub fn at_home(home: impl Into<PathBuf>) -> Self {
+        Self { home: home.into() }
+    }
+
+    /// Resolve from the current process environment, honouring
+    /// `AWMAN_CONFIG_HOME` / `XDG_CONFIG_HOME` exactly as the global config does.
+    pub fn from_process_env() -> Result<Self, DataError> {
+        Ok(Self::at_home(GlobalConfig::home_dir()?))
+    }
+
+    /// The awman home directory this resolver is bound to.
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+
+    /// Root directory holding every emitted kit: `<home>/kits`.
+    pub fn kits_root(&self) -> PathBuf {
+        self.home.join("kits")
+    }
+
+    /// Directory for a single agent's kit: `<home>/kits/<agent>`.
+    pub fn kit_dir(&self, agent: &str) -> PathBuf {
+        self.kits_root().join(agent)
+    }
+
+    /// The rendered kit manifest: `<home>/kits/<agent>/spec.yaml`.
+    pub fn spec_file(&self, agent: &str) -> PathBuf {
+        self.kit_dir(agent).join("spec.yaml")
+    }
+
+    /// The bundled-assets root copied into the VM's `/home/agent/`:
+    /// `<home>/kits/<agent>/files/home`.
+    pub fn files_home_dir(&self, agent: &str) -> PathBuf {
+        self.kit_dir(agent).join("files").join("home")
+    }
+
+    /// The per-launch startup script:
+    /// `<home>/kits/<agent>/files/home/.awman/apply-session-config.sh`.
+    pub fn apply_script_file(&self, agent: &str) -> PathBuf {
+        self.files_home_dir(agent)
+            .join(".awman")
+            .join("apply-session-config.sh")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn resolver() -> SandboxKitPaths {
+        SandboxKitPaths::at_home("/home/u/.awman")
+    }
+
+    #[test]
+    fn kit_dir_is_under_kits_root() {
+        let r = resolver();
+        assert_eq!(r.kit_dir("claude"), Path::new("/home/u/.awman/kits/claude"));
+    }
+
+    #[test]
+    fn spec_file_path() {
+        let r = resolver();
+        assert_eq!(
+            r.spec_file("codex"),
+            Path::new("/home/u/.awman/kits/codex/spec.yaml")
+        );
+    }
+
+    #[test]
+    fn apply_script_is_under_files_home_awman() {
+        let r = resolver();
+        assert_eq!(
+            r.apply_script_file("gemini"),
+            Path::new("/home/u/.awman/kits/gemini/files/home/.awman/apply-session-config.sh")
+        );
+    }
+
+    #[test]
+    fn distinct_agents_get_distinct_dirs() {
+        let r = resolver();
+        assert_ne!(r.kit_dir("claude"), r.kit_dir("gemini"));
+    }
+}

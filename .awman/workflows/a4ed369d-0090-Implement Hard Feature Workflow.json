@@ -1,0 +1,68 @@
+{
+  "schema_version": 4,
+  "invocation_id": "39ec38ab-c1e2-4c4b-bd4f-8eeda18c6ce2",
+  "workflow_name": "Implement Hard Feature Workflow",
+  "workflow_hash": "9c7cf1e60abce27972aab53419d87eaf073bc9fff2ccc46cfbbde7be8d534e57",
+  "work_item": 90,
+  "step_states": {
+    "tests": "Succeeded",
+    "review": {
+      "Running": {
+        "container_id": "awman-78958-646982000"
+      }
+    },
+    "docs": "Succeeded",
+    "review-plan": "Succeeded",
+    "implement": "Succeeded"
+  },
+  "completed_steps": [
+    "docs",
+    "implement",
+    "tests",
+    "review-plan"
+  ],
+  "current_step_index": null,
+  "started_at": "2026-06-10T01:42:33.711407Z",
+  "updated_at": "2026-06-10T02:45:05.648823Z",
+  "steps": [
+    {
+      "name": "review-plan",
+      "depends_on": [],
+      "agent": "codex"
+    },
+    {
+      "name": "implement",
+      "depends_on": [
+        "review-plan"
+      ],
+      "model": "claude-opus-4-8"
+    },
+    {
+      "name": "tests",
+      "depends_on": [
+        "implement"
+      ],
+      "model": "claude-sonnet-4-6"
+    },
+    {
+      "name": "docs",
+      "depends_on": [
+        "implement"
+      ],
+      "model": "claude-sonnet-4-6"
+    },
+    {
+      "name": "review",
+      "depends_on": [
+        "docs",
+        "tests"
+      ],
+      "model": "claude-fable-5"
+    }
+  ],
+  "current_phase": "Main",
+  "setup_completed": false,
+  "teardown_completed": false,
+  "setup_step_states": [],
+  "teardown_step_states": []
+}

@@ -1,8 +1,17 @@
 //! Docker Sandbox driver (`sbx` CLI).
 //!
-//! Stubbed in WI 0089 — every `SandboxBackend` method returns
-//! `EngineError::NotImplemented`. WI 0090 lands the real implementation.
+//! WI 0090 implementation. The concrete driver and its companions
+//! (kit emitter, credential injector, session-config writer, spawn helper,
+//! I/O bridge) are all internal to `src/engine/sandbox/`. Callers outside the
+//! sandbox module see only `SandboxRuntime`.
 
+mod auth;
 mod backend;
+mod io_bridge;
+mod kit;
+mod ready;
+mod session_config;
+mod spawn;
 
-pub(super) use backend::DSbxBackend;
+pub(in crate::engine::sandbox) use backend::{run_interactive, DSbxBackend};
+pub(in crate::engine::sandbox) use ready::ready_agent;

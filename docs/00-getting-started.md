@@ -9,7 +9,7 @@ New to awman? Skim [Concepts](01-concepts.md) after this for the mental model be
 ## Prerequisites
 
 - **Git** — your project must be in a Git repository
-- **A container runtime** — Docker (all platforms, daemon running) or Apple Containers (macOS 26+)
+- **A container runtime** — Docker (all platforms, daemon running), Apple Containers (macOS 26+), or Docker Sandboxes (`sbx` CLI, macOS arm64 / Windows)
 - **An account with a supported agent** — Claude Code, OpenAI Codex, OpenCode, Maki, Google Gemini, GitHub Copilot CLI, Crush, Cline, or Google Antigravity
 
 ## 1. Install

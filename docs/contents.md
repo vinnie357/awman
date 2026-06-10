@@ -24,6 +24,7 @@ A guide to using awman, the containerized multi-agent terminal multiplexer.
 | 13 | [GitHub Integration](13-github-integration.md) | `--issue` flag, fetching issues, authentication |
 | 14 | [Context Overlays](14-context-overlays.md) | Persistent context, system prompts, global/repo/workflow scopes |
 | 15 | [Mouse & TUI Agents](15-mouse-and-tui-agents.md) | Scroll forwarding, text selection, agent mouse tracking |
+| 16 | [Runtimes](16-runtimes.md) | Docker, Apple Containers, Docker Sandboxes — platform support, setup, lifecycle |
 | — | [Architecture (Detailed)](architecture.md) | Source layout, in-depth design decisions |
 
 ---

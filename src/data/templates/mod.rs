@@ -34,3 +34,45 @@ pub fn agent_dockerfile_for(agent: &str) -> Option<&'static str> {
 pub fn dockerfile_matches_template(content: &str) -> bool {
     content.trim() == project_dockerfile_dev().trim()
 }
+
+/// Per-agent Docker Sandbox kit YAML template (`spec.yaml` source).
+///
+/// Additive sibling of [`agent_dockerfile_for`] — the sbx kit templates live
+/// alongside the Dockerfile templates in `templates/` and are embedded with
+/// the same `include_str!` mechanism. A caller that wants a Dockerfile calls
+/// `agent_dockerfile_for`; a caller that wants a kit calls this. The two
+/// families never collide because of the `sbx-kit.` filename prefix.
+pub fn sbx_kit_template_for(agent: &str) -> Option<&'static str> {
+    Some(match agent {
+        "claude" => include_str!("../../../templates/sbx-kit.claude.yaml"),
+        "codex" => include_str!("../../../templates/sbx-kit.codex.yaml"),
+        "opencode" => include_str!("../../../templates/sbx-kit.opencode.yaml"),
+        "maki" => include_str!("../../../templates/sbx-kit.maki.yaml"),
+        "gemini" => include_str!("../../../templates/sbx-kit.gemini.yaml"),
+        "copilot" => include_str!("../../../templates/sbx-kit.copilot.yaml"),
+        "crush" => include_str!("../../../templates/sbx-kit.crush.yaml"),
+        "cline" => include_str!("../../../templates/sbx-kit.cline.yaml"),
+        "antigravity" => include_str!("../../../templates/sbx-kit.antigravity.yaml"),
+        _ => return None,
+    })
+}
+
+/// Per-agent Docker Sandbox startup script (`apply-session-config.sh` source).
+///
+/// Written into the emitted kit's `files/home/.awman/` directory by the kit
+/// emitter at `awman ready` time and re-run by the kit's `commands.startup`
+/// on every sandbox restart.
+pub fn sbx_apply_script_for(agent: &str) -> Option<&'static str> {
+    Some(match agent {
+        "claude" => include_str!("../../../templates/sbx-apply.claude.sh"),
+        "codex" => include_str!("../../../templates/sbx-apply.codex.sh"),
+        "opencode" => include_str!("../../../templates/sbx-apply.opencode.sh"),
+        "maki" => include_str!("../../../templates/sbx-apply.maki.sh"),
+        "gemini" => include_str!("../../../templates/sbx-apply.gemini.sh"),
+        "copilot" => include_str!("../../../templates/sbx-apply.copilot.sh"),
+        "crush" => include_str!("../../../templates/sbx-apply.crush.sh"),
+        "cline" => include_str!("../../../templates/sbx-apply.cline.sh"),
+        "antigravity" => include_str!("../../../templates/sbx-apply.antigravity.sh"),
+        _ => return None,
+    })
+}

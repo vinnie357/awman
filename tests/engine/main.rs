@@ -12,6 +12,7 @@ mod container_io;
 mod context_overlay_0087;
 mod git_engine;
 mod overlay_engine;
+mod sbx;
 mod stuck_event_wiring;
 mod workflow_end_to_end;
 mod workflow_on_failure;

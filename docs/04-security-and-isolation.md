@@ -1,30 +1,40 @@
 # Security & Isolation
 
-awman is built around a simple principle: agents never run on your host machine. Every agent session runs inside a Docker container that only sees what you explicitly give it. This section explains the isolation mechanisms and when to opt into elevated access.
+awman is built around a simple principle: agents never run on your host machine. Every agent session runs inside an isolated environment — a container or microVM — that only sees what you explicitly give it. This section explains the isolation mechanisms and when to opt into elevated access.
 
 ---
 
 ## The containment model
 
-By default, an agent container:
+By default, an agent environment:
 
-- Sees only your current Git repository, mounted at `/workspace`
-- Receives your credentials as environment variables (never as mounted files)
-- Has no access to your home directory, SSH keys, or Docker daemon
-- Is removed when the session ends (`--rm`)
+- Sees only your current Git repository (mounted via bind mount or virtiofs)
+- Receives your credentials through a secure per-session channel (never exposed to other sessions)
+- Has no access to your home directory, SSH keys, or host Docker daemon
+- Is stopped or removed when the session ends
 
 This means a misbehaving agent can't access your SSH keys, can't run arbitrary containers on your behalf, and can't touch files outside the project. The worst case is that it makes bad edits inside the repo — which git can undo.
 
+**Docker / Apple Containers:** agents run in a Linux container or lightweight VM respectively. The container is removed (`--rm`) when the session ends. Credentials are injected as environment variables.
+
+**Docker Sandboxes (`docker-sbx-experimental`):** agents run in a dedicated microVM with its own kernel, private Docker daemon, and private filesystem. Host escape requires a hypervisor exploit rather than a container escape. Sandboxes persist between sessions (state survives `sbx stop`); awman runs `sbx rm` only on explicit teardown. Credentials are registered with `sbx secret set` and injected at VM boot. See [Runtimes](16-runtimes.md#docker-sandboxes-experimental) for setup and limitations.
+
 ### Transparency
 
-Every time awman runs a container command, the full CLI invocation is printed before it executes:
+Every time awman runs a container or sandbox command, the full CLI invocation is printed before it executes:
 
 ```
 $ docker run --rm -it -v /home/user/myproject:/workspace -w /workspace \
     -e CLAUDE_CODE_OAUTH_TOKEN=*** awman-myproject:latest claude "..."
 ```
 
-Credential values are masked (`***`), but everything else is visible. You can always see exactly what awman is doing.
+For Docker Sandboxes, every `sbx` invocation is announced the same way:
+
+```
+Running: sbx run --kit ~/.awman/kits/claude --name awman-ab12-claude --workspace-dir /home/user/myproject claude
+```
+
+Credential values are masked, but everything else is visible. You can always see exactly what awman is doing.
 
 ---
 
@@ -337,9 +347,9 @@ When used with a workflow, the SSH directory is mounted into every workflow-step
 
 ---
 
-## Container transparency
+## Command transparency
 
-Every `docker build` and `docker run` command awman issues is printed before it executes — in command mode to stdout, in TUI mode as the first line of the execution window.
+Every command awman issues to the underlying runtime is printed before it executes — in command mode to stdout, in TUI mode as the first line of the execution window.
 
 ```
 $ docker build -t awman-myapp:latest -f Dockerfile.dev /path/to/repo
@@ -350,7 +360,7 @@ $ docker run --rm -it \
     awman-myapp:latest claude "Implement work item 0001..."
 ```
 
-With the Apple Containers runtime, the same commands are shown with `container` instead of `docker`. Credential values are always masked.
+With the Apple Containers runtime, the same commands are shown with `container` instead of `docker`. With the Docker Sandboxes runtime, every `sbx` invocation is announced — `sbx run`, `sbx exec`, `sbx stop`, `sbx rm`, `sbx secret set`, `sbx kit validate` — with sensitive values masked. Credential values are always masked across all runtimes.
 
 ---
 

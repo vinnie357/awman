@@ -1,0 +1,24 @@
+# awman-generated Docker Sandbox kit — agent: gemini (kind: mixin)
+# Rendered by DSbxKitEmitter at `awman ready`. Do not edit by hand inside a kit
+# directory; edit the template and re-run `awman ready`.
+# awman version: {{AWMAN_VERSION}}
+kind: mixin
+extends: gemini
+persistence: persistent
+network:
+  allowedDomains:
+    - generativelanguage.googleapis.com
+    - registry.npmjs.org
+credentials:
+  sources:
+    GEMINI_API_KEY: google
+environment:
+  proxyManaged:
+    - GEMINI_API_KEY
+memory: |
+  This sandbox is orchestrated by awman {{AWMAN_VERSION}} using the
+  Docker Sandboxes (experimental) runtime. Per-launch configuration is read
+  from ${WORKDIR}/.awman/session.json by the startup script.
+commands:
+  startup:
+    - bash /home/agent/.awman/apply-session-config.sh

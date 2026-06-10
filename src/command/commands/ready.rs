@@ -179,6 +179,47 @@ impl Command for ReadyCommand {
                 return Err(e);
             }
         };
+        // Sandbox runtime: `awman ready` emits kits and registers secrets
+        // instead of building Docker images. Route to the sbx-specific flow
+        // and skip the container ReadyEngine entirely.
+        if self.engines.sandbox_runtime.is_some() {
+            if self.flags.allow_docker {
+                // No-op under sbx: every sandbox gets a private DinD daemon.
+                tracing::debug!("--allow-docker is a no-op under sbx (private DinD is always on)");
+            }
+            let credentials = self
+                .engines
+                .auth_engine
+                .resolve_agent_auth(&session, &agent)
+                .map(|c| c.env_vars)
+                .unwrap_or_default();
+            let result = crate::engine::sandbox::ready_sbx_agent(
+                agent.as_str(),
+                &credentials,
+                self.flags.no_cache,
+                frontend.as_mut(),
+            );
+            frontend.replay_queued();
+            let agent_status = match &result {
+                Ok(()) => StepStatus::Done,
+                Err(e) => StepStatus::Failed(e.to_string()),
+            };
+            let outcome = ReadyOutcome {
+                runtime: self.engines.runtime.runtime_name().to_string(),
+                dockerfile: StepStatus::Skipped,
+                base_image: StepStatus::Skipped,
+                agent_image: agent_status,
+                local_agent: StepStatus::Skipped,
+                audit: StepStatus::Skipped,
+                image_rebuild: StepStatus::Skipped,
+                non_default_agent_images: Vec::new(),
+                json_requested: self.flags.json,
+                refresh_requested: self.flags.refresh,
+            };
+            result.map_err(CommandError::from)?;
+            return Ok(outcome);
+        }
+
         let options = ReadyEngineOptions {
             agent,
             refresh: self.flags.refresh,

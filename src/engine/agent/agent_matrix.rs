@@ -75,6 +75,10 @@ pub struct AgentMatrix {
     pub system_prompt_delivery: SystemPromptMode,
     /// CLI flag for system prompt delivery (e.g. `--append-system-prompt-file`).
     pub system_prompt_flag: Option<&'static str>,
+    /// Which Docker Sandbox kit kind awman emits for this agent. Consulted
+    /// only by the sbx runtime (`src/engine/sandbox/dsbx/`); other runtimes
+    /// ignore it.
+    pub sbx_kit_kind: SbxKitKind,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -85,6 +89,20 @@ pub enum ModelFlagDelivery {
     EqArg,
     /// Not supported.
     Unsupported,
+}
+
+/// Which Docker Sandbox kit kind awman emits for this agent.
+///
+/// Consulted only by the sbx kit emitter and launcher (`src/engine/sandbox/
+/// dsbx/`); the Docker and Apple runtimes ignore it. `Mixin` extends one of
+/// Docker's published built-in agent templates; `Agent` installs the agent
+/// itself on top of the generic shell template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SbxKitKind {
+    /// Extends a Docker built-in template (`kind: mixin`).
+    Mixin,
+    /// Full agent spec extending the shell template (`kind: agent`).
+    Agent,
 }
 
 /// Lookup the matrix entry for a known agent name.
@@ -103,6 +121,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::Append,
             system_prompt_flag: Some("--append-system-prompt-file"),
+            sbx_kit_kind: SbxKitKind::Mixin,
         },
         "codex" => AgentMatrix {
             agent: "codex",
@@ -124,6 +143,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
                 key: "developer_instructions",
             },
             system_prompt_flag: Some("--config"),
+            sbx_kit_kind: SbxKitKind::Mixin,
         },
         "opencode" => AgentMatrix {
             agent: "opencode",
@@ -138,6 +158,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::AgentsMd,
             system_prompt_flag: None,
+            sbx_kit_kind: SbxKitKind::Mixin,
         },
         "maki" => AgentMatrix {
             agent: "maki",
@@ -152,6 +173,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::Unsupported,
             system_prompt_flag: None,
+            sbx_kit_kind: SbxKitKind::Agent,
         },
         "gemini" => AgentMatrix {
             agent: "gemini",
@@ -168,6 +190,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
                 var: "GEMINI_SYSTEM_MD",
             },
             system_prompt_flag: None,
+            sbx_kit_kind: SbxKitKind::Mixin,
         },
         "copilot" => AgentMatrix {
             agent: "copilot",
@@ -184,6 +207,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
                 var: "COPILOT_CUSTOM_INSTRUCTIONS_DIRS",
             },
             system_prompt_flag: None,
+            sbx_kit_kind: SbxKitKind::Mixin,
         },
         "crush" => AgentMatrix {
             agent: "crush",
@@ -198,6 +222,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::Unsupported,
             system_prompt_flag: None,
+            sbx_kit_kind: SbxKitKind::Agent,
         },
         "cline" => AgentMatrix {
             agent: "cline",
@@ -212,6 +237,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::Replace,
             system_prompt_flag: Some("--system"),
+            sbx_kit_kind: SbxKitKind::Agent,
         },
         "antigravity" => AgentMatrix {
             // Verified against `agy --help` (v1.0.x). Flags actually accepted:
@@ -240,6 +266,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             supports_stdin_injection: false,
             system_prompt_delivery: SystemPromptMode::AddDir { flag: "--add-dir" },
             system_prompt_flag: None,
+            sbx_kit_kind: SbxKitKind::Agent,
         },
         other => {
             return Err(EngineError::Other(format!(

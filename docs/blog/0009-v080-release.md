@@ -19,7 +19,7 @@ curl -s https://prettysmart.dev/install/amux.sh | sh
 
 **Fewer bugs.** The old architecture allowed subtle drift between frontends that was hard to test for. The new layering makes that class of bug structurally impossible.
 
-**Skills overlay.** One new feature shipped alongside the refactor as a test of adding features under the new architecture. Your global amux skills (`~/.amux/skills/`) can now be mounted into any agent container automatically. Enable it with `--overlay "skill()"`, `amux config set overlays.skills true`, or the `AMUX_OVERLAYS` env var. amux figures out the right container path for each agent. See the [docs](../03-security-and-isolation.md#skills-overlay) for details.
+**Skills overlay.** One new feature shipped alongside the refactor as a test of adding features under the new architecture. Your global amux skills (`~/.amux/skills/`) can now be mounted into any agent container automatically. Enable it with `--overlay "skill()"`, `amux config set overlays.skills true`, or the `AMUX_OVERLAYS` env var. amux figures out the right container path for each agent. See the [docs](../04-security-and-isolation.md#skills-overlay) for details.
 
 No breaking changes. Your `.amux/config.json`, workflows, headless database, and every CLI invocation work exactly as before. `amux ready` and go.
 
