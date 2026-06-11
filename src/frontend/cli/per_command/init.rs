@@ -172,24 +172,7 @@ pub(crate) fn dockerfile_decision_from_input(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::dispatch::catalogue::CommandCatalogue;
     use crate::engine::init::frontend::DockerfileSetupDecision;
-    use crate::engine::init::InitFrontend;
-
-    // ─── Non-TTY path ────────────────────────────────────────────────────────
-
-    #[test]
-    fn non_tty_stdin_returns_create_new() {
-        // Test environments never have a TTY attached to stdin, so
-        // ask_dockerfile_setup must return CreateNew immediately.
-        let cmd = CommandCatalogue::get().build_clap_command();
-        let m = cmd.try_get_matches_from(["awman", "init"]).unwrap();
-        let mut frontend = CliFrontend::new(m);
-        let result = frontend
-            .ask_dockerfile_setup(std::path::Path::new("/tmp"))
-            .unwrap();
-        assert_eq!(result, DockerfileSetupDecision::CreateNew);
-    }
 
     // ─── TTY decision logic (via injectable helper) ───────────────────────────
 

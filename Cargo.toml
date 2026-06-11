@@ -9,7 +9,6 @@ description = "A containerized code agent manager"
 # Suppress auto-discovery so `cargo test` only runs Layer 0–3 unit tests
 # until then.
 autotests = false
-autobenches = false
 
 [[bin]]
 name = "awman"
@@ -65,14 +64,8 @@ nix = { version = "0.31", features = ["signal", "process", "fs", "poll"] }
 libc = "0.2"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
 reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
 wiremock = "0.6"
-
-# `benches/performance.rs` references the legacy oldsrc TUI API and is
-# rebuilt from scratch alongside the new TUI in work item 0072. The
-# explicit `[[bench]]` block is omitted (and `autobenches = false` above
-# suppresses discovery) until that work lands.
 
 # ── New architecture integration tests (WI 0073) ─────────────────────────────
 # autotests = false suppresses the legacy tests/; these explicit entries
