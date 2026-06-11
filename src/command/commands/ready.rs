@@ -179,23 +179,17 @@ impl Command for ReadyCommand {
                 return Err(e);
             }
         };
-        // Sandbox runtime: `awman ready` emits kits and registers secrets
-        // instead of building Docker images. Route to the sbx-specific flow
-        // and skip the container ReadyEngine entirely.
+        // Sandbox runtime: `awman ready` emits and validates kits instead of
+        // building Docker images. Route to the sbx-specific flow and skip the
+        // container ReadyEngine entirely. No credential resolution here — all
+        // sbx secret registration is sandbox-scoped at agent-launch time.
         if self.engines.sandbox_runtime.is_some() {
             if self.flags.allow_docker {
                 // No-op under sbx: every sandbox gets a private DinD daemon.
                 tracing::debug!("--allow-docker is a no-op under sbx (private DinD is always on)");
             }
-            let credentials = self
-                .engines
-                .auth_engine
-                .resolve_agent_auth(&session, &agent)
-                .map(|c| c.env_vars)
-                .unwrap_or_default();
             let result = crate::engine::sandbox::ready_sbx_agent(
                 agent.as_str(),
-                &credentials,
                 self.flags.no_cache,
                 frontend.as_mut(),
             );

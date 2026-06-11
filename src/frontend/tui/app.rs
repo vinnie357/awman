@@ -147,6 +147,10 @@ impl App {
     /// Spawn a parsed command as an async tokio task, wiring up all channels
     /// between the event loop and the command thread.
     pub fn spawn_command(&mut self, _command_text: &str, parsed: ParsedCommandBoxInput) {
+        // Capture the runtime class before borrowing the tab mutably: a
+        // sandbox-class runtime (e.g. docker-sbx-experimental) labels the
+        // overlay "(sandboxed)" rather than "(containerized)".
+        let sandboxed = self.engines.sandbox_runtime.is_some();
         let tab = self.active_tab_mut();
 
         // Clear previous output so the new command starts with a fresh log.
@@ -166,6 +170,7 @@ impl App {
             tab.session.effective_config().scrollback_lines(),
         );
         tab.container_scroll_offset = 0;
+        tab.container_rendered = false;
         tab.mouse_selection = None;
         tab.agent_alt_screen = false;
         tab.agent_alternate_scroll = false;
@@ -266,6 +271,7 @@ impl App {
             start_time: std::time::Instant::now(),
             latest_stats: None,
             stats_history: Vec::new(),
+            sandboxed,
         });
 
         // Show the "Interactive Mode" banner for containerized commands.
@@ -850,6 +856,7 @@ mod tests {
             start_time: std::time::Instant::now(),
             latest_stats: None,
             stats_history: Vec::new(),
+            sandboxed: false,
         });
         assert!(app
             .active_tab()
@@ -895,6 +902,7 @@ mod tests {
             start_time: std::time::Instant::now(),
             latest_stats: None,
             stats_history: Vec::new(),
+            sandboxed: false,
         });
 
         // Simulate the engine reporting the container name.
@@ -925,6 +933,7 @@ mod tests {
                 memory_mb: 100.0,
             }),
             stats_history: vec![(10.0, 100.0)],
+            sandboxed: false,
         });
 
         // Simulate a workflow step transition reporting a new container name.
@@ -959,6 +968,7 @@ mod tests {
                 memory_mb: 256.0,
             }),
             stats_history: Vec::new(),
+            sandboxed: false,
         });
 
         let title = crate::frontend::tui::container_view::build_stats_title_for_test(tab);

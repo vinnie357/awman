@@ -9,7 +9,6 @@ use crate::data::fs::SandboxKitPaths;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::error::EngineError;
 
-use super::auth::inject_credentials;
 use super::kit::DSbxKitEmitter;
 use super::spawn::SbxCommand;
 
@@ -18,15 +17,17 @@ fn emit(sink: &mut dyn UserMessageSink, level: MessageLevel, text: String) {
 }
 
 /// Prepare the sbx runtime for a single agent: check the binary + login, emit
-/// the kit, register credentials, and validate the kit. Returns an error for
-/// launch-blocking failures (missing binary, kit emission failure, credential
-/// registration failure, kit validation failure); soft issues (not logged in,
-/// missing `kit validate` subcommand) are surfaced as warnings and do not
-/// abort. `no_cache` removes the agent's existing awman sandboxes first so the
-/// next launch re-runs the kit install.
+/// the kit, and validate it. Returns an error for launch-blocking failures
+/// (missing binary, kit emission failure, kit validation failure); soft
+/// issues (not logged in, missing `kit validate` subcommand) are surfaced as
+/// warnings and do not abort. `no_cache` removes the agent's existing awman
+/// sandboxes first so the next launch re-runs the kit install.
+///
+/// No credentials are registered here: all `sbx secret set` calls are
+/// sandbox-scoped and happen at agent-launch time (`run_interactive`), so the
+/// sandbox exists to scope to and rotated keys apply per launch.
 pub(in crate::engine::sandbox) fn ready_agent(
     agent: &str,
-    credentials: &[(String, String)],
     no_cache: bool,
     sink: &mut dyn UserMessageSink,
 ) -> Result<(), EngineError> {
@@ -77,19 +78,21 @@ pub(in crate::engine::sandbox) fn ready_agent(
     );
     DSbxKitEmitter::new().emit_for_agent(agent, &kit_dir)?;
 
-    // 5. Register credentials (`sbx secret set`, announced + redacted).
-    inject_credentials(credentials, sink)?;
-
-    // 6. Validate the kit. A real validation failure is surfaced verbatim
+    // 5. Validate the kit. A real validation failure is surfaced verbatim
     //    with the kit path and fails loudly (WI 0090); only an sbx build that
     //    lacks the `kit validate` subcommand is soft-skipped.
     let kit_dir_str = kit_dir.display().to_string();
     if let Err(e) = SbxCommand::new(["kit", "validate", &kit_dir_str]).run_announced(sink) {
         let msg = e.to_string();
         let lower = msg.to_lowercase();
-        let subcommand_missing = ["unknown command", "unknown subcommand", "unrecognized", "no such command"]
-            .iter()
-            .any(|needle| lower.contains(needle));
+        let subcommand_missing = [
+            "unknown command",
+            "unknown subcommand",
+            "unrecognized",
+            "no such command",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
         if subcommand_missing {
             emit(
                 sink,
@@ -106,7 +109,7 @@ pub(in crate::engine::sandbox) fn ready_agent(
         }
     }
 
-    // 7. Networking note — raw TCP/UDP is blocked by default.
+    // 6. Networking note — raw TCP/UDP is blocked by default.
     emit(
         sink,
         MessageLevel::Info,

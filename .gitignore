@@ -22,7 +22,9 @@ target
 
 .DS_Store
 .claude/worktrees
-.amux/workflows
+.awman/workflows
+.awman/session.json
 .cargo
 .antigravitycli
+.crush
 

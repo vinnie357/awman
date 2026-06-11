@@ -8,8 +8,8 @@ use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::{MountScope, MountScopeFrontend};
 use crate::command::commands::Command;
 use crate::command::commands::{
-    collect_all_overlay_specs, parse_overlay_list, resolve_agent, resolve_context_overlays,
-    warn_legacy_config,
+    collect_all_overlay_specs, parse_overlay_list, report_session_end, resolve_agent,
+    resolve_context_overlays, warn_legacy_config,
 };
 use crate::command::dispatch::Engines;
 use crate::command::error::CommandError;
@@ -306,10 +306,7 @@ impl Command for ChatCommand {
         frontend.set_pty_active(false);
         frontend.replay_queued();
 
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: "Agent session ended".into(),
-        });
+        report_session_end(frontend.as_mut(), "chat", &exit);
 
         let exit_code = exit.map(|e| e.exit_code).ok();
         Ok(ChatOutcome {

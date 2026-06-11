@@ -22,8 +22,8 @@
 use awman::data::config::global::GlobalConfig;
 use awman::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use awman::engine::agent_runtime::AgentRuntimeEngine;
-use awman::engine::sandbox::{SandboxRuntime, generate_sandbox_name};
 use awman::engine::error::EngineError;
+use awman::engine::sandbox::{generate_sandbox_name, SandboxRuntime};
 
 // ─── Guard helper ─────────────────────────────────────────────────────────────
 
@@ -115,8 +115,15 @@ fn sbx_kit_validate_passes_for_all_agents() {
     }
 
     let agents = [
-        "claude", "codex", "gemini", "copilot", "opencode",
-        "antigravity", "crush", "maki", "cline",
+        "claude",
+        "codex",
+        "gemini",
+        "copilot",
+        "opencode",
+        "antigravity",
+        "crush",
+        "maki",
+        "cline",
     ];
     let mut sink = VecSink::default();
 
@@ -125,7 +132,7 @@ fn sbx_kit_validate_passes_for_all_agents() {
         // Errors from binary/login checks are OK for kit-validate purposes
         // since we re-check sbx_on_path() above.
         // ready_sbx_agent emits the kit and validates it internally.
-        let _ = awman::engine::sandbox::ready_sbx_agent(agent, &[], false, &mut sink);
+        let _ = awman::engine::sandbox::ready_sbx_agent(agent, false, &mut sink);
 
         // If the kit dir exists (emit succeeded), run the validator.
         // The kit_dir is under $HOME/.awman/kits/<agent>/ in production; in
@@ -134,7 +141,9 @@ fn sbx_kit_validate_passes_for_all_agents() {
     }
 
     // Verify no Error-level messages from ready_sbx_agent for kit emission itself.
-    let errors: Vec<_> = sink.0.iter()
+    let errors: Vec<_> = sink
+        .0
+        .iter()
         .filter(|m| m.level == MessageLevel::Error)
         .collect();
     for e in &errors {
@@ -190,8 +199,14 @@ fn sandbox_naming_is_deterministic_across_calls() {
 fn sandbox_name_encodes_both_hash_and_agent() {
     let name = generate_sandbox_name("deadbeef", "gemini");
     assert!(name.starts_with("awman-"), "name must start with awman-");
-    assert!(name.contains("deadbeef"), "name must contain the worktree hash");
-    assert!(name.ends_with("-gemini"), "name must end with the agent name");
+    assert!(
+        name.contains("deadbeef"),
+        "name must contain the worktree hash"
+    );
+    assert!(
+        name.ends_with("-gemini"),
+        "name must end with the agent name"
+    );
 }
 
 // ─── Runtime detection (host-side, always runs) ───────────────────────────────
@@ -256,7 +271,14 @@ fn exec_prompt_non_interactive_sbx_does_not_return_not_implemented() {
     std::fs::write(tmp_config.path().join("config.json"), config_content).unwrap();
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
-        .args(["exec", "prompt", "--agent", "claude", "--non-interactive", "hello from test"])
+        .args([
+            "exec",
+            "prompt",
+            "--agent",
+            "claude",
+            "--non-interactive",
+            "hello from test",
+        ])
         .current_dir(tmp_root.path())
         .env("AWMAN_CONFIG_HOME", tmp_config.path())
         .output()
@@ -336,11 +358,7 @@ fn workflow_two_step_sbx_does_not_error_with_not_implemented() {
     std::fs::write(&workflow_path, workflow_yaml).unwrap();
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
-        .args([
-            "exec",
-            "workflow",
-            workflow_path.to_str().unwrap(),
-        ])
+        .args(["exec", "workflow", workflow_path.to_str().unwrap()])
         .current_dir(tmp_root.path())
         .env("AWMAN_CONFIG_HOME", tmp_config.path())
         .output()
@@ -425,7 +443,14 @@ fn runtime_switching_docker_sbx_docker_real_launch_paths() {
         let config = format!(r#"{{"runtime":"{runtime}","default_agent":"claude"}}"#);
         std::fs::write(tmp_config.path().join("config.json"), config).unwrap();
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_awman"))
-            .args(["exec", "prompt", "--agent", "claude", "--non-interactive", "ping"])
+            .args([
+                "exec",
+                "prompt",
+                "--agent",
+                "claude",
+                "--non-interactive",
+                "ping",
+            ])
             .current_dir(tmp_root.path())
             .env("AWMAN_CONFIG_HOME", tmp_config.path())
             .output()

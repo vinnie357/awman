@@ -351,11 +351,9 @@ impl Command for ExecPromptCommand {
         frontend.set_pty_active(false);
         frontend.replay_queued();
 
+        crate::command::commands::report_session_end(frontend.as_mut(), "exec prompt", &exit);
+
         let exit_code = exit.map(|e| e.exit_code).ok();
-        frontend.write_message(UserMessage {
-            level: MessageLevel::Info,
-            text: "Agent session ended".into(),
-        });
         Ok(ExecPromptOutcome {
             agent: Some(agent.as_str().to_string()),
             exit_code,

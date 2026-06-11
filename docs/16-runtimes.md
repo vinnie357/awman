@@ -87,7 +87,7 @@ The VM's private Docker daemon supports Docker-in-Docker, so agents that need to
 | Host escape requires | Container escape | Hypervisor CVE | Hypervisor CVE |
 | Image model | Build from `Dockerfile.<agent>` | Same | Kit YAML — no custom OCI build or registry push |
 | Volume mounts | `-v` bind mounts | `-v` bind mounts | virtiofs; workspace appears at the same absolute path inside VM |
-| Env vars | `-e` flag or env file | Same | Via kit credentials block + `sbx secret set` (not inherited from host shell) |
+| Env vars | `-e` flag or env file | Same | Credentials via `sbx secret set` + the credential proxy (not inherited from host shell) |
 | Networking | Host bridge or NAT | Per-container network | All traffic through HTTP/HTTPS proxy; raw TCP/UDP blocked |
 | Startup time | Milliseconds | ~1 second | 2–5 seconds cold (first launch per worktree) + startup script; subsequent restarts are faster |
 | Stats | `docker stats` | `container stats` | Status only — no per-resource CPU/memory metrics |
@@ -121,8 +121,9 @@ awman ready
 `awman ready` for the sbx runtime:
 - Verifies that `sbx` is on your PATH and that you are logged in.
 - Emits per-agent kit files to `~/.awman/kits/<agent>/` for every configured agent.
-- Registers your API credentials with `sbx secret set` for each recognized service (Anthropic, OpenAI, GitHub, Google, AWS, Groq, Mistral).
 - Validates each kit with `sbx kit validate`.
+
+No credentials are registered at ready time — all secret registration happens at agent launch, scoped to the launched sandbox. See [Credentials](#credentials) below.
 
 No images are built and nothing is pushed to a registry. `awman ready` for sbx is fast: kit emission and credential registration are text-file writes and short subprocess calls.
 
@@ -159,7 +160,7 @@ Unlike Docker and Apple Containers, sbx sandboxes **persist between sessions**. 
 awman chat claude          # sbx creates the sandbox, installs the agent (one-time), attaches
 ```
 
-awman runs `sbx run --kit ~/.awman/kits/claude --name awman-<hash>-claude --workspace-dir <worktree> claude`.
+awman runs `sbx create --kit ~/.awman/kits/claude --name awman-<hash>-claude claude <worktree>` (the worktree is the positional workspace path; it appears inside the VM at the identical absolute path), registers any sandbox-scoped secrets (see [Credentials](#credentials)), then attaches with `sbx run awman-<hash>-claude`.
 
 **Subsequent launches (same worktree):**
 
@@ -167,7 +168,7 @@ awman runs `sbx run --kit ~/.awman/kits/claude --name awman-<hash>-claude --work
 awman chat claude          # sbx restarts the existing sandbox, re-runs startup script, attaches
 ```
 
-awman runs `sbx run --name awman-<hash>-claude claude` (no `--kit` flag — the installed state is preserved).
+awman re-registers the sandbox-scoped secrets (so rotated keys apply) and runs `sbx run awman-<hash>-claude` (the existing sandbox is addressed by its positional name — `--name` is only valid when creating a new sandbox — and no `--kit` flag is passed, so the installed state is preserved).
 
 **Teardown:**
 
@@ -192,21 +193,35 @@ sbx ls                     # shows all sandboxes including non-awman ones
 
 ### Credentials
 
-awman registers credentials with `sbx secret set` during `awman ready`. Registered secrets are auto-injected into the VM at launch by `sbx` — you do not need to pass any credential flags at `awman chat` time.
+The supported way to authenticate an sbx-backed agent is an `env(VAR)` overlay at launch time. Set the provider API key in your shell, then request it as an overlay:
 
-Supported services and the environment variables awman maps to them:
+```sh
+export ANTHROPIC_API_KEY=sk-ant-...
+awman chat claude --overlay 'env(ANTHROPIC_API_KEY)'
+```
 
-| Environment variable | sbx service |
-|---|---|
-| `ANTHROPIC_API_KEY` | `anthropic` |
-| `OPENAI_API_KEY` | `openai` |
-| `GH_TOKEN` / `GITHUB_TOKEN` | `github` |
-| `GEMINI_API_KEY` | `google` |
-| `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` | `aws` |
-| `GROQ_API_KEY` | `groq` |
-| `MISTRAL_API_KEY` | `mistral` |
+At agent launch (not `awman ready`), awman reads the value from your shell environment and registers it with a **sandbox-scoped** `sbx secret set <sandbox> <service>`, so the sbx host proxy is authenticated by the time the agent starts. On first launch awman creates the sandbox first (`sbx create --kit …`), sets the scoped secrets, then attaches with `sbx run <sandbox>`. awman never sets global (`-g`) secrets: scoped secrets take effect immediately (global ones only apply at sandbox creation), your keys never leak into sandboxes awman doesn't manage, and removing a sandbox removes its secrets with it. Because rotated keys are re-registered on every launch, you never need to re-run `awman ready` after changing a key.
 
-Credentials are piped to `sbx secret set` via stdin — they never appear in process listings or log output. If awman cannot find a required credential, it warns at launch time rather than silently starting a sandbox that will fail.
+Each agent accepts a specific allowlist of auth variables (matching the [Docker Sandboxes credential services](https://docs.docker.com/ai/sandboxes/security/credentials/)):
+
+| Agent | Supported env vars | sbx service |
+|---|---|---|
+| `claude` | `ANTHROPIC_API_KEY` | `anthropic` |
+| `codex` | `OPENAI_API_KEY` | `openai` |
+| `gemini` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | `google` |
+| `copilot` | `GH_TOKEN` or `GITHUB_TOKEN` | `github` |
+| `opencode` | `ANTHROPIC_API_KEY` | `anthropic` |
+
+Rules:
+
+- An `env(VAR)` overlay for a credential-class variable **not** on the agent's allowlist is dropped with a warning (it is never written anywhere workspace-readable).
+- Launching with no supported auth overlay prints a warning that auth must be configured manually (`sbx secret set <sandbox> <service>` — sandbox-scoped secrets apply immediately, even to a running sandbox) or via the agent's own login flow inside the sandbox — the launch still proceeds.
+- Custom-kit agents (`antigravity`, `crush`, `maki`, `cline`) do not participate in launch-time auto-auth yet; register their credentials manually with `sbx secret set`.
+- Non-credential `env(VAR)` overlays (e.g. `LOG_LEVEL`) are unaffected — they reach the agent through `session.json` as before.
+
+Credentials are piped to `sbx secret set` via stdin — they never appear in process listings, and they are masked in all awman output.
+
+**Claude subscription tokens:** Docker Sandboxes does not yet support `CLAUDE_CODE_OAUTH_TOKEN` (the token from `claude setup-token`), so awman cannot register it with `sbx secret set` and warns instead. To use Claude Code under the sbx runtime, either set `ANTHROPIC_API_KEY`, or run `/login` inside the sandbox on first launch — the sbx credential proxy completes the OAuth flow and keeps the resulting token on the host.
 
 Non-credential config (model selection, mode flags, system prompts, tool lists) is written to `<workspace>/.awman/session.json` before each launch and read by the startup script inside the VM. Credential values are never written to `session.json`.
 
@@ -294,6 +309,13 @@ The kit on disk was emitted by an older version of awman. Run `awman ready` to r
 awman: sbx kit validate failed for ~/.awman/kits/claude: <error from sbx>
 ```
 The error text from `sbx kit validate` is printed verbatim. Common causes are a stale `sbx` binary (upgrade it) or a network issue during template pull. Run `awman ready --no-cache` to force a clean re-emit.
+
+**Launch failure:**
+```
+sbx exited with code 1; last output:
+ERROR: failed to create sandbox: <error from sbx>
+```
+When `sbx run` exits non-zero, awman replays the tail of sbx's output into the execution window alongside the exit code, so the failure is diagnosable without re-running the announced `sbx` command by hand.
 
 ---
 

@@ -19,6 +19,87 @@ use crate::engine::error::EngineError;
 /// both reach it.
 pub(super) type PtyMaster = Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>;
 
+/// Cap on captured output bytes — enough to hold sbx launch diagnostics
+/// (kit compose errors, login prompts) without retaining a whole session.
+const CAPTURE_CAP: usize = 16 * 1024;
+
+/// Bounded capture of the most recent agent output bytes, shared between the
+/// bridge reader threads and the execution backend so a non-zero exit can
+/// replay what sbx printed into the message sink.
+#[derive(Default)]
+pub(super) struct OutputCapture {
+    buf: Vec<u8>,
+}
+
+impl OutputCapture {
+    pub(super) fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+        if self.buf.len() > CAPTURE_CAP {
+            let excess = self.buf.len() - CAPTURE_CAP;
+            self.buf.drain(..excess);
+        }
+    }
+
+    /// The last `max` non-empty output lines, terminal control sequences
+    /// stripped so PTY output reads as plain message text.
+    pub(super) fn tail_lines(&self, max: usize) -> Vec<String> {
+        let text = strip_control_sequences(&String::from_utf8_lossy(&self.buf));
+        let lines: Vec<String> = text
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect();
+        let skip = lines.len().saturating_sub(max);
+        lines[skip..].to_vec()
+    }
+}
+
+/// Remove ANSI escape sequences (CSI/OSC) and non-printing control bytes,
+/// keeping newlines and tabs.
+fn strip_control_sequences(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                // CSI: parameters/intermediates until a final byte in @..~.
+                Some('[') => {
+                    for n in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: terminated by BEL or ESC \.
+                Some(']') => {
+                    while let Some(n) = chars.next() {
+                        if n == '\u{07}' {
+                            break;
+                        }
+                        if n == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Two-character escape — drop both.
+                _ => {}
+            },
+            '\r' => {}
+            c if c.is_control() && c != '\n' && c != '\t' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Artifacts the launch path stores for the execution lifetime.
 pub(super) struct SandboxBridge {
     /// Sender feeding the stdin writer task; the engine keeps a clone for
@@ -26,6 +107,8 @@ pub(super) struct SandboxBridge {
     pub stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// Broadcast sender for stuck events, stored in `AgentExecution`.
     pub stuck_tx: Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
+    /// Tail of everything the agent wrote, for failure reporting on exit.
+    pub output: Arc<Mutex<OutputCapture>>,
 }
 
 fn new_stuck_tx() -> Arc<tokio::sync::broadcast::Sender<StuckEvent>> {
@@ -50,9 +133,12 @@ pub(super) fn bridge_pty(
         .take_writer()
         .map_err(|e| EngineError::Sandbox(format!("take sbx pty writer: {e}")))?;
 
+    let output: Arc<Mutex<OutputCapture>> = Arc::default();
+
     // Reader thread: PTY → stdout channel. Keep draining even if the sink dies
     // so the VM is never backpressured by a dead frontend.
     let stdout_tx = io.stdout;
+    let capture = Arc::clone(&output);
     std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = [0u8; 4096];
@@ -61,6 +147,9 @@ pub(super) fn bridge_pty(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    if let Ok(mut cap) = capture.lock() {
+                        cap.push(&buf[..n]);
+                    }
                     if sink_open && stdout_tx.send(buf[..n].to_vec()).is_err() {
                         sink_open = false;
                     }
@@ -105,14 +194,18 @@ pub(super) fn bridge_pty(
         SandboxBridge {
             stdin_injector: stdin_tx,
             stuck_tx: new_stuck_tx(),
+            output,
         },
     ))
 }
 
 /// Bridge a piped child process to the frontend's `AgentIo` channels.
 pub(super) fn bridge_piped(io: AgentIo, child: &mut std::process::Child) -> SandboxBridge {
+    let output: Arc<Mutex<OutputCapture>> = Arc::default();
+
     if let Some(child_stdout) = child.stdout.take() {
         let stdout_tx = io.stdout;
+        let capture = Arc::clone(&output);
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stdout;
@@ -122,6 +215,9 @@ pub(super) fn bridge_piped(io: AgentIo, child: &mut std::process::Child) -> Sand
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        if let Ok(mut cap) = capture.lock() {
+                            cap.push(&buf[..n]);
+                        }
                         if sink_open && stdout_tx.send(buf[..n].to_vec()).is_err() {
                             sink_open = false;
                         }
@@ -133,6 +229,7 @@ pub(super) fn bridge_piped(io: AgentIo, child: &mut std::process::Child) -> Sand
 
     if let Some(child_stderr) = child.stderr.take() {
         let stderr_tx = io.stderr;
+        let capture = Arc::clone(&output);
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stderr;
@@ -142,6 +239,9 @@ pub(super) fn bridge_piped(io: AgentIo, child: &mut std::process::Child) -> Sand
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        if let Ok(mut cap) = capture.lock() {
+                            cap.push(&buf[..n]);
+                        }
                         if sink_open && stderr_tx.send(buf[..n].to_vec()).is_err() {
                             sink_open = false;
                         }
@@ -168,5 +268,47 @@ pub(super) fn bridge_piped(io: AgentIo, child: &mut std::process::Child) -> Sand
     SandboxBridge {
         stdin_injector: stdin_tx,
         stuck_tx: new_stuck_tx(),
+        output,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_is_bounded_and_keeps_the_newest_bytes() {
+        let mut cap = OutputCapture::default();
+        cap.push(&vec![b'a'; CAPTURE_CAP]);
+        cap.push(b"\nthe end\n");
+        assert!(cap.len() <= CAPTURE_CAP, "capture must stay bounded");
+        let tail = cap.tail_lines(1);
+        assert_eq!(tail, vec!["the end"], "newest bytes must survive the cap");
+    }
+
+    #[test]
+    fn tail_lines_returns_last_n_non_empty_lines() {
+        let mut cap = OutputCapture::default();
+        cap.push(b"one\n\ntwo\n   \nthree\n");
+        assert_eq!(cap.tail_lines(2), vec!["two", "three"]);
+        assert_eq!(cap.tail_lines(10), vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn tail_lines_strips_ansi_and_control_sequences() {
+        let mut cap = OutputCapture::default();
+        cap.push(b"\x1b[31mERROR:\x1b[0m boom\r\n");
+        cap.push(b"\x1b]0;window title\x07plain after osc\r\n");
+        assert_eq!(cap.tail_lines(10), vec!["ERROR: boom", "plain after osc"]);
+    }
+
+    #[test]
+    fn strip_control_sequences_keeps_tabs_and_newlines() {
+        assert_eq!(strip_control_sequences("a\tb\nc\x07d"), "a\tb\ncd");
+    }
+
+    #[test]
+    fn tail_lines_empty_capture_is_empty() {
+        assert!(OutputCapture::default().tail_lines(5).is_empty());
     }
 }

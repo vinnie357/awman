@@ -17,7 +17,7 @@ This means a misbehaving agent can't access your SSH keys, can't run arbitrary c
 
 **Docker / Apple Containers:** agents run in a Linux container or lightweight VM respectively. The container is removed (`--rm`) when the session ends. Credentials are injected as environment variables.
 
-**Docker Sandboxes (`docker-sbx-experimental`):** agents run in a dedicated microVM with its own kernel, private Docker daemon, and private filesystem. Host escape requires a hypervisor exploit rather than a container escape. Sandboxes persist between sessions (state survives `sbx stop`); awman runs `sbx rm` only on explicit teardown. Credentials are registered with `sbx secret set` and injected at VM boot. See [Runtimes](16-runtimes.md#docker-sandboxes-experimental) for setup and limitations.
+**Docker Sandboxes (`docker-sbx-experimental`):** agents run in a dedicated microVM with its own kernel, private Docker daemon, and private filesystem. Host escape requires a hypervisor exploit rather than a container escape. Sandboxes persist between sessions (state survives `sbx stop`); awman runs `sbx rm` only on explicit teardown. Credentials are registered at agent launch with sandbox-scoped `sbx secret set` calls (never global), so removing a sandbox removes its secrets with it. See [Runtimes](16-runtimes.md#docker-sandboxes-experimental) for setup and limitations.
 
 ### Transparency
 
@@ -31,7 +31,9 @@ $ docker run --rm -it -v /home/user/myproject:/workspace -w /workspace \
 For Docker Sandboxes, every `sbx` invocation is announced the same way:
 
 ```
-Running: sbx run --kit ~/.awman/kits/claude --name awman-ab12-claude --workspace-dir /home/user/myproject claude
+Running: sbx create --kit ~/.awman/kits/claude --name awman-ab12-claude claude /home/user/myproject
+Running: sbx secret set awman-ab12-claude anthropic (value piped via stdin)
+Running: sbx run awman-ab12-claude
 ```
 
 Credential values are masked, but everything else is visible. You can always see exactly what awman is doing.

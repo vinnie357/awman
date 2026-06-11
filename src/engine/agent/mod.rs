@@ -458,9 +458,7 @@ impl AgentEngine {
             options.push(SandboxOption::AllowedTools(run.allowed_tools.clone()));
         }
         if !run.disallowed_tools.is_empty() {
-            options.push(SandboxOption::DisallowedTools(
-                run.disallowed_tools.clone(),
-            ));
+            options.push(SandboxOption::DisallowedTools(run.disallowed_tools.clone()));
         }
 
         // Env passthrough. Credential-class names are filtered out of the
@@ -1444,11 +1442,13 @@ mod tests {
             "AgentId(\"claude\") must be present; got {opts:?}"
         );
         assert!(
-            opts.iter().any(|o| matches!(o, SandboxOption::WorkspaceDir(_))),
+            opts.iter()
+                .any(|o| matches!(o, SandboxOption::WorkspaceDir(_))),
             "WorkspaceDir must be present; got {opts:?}"
         );
         assert!(
-            opts.iter().any(|o| matches!(o, SandboxOption::Interactive(_))),
+            opts.iter()
+                .any(|o| matches!(o, SandboxOption::Interactive(_))),
             "Interactive must be present; got {opts:?}"
         );
     }
@@ -1458,8 +1458,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = make_agent_engine(tmp.path());
         let agent = crate::data::session::AgentName::new("claude").unwrap();
-        let run = AgentRunOptions { non_interactive: true, ..Default::default() };
-        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let run = AgentRunOptions {
+            non_interactive: true,
+            ..Default::default()
+        };
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
         let interactive_val = opts
             .iter()
             .find_map(|o| {
@@ -1470,7 +1475,10 @@ mod tests {
                 }
             })
             .expect("Interactive option must be present");
-        assert!(!interactive_val, "Interactive must be false for non_interactive=true");
+        assert!(
+            !interactive_val,
+            "Interactive must be false for non_interactive=true"
+        );
     }
 
     #[test]
@@ -1482,7 +1490,9 @@ mod tests {
             initial_prompt: Some("do something useful".into()),
             ..Default::default()
         };
-        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
         let prompt_count = opts
             .iter()
             .filter(|o| matches!(o, SandboxOption::SeededPrompt(_)))
@@ -1516,9 +1526,12 @@ mod tests {
             model: Some("claude-opus-4-8".into()),
             ..Default::default()
         };
-        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
         assert!(
-            opts.iter().any(|o| matches!(o, SandboxOption::Model { .. })),
+            opts.iter()
+                .any(|o| matches!(o, SandboxOption::Model { .. })),
             "Model option must be present when run.model is Some; got {opts:?}"
         );
     }
@@ -1532,7 +1545,9 @@ mod tests {
             allowed_tools: vec!["Bash".into(), "Read".into()],
             ..Default::default()
         };
-        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
         let found = opts.iter().any(|o| {
             if let SandboxOption::AllowedTools(tools) = o {
                 tools.contains(&"Bash".to_string()) && tools.contains(&"Read".to_string())
@@ -1540,7 +1555,10 @@ mod tests {
                 false
             }
         });
-        assert!(found, "AllowedTools must contain the requested tools; got {opts:?}");
+        assert!(
+            found,
+            "AllowedTools must contain the requested tools; got {opts:?}"
+        );
     }
 
     #[test]
@@ -1552,7 +1570,9 @@ mod tests {
             disallowed_tools: vec!["Write".into()],
             ..Default::default()
         };
-        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
         let found = opts.iter().any(|o| {
             if let SandboxOption::DisallowedTools(tools) = o {
                 tools.contains(&"Write".to_string())
@@ -1560,7 +1580,10 @@ mod tests {
                 false
             }
         });
-        assert!(found, "DisallowedTools must contain the requested tools; got {opts:?}");
+        assert!(
+            found,
+            "DisallowedTools must contain the requested tools; got {opts:?}"
+        );
     }
 
     #[test]
@@ -1572,7 +1595,9 @@ mod tests {
             env_passthrough: Some(vec!["LOG_LEVEL".into(), "DEBUG".into()]),
             ..Default::default()
         };
-        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
         let pass_names: Vec<_> = opts
             .iter()
             .filter_map(|o| {
@@ -1659,9 +1684,12 @@ mod tests {
             system_prompt: Some("focus on performance".into()),
             ..Default::default()
         };
-        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
         assert!(
-            opts.iter().any(|o| matches!(o, SandboxOption::SystemPromptInline { .. })),
+            opts.iter()
+                .any(|o| matches!(o, SandboxOption::SystemPromptInline { .. })),
             "SystemPromptInline must be present for claude system_prompt; got {opts:?}"
         );
         // No file-based delivery — sandbox VMs don't have arbitrary host mounts.
@@ -1685,7 +1713,9 @@ mod tests {
             system_prompt: Some("focus on tests".into()),
             ..Default::default()
         };
-        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
         let inline = opts
             .iter()
             .find_map(|o| {
@@ -1710,7 +1740,9 @@ mod tests {
             system_prompt: Some("focus on tests".into()),
             ..Default::default()
         };
-        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
         assert!(
             opts.iter().any(|o| matches!(
                 o,
@@ -1739,7 +1771,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
         assert!(
             opts.iter().any(|o| matches!(
                 o,
@@ -1756,10 +1790,18 @@ mod tests {
         let (engine, session) = make_agent_engine(tmp.path());
         let agent = crate::data::session::AgentName::new("claude").unwrap();
         for run in [
-            AgentRunOptions { include_all_skills: true, ..Default::default() },
-            AgentRunOptions { named_skills: vec!["review".into()], ..Default::default() },
+            AgentRunOptions {
+                include_all_skills: true,
+                ..Default::default()
+            },
+            AgentRunOptions {
+                named_skills: vec!["review".into()],
+                ..Default::default()
+            },
         ] {
-            let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+            let opts = engine
+                .build_sandbox_options(&session, &agent, &run)
+                .unwrap();
             assert!(
                 opts.iter().any(|o| matches!(
                     o,
@@ -1784,7 +1826,9 @@ mod tests {
             }],
             ..Default::default()
         };
-        let opts = engine.build_sandbox_options(&session, &agent, &run).unwrap();
+        let opts = engine
+            .build_sandbox_options(&session, &agent, &run)
+            .unwrap();
         assert!(
             opts.iter().any(|o| matches!(
                 o,
@@ -1869,9 +1913,7 @@ mod tests {
         ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
             Ok(vec![])
         }
-        fn list_running_all(
-            &self,
-        ) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
+        fn list_running_all(&self) -> Result<Vec<crate::data::session::AgentHandle>, EngineError> {
             Ok(vec![])
         }
         fn stats(
@@ -1887,13 +1929,7 @@ mod tests {
         fn stop(&self, _: &crate::data::session::AgentHandle) -> Result<(), EngineError> {
             Ok(())
         }
-        fn exec_args(
-            &self,
-            _: &str,
-            _: &str,
-            _: &[&str],
-            _: &[(&str, &str)],
-        ) -> Vec<String> {
+        fn exec_args(&self, _: &str, _: &str, _: &[&str], _: &[(&str, &str)]) -> Vec<String> {
             vec![]
         }
         fn cli_binary(&self) -> &'static str {
@@ -1907,10 +1943,20 @@ mod tests {
         let (engine, session) = make_agent_engine(tmp.path());
         let agent = crate::data::session::AgentName::new("claude").unwrap();
         let fake_sbx = FakeRuntime::sandbox();
-        let result =
-            engine.resolve_agent_options(&session, &agent, &AgentRunOptions::default(), &[], &fake_sbx);
+        let result = engine.resolve_agent_options(
+            &session,
+            &agent,
+            &AgentRunOptions::default(),
+            &[],
+            &fake_sbx,
+        );
         assert!(
-            matches!(result, Ok(crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(_))),
+            matches!(
+                result,
+                Ok(crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(
+                    _
+                ))
+            ),
             "kit_declarative runtime must yield Sandbox variant; got {result:?}"
         );
     }
@@ -1945,11 +1991,19 @@ mod tests {
         let fake_sbx = FakeRuntime::sandbox();
         let creds = vec![("ANTHROPIC_API_KEY".to_string(), "sk-secret".to_string())];
         let result = engine
-            .resolve_agent_options(&session, &agent, &AgentRunOptions::default(), &creds, &fake_sbx)
+            .resolve_agent_options(
+                &session,
+                &agent,
+                &AgentRunOptions::default(),
+                &creds,
+                &fake_sbx,
+            )
             .unwrap();
         if let crate::engine::agent_runtime::ResolvedAgentOptions::Sandbox(resolved) = result {
             assert!(
-                resolved.agent_credentials.contains(&("ANTHROPIC_API_KEY".into(), "sk-secret".into())),
+                resolved
+                    .agent_credentials
+                    .contains(&("ANTHROPIC_API_KEY".into(), "sk-secret".into())),
                 "credential must appear in agent_credentials; got {:?}",
                 resolved.agent_credentials
             );
@@ -1979,7 +2033,10 @@ mod tests {
             // values in the session config (they are filtered by DSbxSessionConfig).
             // The agent_credentials field must carry the credential pair.
             assert!(
-                resolved.agent_credentials.iter().any(|(k, _)| k == "ANTHROPIC_API_KEY"),
+                resolved
+                    .agent_credentials
+                    .iter()
+                    .any(|(k, _)| k == "ANTHROPIC_API_KEY"),
                 "ANTHROPIC_API_KEY must appear in agent_credentials; got {:?}",
                 resolved.agent_credentials
             );
@@ -2022,7 +2079,10 @@ mod tests {
         };
 
         // Agent id.
-        assert_eq!(sbx_opts.agent_id, "claude", "sandbox agent_id must be claude");
+        assert_eq!(
+            sbx_opts.agent_id, "claude",
+            "sandbox agent_id must be claude"
+        );
 
         // Seeded prompt is present in sandbox.
         assert_eq!(

@@ -62,7 +62,12 @@ pub fn render_container_maximized(
         .as_ref()
         .map(|i| i.agent_display_name.as_str())
         .unwrap_or("Agent");
-    let left_title = format!(" \u{1F512} {} (containerized) ", agent_name);
+    let runtime_label = if tab.container_info.as_ref().is_some_and(|i| i.sandboxed) {
+        "sandboxed"
+    } else {
+        "containerized"
+    };
+    let left_title = format!(" \u{1F512} {} ({}) ", agent_name, runtime_label);
     let right_title = build_stats_title(tab);
 
     let mut block = Block::default()

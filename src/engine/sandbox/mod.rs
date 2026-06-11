@@ -28,9 +28,8 @@ pub use runtime::SandboxRuntime;
 /// clean state.
 pub fn ready_sbx_agent(
     agent: &str,
-    credentials: &[(String, String)],
     no_cache: bool,
     sink: &mut dyn crate::data::message::UserMessageSink,
 ) -> Result<(), crate::engine::error::EngineError> {
-    dsbx::ready_agent(agent, credentials, no_cache, sink)
+    dsbx::ready_agent(agent, no_cache, sink)
 }

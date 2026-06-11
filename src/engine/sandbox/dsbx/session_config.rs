@@ -30,10 +30,7 @@ impl DSbxSessionConfig {
     /// credential-exclusion invariant can be asserted directly.
     pub(super) fn build_value(options: &ResolvedSandboxOptions) -> Value {
         let mut root = Map::new();
-        root.insert(
-            "schema_version".into(),
-            json!(SESSION_SCHEMA_VERSION),
-        );
+        root.insert("schema_version".into(), json!(SESSION_SCHEMA_VERSION));
         root.insert("agent".into(), json!(options.agent_id));
         root.insert("interactive".into(), json!(options.interactive));
 
@@ -98,7 +95,13 @@ impl DSbxSessionConfig {
         // AgentSettingsPassthrough analogue). These are not credentials.
         root.insert(
             "agent_settings".into(),
-            Value::Object(options.agent_settings.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            Value::Object(
+                options
+                    .agent_settings
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            ),
         );
 
         Value::Object(root)
@@ -124,7 +127,7 @@ impl DSbxSessionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::container::options::{EnvLiteral, Entrypoint, ModelFlagForm};
+    use crate::engine::container::options::{Entrypoint, EnvLiteral, ModelFlagForm};
     use crate::engine::sandbox::options::SandboxOption;
     use std::path::PathBuf;
 
@@ -136,9 +139,8 @@ mod tests {
 
     #[test]
     fn includes_schema_and_agent() {
-        let v = DSbxSessionConfig::build_value(&resolve(vec![SandboxOption::AgentId(
-            "claude".into(),
-        )]));
+        let v =
+            DSbxSessionConfig::build_value(&resolve(vec![SandboxOption::AgentId("claude".into())]));
         assert_eq!(v["schema_version"], json!(1));
         assert_eq!(v["agent"], json!("claude"));
     }
@@ -163,7 +165,10 @@ mod tests {
             }),
         ]));
         let env = &v["env_config"];
-        assert!(env.get("ANTHROPIC_API_KEY").is_none(), "credential must be excluded");
+        assert!(
+            env.get("ANTHROPIC_API_KEY").is_none(),
+            "credential must be excluded"
+        );
         assert_eq!(env["LOG_LEVEL"], json!("debug"));
         let serialized = serde_json::to_string(&v).unwrap();
         assert!(!serialized.contains("sk-secret"));
@@ -184,10 +189,12 @@ mod tests {
         ];
         let opts: Vec<SandboxOption> = cred_vars
             .iter()
-            .map(|k| SandboxOption::EnvLiteral(EnvLiteral {
-                key: k.to_string(),
-                value: "secret-value".into(),
-            }))
+            .map(|k| {
+                SandboxOption::EnvLiteral(EnvLiteral {
+                    key: k.to_string(),
+                    value: "secret-value".into(),
+                })
+            })
             .collect();
         let v = DSbxSessionConfig::build_value(&resolve(opts));
         let env = &v["env_config"];
@@ -198,7 +205,10 @@ mod tests {
             );
         }
         let serialized = serde_json::to_string(&v).unwrap();
-        assert!(!serialized.contains("secret-value"), "no secret value must appear in output");
+        assert!(
+            !serialized.contains("secret-value"),
+            "no secret value must appear in output"
+        );
     }
 
     #[test]
@@ -235,7 +245,9 @@ mod tests {
             SandboxOption::Interactive(true),
             SandboxOption::EntrypointOverride(Entrypoint(vec!["/bin/sh".to_string()])),
             SandboxOption::SeededPrompt("do something".into()),
-            SandboxOption::Model { flag: ModelFlagForm::Argument("gemini-2.0-flash".into()) },
+            SandboxOption::Model {
+                flag: ModelFlagForm::Argument("gemini-2.0-flash".into()),
+            },
             SandboxOption::SystemPromptInline {
                 flag: "--system-prompt".into(),
                 text: "You are a helpful assistant.".into(),
@@ -300,8 +312,14 @@ mod tests {
             SandboxOption::CpuLimit(4.0),
         ]));
         let s = serde_json::to_string(&v).unwrap();
-        assert!(!s.contains("cpu"), "cpu_limit must not appear in session.json");
-        assert!(!s.contains("4.0"), "cpu value must not appear in session.json");
+        assert!(
+            !s.contains("cpu"),
+            "cpu_limit must not appear in session.json"
+        );
+        assert!(
+            !s.contains("4.0"),
+            "cpu value must not appear in session.json"
+        );
     }
 
     // ─── write_for persists to filesystem ────────────────────────────────
@@ -323,6 +341,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let opts = resolve(vec![]);
         DSbxSessionConfig::write_for(&opts, tmp.path()).unwrap();
-        assert!(tmp.path().join(".awman").is_dir(), ".awman subdir must be created");
+        assert!(
+            tmp.path().join(".awman").is_dir(),
+            ".awman subdir must be created"
+        );
     }
 }

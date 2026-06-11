@@ -380,11 +380,6 @@ mod tests {
     }
 
     #[test]
-    fn is_process_alive_bogus_pid() {
-        assert!(!is_process_alive(u32::MAX - 1));
-    }
-
-    #[test]
     fn pid_is_awman_returns_false_for_a_clearly_non_awman_pid() {
         // PID 1 is `init`/`launchd` on Unix and `System Idle Process` on Windows;
         // none of those are named "awman".

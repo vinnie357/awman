@@ -54,6 +54,34 @@ pub fn resolve_agent(
     AgentName::new("claude").map_err(CommandError::from)
 }
 
+/// Report the end of an interactive agent session on the sink, reflecting
+/// how it actually ended: Info for a clean exit, Error with the exit code
+/// when the agent exited non-zero, Error when waiting on the agent itself
+/// failed. Shared by `chat` and `exec prompt` so a failed launch is never
+/// reported as a quiet "Agent session ended".
+pub(crate) fn report_session_end(
+    sink: &mut dyn crate::data::message::UserMessageSink,
+    command: &str,
+    exit: &Result<
+        crate::engine::agent_runtime::execution::AgentExitInfo,
+        crate::engine::error::EngineError,
+    >,
+) {
+    use crate::data::message::{MessageLevel, UserMessage};
+    let (level, text) = match exit {
+        Ok(info) if info.exit_code == 0 => (MessageLevel::Info, "Agent session ended".to_string()),
+        Ok(info) => (
+            MessageLevel::Error,
+            format!("Agent session ended with exit code {}", info.exit_code),
+        ),
+        Err(e) => (
+            MessageLevel::Error,
+            format!("{command}: failed to wait for agent exit: {e}"),
+        ),
+    };
+    sink.write_message(UserMessage { level, text });
+}
+
 /// Specification for a skill overlay: all skills or a named one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillSpec {

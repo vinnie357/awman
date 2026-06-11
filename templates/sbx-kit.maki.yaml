@@ -2,7 +2,11 @@
 # Rendered by DSbxKitEmitter at `awman ready`. Do not edit by hand inside a kit
 # directory; edit the template and re-run `awman ready`.
 # awman version: {{AWMAN_VERSION}}
+schemaVersion: "1"
 kind: agent
+name: awman-maki
+displayName: awman (Maki)
+description: awman-managed Maki sandbox
 agent:
   image: docker/sandbox-templates:shell-docker
   entrypoint:
@@ -15,23 +19,27 @@ network:
     - registry.npmjs.org
 credentials:
   sources:
-    ANTHROPIC_API_KEY: anthropic
+    anthropic:
+      env:
+        - ANTHROPIC_API_KEY
 environment:
   proxyManaged:
     - ANTHROPIC_API_KEY
-memory: |
+agentContext: |
   This sandbox is orchestrated by awman {{AWMAN_VERSION}} using the
   Docker Sandboxes (experimental) runtime. Per-launch configuration is read
   from ${WORKDIR}/.awman/session.json by the startup script.
 commands:
   install:
-    - |
-      n=0
-      until [ "$n" -ge 5 ]; do
-        npm i -g maki && break
-        n=$((n+1))
-        echo "maki install attempt $n failed; retrying..." >&2
-        sleep 3
-      done
+    - command: |
+        n=0
+        until [ "$n" -ge 5 ]; do
+          npm i -g maki && break
+          n=$((n+1))
+          echo "maki install attempt $n failed; retrying..." >&2
+          sleep 3
+        done
+      description: Install the maki CLI (retries on npm failure)
   startup:
-    - bash /home/agent/.awman/apply-session-config.sh
+    - command: ["bash", "/home/agent/.awman/apply-session-config.sh"]
+      description: Apply awman per-launch session config

@@ -89,12 +89,11 @@ pub fn render_frame(app: &mut App, frame: &mut Frame) {
     // Container maximized overlay (rendered on top of execution window only,
     // not over the workflow strip or bottom chrome).
     if container_state == ContainerWindowState::Maximized {
-        container_view::render_container_maximized(
-            app.active_tab_mut(),
-            area,
-            workflow_height,
-            frame,
-        );
+        let tab = app.active_tab_mut();
+        // The overlay made it to the screen; close_container_overlay no
+        // longer needs to replay its contents into the status log.
+        tab.container_rendered = true;
+        container_view::render_container_maximized(tab, area, workflow_height, frame);
     }
 
     // Active dialog (rendered on top of everything).

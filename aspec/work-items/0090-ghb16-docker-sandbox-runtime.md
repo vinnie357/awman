@@ -62,7 +62,7 @@ The four sbx kit injection tiers, ordered from one-time/expensive to per-launch/
 | `commands.initFiles` | Every sandbox start | Yes | Templated files using `${WORKDIR}` substitution |
 | `commands.startup` | Every sandbox start | Yes (must be idempotent) | Dynamic per-launch config, refresh logic |
 
-`persistence: persistent` makes the post-install VM filesystem survive between `sbx stop` / `sbx run --name <existing>`. This converts awman from its current "ephemeral container per session" model to "persistent sandbox per worktree" on the sbx backend — pay the install cost once per worktree, then every subsequent invocation just restarts and re-runs idempotent startup scripts.
+`persistence: persistent` makes the post-install VM filesystem survive between `sbx stop` / `sbx run <existing-name>`. This converts awman from its current "ephemeral container per session" model to "persistent sandbox per worktree" on the sbx backend — pay the install cost once per worktree, then every subsequent invocation just restarts and re-runs idempotent startup scripts.
 
 ### Built-in agent matrix
 
@@ -89,7 +89,7 @@ For the four `kind: agent` paths, awman emits a full agent spec that extends `do
 awman provides three credential delivery mechanisms, used in combination:
 
 1. **`environment.proxyManaged`** (preferred for HTTP API keys): the host-side proxy holds the real key and rewrites outbound request headers. The placeholder value (or a `{rand}` token) goes into the VM; the real key never enters the VM address space.
-2. **`sbx secret set -g <service>`** (preferred for credentials that the agent reads as env vars at boot): awman calls `sbx secret set` for known services from `AuthEngine`-resolved keys. The credential value is piped via stdin (never argv) to avoid process-listing leakage. Run at agent-launch time so rotated keys take effect without re-running `awman ready`.
+2. **`sbx secret set <sandbox> <service>`** (preferred for credentials that the agent reads as env vars at boot): awman registers credentials sandbox-scoped, never globally (`-g`) — scoped secrets take effect immediately (global ones only apply at sandbox creation), and awman's keys never leak into sandboxes it does not own. The credential value is piped via stdin (never argv) to avoid process-listing leakage. Run at agent-launch time, after the sandbox exists, so rotated keys take effect without re-running `awman ready`.
 3. **Workspace-backed session config** (for non-credential dynamic state): awman writes `<workspace>/.awman/session.json` before each launch with current mode flags, model selection, system prompt, disallowed tools, etc. A `commands.startup` script inside the kit reads this file and renders the corresponding agent config (`.claude/settings.json`, env files, etc.) inside the VM. This is the sandbox-side equivalent of the Container-side `ContainerOption::AgentSettingsPassthrough` — the workspace is the only host→VM channel available at launch time, so `ResolvedSandboxOptions::agent_settings` is delivered via this structured config-passing surface instead of a bind mount.
 
 There is no `sbx run`-level flag to inject env vars or override kit variables at launch time. Anything that needs to change between launches without rebuilding the kit must go through the workspace-backed `session.json` channel.
@@ -140,7 +140,7 @@ Concretely:
   - Docker / Apple: existing `.awman/Dockerfile.<agent>` per-repo Dockerfiles and the local Docker / containerd image store. No change.
   - sbx: `$HOME/.awman/kits/<agent>/spec.yaml` (host-global kits), `<workspace>/.awman/session.json` (per-launch dynamic state — same workspace dir is shared but only sbx writes this file), and sbx's own per-VM persistent volumes (managed by `sandboxd`).
   - These three directory sets do not overlap. Switching runtimes does not require deleting or moving files for the other runtimes.
-- **`awman ready` is per-runtime, not global.** Running `awman ready` with `runtime: "docker"` does what it does today (build images via `docker build`). Running `awman ready` with `runtime: "docker-sbx-experimental"` emits kits and calls `sbx secret set` — it does NOT touch existing Docker images or local Apple containers. Switching the runtime and re-running `ready` makes the new runtime ready without invalidating the prior one. The user may keep both ready simultaneously.
+- **`awman ready` is per-runtime, not global.** Running `awman ready` with `runtime: "docker"` does what it does today (build images via `docker build`). Running `awman ready` with `runtime: "docker-sbx-experimental"` emits and validates kits (credential registration happens at agent launch, not ready) — it does NOT touch existing Docker images or local Apple containers. Switching the runtime and re-running `ready` makes the new runtime ready without invalidating the prior one. The user may keep both ready simultaneously.
 - **`awman chat`, `awman exec`, `awman exec workflow` are runtime-routed at dispatch time** via `AgentRuntimeEngine::detect(&global_config)`. Each invocation uses the runtime named in the config at that moment. No persistent in-memory state carries between invocations.
 - **No daemon shutdown.** Switching to sbx does not stop the Docker daemon and does not stop Apple's containerd. Switching back from sbx does not stop `sandboxd`. All three daemons may run simultaneously; the host has the resources for it (sbx claims ~50% of host RAM per running VM but is dormant when no sandbox is up).
 - **No port or socket conflicts.** Docker uses `/var/run/docker.sock`; Apple uses its own socket; sbx uses `~/.docker/sandboxes/sandboxd.sock`. No two of these collide. Awman never mounts any of these into another runtime's containers.
@@ -160,11 +160,11 @@ The user must have full visibility into everything awman does with the `sbx` CLI
 
 Concretely:
 
-- **Command announcement**: immediately before spawning any `sbx` subprocess, emit an Info-level message containing the full argv that is about to run (e.g. `Running: sbx run --kit ~/.awman/kits/claude --name awman-ab12-claude --workspace-dir /path/to/wt claude`). This applies to every `sbx` invocation without exception: `sbx run`, `sbx create`, `sbx exec`, `sbx stop`, `sbx rm`, `sbx ls`, `sbx secret set`, `sbx kit validate`, and any others added later.
+- **Command announcement**: immediately before spawning any `sbx` subprocess, emit an Info-level message containing the full argv that is about to run (e.g. `Running: sbx run --kit ~/.awman/kits/claude --name awman-ab12-claude claude /path/to/wt`). This applies to every `sbx` invocation without exception: `sbx run`, `sbx create`, `sbx exec`, `sbx stop`, `sbx rm`, `sbx ls`, `sbx secret set`, `sbx kit validate`, and any others added later.
 - **stdout/stderr publication**: all stdout and stderr produced by these `sbx` invocations is published on the sink as it is produced (line-buffered streaming where the invocation is long-running, e.g. install steps during first launch; a single post-exit message is acceptable for short, quiet commands like `sbx ls`). stdout lines are emitted at Info level; stderr lines at Warning level (or Error when the command exits non-zero).
 - **Exit reporting**: when an `sbx` subprocess exits non-zero, the failure message must include the command that ran and its captured stderr, in addition to the wrapped `EngineError::Sandbox(...)`.
-- **Exception — the interactive agent PTY**: the agent's own interactive I/O (the PTY bridged `sbx run` / `sbx exec -it` session the user is typing into) flows through the container/sandbox I/O bridge as today, not through the message sink. The announcement message for that invocation is still emitted before the PTY takes over.
-- **Credential masking**: `sbx secret set` invocations are announced like any other command, but the secret value never appears in any message — it is piped via stdin (per Phase 4) and the announcement shows only the service name (e.g. `Running: sbx secret set -g anthropic (value piped via stdin)`). Any stdout/stderr from `sbx secret set` is scanned by the existing masking helpers before publication in case the CLI echoes input.
+- **Exception — the interactive agent PTY**: the agent's own interactive I/O (the PTY bridged `sbx run` / `sbx exec -it` session the user is typing into) flows through the container/sandbox I/O bridge as today, not through the message sink. The announcement message for that invocation is still emitted before the PTY takes over. However, when the bridged `sbx run` exits **non-zero**, the tail of its captured output (control sequences stripped) is replayed on the message sink at Error level — launch failures (kit compose errors, login problems) otherwise vanish with the PTY, leaving only an exit code and a by-hand sbx rerun to diagnose.
+- **Credential masking**: `sbx secret set` invocations are announced like any other command, but the secret value never appears in any message — it is piped via stdin (per Phase 4) and the announcement shows only the service name (e.g. `Running: sbx secret set awman-ab12-claude anthropic (value piped via stdin)`). Any stdout/stderr from `sbx secret set` is scanned by the existing masking helpers before publication in case the CLI echoes input.
 
 This mirrors how the Docker and Apple backends report their lifecycle phases today, but is stricter: because sbx is experimental and its CLI behavior may shift between releases, the user must always be able to see exactly which commands awman ran and what they printed, without raising verbosity flags or consulting external logs.
 
@@ -210,6 +210,7 @@ Report findings to the developer for approval before proceeding.
 3. **PTY size workaround (Issue #63)**: verify that passing `COLUMNS` and `LINES` to `sbx exec` propagates effectively to TUI apps inside the VM.
 4. **`sbx secret set` behavior**: verify that secrets registered for well-known services (`anthropic`, `openai`, `github`, `google`, `aws`, `groq`, `mistral`) are auto-injected at VM boot for matching agents without additional Kit YAML configuration.
 5. **`sbx run --name` collision and reattach semantics**: confirm that `sbx run --name <existing-stopped-name>` restarts the existing sandbox (rather than erroring or recreating). This is load-bearing for the per-worktree persistent-sandbox model.
+   - **RESOLVED (2026-06-11, observed against real sbx)**: it errors — `--name` is creation-only (`ERROR: sandbox '<name>' already exists; --name can only be used when creating a new sandbox`). An existing sandbox is restarted by passing its name as the positional: `sbx run <name> [-- AGENT_ARGS...]` (no `--kit`, no agent — both are baked into the sandbox). The persistent-sandbox model holds; only the restart argv shape differs from the assumption above.
 6. **Per-agent default entrypoints**: for each of the five mixin candidates (`claude-code`, `codex`, `gemini`, `copilot`, `opencode`), capture the default `entrypoint.run` Docker's template uses. If awman needs to override (e.g., to switch yolo/auto/plan mode), that agent must use `kind: agent` with awman's chosen entrypoint, not `kind: mixin`. Produce a per-agent decision table at the end of Phase 0.
 7. **Kit feature surface verification**: confirm via the official Docker sandbox-templates that the built-in five agents accept the credential-delivery mechanism awman plans to use (proxyManaged vs sbx secret set) for each agent's required keys.
 
@@ -232,11 +233,11 @@ The kit emitter generates a `spec.yaml` (plus optional `files/` directory) per a
 
 **Mixin path** (built-in five): emit `kind: mixin` with:
 - No `agent:` block (the built-in agent provides its own entrypoint).
-- `credentials.sources` mapping awman's required env keys to the relevant service.
+- No `credentials:` block — the built-in kit the mixin extends already defines the well-known credential source (`anthropic`, `openai`, `google`, `github`), and sbx compose rejects a credential source defined in both a kit and a mixin extending it (`compose: credential source "<service>" defined in both ...`). Values reach sbx via sandbox-scoped `sbx secret set <sandbox> <service>` at launch instead.
 - `environment.proxyManaged` for HTTP API keys where proxy interception is preferable.
 - `commands.install` for any awman-specific tooling not already in Docker's template.
 - `commands.startup` invoking `apply-session-config.sh`.
-- `memory:` block with awman-context boilerplate.
+- `agentContext:` block with awman-context boilerplate. (Originally `memory:`; kit-spec v2 deprecated that name — sbx warns `deprecated field "memory": use 'agentContext' instead` at compose.)
 
 **Agent path** (the other four): emit `kind: agent` with:
 - `agent.image: docker/sandbox-templates:shell-docker` (or `:shell` when DinD isn't needed for that agent).
@@ -244,7 +245,25 @@ The kit emitter generates a `spec.yaml` (plus optional `files/` directory) per a
 - `agent.persistence: persistent`.
 - `commands.install` running the agent's install steps (curl-to-bash, npm install -g, apt, etc.) — equivalent of today's `Dockerfile.<agent>` body.
 - `commands.startup` invoking `apply-session-config.sh`.
-- Other blocks (network, credentials, environment, memory) as for the mixin path.
+- Other blocks (network, environment, agentContext) as for the mixin path, plus `credentials.sources` keyed by sbx service id, each value an object with an `env:` list (service → `{env: [...]}`, not env-var → service) — agent kits extend no built-in agent, so they must declare the source themselves and no compose conflict arises.
+
+**Schema corrections validated against `sbx kit validate` v0.32.0** (the shapes
+originally sketched above predate testing against a real sbx build):
+- `schemaVersion: "1"` and `name:` are required top-level fields in every kit.
+- `persistence` exists only under the `agent:` block (`agent.persistence`);
+  mixins cannot declare it — the parent template/`sbx run` governs persistence.
+- The well-known agent name for Claude Code is `extends: claude`, not
+  `claude-code`.
+- `commands.startup` entries are objects whose `command` is an argv array
+  (`- command: ["bash", "..."]`); `commands.install` entries are objects whose
+  `command` is a shell string. Bare string list entries fail strict unmarshal.
+- Mixins must not redeclare a credential source their base kit defines: the
+  built-in agent kits declare their own well-known sources, and compose fails
+  with `compose: credential source "anthropic" defined in both "claude" and
+  "awman-claude"`. Only `kind: agent` kits carry a `credentials:` block.
+- `CLAUDE_CODE_OAUTH_TOKEN` has no sbx service mapping (docker/sbx-releases#11
+  open as of June 2026); awman warns with the supported alternatives
+  (`ANTHROPIC_API_KEY` or in-sandbox `/login` via the credential proxy).
 
 **Source of truth — template files live in `templates/` alongside Dockerfile templates**. Per-agent kit templates are stored at:
 
@@ -315,11 +334,26 @@ Create `src/engine/sandbox/dsbx/backend.rs` with `pub(super) struct DSbxBackend`
 
 **`DSbxSandboxInstance::run_with_frontend()`** — performs all subprocess side effects:
 1. Write `<workspace>/.awman/session.json` from the resolved options (`DSbxBackend` calls `DSbxSessionConfig::write_for(&options, workspace)`).
-2. Inject credentials via `sbx_auth::inject_credentials(&resolved_credentials)` — `sbx secret set` calls with values piped via stdin.
-3. Determine launch mode: if a sandbox with the resolved name exists and is stopped, the argv is `sbx run --name <name> <agent>` (no `--kit` flag — the kit is already baked into the existing sandbox). If new, `sbx run --kit <kit-dir> --name <name> --workspace-dir <workspace> <agent>`.
-4. Spawn via the same `portable-pty` / piped-stdio bridge pattern used by `DockerContainerInstance` and `AppleContainerInstance`.
+2. Ensure the sandbox exists: when no sandbox with the resolved name exists, run `sbx create --kit <kit-dir> --name <name> <agent> <workspace>` (announced). This must precede credential registration — secrets are sandbox-scoped.
+3. Register credentials: `auto_auth_env_overlays` (allowlisted `env(VAR)` overlays) then `inject_credentials` (awman-resolved credentials), all via sandbox-scoped `sbx secret set <name> <service>` with values piped via stdin. A failure after a fresh create leaves the sandbox in place (the next launch reuses it) and the error says so.
+4. Launch with `sbx run <name> [-- AGENT_ARGS...]` — the positional name addresses the existing sandbox; `--name` is creation-only, and the kit/agent/workspace are baked in at creation.
+5. Spawn via the same `portable-pty` / piped-stdio bridge pattern used by `DockerContainerInstance` and `AppleContainerInstance`.
 
 All `sbx` subprocess invocations made by `DSbxBackend` and `DSbxSandboxInstance` go through a single spawn helper that implements the "Subprocess transparency via the user message sink" requirements above: announce the argv on the sink before spawning, stream/publish stdout and stderr on the sink, and report non-zero exits with the command and captured stderr. Do not scatter ad-hoc `Command::new("sbx")` calls that bypass this helper.
+
+**CLI corrections validated against the real `sbx run` (Docker CLI reference,
+June 2026)** (the argv shapes originally sketched in this work item predate
+testing against a real sbx build):
+- The synopsis is `sbx run [flags] SANDBOX | AGENT [PATH...] [-- AGENT_ARGS...]`.
+  There is **no `--workspace-dir` flag** — workspace paths are positionals
+  after the agent name, extra workspaces may be suffixed `:ro`, and with no
+  PATH given sbx uses the invoking cwd. `sbx create` follows the same shape.
+- Anything intended for the agent itself (e.g. the seeded prompt for
+  `kind: agent` kits) must follow the `--` delimiter; a bare positional after
+  the agent is parsed by sbx as another workspace PATH.
+- `sbx run` **does** accept `--cpus <n>` (default 0 = auto: host CPUs − 1),
+  contradicting the `cpu_limit` row below. awman currently still warns and
+  ignores `cpu_limit`; wiring it to `--cpus` is a separate, deliberate change.
 
 **Argv mapping — what `ResolvedSandboxOptions` fields translate to**:
 
@@ -329,10 +363,10 @@ The option type used by `DSbxBackend` is `ResolvedSandboxOptions` (defined in WI
 |---|---|
 | `agent_id` | Selects the kit at `$HOME/.awman/kits/<agent_id>/`. |
 | `entrypoint_override` | For `kind: agent` kits: baked into `agent.entrypoint.run` at kit emission. For `kind: mixin`: must match the built-in's entrypoint; mismatches force `kind: agent` (see Phase 0 #6). |
-| `workspace_dir` | Passed as `--workspace-dir` to `sbx run`; the VM mounts it at the identical absolute path. |
+| `workspace_dir` | Passed as the positional workspace PATH after the agent on `sbx run` / `sbx create` (there is no `--workspace-dir` flag); the VM mounts it at the identical absolute path. Omitted when unset — sbx defaults to the invoking cwd. |
 | `extra_overlays` | Workspace-rooted overlays are a no-op (workspace is already mounted). Non-workspace overlays cannot be referenced directly from inside the VM; the host side must either materialize allowed file contents into a workspace-owned staging path under `.awman/` before launch and reference that staged path in `session.json`, or reject the overlay with a clear error. Do not serialize arbitrary outside-workspace file contents into `session.json`. |
-| `env_passthrough` | Service-mapped credential vars go to `sbx secret set`; non-sensitive config vars may be written to `session.json` and applied inside the VM by the startup script. Unmapped credential-class vars are warned and withheld rather than written to the workspace. |
-| `env_literal` | Non-sensitive literals may be written to `session.json` for the startup script to export. Credential-class literals are routed through `sbx secret set` / proxy management when recognized, and otherwise warned/rejected rather than written to the workspace. |
+| `env_passthrough` | Vars on the launching agent's auto-auth allowlist (see Phase 4) are read from the host environment at launch and registered via `sbx secret set`; non-sensitive config vars may be written to `session.json` and applied inside the VM by the startup script. Credential-class vars outside the allowlist are warned and dropped rather than written to the workspace. |
+| `env_literal` | Non-sensitive literals may be written to `session.json` for the startup script to export. Credential-class literals are warned and withheld (the warning points at the `env(VAR)` overlay route), never written to the workspace. |
 | `seeded_prompt` | Written to `session.json`; startup script appends it as a positional arg to the agent's launch (for `kind: agent`) or invokes the agent via `sbx exec` with the prompt (for `kind: mixin`). |
 | `interactive` | Determines whether to use `sbx run` (attach) or `sbx create` (background). |
 | `sandbox_name` | Used as `--name <name>`. Always populated by `DSbxBackend` via `generate_sandbox_name(worktree_hash, agent)` if the caller did not pre-set it. |
@@ -362,7 +396,7 @@ Note the absence of an `image` field: sandboxes do not take an image ref at run 
 **Image-introspection methods**: `SandboxBackend` does not expose `image_home_dir()` or `image_exists()` — these are container-paradigm concerns that don't exist for sandboxes. `SandboxRuntime` does not declare them in its trait surface. If Layer 2 needs sandbox metadata such as an in-VM home directory, that metadata must be exposed through the WI 0089 `AgentRuntimeEngine` surface or a Layer 0 data table, not by reaching into `DSbxKitEmitter` or any `pub(super)` sandbox internals.
 
 **Background ops on `SandboxBackend`**: the `SandboxBackend` trait (defined in WI 0089) declares background operations directly in sandbox terms — there are no `default_*` Docker-shaped fallbacks because sandboxes don't share Docker's argv shape. The methods `DSbxBackend` implements:
-- `start_background(workspace, agent_id, kit_dir, env, overlays) -> Result<SandboxId, EngineError>` → `sbx create --kit <kit-dir> --name <generated> --workspace-dir <workdir> <agent>`.
+- `start_background(workspace, agent_id, kit_dir, env, overlays) -> Result<SandboxId, EngineError>` → `sbx create --kit <kit-dir> --name <generated> <agent> <workdir>`.
 - `exec_in_sandbox(sandbox_id, command, working_dir, env) -> Result<ExecOutput, EngineError>` → `sbx exec <sandbox_id> <command>`.
 - `exec_in_sandbox_streaming(sandbox_id, command, ..., on_line)` → same with streaming bridge.
 - `stop_and_remove(sandbox_id) -> Result<(), EngineError>` → `sbx stop <sandbox_id>` followed by `sbx rm <sandbox_id>`.
@@ -371,21 +405,47 @@ Note the absence of an `image` field: sandboxes do not take an image ref at run 
 
 Module: `src/engine/sandbox/dsbx/auth.rs`, `pub(super)`. Contains:
 - The awman-credential → sbx-service-name mapping table.
-- `inject_credentials(creds: &[(String, String)]) -> Result<(), EngineError>` that calls `sbx secret set -g <service>` with each value piped via **stdin** (never argv) to avoid process-listing leakage.
+- The per-agent **auto-auth allowlist** (`supported_auth_env_vars`) for launch-time `env(VAR)` overlay auth (see below).
+- `inject_credentials(creds, sandbox, sink)` that calls sandbox-scoped `sbx secret set <sandbox> <service>` with each value piped via **stdin** (never argv) to avoid process-listing leakage.
+- `auto_auth_env_overlays(...)` implementing the launch-time `env(VAR)` overlay flow.
 - Credential-not-found warning logic that mirrors today's behavior for Docker (warn at launch, don't silently fail).
 - Sink reporting per the "Subprocess transparency" section: each `sbx secret set` invocation is announced on the user message sink with the service name only (never the value), and its stdout/stderr is masked before publication.
 
-Service mapping:
+Service mapping (matches the Docker Sandboxes credential-services docs, June 2026):
 
 | awman credential | sbx service name |
 |---|---|
 | `ANTHROPIC_API_KEY` | `anthropic` |
 | `OPENAI_API_KEY` | `openai` |
 | `GH_TOKEN` / `GITHUB_TOKEN` | `github` |
-| `GEMINI_API_KEY` | `google` |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | `google` |
 | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` | `aws` |
 | `GROQ_API_KEY` | `groq` |
 | `MISTRAL_API_KEY` | `mistral` |
+
+**Launch-time `env(VAR)` overlay auto-auth** (added 2026-06-11): the supported
+way to authenticate a mixin-kit agent. At agent-launch time (`run_interactive`,
+NOT `awman ready`, so rotated keys apply per launch), each `env_passthrough`
+var on the launching agent's allowlist is read from the host environment and
+registered via `sbx secret set` (stdin-piped, masked). Per-agent allowlist —
+mixin kits only; agent-kit agents (antigravity, crush, maki, cline) are
+deliberately excluded for now:
+
+| Agent | Allowlisted env vars | sbx service |
+|---|---|---|
+| `claude` | `ANTHROPIC_API_KEY` | `anthropic` |
+| `codex` | `OPENAI_API_KEY` | `openai` |
+| `gemini` | `GEMINI_API_KEY`, `GOOGLE_API_KEY` | `google` |
+| `copilot` | `GH_TOKEN`, `GITHUB_TOKEN` | `github` |
+| `opencode` | `ANTHROPIC_API_KEY` | `anthropic` |
+
+Behavioral rules:
+- Credential-class `env(VAR)` overlays outside the agent's allowlist: warn and drop (already excluded from `session.json`).
+- Allowlisted var unset in the host environment: warn, no registration.
+- Mixin agent launched with no allowlisted overlay registering a credential: warn that auth must be set up manually (`sbx secret set <sandbox> <service>`) or via in-sandbox login, then continue the launch.
+- A failed `sbx secret set` subprocess remains launch-blocking; when the sandbox was freshly created, the error notes that it is left in place and reused on the next launch.
+- **Sandbox-scoped only, never global** (revised 2026-06-11): per the sbx docs, `-g` secrets only take effect at sandbox *creation* while sandbox-scoped secrets apply immediately (running or stopped). awman therefore creates the sandbox first (`sbx create` on first launch) and registers every secret sandbox-scoped — `-g` is never used. Benefits: rotated keys always apply, awman's keys never leak into non-awman sandboxes, and `sbx rm` removes the secret scope with the sandbox. `awman ready` registers no secrets at all (the keychain OAuth token it used to forward is unusable with sbx anyway).
+- **`--password-stdin` doc inconsistency**: the sbx docs disagree on whether non-interactive `sbx secret set` requires `--password-stdin`. Plain stdin piping is confirmed working and is the primary form; on a failure that looks like an interactive-prompt error, retry once with `--password-stdin` appended.
 
 Unmapped credentials are not silent failures: emit a warning naming the variable and suggest kit-level `environment.proxyManaged` or a future explicit custom-secret mapping. Credential-class values must not be written to `session.json`; if an unmapped variable is truly non-sensitive configuration, handle it through the normal `env_passthrough` / `env_literal` path. When classification is ambiguous, prefer not passing the value and surface the warning.
 
@@ -425,9 +485,9 @@ The writer **must not** include any credential values (those go through `sbx_aut
 **`generate_container_name()`** — do not extend or modify it. Sandbox callers use the WI 0089 helper `generate_sandbox_name(worktree_hash: &str, agent: &str) -> String` from `src/engine/sandbox/naming.rs`; existing container callers keep the current behavior.
 
 **Lifecycle:**
-- First `awman chat <agent>` against a worktree → `sbx run --kit … --name awman-<hash>-<agent> --workspace-dir <wt> <agent>`. Install runs (one-time per worktree+agent), startup runs, agent attaches.
+- First `awman chat <agent>` against a worktree → `sbx create --kit … --name awman-<hash>-<agent> <agent> <wt>`, sandbox-scoped `sbx secret set` calls, then `sbx run awman-<hash>-<agent>`. Install runs (one-time per worktree+agent), startup runs, agent attaches.
 - Agent exits → sandbox transitions to stopped. State preserved via `persistence: persistent` in the kit.
-- Second `awman chat <agent>` → `sbx run --name awman-<hash>-<agent> <agent>` (no `--kit` flag for restarts). Startup re-runs against the latest `session.json`; agent re-attaches.
+- Second `awman chat <agent>` → `sbx run awman-<hash>-<agent>` (positional name, no `--name`/`--kit`/agent for restarts). Startup re-runs against the latest `session.json`; agent re-attaches.
 - `awman destroy <worktree>` or equivalent teardown → `sbx rm awman-<hash>-<agent>` for each agent that has a sandbox against this worktree. Also clears the persistent volume.
 - `awman ready --no-cache` → `sbx rm` all awman sandboxes that use the affected agent kit, then re-emit the kit. Next launch re-runs install.
 
@@ -443,9 +503,10 @@ Update `src/engine/ready/` for the sbx path:
 2. Check `sbx login` status via `sbx ls`. Helpful hint if not logged in (`Run sbx login to authenticate Docker Sandboxes`).
 3. Emit the per-agent kit at `$HOME/.awman/kits/<agent>/` for every configured agent (via `DSbxKitEmitter`).
 4. Copy bundled `apply-session-config.sh` into each kit's `files/home/.awman/`.
-5. For each agent, run the credential pre-flight: resolve required credentials via `AuthEngine`, call `sbx secret set` for the mapped services, warn on missing.
-6. Validate the kit by invoking `sbx kit validate <kit-dir>` for each emitted kit (if available — confirm in Phase 0). Surface validation errors with the kit path.
-7. Report per-phase status messages. Every `sbx` invocation made by the ready flow (`sbx ls`, `sbx secret set`, `sbx kit validate`, any `sbx rm` triggered by `--no-cache`) follows the "Subprocess transparency" section: the command is announced on the user message sink and its stdout/stderr is published there.
+5. Validate the kit by invoking `sbx kit validate <kit-dir>` for each emitted kit (if available — confirm in Phase 0). Surface validation errors with the kit path.
+6. Report per-phase status messages. Every `sbx` invocation made by the ready flow (`sbx ls`, `sbx kit validate`, any `sbx rm` triggered by `--no-cache`) follows the "Subprocess transparency" section: the command is announced on the user message sink and its stdout/stderr is published there.
+
+`awman ready` registers **no credentials** (revised 2026-06-11): every `sbx secret set` is sandbox-scoped and runs at agent-launch time (Phase 3 step 3), and the keychain-resolved OAuth token ready used to forward is unusable with sbx anyway.
 
 No registry push step. No `docker build` step for sbx. `awman ready` for sbx is text-file emission plus subprocess validation.
 
@@ -460,7 +521,7 @@ User docs must cover:
 - How to switch runtime to `docker-sbx-experimental`.
 - Where kits live and what they contain.
 - The persistent-sandbox lifecycle and how to clean up.
-- Credential setup (`sbx login`, `sbx secret set` if not auto-handled).
+- Credential setup (`sbx login`; launch-time `env(VAR)` overlay auto-auth, with manual sandbox-scoped `sbx secret set` as the fallback).
 - Known limitations: Linux blocked, Intel Mac blocked, no per-resource stats, raw TCP/UDP blocked.
 
 ---
@@ -539,7 +600,7 @@ User docs must cover:
 ### Integration tests
 
 - Gate all sbx integration tests behind `#[cfg(target_os = "macos")]` + `#[cfg(target_arch = "aarch64")]` and an env var guard (`AWMAN_TEST_SBX=1`).
-- **First-launch lifecycle**: emit a minimal kit, `sbx run`, verify install runs, sandbox reaches running state, `sbx stop`, verify stopped, `sbx run --name` (restart) verifies install does NOT re-run.
+- **First-launch lifecycle**: emit a minimal kit, `sbx run`, verify install runs, sandbox reaches running state, `sbx stop`, verify stopped, `sbx run <name>` (positional restart) verifies install does NOT re-run.
 - **`is_available()` paths**: sbx installed + logged in vs. not installed.
 - **`sbx kit validate`** on emitted kits for each agent.
 

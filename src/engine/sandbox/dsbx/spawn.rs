@@ -87,10 +87,7 @@ impl SbxCommand {
     }
 
     /// Run the command, announcing the argv and publishing output on `sink`.
-    pub fn run_announced(
-        &self,
-        sink: &mut dyn UserMessageSink,
-    ) -> Result<SbxOutput, EngineError> {
+    pub fn run_announced(&self, sink: &mut dyn UserMessageSink) -> Result<SbxOutput, EngineError> {
         announce(sink, &self.display_line());
         let out = self.run_quiet()?;
         for line in out.stdout.lines() {
@@ -113,6 +110,32 @@ impl SbxCommand {
                 self.display_line(),
                 out.exit_code,
                 redact(out.stderr.trim(), &self.redactions),
+            )));
+        }
+        Ok(out)
+    }
+
+    /// Like [`run_quiet`](Self::run_quiet), but a non-zero exit is an error
+    /// carrying everything sbx printed (stderr, then stdout). For launch-path
+    /// callers that have no frontend sink (`start_sandbox`,
+    /// `restart_sandbox`) — the caller surfaces the error text, so sbx's own
+    /// diagnostics must travel inside it.
+    pub fn run_checked(&self) -> Result<SbxOutput, EngineError> {
+        let out = self.run_quiet()?;
+        if !out.success() {
+            let mut detail = out.stderr.trim().to_string();
+            let stdout = out.stdout.trim();
+            if !stdout.is_empty() {
+                if !detail.is_empty() {
+                    detail.push_str("; stdout: ");
+                }
+                detail.push_str(stdout);
+            }
+            return Err(EngineError::Sandbox(format!(
+                "`{}` exited with code {}: {}",
+                self.display_line(),
+                out.exit_code,
+                redact(&detail, &self.redactions),
             )));
         }
         Ok(out)
@@ -209,11 +232,11 @@ mod tests {
 
     #[test]
     fn display_line_includes_suffix() {
-        let cmd = SbxCommand::new(["secret", "set", "-g", "anthropic"])
+        let cmd = SbxCommand::new(["secret", "set", "awman-x-claude", "anthropic"])
             .announce_suffix("(value piped via stdin)");
         assert_eq!(
             cmd.display_line(),
-            "sbx secret set -g anthropic (value piped via stdin)"
+            "sbx secret set awman-x-claude anthropic (value piped via stdin)"
         );
     }
 
@@ -277,9 +300,9 @@ mod tests {
         // Ignore the result — sbx may not be installed.
         let _ = cmd.run_announced(&mut sink);
         assert!(
-            sink.messages.iter().any(|m| {
-                m.level == MessageLevel::Info && m.text == "Running: sbx version"
-            }),
+            sink.messages
+                .iter()
+                .any(|m| { m.level == MessageLevel::Info && m.text == "Running: sbx version" }),
             "Info announcement must be written even when sbx is unavailable; messages: {:?}",
             sink.messages
         );
@@ -288,7 +311,7 @@ mod tests {
     #[test]
     fn run_announced_announcement_never_contains_value_when_suffix_used() {
         let mut sink = VecSink::default();
-        let cmd = SbxCommand::new(["secret", "set", "-g", "anthropic"])
+        let cmd = SbxCommand::new(["secret", "set", "awman-x-claude", "anthropic"])
             .announce_suffix("(value piped via stdin)")
             .with_stdin(b"sk-supersecret".to_vec())
             .redact("sk-supersecret".to_string());
@@ -305,38 +328,15 @@ mod tests {
 
     // ─── Subprocess output routing (requires a fake `sbx` on PATH) ────────
     //
-    // These tests prepend a temp dir containing a mock `sbx` script to PATH,
-    // then invoke SbxCommand and verify stdout→Info and stderr→Warning routing.
-    // A static mutex serialises PATH mutations across parallel test threads.
+    // These tests prepend a temp dir containing a mock `sbx` script to PATH
+    // (via the dsbx-wide `test_support::with_fake_sbx`, whose lock serialises
+    // PATH mutations across parallel test threads), then invoke SbxCommand
+    // and verify stdout→Info and stderr→Warning routing.
 
     #[cfg(unix)]
     mod subprocess_routing {
         use super::*;
-        use std::sync::Mutex;
-
-        static PATH_LOCK: Mutex<()> = Mutex::new(());
-
-        fn write_fake_sbx(dir: &std::path::Path, script: &str) {
-            use std::os::unix::fs::PermissionsExt;
-            let path = dir.join("sbx");
-            std::fs::write(&path, script).unwrap();
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-        }
-
-        fn with_fake_sbx<F: FnOnce()>(script: &str, f: F) {
-            let tmp = tempfile::tempdir().unwrap();
-            write_fake_sbx(tmp.path(), script);
-            let _guard = PATH_LOCK.lock().unwrap();
-            let orig = std::env::var("PATH").unwrap_or_default();
-            std::env::set_var(
-                "PATH",
-                format!("{}:{orig}", tmp.path().display()),
-            );
-            f();
-            std::env::set_var("PATH", orig);
-        }
+        use crate::engine::sandbox::dsbx::test_support::with_fake_sbx;
 
         #[test]
         fn stdout_lines_arrive_at_info_level() {
@@ -344,9 +344,9 @@ mod tests {
                 let mut sink = VecSink::default();
                 SbxCommand::new(["dummy"]).run_announced(&mut sink).unwrap();
                 assert!(
-                    sink.messages.iter().any(|m| {
-                        m.level == MessageLevel::Info && m.text == "hello stdout"
-                    }),
+                    sink.messages
+                        .iter()
+                        .any(|m| { m.level == MessageLevel::Info && m.text == "hello stdout" }),
                     "stdout must arrive at Info level; messages: {:?}",
                     sink.messages
                 );
@@ -359,9 +359,9 @@ mod tests {
                 let mut sink = VecSink::default();
                 SbxCommand::new(["dummy"]).run_announced(&mut sink).unwrap();
                 assert!(
-                    sink.messages.iter().any(|m| {
-                        m.level == MessageLevel::Warning && m.text == "side note"
-                    }),
+                    sink.messages
+                        .iter()
+                        .any(|m| { m.level == MessageLevel::Warning && m.text == "side note" }),
                     "stderr on a successful run must arrive at Warning; messages: {:?}",
                     sink.messages
                 );
@@ -384,6 +384,39 @@ mod tests {
             });
         }
 
+        // ─── run_checked ───────────────────────────────────────────────────
+
+        #[test]
+        fn run_checked_error_carries_stderr_and_stdout() {
+            with_fake_sbx(
+                "#!/bin/sh\necho 'out detail'\necho 'ERROR: failed to create sandbox: boom' >&2\nexit 1\n",
+                || {
+                    let err = SbxCommand::new(["create"]).run_checked().unwrap_err();
+                    match err {
+                        EngineError::Sandbox(msg) => {
+                            assert!(msg.contains("sbx create"), "must name the argv: {msg}");
+                            assert!(msg.contains("code 1"), "must name the exit code: {msg}");
+                            assert!(
+                                msg.contains("failed to create sandbox: boom"),
+                                "must carry sbx's stderr: {msg}"
+                            );
+                            assert!(msg.contains("out detail"), "must carry sbx's stdout: {msg}");
+                        }
+                        other => panic!("expected Sandbox error, got: {other:?}"),
+                    }
+                },
+            );
+        }
+
+        #[test]
+        fn run_checked_passes_through_success() {
+            with_fake_sbx("#!/bin/sh\necho ok\n", || {
+                let out = SbxCommand::new(["create"]).run_checked().unwrap();
+                assert_eq!(out.exit_code, 0);
+                assert_eq!(out.stdout.trim(), "ok");
+            });
+        }
+
         #[test]
         fn secret_value_redacted_from_sink_output() {
             // A fake sbx that echoes its stdin back on stdout (simulating a
@@ -391,7 +424,7 @@ mod tests {
             // mask the value before it reaches the sink.
             with_fake_sbx("#!/bin/sh\ncat\n", || {
                 let mut sink = VecSink::default();
-                let _ = SbxCommand::new(["secret", "set", "-g", "anthropic"])
+                let _ = SbxCommand::new(["secret", "set", "awman-x-claude", "anthropic"])
                     .with_stdin(b"sk-supersecret".to_vec())
                     .announce_suffix("(value piped via stdin)")
                     .redact("sk-supersecret".to_string())

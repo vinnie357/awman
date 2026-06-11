@@ -166,6 +166,10 @@ pub struct ContainerInfo {
     /// History of `(cpu_percent, memory_mb)` samples for averaging in the
     /// post-exit summary bar.
     pub stats_history: Vec<(f64, f64)>,
+    /// Whether the active runtime is sandbox-class (e.g.
+    /// `docker-sbx-experimental`) rather than container-class. Drives the
+    /// overlay title — "(sandboxed)" vs "(containerized)".
+    pub sandboxed: bool,
 }
 
 /// Summary captured after a containerized command exits, displayed in a
@@ -198,6 +202,13 @@ pub struct Tab {
     /// the renderer. Used by the mouse handler to translate raw terminal
     /// coords into vt100 cell coords.
     pub container_inner_area: Option<Rect>,
+    /// Whether the container overlay has been drawn at least once this
+    /// session. Set by the renderer when it draws the maximized overlay;
+    /// cleared at command start. When the agent exits before any frame was
+    /// drawn (fast-failing launch), `close_container_overlay` dumps the
+    /// captured terminal contents to the status log instead of silently
+    /// discarding them.
+    pub container_rendered: bool,
     /// Inner content rect of the execution window, refreshed each frame by
     /// the renderer while the container overlay is not Maximized. Used by
     /// the mouse handler to translate raw terminal coords into execution
@@ -302,6 +313,7 @@ impl Tab {
             container_info: None,
             last_container_summary: None,
             container_inner_area: None,
+            container_rendered: false,
             exec_inner_area: None,
             exec_window_grid: Vec::new(),
             workflow_state: Arc::new(Mutex::new(None)),
@@ -378,6 +390,7 @@ impl Tab {
     ) {
         self.container_window_state = ContainerWindowState::Maximized;
         self.container_scroll_offset = 0;
+        self.container_rendered = false;
         self.vt100_parser = vt100::Parser::new(
             rows,
             cols,
@@ -394,6 +407,7 @@ impl Tab {
             start_time: Instant::now(),
             latest_stats: None,
             stats_history: Vec::new(),
+            sandboxed: false,
         });
     }
 
@@ -527,6 +541,7 @@ impl Tab {
                     self.session.effective_config().scrollback_lines(),
                 );
                 self.container_scroll_offset = 0;
+                self.container_rendered = false;
                 self.mouse_selection = None;
                 self.agent_alt_screen = false;
                 self.agent_alternate_scroll = false;
@@ -562,11 +577,41 @@ impl Tab {
         }
     }
 
+    /// Push the container's terminal contents to the status log when the
+    /// overlay never got a frame on screen (the agent exited within one
+    /// event-loop tick of producing its first output). Without this, a
+    /// fast-failing launch's error output is parsed into the vt100 grid and
+    /// then discarded before the user ever sees it.
+    fn surface_unseen_container_output(&mut self) {
+        if self.container_rendered {
+            return;
+        }
+        let contents = self.vt100_parser.screen().contents();
+        let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.is_empty() {
+            return;
+        }
+        if let Ok(mut log) = self.status_log.lock() {
+            log.push(crate::frontend::tui::user_message::StatusLogEntry {
+                level: crate::data::message::MessageLevel::Warning,
+                text: "Agent exited before its output could be displayed; captured output:"
+                    .to_string(),
+            });
+            for line in lines {
+                log.push(crate::frontend::tui::user_message::StatusLogEntry {
+                    level: crate::data::message::MessageLevel::Info,
+                    text: format!("  {line}"),
+                });
+            }
+        }
+    }
+
     /// Tear down the container overlay state. Called when a containerized
     /// command finishes (exit, error, or task drop). Captures
     /// `LastContainerSummary` from `container_info` (if any) so the post-exit
     /// summary bar can show averaged stats and the exit code.
     fn close_container_overlay(&mut self, exit_code: i32) {
+        self.surface_unseen_container_output();
         if self.container_window_state != ContainerWindowState::Hidden {
             if let Some(info) = self.container_info.take() {
                 let elapsed = info.start_time.elapsed().as_secs();
@@ -608,22 +653,39 @@ impl Tab {
     pub fn poll_command_completion(&mut self) {
         if let Some(ref rx) = self.command_result_rx {
             match rx.try_recv() {
-                Ok(Ok(_outcome)) => {
+                Ok(Ok(outcome)) => {
                     let cmd_name = match &self.execution_phase {
                         ExecutionPhase::Running { command } => command.clone(),
                         _ => String::new(),
                     };
+                    // Agent-session commands carry the agent's real exit code;
+                    // reflect it instead of unconditionally reporting success.
+                    let exit_code = match &outcome {
+                        CommandOutcome::Chat(o) => o.exit_code.unwrap_or(0),
+                        CommandOutcome::ExecPrompt(o) => o.exit_code.unwrap_or(0),
+                        _ => 0,
+                    };
                     if let Ok(mut log) = self.status_log.lock() {
-                        log.push(crate::frontend::tui::user_message::StatusLogEntry {
-                            level: crate::data::message::MessageLevel::Success,
-                            text: format!("Command '{}' completed successfully.", cmd_name),
-                        });
+                        if exit_code == 0 {
+                            log.push(crate::frontend::tui::user_message::StatusLogEntry {
+                                level: crate::data::message::MessageLevel::Success,
+                                text: format!("Command '{}' completed successfully.", cmd_name),
+                            });
+                        } else {
+                            log.push(crate::frontend::tui::user_message::StatusLogEntry {
+                                level: crate::data::message::MessageLevel::Error,
+                                text: format!(
+                                    "Command '{}' finished: agent exited with code {}.",
+                                    cmd_name, exit_code
+                                ),
+                            });
+                        }
                     }
                     self.execution_phase = ExecutionPhase::Done {
                         command: cmd_name,
-                        exit_code: 0,
+                        exit_code,
                     };
-                    self.close_container_overlay(0);
+                    self.close_container_overlay(exit_code);
                     self.command_result_rx = None;
                     self.container_stdout_rx = None;
                     self.container_stdin_tx = None;
@@ -1425,6 +1487,128 @@ mod tests {
         assert!(
             scrolled_back.contains("history line 0"),
             "earliest history line must be reachable in scrollback"
+        );
+    }
+
+    // ── Agent exit-code reporting and fast-exit output capture ──────────
+
+    fn finish_with_chat_outcome(tab: &mut Tab, exit_code: Option<i32>) {
+        let (result_tx, result_rx) =
+            std::sync::mpsc::channel::<Result<CommandOutcome, CommandError>>();
+        tab.command_result_rx = Some(result_rx);
+        tab.execution_phase = ExecutionPhase::Running {
+            command: "chat".into(),
+        };
+        result_tx
+            .send(Ok(CommandOutcome::Chat(
+                crate::command::commands::chat::ChatOutcome {
+                    agent: Some("claude".into()),
+                    exit_code,
+                },
+            )))
+            .unwrap();
+        tab.poll_command_completion();
+    }
+
+    fn log_texts(tab: &Tab) -> Vec<(crate::data::message::MessageLevel, String)> {
+        tab.status_log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| (e.level, e.text.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn poll_completion_reports_nonzero_agent_exit_code() {
+        let mut tab = make_tab();
+        finish_with_chat_outcome(&mut tab, Some(2));
+
+        assert!(
+            matches!(
+                tab.execution_phase,
+                ExecutionPhase::Done { exit_code: 2, .. }
+            ),
+            "Done phase must carry the agent's exit code: {:?}",
+            tab.execution_phase
+        );
+        let logs = log_texts(&tab);
+        assert!(
+            logs.iter().any(|(level, text)| {
+                *level == crate::data::message::MessageLevel::Error
+                    && text.contains("agent exited with code 2")
+            }),
+            "non-zero agent exit must be reported as an Error, got: {logs:?}"
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|(_, text)| text.contains("completed successfully")),
+            "non-zero agent exit must not be reported as success: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn poll_completion_zero_exit_reports_success() {
+        let mut tab = make_tab();
+        finish_with_chat_outcome(&mut tab, Some(0));
+
+        let logs = log_texts(&tab);
+        assert!(
+            logs.iter().any(|(level, text)| {
+                *level == crate::data::message::MessageLevel::Success
+                    && text.contains("completed successfully")
+            }),
+            "clean agent exit keeps the success message: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn unrendered_container_output_is_surfaced_to_status_log() {
+        let mut tab = make_tab();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tab.container_stdout_rx = Some(rx);
+
+        // The agent prints an error and dies before the renderer draws a
+        // single frame — drain opens the overlay, poll closes it in the same
+        // tick, container_rendered stays false.
+        tx.send(b"ERROR: unknown flag: --workspace-dir\r\n".to_vec())
+            .unwrap();
+        tab.drain_container_output();
+        assert!(!tab.container_rendered);
+        finish_with_chat_outcome(&mut tab, Some(1));
+
+        let logs = log_texts(&tab);
+        assert!(
+            logs.iter()
+                .any(|(_, text)| text.contains("before its output could be displayed")),
+            "must announce the captured-output replay: {logs:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|(_, text)| text.contains("ERROR: unknown flag: --workspace-dir")),
+            "the agent's dying words must land in the status log: {logs:?}"
+        );
+    }
+
+    #[test]
+    fn rendered_container_output_is_not_duplicated_into_status_log() {
+        let mut tab = make_tab();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        tab.container_stdout_rx = Some(rx);
+
+        tx.send(b"normal session output\r\n".to_vec()).unwrap();
+        tab.drain_container_output();
+        // The renderer drew the overlay at least once.
+        tab.container_rendered = true;
+        finish_with_chat_outcome(&mut tab, Some(0));
+
+        let logs = log_texts(&tab);
+        assert!(
+            !logs
+                .iter()
+                .any(|(_, text)| text.contains("normal session output")),
+            "output the user already saw must not be replayed: {logs:?}"
         );
     }
 }
