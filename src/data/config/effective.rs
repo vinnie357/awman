@@ -209,9 +209,14 @@ impl EffectiveConfig {
 
     /// Effective credential injection mode (repo > built-in default `keychain`).
     ///
-    /// `passthrough` skips keychain injection entirely; `none` disables all
+    /// `passthrough` skips keychain injection entirely; `none` disables keychain
     /// injection; `keychain` (default) injects host keychain creds, subject to
-    /// injection-time dedup of any harness-declared env vars.
+    /// injection-time dedup of any repo-declared env vars.
+    ///
+    /// Single-layer resolution (repo only, no global flag override) is a
+    /// deliberate conservative choice: a credential toggle must be an explicit
+    /// per-repo decision, not silently inherited from a global default that the
+    /// operator may not realize is set.
     pub fn auth_mode(&self) -> AgentAuthMode {
         self.repo.auth.unwrap_or_default()
     }

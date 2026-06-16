@@ -42,13 +42,14 @@ pub struct ApiConfig {
     pub always_non_interactive: Option<bool>,
 }
 
-/// Per-harness credential injection mode.
+/// Per-repo credential injection mode.
 ///
 /// Controls how awman injects credentials into agent containers.  The default
 /// (`keychain`) injects whatever the host keychain resolves, subject to
 /// injection-time deduplication (Part A).  `passthrough` skips keychain
 /// injection entirely — the harness must supply credentials via `env(VAR)`
-/// overlays.  `none` disables all credential injection.
+/// overlays.  `none` disables KEYCHAIN credential injection; declared `env()`
+/// overlays still apply.
 ///
 /// Resolved through `EffectiveConfig::auth_mode()`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,9 +58,10 @@ pub enum AgentAuthMode {
     /// Inject host keychain credentials (with injection-time dedup). Default.
     #[default]
     Keychain,
-    /// Skip keychain injection; rely on harness-declared `env()` overlays.
+    /// Skip KEYCHAIN injection; rely on repo-declared `env()` overlays.
+    /// Declared `env()` overlays still apply.
     Passthrough,
-    /// No credential injection of any kind.
+    /// No KEYCHAIN credential injection; declared `env()` overlays still apply.
     None,
 }
 
@@ -101,7 +103,7 @@ pub struct RepoConfig {
     #[serde(rename = "dockerfile", skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<String>,
     /// Credential injection mode for agent containers. See [`AgentAuthMode`].
-    /// Resolved per-harness; `keychain` (default) injects host keychain creds.
+    /// Resolved per-repo; `keychain` (default) injects host keychain creds.
     #[serde(rename = "auth", skip_serializing_if = "Option::is_none")]
     pub auth: Option<AgentAuthMode>,
 }

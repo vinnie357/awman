@@ -167,13 +167,15 @@ impl AuthEngine {
         })
     }
 
-    /// Composite resolver: keychain credentials gated on the harness `auth` mode.
+    /// Composite resolver: keychain credentials gated on the repo `auth` mode.
     ///
     /// - `keychain` (default) — inject host keychain credentials. Part-A dedup
     ///   is applied later at `ResolvedContainerOptions::resolve` time.
-    /// - `passthrough` — skip keychain injection entirely; the harness must
-    ///   supply credentials via `env(VAR)` overlays.
-    /// - `none` — no credential injection of any kind.
+    /// - `passthrough` — skip keychain injection entirely; the repo must
+    ///   supply credentials via `env(VAR)` overlays.  Declared `env()` overlays
+    ///   still apply.
+    /// - `none` — no KEYCHAIN credential injection; declared `env()` overlays
+    ///   still apply.
     ///
     /// The Layer-2 `auto_agent_auth_accepted` consent flag is a separate concern;
     /// this method only resolves *which* credentials to inject.

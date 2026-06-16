@@ -180,9 +180,9 @@ credentials through other means:
 
 | Value | Behaviour |
 |-------|-----------|
-| `keychain` (default) | Inject host keychain credentials. When the harness also declares `env(ANTHROPIC_API_KEY)` (or another credential that covers the same provider), the keychain OAuth token for that provider is automatically suppressed at injection time — the container receives exactly one set of credentials per provider. |
-| `passthrough` | Skip keychain injection entirely. Supply credentials via `env(VAR)` overlays; awman never injects anything from the keychain. |
-| `none` | No credential injection at all. |
+| `keychain` (default) | Inject host keychain credentials. When the repo also declares `env(ANTHROPIC_API_KEY)` (or another credential that covers the same provider) **and that variable is set on the host**, the keychain OAuth token for that provider is automatically suppressed at injection time — the container receives exactly one set of credentials per provider. If the declared passthrough var is not set on the host, the keychain credential is retained so the container is not left with zero credentials for that provider. |
+| `passthrough` | No KEYCHAIN credential injection; declared `env()` overlays still apply. Supply credentials via `env(VAR)` overlays. |
+| `none` | No KEYCHAIN credential injection; declared `env()` overlays still apply. |
 
 Set `auth` in `.awman/config.json` directly (it is not settable via `config set`). The field is per-repo only — cloud harnesses that do not declare an anthropic env var remain on the default `keychain` path and continue to receive keychain OAuth unaffected.
 
