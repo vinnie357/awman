@@ -57,10 +57,52 @@ pub fn agent_keychain_files(agent: &AgentName) -> Vec<AgentSecretFile> {
 
 // ── Claude (env-var) ────────────────────────────────────────────────────────
 
+/// Returns `true` when the harness already supplies its own Anthropic
+/// credential, making keychain OAuth injection unnecessary and harmful.
+/// Claude Code warns "auth may not work" when both `CLAUDE_CODE_OAUTH_TOKEN`
+/// and `ANTHROPIC_API_KEY` are present in the same environment.
+///
+/// Triggers when:
+/// - `ANTHROPIC_API_KEY` is set and non-empty (direct API-key auth), or
+/// - `ANTHROPIC_BASE_URL` is set to a non-anthropic.com endpoint (local/omlx
+///   harness pointing at a custom base URL).
+///
+/// `lookup_env` abstracts `std::env::var` so tests stay hermetic and never
+/// mutate process-global state, mirroring the `lookup_env` pattern used by
+/// `auto_auth_env_overlays`.
+fn harness_supplies_anthropic_auth(lookup_env: impl Fn(&str) -> Option<String>) -> bool {
+    if lookup_env("ANTHROPIC_API_KEY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if let Some(base_url) = lookup_env("ANTHROPIC_BASE_URL") {
+        if !base_url.is_empty() {
+            let lower = base_url.to_ascii_lowercase();
+            // Cloud endpoints: api.anthropic.com and *.anthropic.com are
+            // first-party — keychain OAuth still applies. Anything else (local
+            // address, omlx harness, custom proxy) means the harness owns auth.
+            let is_cloud = lower.contains("anthropic.com");
+            if !is_cloud {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// macOS-only: look up the Claude Code OAuth credential and extract its
 /// access token via the JSON path `claudeAiOauth.accessToken`.
+///
+/// Returns an empty list immediately (without touching the keychain) when the
+/// harness already supplies its own Anthropic credential — see
+/// [`harness_supplies_anthropic_auth`].
 fn claude_keychain_credentials() -> Vec<(String, String)> {
     if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    if harness_supplies_anthropic_auth(|key| std::env::var(key).ok()) {
         return Vec::new();
     }
     let Some(raw) = run_macos_keychain_lookup("Claude Code-credentials", None) else {
@@ -254,5 +296,62 @@ mod tests {
     fn agent_keychain_credentials_for_unknown_agent_is_empty() {
         let agent = AgentName::new("totallymadeup").unwrap();
         assert!(agent_keychain_credentials(&agent).is_empty());
+    }
+
+    // ── harness_supplies_anthropic_auth ────────────────────────────────────
+
+    /// Helper: build a lookup closure from a static list of (key, value) pairs.
+    fn env_from<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn harness_auth_true_when_api_key_set_nonempty() {
+        let lookup = env_from(&[("ANTHROPIC_API_KEY", "sk-ant-test123")]);
+        assert!(
+            harness_supplies_anthropic_auth(lookup),
+            "non-empty ANTHROPIC_API_KEY must signal harness auth"
+        );
+    }
+
+    #[test]
+    fn harness_auth_false_when_api_key_empty_string() {
+        let lookup = env_from(&[("ANTHROPIC_API_KEY", "")]);
+        assert!(
+            !harness_supplies_anthropic_auth(lookup),
+            "empty ANTHROPIC_API_KEY must not trigger the guard"
+        );
+    }
+
+    #[test]
+    fn harness_auth_true_when_base_url_is_non_cloud() {
+        let lookup = env_from(&[("ANTHROPIC_BASE_URL", "http://192.168.65.1:8000")]);
+        assert!(
+            harness_supplies_anthropic_auth(lookup),
+            "non-anthropic.com ANTHROPIC_BASE_URL must signal harness auth"
+        );
+    }
+
+    #[test]
+    fn harness_auth_false_when_base_url_is_anthropic_com() {
+        let lookup = env_from(&[("ANTHROPIC_BASE_URL", "https://api.anthropic.com")]);
+        assert!(
+            !harness_supplies_anthropic_auth(lookup),
+            "official anthropic.com base URL must not suppress keychain OAuth"
+        );
+    }
+
+    #[test]
+    fn harness_auth_false_when_nothing_set() {
+        let lookup = env_from(&[]);
+        assert!(
+            !harness_supplies_anthropic_auth(lookup),
+            "no env vars set must not trigger the guard"
+        );
     }
 }
