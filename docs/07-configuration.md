@@ -168,6 +168,24 @@ awman config set yoloDisallowedTools ""                # set an empty list
 
 An empty repo list actively overrides a non-empty global list. To stop overriding, remove the field from the repo config file. See [Yolo Mode](06-yolo-mode.md).
 
+### Control credential injection (`auth` mode)
+
+By default awman injects host keychain credentials into agent containers
+(`keychain` mode). Two alternatives are available for harnesses that supply
+credentials through other means:
+
+```json
+{ "auth": "passthrough" }
+```
+
+| Value | Behaviour |
+|-------|-----------|
+| `keychain` (default) | Inject host keychain credentials. When the harness also declares `env(ANTHROPIC_API_KEY)` (or another credential that covers the same provider), the keychain OAuth token for that provider is automatically suppressed at injection time — the container receives exactly one set of credentials per provider. |
+| `passthrough` | Skip keychain injection entirely. Supply credentials via `env(VAR)` overlays; awman never injects anything from the keychain. |
+| `none` | No credential injection at all. |
+
+Set `auth` in `.awman/config.json` directly (it is not settable via `config set`). The field is per-repo only — cloud harnesses that do not declare an anthropic env var remain on the default `keychain` path and continue to receive keychain OAuth unaffected.
+
 ---
 
 ## Runtimes
@@ -220,6 +238,7 @@ awman keeps global config and data (workflows, skills, worktrees, API state) und
 | `agentStuckTimeout` | integer (seconds) | 30 | Inactivity period before an agent is flagged as stuck | yes |
 | `baseImage` | string | (unset → global) | Image tag for workflow setup/teardown containers — see [Workflows](05-workflows.md) | no (edit file) |
 | `dockerfile` | string | `Dockerfile.dev` | Path to the project base Dockerfile, relative to repo root or absolute | no (edit file) |
+| `auth` | `"keychain"` \| `"passthrough"` \| `"none"` | `"keychain"` | Credential injection mode — see [Control credential injection](#control-credential-injection-auth-mode) | no (edit file) |
 
 ### Global config fields (`$HOME/.awman/config.json`)
 
