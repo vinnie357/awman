@@ -336,5 +336,98 @@ class StartupGateBootstrapTest(unittest.TestCase):
         self.assertEqual(events, ["mount", "tree", "probe", "ready", "release", "exec"])
         self.assertEqual(exec_calls, [(original_argv[0], original_argv, original_env)])
 
+
+class StartupGateRegressionTest(unittest.TestCase):
+    VALID_MOUNTINFO = "11 1 0:2 / /review/input ro,relatime - bind /prepared ro"
+
+    def test_verify_tree_rejects_root_symlink(self):
+        with tempfile.TemporaryDirectory() as parent:
+            parent_path = Path(parent)
+            real = parent_path / "real"
+            real.mkdir()
+            link = parent_path / "root-link"
+            link.symlink_to(real, target_is_directory=True)
+            with self.assertRaises(bootstrap.GateError):
+                bootstrap.verify_tree(link, {"version": 1, "entries": []})
+
+    def test_verify_tree_rejects_walk_onerror_even_when_iterator_is_empty(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            def failed_walk(*_args, **kwargs):
+                kwargs["onerror"](PermissionError("fixture traversal denied"))
+                return iter(())
+            with mock.patch.object(bootstrap.os, "walk", side_effect=failed_walk):
+                with self.assertRaises(bootstrap.GateError):
+                    bootstrap.verify_tree(root_path, {"version": 1, "entries": []})
+
+    def test_read_write_probe_requires_successful_removal(self):
+        with tempfile.TemporaryDirectory() as root:
+            binding = {"workspace_path": root, "access": "read-write"}
+            with mock.patch.object(Path, "unlink", side_effect=PermissionError("fixture unlink denied")):
+                with self.assertRaises(bootstrap.GateError):
+                    bootstrap.probe_access(binding)
+
+    def test_run_gate_rejects_empty_bindings_without_ready_or_exec(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as control:
+            control_path = Path(control)
+            (control_path / "request.json").write_bytes(b'{"version":1,"bindings":[]}')
+            (control_path / "request.json").chmod(0o600)
+            with self.assertRaises(bootstrap.GateError):
+                bootstrap.run_gate(control_path, ["agent"], {}, self.VALID_MOUNTINFO, exec_fn=lambda *args: calls.append(args))
+            self.assertFalse((control_path / "ready.json").exists())
+        self.assertEqual(calls, [])
+
+    def test_request_and_manifest_bounds_and_safe_manifest_basename_fail_before_ready(self):
+        cases = ("request-oversize", "manifest-oversize", "traversal", "symlink")
+        with tempfile.TemporaryDirectory() as owned:
+            owned_path = Path(owned)
+            outside = owned_path / "outside.json"
+            outside.write_bytes(manifest_bytes([]))
+            for case in cases:
+                with self.subTest(case=case), tempfile.TemporaryDirectory(dir=owned) as control:
+                    control_path = Path(control)
+                    if case == "manifest-oversize":
+                        raw = b'{"version":1,"entries":[]}' + b" " * (8 * 1024 * 1024 + 1 - len(b'{"version":1,"entries":[]}'))
+                        manifest_file = "large.json"
+                        (control_path / manifest_file).write_bytes(raw)
+                    else:
+                        raw = outside.read_bytes()
+                        if case == "traversal":
+                            manifest_file = "../outside.json"
+                        elif case == "symlink":
+                            manifest_file = "linked.json"
+                            (control_path / manifest_file).symlink_to(outside)
+                        else:
+                            manifest_file = "review.json"
+                            (control_path / manifest_file).write_bytes(raw)
+                    request = {"version": 1, "bindings": [{"id": "review-input", "workspace_path": "/review/input", "manifest_id": hashlib.sha256(raw).hexdigest(), "manifest_file": manifest_file, "access": "read-only"}]}
+                    request_raw = json.dumps(request, separators=(",", ":")).encode()
+                    if case == "request-oversize":
+                        request_raw += b" " * (4097 - len(request_raw))
+                    (control_path / "request.json").write_bytes(request_raw)
+                    (control_path / "request.json").chmod(0o600)
+                    if (control_path / manifest_file).exists() and not (control_path / manifest_file).is_symlink():
+                        (control_path / manifest_file).chmod(0o600)
+                    expected_code = "request-invalid" if case in ("request-oversize", "traversal") else "manifest-invalid"
+                    clock = FakeClock()
+                    with mock.patch.object(bootstrap, "verify_tree", return_value=None), mock.patch.object(
+                        bootstrap, "probe_access", return_value=None
+                    ):
+                        with self.assertRaises(bootstrap.GateError) as raised:
+                            bootstrap.run_gate(
+                                control_path,
+                                ["agent"],
+                                {},
+                                self.VALID_MOUNTINFO,
+                                exec_fn=lambda *_: self.fail("must not exec"),
+                                timeout=1,
+                                clock=clock.monotonic,
+                                sleep=clock.sleep,
+                            )
+                    self.assertEqual(raised.exception.code, expected_code)
+                    self.assertFalse((control_path / "ready.json").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

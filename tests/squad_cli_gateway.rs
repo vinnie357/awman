@@ -7,7 +7,7 @@
 //! envelopes against the daemon's wire responses.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -668,9 +668,34 @@ fn init_repo(path: &Path) {
 }
 
 #[cfg(unix)]
+const AWMAN_SQUAD_GATEWAY_HOLDER_CHILD: &str = "AWMAN_SQUAD_GATEWAY_HOLDER_CHILD";
+
+#[cfg(unix)]
+#[test]
+fn fake_awman_process_holder_child() {
+    if std::env::var_os(AWMAN_SQUAD_GATEWAY_HOLDER_CHILD).as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return;
+    }
+
+    use std::io::Read;
+    let mut stdin = std::io::stdin().lock();
+    let mut buffer = [0_u8; 256];
+    loop {
+        match stdin.read(&mut buffer) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(error) => panic!("holder child must read stdin until EOF: {error}"),
+        }
+    }
+}
+
+#[cfg(unix)]
 struct FakeAwmanProcess {
     _dir: tempfile::TempDir,
     child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
 }
 
 #[cfg(unix)]
@@ -678,7 +703,8 @@ impl FakeAwmanProcess {
     fn spawn() -> Self {
         let dir = tempfile::tempdir().expect("fake awman process directory");
         let executable = dir.path().join("awman-squad-test-holder");
-        std::fs::copy("/bin/sleep", &executable).expect("copy sleep holder");
+        let test_binary = std::env::current_exe().expect("current squad gateway test binary");
+        std::fs::copy(test_binary, &executable).expect("copy squad gateway test holder");
         use std::os::unix::fs::PermissionsExt;
         let mut permissions = std::fs::metadata(&executable)
             .expect("holder metadata")
@@ -691,8 +717,15 @@ impl FakeAwmanProcess {
         // executable as busy (`ETXTBSY`) until that fork execs. Retry briefly
         // rather than require `--test-threads=1`, as the other squad fixtures do.
         let mut attempt = 0;
-        let child = loop {
-            match Command::new(&executable).arg("60").spawn() {
+        let mut child = loop {
+            match Command::new(&executable)
+                .args(["--exact", "fake_awman_process_holder_child", "--nocapture"])
+                .env(AWMAN_SQUAD_GATEWAY_HOLDER_CHILD, "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
                 Ok(child) => break child,
                 Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 20 => {
                     attempt += 1;
@@ -701,6 +734,7 @@ impl FakeAwmanProcess {
                 Err(e) => panic!("awman-named holder must start: {e}"),
             }
         };
+        let stdin = child.stdin.take().expect("holder child stdin");
 
         // `spawn` returns once the child *exists*, not once it has finished
         // `execve`. Until that exec lands, the child's command name is still
@@ -708,11 +742,14 @@ impl FakeAwmanProcess {
         // rejects; a supervisor checked inside that window would treat the
         // pidfile as stale and try to auto-start a daemon. Wait for the
         // identity this fixture exists to present.
-        let mut child = child;
         let pid = child.id();
         for _ in 0..500 {
             if awman::data::fs::daemon_process::pid_is_awman(pid) {
-                return Self { _dir: dir, child };
+                return Self {
+                    _dir: dir,
+                    child,
+                    stdin: Some(stdin),
+                };
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -729,7 +766,10 @@ impl FakeAwmanProcess {
 #[cfg(unix)]
 impl Drop for FakeAwmanProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        drop(self.stdin.take());
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
     }
 }

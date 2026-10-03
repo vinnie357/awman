@@ -172,3 +172,81 @@ belong to `awman squad` itself; pass them before a subcommand when using one:
 - Environment overrides: `AWMAN_*` variables (notably `AWMAN_OVERLAYS`, `AWMAN_API_KEY`, `AWMAN_SQUAD_KEY`, `AWMAN_API_ROOT`).
 
 Precedence (highest to lowest): CLI flag → environment variable → repo config → global config → built-in default.
+# Orchestrator startup-gate flags
+
+`chat` and `exec prompt` accept CLI-only `--startup-gate-control <DIR>` and
+`--startup-gate-timeout <SECONDS>` flags. Timeout defaults to 120 seconds and
+must be in `1..=3600`; specifying it without a control directory is a usage
+error. These flags are unavailable to API, remote, squad, TUI, ACP, and
+sandbox-class launches.
+
+This fork's first `exec workflow` integration accepts a single agent step and
+no setup, teardown, or dynamic leader. It rejects other workflow shapes before
+agent dispatch because one control directory is single-use.
+
+### Validated host snapshot
+
+The host loader returns the parsed request together with the exact manifest
+bytes that passed the bounded file, digest, and schema checks. The owned
+contract is:
+
+```rust
+pub struct StartupGateSpec {
+    pub control_dir: PathBuf,
+    pub request: StartupGateRequest,
+    pub timeout: Duration,
+    pub validated_manifests: BTreeMap<String, Vec<u8>>,
+}
+```
+
+Before launch, staging reloads the control directory and rejects a changed
+request or manifest. It writes each staged manifest from the second loader
+result's `validated_manifests`; it does not reopen a caller manifest after
+validation. Request and manifest inputs must be regular, current-user-owned,
+mode-`0600`, single-link files beneath a current-user-owned mode-`0700`
+control directory. Reads are bounded and do not follow symlinks.
+
+### Readiness and credential-refresh latch
+
+`ready.json` is bounded to 64 KiB and contains `version`, a 64-character
+lowercase hexadecimal `nonce`, the authoritative `container_name`, and the
+verified `bindings`. Each ready binding contains `id`, `workspace_path`,
+`manifest_id`, and `access`, and must match the current request. After the
+orchestrator's matching `release.json` is consumed, the bootstrap writes the
+two-field receipt `.released` containing exactly `version` and `nonce`;
+that receipt is bounded to 4 KiB. Status records use the same protected-file
+rules as request inputs.
+
+The credential-refresh registry releases a pending lease only when the ready
+container equals the container registered for that lease, the binding identity
+matches the current request, the receipt nonce matches, and no
+`failure.json` is present. A successful release is latched for that lease
+generation. Until then, the monitor neither refreshes the host credential nor
+rewrites the staged credential.
+
+### Startup-gated image inspection
+
+Image inspection normalizes both runtime formats through this internal
+contract:
+
+```rust
+#[derive(Debug, Eq, PartialEq)]
+struct GateImageConfig {
+    user: String,
+    env: Vec<String>,
+    entrypoint: Vec<String>,
+    trusted: bool,
+}
+
+fn parse_gate_image_config(
+    runtime_name: &str,
+    raw: &[u8],
+) -> Result<GateImageConfig, EngineError>
+```
+
+Docker supplies the formatted image Config object. Apple Containers supplies
+its inspection array with the first variant's nested `config.config` object.
+A missing, null, or empty image `Entrypoint` normalizes to an empty vector.
+Malformed security fields, any nonempty image entrypoint, and image variables
+`PYTHONHOME`, `PYTHONPATH`, `LD_*`, or `DYLD_*` are rejected before
+container launch even when the image has the trusted capability label.

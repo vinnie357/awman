@@ -1008,3 +1008,26 @@ Alongside the fields above, the output includes an `agent_credentials` array —
 ---
 
 [← Using the TUI](02-using-the-tui.md) · [Next: Security & Isolation →](04-security-and-isolation.md)
+# Orchestrated startup gates
+
+Command-mode `chat` and `exec prompt` can delay the agent entrypoint until an
+orchestrator verifies that the container sees its prepared workspaces. Pass
+`--startup-gate-control DIR`; the directory must contain the strict v1
+`request.json` and manifest files described by the CLI reference. Awman writes
+`ready.json` only after checking the actual guest mounts, access modes, and full
+manifest trees. The orchestrator then writes a nonce-matched `release.json`.
+Until that release arrives, the agent process has not started.
+
+`--startup-gate-timeout SECONDS` defaults to 120 and accepts 1 through 3600.
+Failure, cancellation, or timeout writes `failure.json` and exits without
+running the agent. A control directory is single-use.
+
+For `exec workflow`, the initial fork extension accepts exactly one agent step,
+with no setup, teardown, or dynamic leader. Retries require a fresh control
+directory and invocation. Multi-agent orchestration gives each container its
+own control directory rather than reusing one workflow flag.
+
+Gated images must carry the generated-template capability label and must not
+define `PYTHONHOME` or `PYTHONPATH`. After upgrading this fork, run
+`awman ready --no-cache` to rebuild the project and agent images with the
+trusted interpreter and label.

@@ -5,9 +5,9 @@
 use awman::data::startup_gate::{load_startup_gate, StartupGateAccess};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{symlink, FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -89,6 +89,102 @@ fn assert_rejected(control: &Path, label: &str) {
     assert!(
         load_startup_gate(control, Duration::from_secs(120)).is_err(),
         "{label} must fail closed"
+    );
+}
+
+const FIFO_CHILD_CONTROL: &str = "AWMAN_STARTUP_GATE_FIFO_CHILD_CONTROL";
+const FIFO_CHILD_DONE: &str = "AWMAN_STARTUP_GATE_FIFO_CHILD_DONE";
+
+#[test]
+fn fifo_loader_child() {
+    let Some(control) = std::env::var_os(FIFO_CHILD_CONTROL) else {
+        return;
+    };
+    let done =
+        PathBuf::from(std::env::var_os(FIFO_CHILD_DONE).expect("FIFO child completion path"));
+    assert_rejected(Path::new(&control), "FIFO input");
+    fs::write(done, b"rejected").expect("record bounded child completion");
+}
+
+fn assert_fifo_rejected_in_bounded_child(name: &str) {
+    let fixture = GateFixture::valid();
+    let fifo = fixture.control.join(name);
+    fs::remove_file(&fifo).expect("remove regular fixture file");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("create FIFO");
+    assert!(status.success(), "mkfifo must succeed");
+    assert!(fs::symlink_metadata(&fifo)
+        .expect("FIFO metadata")
+        .file_type()
+        .is_fifo());
+
+    let done = fixture
+        .control
+        .parent()
+        .expect("fixture parent")
+        .join(format!("{name}.done"));
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", "startup_gate::fifo_loader_child", "--nocapture"])
+        .env(FIFO_CHILD_CONTROL, &fixture.control)
+        .env(FIFO_CHILD_DONE, &done)
+        .spawn()
+        .expect("spawn isolated FIFO loader child");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait().expect("poll FIFO loader child") {
+            Some(status) => {
+                assert!(status.success(), "FIFO loader child failed: {status}");
+                assert_eq!(
+                    fs::read(&done).expect("child completion proof"),
+                    b"rejected"
+                );
+                break;
+            }
+            None if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("startup-gate loader blocked while opening {name} FIFO");
+            }
+        }
+    }
+}
+
+#[test]
+fn request_and_manifest_fifos_are_rejected_without_blocking_the_test_process() {
+    for name in ["request.json", "review.manifest.json"] {
+        assert_fifo_rejected_in_bounded_child(name);
+    }
+}
+
+#[test]
+fn loaded_spec_owns_the_exact_validated_manifest_bytes() {
+    let fixture = GateFixture::valid();
+    let approved =
+        fs::read(fixture.control.join("review.manifest.json")).expect("approved manifest");
+    let spec = fixture.load().expect("valid gate");
+    assert_eq!(
+        spec.validated_manifests
+            .get("review.manifest.json")
+            .expect("validated manifest"),
+        &approved
+    );
+
+    fs::write(
+        fixture.control.join("review.manifest.json"),
+        b"caller changed after load",
+    )
+    .expect("replace caller manifest");
+    assert_eq!(
+        spec.validated_manifests
+            .get("review.manifest.json")
+            .expect("owned validated manifest"),
+        &approved,
+        "the validated snapshot must not alias or reopen the caller path"
     );
 }
 

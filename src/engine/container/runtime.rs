@@ -456,6 +456,135 @@ mod tests {
     use crate::engine::agent_runtime::ResolvedAgentOptions;
     use crate::engine::sandbox::options::ResolvedSandboxOptions;
 
+    fn docker_gate_config(env: serde_json::Value, entrypoint: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "User": "1000:1000",
+            "Env": env,
+            "Entrypoint": entrypoint,
+            "Labels": {"dev.awman.startup-gate": "1"}
+        }))
+        .expect("Docker inspect fixture")
+    }
+
+    fn apple_gate_config(env: serde_json::Value, entrypoint: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!([{
+            "variants": [{
+                "config": {
+                    "config": {
+                        "User": "1000:1000",
+                        "Env": env,
+                        "Entrypoint": entrypoint,
+                        "Labels": {"dev.awman.startup-gate": "1"}
+                    }
+                }
+            }]
+        }]))
+        .expect("Apple Containers inspect fixture")
+    }
+
+    #[test]
+    fn gate_image_parser_accepts_real_docker_and_apple_config_shapes() {
+        for (runtime, raw) in [
+            (
+                "docker",
+                docker_gate_config(
+                    serde_json::json!(["PATH=/usr/bin"]),
+                    serde_json::Value::Null,
+                ),
+            ),
+            (
+                "apple-containers",
+                apple_gate_config(serde_json::json!(["PATH=/usr/bin"]), serde_json::json!([])),
+            ),
+        ] {
+            let parsed =
+                parse_gate_image_config(runtime, &raw).expect("supported startup-gate image");
+            assert_eq!(
+                parsed,
+                GateImageConfig {
+                    user: "1000:1000".into(),
+                    env: vec!["PATH=/usr/bin".into()],
+                    entrypoint: Vec::new(),
+                    trusted: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_gate_label_does_not_allow_image_loader_environment() {
+        for key in [
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+        ] {
+            for (runtime, raw) in [
+                (
+                    "docker",
+                    docker_gate_config(
+                        serde_json::json!([format!("{key}=/untrusted")]),
+                        serde_json::Value::Null,
+                    ),
+                ),
+                (
+                    "apple-containers",
+                    apple_gate_config(
+                        serde_json::json!([format!("{key}=/untrusted")]),
+                        serde_json::json!([]),
+                    ),
+                ),
+            ] {
+                assert!(
+                    parse_gate_image_config(runtime, &raw).is_err(),
+                    "{runtime} must reject image variable {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trusted_gate_label_does_not_allow_an_image_entrypoint() {
+        for (runtime, raw) in [
+            (
+                "docker",
+                docker_gate_config(
+                    serde_json::json!(["PATH=/usr/bin"]),
+                    serde_json::json!(["/bin/sh", "-c"]),
+                ),
+            ),
+            (
+                "apple-containers",
+                apple_gate_config(
+                    serde_json::json!(["PATH=/usr/bin"]),
+                    serde_json::json!(["python3", "-c"]),
+                ),
+            ),
+        ] {
+            assert!(
+                parse_gate_image_config(runtime, &raw).is_err(),
+                "{runtime} image entrypoint could run before the fixed bootstrap"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_image_parser_rejects_malformed_security_fields() {
+        let non_string_env = docker_gate_config(
+            serde_json::json!(["PATH=/usr/bin", 7]),
+            serde_json::Value::Null,
+        );
+        assert!(parse_gate_image_config("docker", &non_string_env).is_err());
+
+        let scalar_entrypoint = apple_gate_config(
+            serde_json::json!(["PATH=/usr/bin"]),
+            serde_json::json!("/bin/sh"),
+        );
+        assert!(parse_gate_image_config("apple-containers", &scalar_entrypoint).is_err());
+    }
+
     #[test]
     fn build_requires_image_option() {
         let rt = ContainerRuntime::docker();

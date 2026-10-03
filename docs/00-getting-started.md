@@ -85,6 +85,26 @@ That's it — you have an isolated agent working in your repo.
 | GitHub Releases | Download the asset for your platform, `chmod +x`, move onto `PATH` |
 | From source | `git clone https://github.com/prettysmartdev/awman.git && cd awman && make install` (Rust 1.94+) |
 
+## Altana startup-gate fork
+
+The upstream `0.12.0` release does not include the orchestrator startup gate.
+Install the Altana fork from its reviewed startup-gate commit rather than
+installing or relabelling upstream `0.12.0`; deployment records should retain
+both the upstream base (`c730732b`) and the exact fork commit used to build the
+binary.
+
+Callers should detect the extension from CLI metadata already exposed by awman:
+
+```sh
+awman chat --help | grep -- --startup-gate-control
+awman exec prompt --help | grep -- --startup-gate-control
+awman exec workflow --help | grep -- --startup-gate-control
+```
+
+All three checks must succeed before an orchestrator sends gate flags. Do not
+infer support from `awman --version`: the fork currently retains the upstream
+`0.12.0` package version for source compatibility.
+
 Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-amd64`, `awman-macos-arm64`, `awman-windows-amd64.exe`.
 
 ### `awman init`

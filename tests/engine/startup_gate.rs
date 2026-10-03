@@ -1,7 +1,7 @@
 //! WI 0118 Layer 1 startup-gate option and wrapper contract tests.
 
 use awman::data::startup_gate::{
-    StartupGateAccess, StartupGateBinding, StartupGateRequest, StartupGateSpec,
+    load_startup_gate, StartupGateAccess, StartupGateBinding, StartupGateRequest, StartupGateSpec,
 };
 use awman::engine::container::options::{
     ContainerOption, EnvLiteral, EnvVar, ImageRef, OverlayPermission, OverlaySpec,
@@ -10,8 +10,41 @@ use awman::engine::container::options::{
 use awman::engine::container::startup_gate::{
     stage_startup_gate, wrap_entrypoint, CONTAINER_GATE_ROOT,
 };
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::Duration;
+
+fn valid_gate() -> (tempfile::TempDir, StartupGateSpec) {
+    let canonical_temp = fs::canonicalize(std::env::temp_dir()).expect("canonical temp root");
+    let control = tempfile::tempdir_in(canonical_temp).expect("control");
+    fs::set_permissions(control.path(), fs::Permissions::from_mode(0o700)).expect("control mode");
+    let manifest = br#"{"version":1,"entries":[]}"#;
+    fs::write(control.path().join("review.manifest.json"), manifest).expect("manifest");
+    fs::set_permissions(
+        control.path().join("review.manifest.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("manifest mode");
+    let digest: String = Sha256::digest(manifest)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let request = serde_json::json!({"version":1,"bindings":[{"id":"review-input","workspace_path":"/review/input","manifest_id":digest,"manifest_file":"review.manifest.json","access":"read-only"}]});
+    fs::write(
+        control.path().join("request.json"),
+        serde_json::to_vec(&request).expect("json"),
+    )
+    .expect("request");
+    fs::set_permissions(
+        control.path().join("request.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("request mode");
+    let spec = load_startup_gate(control.path(), Duration::from_secs(120)).expect("valid fixture");
+    (control, spec)
+}
 
 fn gate_spec(control_dir: PathBuf) -> StartupGateSpec {
     StartupGateSpec {
@@ -27,13 +60,14 @@ fn gate_spec(control_dir: PathBuf) -> StartupGateSpec {
             }],
         },
         timeout: Duration::from_secs(120),
+        validated_manifests: Default::default(),
     }
 }
 
 #[test]
 fn stage_uses_only_fixed_operational_mounts_and_isolated_absolute_python() {
-    let control = tempfile::tempdir().expect("control");
-    let staged = stage_startup_gate(&gate_spec(control.path().to_path_buf())).expect("stage");
+    let (control, spec) = valid_gate();
+    let staged = stage_startup_gate(&spec).expect("stage");
     assert_eq!(staged.overlays.len(), 2);
     assert!(staged.overlays.iter().any(|overlay| {
         overlay.container_path == PathBuf::from("/.awman/startup-gate/bin")
@@ -58,8 +92,8 @@ fn stage_uses_only_fixed_operational_mounts_and_isolated_absolute_python() {
 
 #[test]
 fn wrapper_preserves_hostile_original_argv_as_exact_distinct_arguments() {
-    let control = tempfile::tempdir().expect("control");
-    let staged = stage_startup_gate(&gate_spec(control.path().to_path_buf())).expect("stage");
+    let (_control, spec) = valid_gate();
+    let staged = stage_startup_gate(&spec).expect("stage");
     let original = vec![
         "agent executable".to_string(),
         "--leading".to_string(),
@@ -190,4 +224,83 @@ fn gate_binding_roots_are_allowlisted_and_never_accept_an_allowed_root_ancestor(
             "source binding {rejected} must fail"
         );
     }
+}
+
+#[test]
+fn stage_rejects_request_changed_after_load() {
+    let (control, spec) = valid_gate();
+    let mut changed: serde_json::Value =
+        serde_json::from_slice(&fs::read(control.path().join("request.json")).expect("request"))
+            .expect("json");
+    changed["bindings"][0]["id"] = serde_json::Value::String("changed-input".into());
+    fs::write(
+        control.path().join("request.json"),
+        serde_json::to_vec(&changed).expect("json"),
+    )
+    .expect("rewrite");
+    fs::set_permissions(
+        control.path().join("request.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("request mode");
+    assert!(stage_startup_gate(&spec).is_err());
+}
+
+#[test]
+fn stage_rejects_manifest_changed_after_load() {
+    let (control, spec) = valid_gate();
+    fs::write(
+        control.path().join("review.manifest.json"),
+        br#"{"version":1,"entries":[{"path":"changed","kind":"directory","size":0,"sha256":null}]}"#,
+    )
+    .expect("replace caller manifest");
+    fs::set_permissions(
+        control.path().join("review.manifest.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("manifest mode");
+    assert!(
+        stage_startup_gate(&spec).is_err(),
+        "pre-stage changes must be rejected rather than copied"
+    );
+}
+
+#[test]
+fn staged_snapshot_is_immutable_after_caller_control_changes() {
+    let (control, spec) = valid_gate();
+    let approved_manifest = spec
+        .validated_manifests
+        .get("review.manifest.json")
+        .expect("validated manifest")
+        .clone();
+    let staged = stage_startup_gate(&spec).expect("stage");
+    let snapshot_root = staged
+        .overlays
+        .iter()
+        .find(|overlay| overlay.container_path == PathBuf::from("/.awman/startup-gate/bin"))
+        .expect("snapshot overlay")
+        .host_path
+        .clone();
+    let request_before = fs::read(snapshot_root.join("request.json")).expect("snapshot request");
+    let manifest_before =
+        fs::read(snapshot_root.join("review.manifest.json")).expect("snapshot manifest");
+    assert_eq!(
+        manifest_before, approved_manifest,
+        "staging must write the bytes returned by bounded validation"
+    );
+    fs::write(control.path().join("request.json"), b"changed caller bytes")
+        .expect("mutate request");
+    fs::write(
+        control.path().join("review.manifest.json"),
+        b"changed caller bytes",
+    )
+    .expect("mutate manifest");
+    assert_eq!(
+        fs::read(snapshot_root.join("request.json")).expect("snapshot request"),
+        request_before
+    );
+    assert_eq!(
+        fs::read(snapshot_root.join("review.manifest.json")).expect("snapshot manifest"),
+        manifest_before
+    );
 }
