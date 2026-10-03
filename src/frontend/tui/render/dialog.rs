@@ -292,7 +292,7 @@ pub(super) fn render_dialog(dialog: &dialogs::Dialog, area: Rect, frame: &mut Fr
             let visible = list_h as usize;
             let start = selected
                 .saturating_sub(visible.saturating_sub(1))
-                .min(items.len().saturating_sub(visible).max(0));
+                .min(items.len().saturating_sub(visible));
             let lines: Vec<Line> = items
                 .iter()
                 .enumerate()
