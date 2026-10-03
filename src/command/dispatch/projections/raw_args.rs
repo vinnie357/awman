@@ -20,6 +20,7 @@ use std::path::PathBuf;
 
 use crate::command::dispatch::catalogue::{
     ArgumentKind, CommandCatalogue, CommandSpec, FlagDefault, FlagKind, FlagSpec, FrontendKind,
+    FrontendVisibility,
 };
 use crate::command::error::CommandError;
 
@@ -225,7 +226,7 @@ impl CommandCatalogue {
             .lookup_with_aliases(path)
             .ok_or_else(|| CommandError::unknown_command(path))?;
         let canonical = self.canonical_path(path);
-        parse_against_spec(spec, &canonical, args)
+        parse_against_spec(spec, &canonical, args, FrontendKind::Cli)
     }
 
     /// Like [`parse_raw_args`](Self::parse_raw_args) but additionally applies
@@ -240,7 +241,7 @@ impl CommandCatalogue {
             .lookup_with_aliases(path)
             .ok_or_else(|| CommandError::unknown_command(path))?;
         let canonical = self.canonical_path(path);
-        let mut parsed = parse_against_spec(spec, &canonical, args)?;
+        let mut parsed = parse_against_spec(spec, &canonical, args, frontend)?;
         apply_frontend_defaults(&mut parsed, spec, frontend);
         Ok(parsed)
     }
@@ -250,6 +251,7 @@ fn parse_against_spec(
     spec: &CommandSpec,
     path: &[&str],
     args: &[String],
+    frontend: FrontendKind,
 ) -> Result<ParsedArgs, CommandError> {
     let mut flags: BTreeMap<String, ParsedFlag> = BTreeMap::new();
     let mut positionals: Vec<String> = Vec::new();
@@ -294,6 +296,7 @@ fn parse_against_spec(
             };
             let flag_spec = spec
                 .find_flag(name)
+                .filter(|flag| flag_visible_to_frontend(flag.frontends, frontend))
                 .ok_or_else(|| CommandError::unknown_flag(path, name))?;
             i = apply_flag(flag_spec, inline, args, i, path, &mut flags)?;
         } else if let Some(short) = arg.strip_prefix('-') {
@@ -305,7 +308,7 @@ fn parse_against_spec(
             let flag_spec = spec
                 .flags
                 .iter()
-                .find(|f| f.short == Some(ch))
+                .find(|f| f.short == Some(ch) && flag_visible_to_frontend(f.frontends, frontend))
                 .ok_or_else(|| CommandError::unknown_flag(path, format!("-{ch}")))?;
             i = apply_flag(flag_spec, None, args, i, path, &mut flags)?;
         } else {
@@ -381,6 +384,20 @@ fn parse_against_spec(
         arguments,
         path_arguments,
     })
+}
+
+fn flag_visible_to_frontend(visibility: FrontendVisibility, frontend: FrontendKind) -> bool {
+    match frontend {
+        FrontendKind::Cli => matches!(
+            visibility,
+            FrontendVisibility::All | FrontendVisibility::CliOnly | FrontendVisibility::CliAndTui
+        ),
+        FrontendKind::Tui => matches!(
+            visibility,
+            FrontendVisibility::All | FrontendVisibility::TuiOnly | FrontendVisibility::CliAndTui
+        ),
+        FrontendKind::Api => matches!(visibility, FrontendVisibility::All),
+    }
 }
 
 /// Apply a single flag to the flag map, consuming a value from `args` when the
@@ -685,5 +702,39 @@ mod tests {
             .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["--yolo"]), FrontendKind::Api)
             .unwrap();
         assert_eq!(p.flag_bool("yolo"), Some(true));
+    }
+
+    #[test]
+    fn api_profile_rejects_cli_only_startup_gate_flags() {
+        for (path, tokens) in [
+            (
+                &["exec", "prompt"][..],
+                vec!["--startup-gate-control", "/orchestrator/gate", "review"],
+            ),
+            (
+                &["exec", "workflow"][..],
+                vec!["workflow.toml", "--startup-gate-timeout", "30"],
+            ),
+        ] {
+            let error = cat()
+                .parse_raw_args_with_profile(path, &argv(&tokens), FrontendKind::Api)
+                .expect_err("API must not accept a CLI-only startup-gate flag");
+            assert!(
+                matches!(error, CommandError::UnknownFlag { .. }),
+                "an API-invisible flag must behave as unavailable: {error:?}"
+            );
+        }
+
+        let cli = cat()
+            .parse_raw_args_with_profile(
+                &["exec", "prompt"],
+                &argv(&["--startup-gate-control", "/orchestrator/gate", "review"]),
+                FrontendKind::Cli,
+            )
+            .expect("CLI retains startup-gate support");
+        assert_eq!(
+            cli.flag_path("startup-gate-control").as_deref(),
+            Some(std::path::Path::new("/orchestrator/gate"))
+        );
     }
 }

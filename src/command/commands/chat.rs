@@ -68,6 +68,7 @@ pub struct ChatCommand {
     flags: ChatCommandFlags,
     engines: Engines,
     session: Session,
+    startup_gate: Option<crate::data::startup_gate::StartupGateSpec>,
 }
 
 impl ChatCommand {
@@ -76,6 +77,7 @@ impl ChatCommand {
             flags,
             engines,
             session,
+            startup_gate: None,
         }
     }
 
@@ -87,7 +89,7 @@ impl ChatCommand {
                 "chat: --startup-gate-timeout requires --startup-gate-control".into(),
             ));
         }
-        Ok(Self::new(
+        let command = Self::new(
             ChatCommandFlags {
                 startup_gate_control: ctx.flags.path("startup-gate-control"),
                 startup_gate_timeout: ctx
@@ -116,11 +118,26 @@ impl ChatCommand {
             },
             ctx.engines.clone(),
             ctx.session.clone(),
-        ))
+        );
+        let startup_gate = crate::command::commands::preflight_startup_gate(
+            "chat",
+            command.flags.startup_gate_control.as_deref(),
+            command.flags.startup_gate_timeout,
+            command.flags.allow_docker,
+        )?;
+        Ok(Self {
+            startup_gate,
+            ..command
+        })
     }
 
     pub fn flags(&self) -> &ChatCommandFlags {
         &self.flags
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_gate(&self) -> Option<&crate::data::startup_gate::StartupGateSpec> {
+        self.startup_gate.as_ref()
     }
 }
 
@@ -133,6 +150,15 @@ impl Command for ChatCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        let startup_gate = match self.startup_gate.clone() {
+            Some(gate) => Some(gate),
+            None => crate::command::commands::preflight_startup_gate(
+                "chat",
+                self.flags.startup_gate_control.as_deref(),
+                self.flags.startup_gate_timeout,
+                self.flags.allow_docker,
+            )?,
+        };
         // 1. Resolve the agent: --agent flag wins over the repo / global default.
         let session = self.session;
         let agent = match resolve_agent(&self.flags.agent, &session) {
@@ -306,18 +332,7 @@ impl Command for ChatCommand {
 
         // 6. Build the run options from flags + credentials.
         let run_opts = AgentRunOptions {
-            startup_gate: self
-                .flags
-                .startup_gate_control
-                .as_ref()
-                .map(|path| {
-                    crate::data::startup_gate::load_startup_gate(
-                        path,
-                        std::time::Duration::from_secs(self.flags.startup_gate_timeout),
-                    )
-                })
-                .transpose()
-                .map_err(|e| CommandError::Other(format!("chat: {e}")))?,
+            startup_gate,
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),

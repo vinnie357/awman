@@ -2,7 +2,10 @@
 """Fixed, dependency-free awman startup-gate bootstrap."""
 
 import errno, grp, hashlib, json, os, pwd, secrets, stat, sys, time
+from collections import namedtuple
 from pathlib import Path
+
+RuntimeIdentity = namedtuple("RuntimeIdentity", ("uid", "gid", "groups", "drop"))
 
 class GateError(Exception):
     def __init__(self, code, message=None):
@@ -175,6 +178,131 @@ def probe_access(binding):
             except OSError as exc: _fail("access-probe", str(exc))
         if binding["access"] == "read-only": _fail("access-probe", "read-only binding was writable")
 
+def resolve_runtime_identity(run_as):
+    if run_as is None:
+        return RuntimeIdentity(os.geteuid(), os.getegid(), tuple(os.getgroups()), False)
+    user_text, separator, group_text = run_as.partition(":")
+    try:
+        if user_text.isdigit():
+            uid = int(user_text)
+            try: record = pwd.getpwuid(uid)
+            except KeyError: record = None
+        else:
+            record = pwd.getpwnam(user_text)
+            uid = record.pw_uid
+        if separator:
+            if not group_text: _fail("runtime-user", "empty runtime group")
+            gid = int(group_text) if group_text.isdigit() else grp.getgrnam(group_text).gr_gid
+            groups = ()
+        else:
+            if record is None:
+                _fail("runtime-user", "numeric user without passwd entry requires an explicit group")
+            gid = record.pw_gid
+            groups = tuple(dict.fromkeys(os.getgrouplist(record.pw_name, gid)))
+        return RuntimeIdentity(uid, gid, groups, True)
+    except (KeyError, ValueError, OSError) as exc:
+        _fail("runtime-user", str(exc))
+
+def apply_runtime_identity(identity):
+    if not identity.drop:
+        return
+    try:
+        os.setgroups(list(identity.groups))
+        os.setgid(identity.gid)
+        os.setuid(identity.uid)
+        if os.geteuid() != identity.uid or os.getegid() != identity.gid:
+            _fail("runtime-user", "effective identity differs after restoration")
+    except (KeyError, ValueError, OSError) as exc:
+        _fail("runtime-user", str(exc))
+
+def verify_binding_as(binding, manifest, identity):
+    try:
+        read_fd, write_fd = os.pipe()
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        _fail("identity-probe", str(exc))
+    try:
+        pid = os.fork()
+    except BaseException as exc:
+        try: os.close(read_fd)
+        except OSError: pass
+        try: os.close(write_fd)
+        except OSError: pass
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        _fail("identity-probe", str(exc))
+    if pid == 0:
+        status = 1
+        try:
+            try:
+                os.close(read_fd)
+                apply_runtime_identity(identity)
+                verify_tree(Path(binding["workspace_path"]), manifest)
+                probe_access(binding)
+                payload = b""
+                status = 0
+            except GateError as exc:
+                payload = (exc.code + "\0" + str(exc)).encode("utf-8", "replace")[:4096]
+            except BaseException as exc:
+                payload = ("identity-probe\0" + str(exc)).encode("utf-8", "replace")[:4096]
+            try:
+                if payload: os.write(write_fd, payload)
+            except BaseException:
+                status = 1
+        finally:
+            try: os.close(write_fd)
+            finally: os._exit(status)
+    deadline = time.monotonic() + 30
+    reaped = False
+    write_open = True
+    try:
+        os.close(write_fd)
+        write_open = False
+        while True:
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited == pid:
+                reaped = True
+                break
+            if time.monotonic() >= deadline:
+                _fail("identity-probe", "target-identity verification timed out")
+            time.sleep(0.01)
+        payload = os.read(read_fd, 4097)
+    except BaseException as exc:
+        if not reaped:
+            try: os.kill(pid, 9)
+            except OSError: pass
+            while True:
+                try:
+                    waited, _ = os.waitpid(pid, 0)
+                except InterruptedError:
+                    continue
+                except ChildProcessError:
+                    reaped = True
+                    break
+                except OSError:
+                    break
+                else:
+                    if waited == pid:
+                        reaped = True
+                    break
+        if isinstance(exc, (GateError, KeyboardInterrupt, SystemExit)):
+            raise
+        _fail("identity-probe", str(exc))
+    finally:
+        if write_open:
+            try: os.close(write_fd)
+            except OSError: pass
+        try: os.close(read_fd)
+        except OSError: pass
+    if len(payload) > 4096:
+        _fail("identity-probe", "target-identity verification response too large")
+    if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+        if payload:
+            code, _, message = payload.decode("utf-8", "replace").partition("\0")
+            _fail(code or "identity-probe", message or "target-identity verification failed")
+        _fail("identity-probe", "target-identity verification failed")
+
 def _atomic_json(path, value, owner=None):
     temp = path.with_name("." + path.name + "." + secrets.token_hex(8))
     payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -344,7 +472,7 @@ def _load_request(control_dir, protected=False):
         if binding["access"] not in ("read-only", "read-write") or not _hex64(binding["manifest_id"]): _fail("request-invalid", "invalid binding")
     return request
 
-def run_gate(control_dir, original_argv, original_env, mountinfo_text, cancel_check=lambda: False, clock=time.monotonic, sleep=time.sleep, exec_fn=os.execvpe, timeout=120, container_name=None, approved_dir=None, control_handle=None, control_owner=None):
+def run_gate(control_dir, original_argv, original_env, mountinfo_text, cancel_check=lambda: False, clock=time.monotonic, sleep=time.sleep, exec_fn=os.execvpe, timeout=120, container_name=None, approved_dir=None, control_handle=None, control_owner=None, runtime_identity=None):
     del control_owner
     control_dir = Path(control_dir)
     approved_dir = Path(approved_dir) if approved_dir is not None else control_dir
@@ -361,8 +489,11 @@ def run_gate(control_dir, original_argv, original_env, mountinfo_text, cancel_ch
             mode = 0o600 if approved_dir != control_dir else None
             raw = _read_bounded_regular(manifest_path, 8 * 1024 * 1024, "manifest-invalid", owner, mode)
             manifest = parse_manifest(raw, binding["manifest_id"])
-            verify_tree(Path(binding["workspace_path"]), manifest)
-            probe_access(binding)
+            if runtime_identity is None:
+                verify_tree(Path(binding["workspace_path"]), manifest)
+                probe_access(binding)
+            else:
+                verify_binding_as(binding, manifest, runtime_identity)
             verified.append({k: binding[k] for k in ("id", "manifest_id", "access", "workspace_path")})
         if not container_name: _fail("identity-invalid", "missing authoritative container identity")
         ready = {"version": 1, "nonce": secrets.token_hex(32), "container_name": container_name, "bindings": verified}
@@ -409,34 +540,11 @@ def main(argv):
         original_env.update(preserved)
     os.environ.pop("PYTHONHOME", None); os.environ.pop("PYTHONPATH", None)
     mountinfo = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+    runtime_identity = resolve_runtime_identity(run_as)
     def final_exec(file, args, env):
-        if run_as is not None:
-            user_name, _, group_text = run_as.partition(":")
-            try:
-                if user_name.isdigit():
-                    uid = int(user_name)
-                    try:
-                        record = pwd.getpwuid(uid)
-                    except KeyError:
-                        record = None
-                else:
-                    record = pwd.getpwnam(user_name)
-                    uid = record.pw_uid
-                if group_text:
-                    gid = int(group_text) if group_text.isdigit() else grp.getgrnam(group_text).gr_gid
-                    os.setgroups([])
-                else:
-                    if record is None:
-                        _fail("runtime-user", "numeric user without passwd entry requires an explicit group")
-                    gid = record.pw_gid
-                    os.initgroups(record.pw_name, gid)
-                os.setgid(gid)
-                os.setuid(uid)
-                if os.geteuid() != uid or os.getegid() != gid:
-                    _fail("runtime-user", "effective identity differs after restoration")
-            except (KeyError, ValueError, OSError) as exc: _fail("runtime-user", str(exc))
+        apply_runtime_identity(runtime_identity)
         os.execvpe(file, args, env)
-    run_gate(control, original, original_env, mountinfo, timeout=timeout, approved_dir=Path(__file__).resolve().parent, exec_fn=final_exec, container_name=container_name)
+    run_gate(control, original, original_env, mountinfo, timeout=timeout, approved_dir=Path(__file__).resolve().parent, exec_fn=final_exec, container_name=container_name, runtime_identity=runtime_identity)
 
 if __name__ == "__main__":
     try: main(sys.argv)

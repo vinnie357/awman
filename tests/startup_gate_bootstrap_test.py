@@ -1116,8 +1116,9 @@ class StartupGateRegressionTest(unittest.TestCase):
             def setgroups(groups):
                 events.append(("setgroups", list(groups)))
 
-            def initgroups(name, gid):
-                events.append(("initgroups", name, gid))
+            def getgrouplist(name, gid):
+                events.append(("getgrouplist", name, gid))
+                return [gid, 5678]
 
             def setgid(gid):
                 events.append(("setgid", gid))
@@ -1155,7 +1156,13 @@ class StartupGateRegressionTest(unittest.TestCase):
                 ), mock.patch.object(
                     bootstrap.os, "setgroups", side_effect=setgroups
                 ), mock.patch.object(
-                    bootstrap.os, "initgroups", side_effect=initgroups
+                    bootstrap.os, "getgrouplist", side_effect=getgrouplist
+                ), mock.patch.object(
+                    bootstrap.os,
+                    "initgroups",
+                    side_effect=AssertionError(
+                        "runtime identity groups were re-resolved after readiness"
+                    ),
                 ), mock.patch.object(
                     bootstrap.os, "setgid", side_effect=setgid
                 ), mock.patch.object(
@@ -1191,8 +1198,9 @@ class StartupGateRegressionTest(unittest.TestCase):
         run_case(
             "agent-user",
             [
+                ("getgrouplist", "agent-user", 2345),
                 "released",
-                ("initgroups", "agent-user", 2345),
+                ("setgroups", [2345, 5678]),
                 ("setgid", 2345),
                 ("setuid", 1234),
                 ("exec", "agent", ["agent"], {"SAFE": "kept"}),
@@ -1308,6 +1316,418 @@ class StartupGateRegressionTest(unittest.TestCase):
                         )
                 self.assertEqual(raised.exception.code, "runtime-user")
 
+    def test_run_gate_verifies_every_binding_as_resolved_identity_before_ready(self):
+        with mock.patch.object(
+            bootstrap.pwd, "getpwuid", side_effect=KeyError(1234)
+        ):
+            identity = bootstrap.resolve_runtime_identity("1234:3456")
+        events = []
+        real_atomic = bootstrap._atomic_control_json
+
+        def record_atomic(control, name, value):
+            events.append(("record", name))
+            return real_atomic(control, name, value)
+
+        with tempfile.TemporaryDirectory() as control_name:
+            control = Path(control_name)
+            control.chmod(0o700)
+            write_valid_control(control)
+            with mock.patch.object(
+                bootstrap,
+                "validate_mount",
+                side_effect=lambda *_args: events.append(("mount",)),
+            ), mock.patch.object(
+                bootstrap,
+                "verify_binding_as",
+                side_effect=lambda _binding, _manifest, actual: events.append(
+                    ("verify-as", actual)
+                ),
+            ), mock.patch.object(
+                bootstrap,
+                "await_release",
+                side_effect=lambda *_args, **_kwargs: events.append(("release",)),
+            ), mock.patch.object(
+                bootstrap,
+                "_atomic_control_json",
+                side_effect=record_atomic,
+            ):
+                bootstrap.run_gate(
+                    control,
+                    ["agent", "--exact"],
+                    {"SAFE": "kept"},
+                    "fixture mountinfo",
+                    runtime_identity=identity,
+                    container_name="fixture-container",
+                    exec_fn=lambda *args: events.append(("exec", args)),
+                )
+
+        verify_index = events.index(("verify-as", identity))
+        ready_index = events.index(("record", "ready.json"))
+        self.assertLess(verify_index, ready_index)
+        self.assertEqual(
+            [event for event in events if event[0] == "verify-as"],
+            [("verify-as", identity)],
+        )
+        self.assertEqual(events[-1][0], "exec")
+
+    def test_runtime_identity_is_an_immutable_tuple_record(self):
+        identity = bootstrap.RuntimeIdentity(
+            uid=1234,
+            gid=3456,
+            groups=(3456, 4567),
+            drop=True,
+        )
+
+        self.assertIsInstance(identity, tuple)
+        self.assertEqual(identity._fields, ("uid", "gid", "groups", "drop"))
+        self.assertEqual(identity.groups, (3456, 4567))
+        with self.assertRaises(AttributeError):
+            identity.uid = 9999
+        with self.assertRaises(TypeError):
+            identity.groups[0] = 9999
+
+        with mock.patch.object(bootstrap.pwd, "getpwuid", side_effect=KeyError(1234)):
+            resolved = bootstrap.resolve_runtime_identity("1234:3456")
+        self.assertIsInstance(resolved, bootstrap.RuntimeIdentity)
+        self.assertEqual(
+            resolved,
+            bootstrap.RuntimeIdentity(1234, 3456, (), True),
+        )
+
+    def test_verify_binding_as_closes_both_pipe_ends_when_fork_fails(self):
+        close = mock.Mock()
+        with mock.patch.object(
+            bootstrap.os, "pipe", return_value=(101, 102)
+        ), mock.patch.object(
+            bootstrap.os, "fork", side_effect=OSError("fork failed")
+        ), mock.patch.object(
+            bootstrap.os, "close", close
+        ), mock.patch.object(
+            bootstrap.os,
+            "kill",
+            side_effect=AssertionError("no child exists to kill"),
+        ), mock.patch.object(
+            bootstrap.os,
+            "waitpid",
+            side_effect=AssertionError("no child exists to reap"),
+        ):
+            with self.assertRaises(bootstrap.GateError) as raised:
+                bootstrap.verify_binding_as({}, {}, object())
+
+        self.assertEqual(raised.exception.code, "identity-probe")
+        self.assertCountEqual(close.call_args_list, [mock.call(101), mock.call(102)])
+
+    def test_verify_binding_as_closes_pipe_ends_and_preserves_fork_interruption(self):
+        close = mock.Mock()
+        with mock.patch.object(
+            bootstrap.os, "pipe", return_value=(111, 112)
+        ), mock.patch.object(
+            bootstrap.os, "fork", side_effect=KeyboardInterrupt("stop")
+        ), mock.patch.object(
+            bootstrap.os, "close", close
+        ), mock.patch.object(
+            bootstrap.os,
+            "kill",
+            side_effect=AssertionError("no child exists to kill"),
+        ), mock.patch.object(
+            bootstrap.os,
+            "waitpid",
+            side_effect=AssertionError("no child exists to reap"),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                bootstrap.verify_binding_as({}, {}, object())
+
+        self.assertCountEqual(close.call_args_list, [mock.call(111), mock.call(112)])
+
+    def test_verify_binding_as_kills_and_reaps_child_when_wait_fails(self):
+        child_pid = 4242
+        wait_calls = []
+
+        def wait_then_reap(pid, options):
+            wait_calls.append((pid, options))
+            if len(wait_calls) == 1:
+                raise OSError("wait failed")
+            return (pid, 0)
+
+        close = mock.Mock()
+        kill = mock.Mock()
+        with mock.patch.object(
+            bootstrap.os, "pipe", return_value=(201, 202)
+        ), mock.patch.object(
+            bootstrap.os, "fork", return_value=child_pid
+        ), mock.patch.object(
+            bootstrap.os, "close", close
+        ), mock.patch.object(
+            bootstrap.os, "waitpid", side_effect=wait_then_reap
+        ), mock.patch.object(
+            bootstrap.os, "kill", kill
+        ), mock.patch.object(
+            bootstrap.os,
+            "read",
+            side_effect=AssertionError("a failed wait cannot consume child output"),
+        ):
+            with self.assertRaises(bootstrap.GateError) as raised:
+                bootstrap.verify_binding_as({}, {}, object())
+
+        self.assertEqual(raised.exception.code, "identity-probe")
+        self.assertEqual(
+            wait_calls,
+            [(child_pid, os.WNOHANG), (child_pid, 0)],
+        )
+        kill.assert_called_once_with(child_pid, 9)
+        self.assertCountEqual(close.call_args_list, [mock.call(201), mock.call(202)])
+
+    def test_verify_binding_as_reaps_child_and_preserves_wait_interruption(self):
+        child_pid = 4343
+        wait_calls = []
+
+        def interrupt_then_reap(pid, options):
+            wait_calls.append((pid, options))
+            if len(wait_calls) == 1:
+                raise KeyboardInterrupt("stop")
+            return (pid, 0)
+
+        close = mock.Mock()
+        kill = mock.Mock()
+        with mock.patch.object(
+            bootstrap.os, "pipe", return_value=(211, 212)
+        ), mock.patch.object(
+            bootstrap.os, "fork", return_value=child_pid
+        ), mock.patch.object(
+            bootstrap.os, "close", close
+        ), mock.patch.object(
+            bootstrap.os, "waitpid", side_effect=interrupt_then_reap
+        ), mock.patch.object(
+            bootstrap.os, "kill", kill
+        ), mock.patch.object(
+            bootstrap.os,
+            "read",
+            side_effect=AssertionError("an interrupted wait cannot consume child output"),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                bootstrap.verify_binding_as({}, {}, object())
+
+        self.assertEqual(
+            wait_calls,
+            [(child_pid, os.WNOHANG), (child_pid, 0)],
+        )
+        kill.assert_called_once_with(child_pid, 9)
+        self.assertCountEqual(close.call_args_list, [mock.call(211), mock.call(212)])
+
+    def test_main_resolves_runtime_identity_once_before_entering_gate(self):
+        identity = object()
+        with tempfile.TemporaryDirectory() as control_name:
+            control = Path(control_name)
+            control.chmod(0o700)
+            with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(
+                bootstrap,
+                "resolve_runtime_identity",
+                return_value=identity,
+            ) as resolve, mock.patch.object(
+                bootstrap, "run_gate", return_value=None
+            ) as run_gate, mock.patch.object(
+                bootstrap.Path, "read_text", return_value="fixture mountinfo"
+            ), mock.patch.object(
+                bootstrap.Path, "exists", return_value=False
+            ):
+                bootstrap.main(
+                    [
+                        "bootstrap.py",
+                        str(control),
+                        "120",
+                        "--run-as",
+                        "1234:3456",
+                        "--container-name",
+                        "fixture-container",
+                        "--",
+                        "agent",
+                    ]
+                )
+
+        resolve.assert_called_once_with("1234:3456")
+        self.assertIs(
+            run_gate.call_args.kwargs["runtime_identity"],
+            identity,
+            "the gate and final exec must share the one resolved identity",
+        )
+
+    @unittest.skipUnless(
+        hasattr(os, "fork") and os.geteuid() == 0,
+        "real target-identity access check requires a root-owned bounded child",
+    )
+    def test_target_identity_cannot_certify_root_only_workspace(self):
+        with tempfile.TemporaryDirectory() as root_name:
+            root = Path(root_name)
+            root.chmod(0o700)
+            secret = root / "secret.txt"
+            secret.write_bytes(b"root only")
+            secret.chmod(0o600)
+            manifest = {
+                "version": 1,
+                "entries": [
+                    {
+                        "path": "secret.txt",
+                        "kind": "file",
+                        "size": len(b"root only"),
+                        "sha256": hashlib.sha256(b"root only").hexdigest(),
+                    }
+                ],
+            }
+            binding = {
+                "id": "root-only",
+                "workspace_path": str(root),
+                "access": "read-only",
+            }
+            with mock.patch.object(
+                bootstrap.pwd, "getpwuid", side_effect=KeyError(65534)
+            ):
+                identity = bootstrap.resolve_runtime_identity("65534:65534")
+
+            with self.assertRaises(bootstrap.GateError) as raised:
+                bootstrap.verify_binding_as(binding, manifest, identity)
+            self.assertEqual(raised.exception.code, "tree-io")
+
 
 if __name__ == "__main__":
     unittest.main()
+class IdentityProbeCleanupRegressionTests(unittest.TestCase):
+    def test_pipe_oserror_is_identity_probe_without_claiming_child_ownership(self):
+        with mock.patch.object(
+            bootstrap.os, "pipe", side_effect=OSError("pipe failed")
+        ), mock.patch.object(
+            bootstrap.os, "fork", side_effect=AssertionError("no child")
+        ), mock.patch.object(
+            bootstrap.os, "close", side_effect=AssertionError("no descriptors")
+        ), mock.patch.object(
+            bootstrap.os, "kill", side_effect=AssertionError("no child")
+        ), mock.patch.object(
+            bootstrap.os, "waitpid", side_effect=AssertionError("no child")
+        ):
+            with self.assertRaises(bootstrap.GateError) as raised:
+                bootstrap.verify_binding_as({}, {}, object())
+
+        self.assertEqual(raised.exception.code, "identity-probe")
+
+    def test_pipe_baseexception_propagates_without_claiming_child_ownership(self):
+        with mock.patch.object(
+            bootstrap.os, "pipe", side_effect=KeyboardInterrupt("stop")
+        ), mock.patch.object(
+            bootstrap.os, "fork", side_effect=AssertionError("no child")
+        ), mock.patch.object(
+            bootstrap.os, "close", side_effect=AssertionError("no descriptors")
+        ), mock.patch.object(
+            bootstrap.os, "kill", side_effect=AssertionError("no child")
+        ), mock.patch.object(
+            bootstrap.os, "waitpid", side_effect=AssertionError("no child")
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                bootstrap.verify_binding_as({}, {}, object())
+
+    def test_cleanup_retries_eintr_and_reaps_only_the_owned_child(self):
+        child_pid = 4444
+        wait_calls = []
+
+        def fail_then_interrupt_then_reap(pid, options):
+            wait_calls.append((pid, options))
+            if len(wait_calls) == 1:
+                raise OSError("initial wait failed")
+            if len(wait_calls) == 2:
+                raise InterruptedError("cleanup interrupted")
+            return (pid, 0)
+
+        close = mock.Mock()
+        kill = mock.Mock()
+        with mock.patch.object(
+            bootstrap.os, "pipe", return_value=(221, 222)
+        ), mock.patch.object(
+            bootstrap.os, "fork", return_value=child_pid
+        ), mock.patch.object(
+            bootstrap.os, "close", close
+        ), mock.patch.object(
+            bootstrap.os, "waitpid", side_effect=fail_then_interrupt_then_reap
+        ), mock.patch.object(
+            bootstrap.os, "kill", kill
+        ), mock.patch.object(
+            bootstrap.os, "read", side_effect=AssertionError("no read")
+        ):
+            with self.assertRaises(bootstrap.GateError) as raised:
+                bootstrap.verify_binding_as({}, {}, object())
+
+        self.assertEqual(raised.exception.code, "identity-probe")
+        kill.assert_called_once_with(child_pid, 9)
+        self.assertEqual(
+            wait_calls,
+            [(child_pid, os.WNOHANG), (child_pid, 0), (child_pid, 0)],
+        )
+        self.assertCountEqual(close.call_args_list, [mock.call(221), mock.call(222)])
+
+    def test_cleanup_accepts_childprocesserror_as_exact_child_already_reaped(self):
+        child_pid = 4545
+        wait_calls = []
+
+        def fail_then_already_reaped(pid, options):
+            wait_calls.append((pid, options))
+            if len(wait_calls) == 1:
+                raise OSError("initial wait failed")
+            raise ChildProcessError("already reaped")
+
+        close = mock.Mock()
+        kill = mock.Mock()
+        with mock.patch.object(
+            bootstrap.os, "pipe", return_value=(231, 232)
+        ), mock.patch.object(
+            bootstrap.os, "fork", return_value=child_pid
+        ), mock.patch.object(
+            bootstrap.os, "close", close
+        ), mock.patch.object(
+            bootstrap.os, "waitpid", side_effect=fail_then_already_reaped
+        ), mock.patch.object(
+            bootstrap.os, "kill", kill
+        ), mock.patch.object(
+            bootstrap.os, "read", side_effect=AssertionError("no read")
+        ):
+            with self.assertRaises(bootstrap.GateError) as raised:
+                bootstrap.verify_binding_as({}, {}, object())
+
+        self.assertEqual(raised.exception.code, "identity-probe")
+        kill.assert_called_once_with(child_pid, 9)
+        self.assertEqual(wait_calls, [(child_pid, os.WNOHANG), (child_pid, 0)])
+        self.assertCountEqual(close.call_args_list, [mock.call(231), mock.call(232)])
+
+    def test_read_failure_does_not_kill_an_already_reaped_child(self):
+        child_pid = 4646
+        wait_calls = []
+
+        def running_then_reap(pid, options):
+            wait_calls.append((pid, options))
+            if len(wait_calls) == 1:
+                return (0, 0)
+            return (pid, 0)
+
+        close = mock.Mock()
+        kill = mock.Mock()
+        with mock.patch.object(
+            bootstrap.os, "pipe", return_value=(241, 242)
+        ), mock.patch.object(
+            bootstrap.os, "fork", return_value=child_pid
+        ), mock.patch.object(
+            bootstrap.os, "close", close
+        ), mock.patch.object(
+            bootstrap.os, "waitpid", side_effect=running_then_reap
+        ), mock.patch.object(
+            bootstrap.time, "sleep"
+        ), mock.patch.object(
+            bootstrap.os, "kill", kill
+        ), mock.patch.object(
+            bootstrap.os, "read", side_effect=OSError("read failed")
+        ):
+            with self.assertRaises(bootstrap.GateError) as raised:
+                bootstrap.verify_binding_as({}, {}, object())
+
+        self.assertEqual(raised.exception.code, "identity-probe")
+        kill.assert_not_called()
+        self.assertEqual(
+            wait_calls,
+            [(child_pid, os.WNOHANG), (child_pid, os.WNOHANG)],
+        )
+        self.assertCountEqual(close.call_args_list, [mock.call(241), mock.call(242)])

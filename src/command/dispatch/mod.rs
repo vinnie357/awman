@@ -991,6 +991,143 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn malformed_startup_gate_fails_during_command_build_before_runtime_effects() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let request = fixture.path().join("request.json");
+        std::fs::write(&request, b"{}").unwrap();
+        std::fs::set_permissions(&request, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        for path in [
+            &["chat"][..],
+            &["exec", "prompt"][..],
+            &["exec", "workflow"][..],
+        ] {
+            let mut frontend = FakeCommandFrontend::new();
+            frontend
+                .paths
+                .insert("startup-gate-control".into(), fixture.path().to_path_buf());
+            if path == ["exec", "prompt"] {
+                frontend.args.insert("prompt".into(), "review".into());
+            } else if path == ["exec", "workflow"] {
+                frontend
+                    .args
+                    .insert("workflow".into(), "/tmp/workflow.toml".into());
+            }
+
+            let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+            let error = match dispatch.build_command(path) {
+                Ok(_) => panic!("malformed gate must prevent command construction"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("startup gate"),
+                "unexpected preflight error for {path:?}: {error}"
+            );
+        }
+
+        let mut timeout_only = FakeCommandFrontend::new();
+        timeout_only
+            .strings
+            .insert("startup-gate-timeout".into(), "120".into());
+        let timeout_dispatch = Dispatch::new(timeout_only, make_session(), make_engines());
+        let timeout_error = match timeout_dispatch.build_command(&["chat"]) {
+            Ok(_) => panic!("an explicitly supplied timeout requires a control directory"),
+            Err(error) => error,
+        };
+        assert!(
+            timeout_error
+                .to_string()
+                .contains("--startup-gate-timeout requires --startup-gate-control"),
+            "unexpected explicit-timeout error: {timeout_error}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn valid_gate_is_snapshotted_during_command_build() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest = br#"{"version":1,"entries":[]}"#;
+        let manifest_path = fixture.path().join("review.manifest.json");
+        std::fs::write(&manifest_path, manifest).unwrap();
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let manifest_id = Sha256::digest(manifest)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let request = serde_json::json!({
+            "version": 1,
+            "bindings": [{
+                "id": "review-input",
+                "workspace_path": "/review/input",
+                "manifest_id": manifest_id,
+                "manifest_file": "review.manifest.json",
+                "access": "read-only"
+            }]
+        });
+        let request_path = fixture.path().join("request.json");
+        std::fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        std::fs::set_permissions(&request_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        for invalid_timeout in ["0", "3601"] {
+            let mut frontend = FakeCommandFrontend::new();
+            frontend
+                .paths
+                .insert("startup-gate-control".into(), fixture.path().to_path_buf());
+            frontend
+                .strings
+                .insert("startup-gate-timeout".into(), invalid_timeout.into());
+            let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+            let error = match dispatch.build_command(&["chat"]) {
+                Ok(_) => panic!("out-of-range gate timeout must prevent command construction"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("1..=3600"),
+                "unexpected timeout range error for {invalid_timeout}: {error}"
+            );
+        }
+
+        let mut frontend = FakeCommandFrontend::new();
+        frontend
+            .paths
+            .insert("startup-gate-control".into(), fixture.path().to_path_buf());
+        let dispatch = Dispatch::new(frontend, make_session(), make_engines());
+        let command = match dispatch
+            .build_command(&["chat"])
+            .expect("valid gate command")
+        {
+            BuiltCommand::Chat(command) => command,
+            _ => panic!("expected chat"),
+        };
+        let gate = command.startup_gate().expect("owned startup-gate snapshot");
+        assert_eq!(
+            gate.validated_manifests
+                .get("review.manifest.json")
+                .expect("validated manifest")
+                .as_slice(),
+            manifest
+        );
+
+        std::fs::write(&manifest_path, b"changed after command build").unwrap();
+        assert_eq!(
+            gate.validated_manifests
+                .get("review.manifest.json")
+                .expect("owned validated manifest")
+                .as_slice(),
+            manifest,
+            "later setup and launch must use the preflight snapshot"
+        );
+    }
+
+    #[test]
     fn build_remote_exec_workflow_with_workflow_argument() {
         let mut frontend = FakeCommandFrontend::new();
         frontend

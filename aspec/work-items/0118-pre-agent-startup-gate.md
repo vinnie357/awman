@@ -40,6 +40,24 @@ catalogue-defined flags:
 ```
 
 `--startup-gate-timeout` without `--startup-gate-control` is a usage error.
+`--allow-docker` with `--startup-gate-control` is also a usage error. The
+combination is rejected before agent setup, image build, or launch because the
+current privileged bootstrap restores the image user's group contract and
+cannot preserve Docker's added socket group. Ungated `--allow-docker` remains
+supported.
+
+All three commands validate and snapshot the control request before agent
+availability checks, image setup, runtime construction, or launch. A gated
+workflow uses a single-attempt policy: its initial launch still occurs, but
+restart and relaunch actions are neither advertised nor accepted, including an
+action returned directly by a frontend. This includes returning to a previous
+step: ordinary and failure control boards explain why the action is unavailable,
+and an injected action is rejected before resetting either step or launching
+again. A mid-step injected action still stops the currently owned execution
+before returning the rejection. A public single-attempt run terminates on a
+failed step without presenting the interactive failure board; the private
+failure-handler regression covers only its injected-action validation boundary.
+Ungated workflow retry behavior is unchanged.
 The flags are command-mode only in this work item. API, remote, squad, TUI,
 setup/teardown entries, ACP and sandbox-class (`sbx`) launches reject the gate
 as unsupported before any container starts. Supporting them later requires an
@@ -85,7 +103,9 @@ at 8 MiB. Its exact v1 JSON wire format is:
 The file is UTF-8 with no BOM. `entries` is strictly sorted by raw UTF-8 path
 bytes and paths are unique, relative slash paths with no empty, `.`, `..`, NUL
 or backslash component. `kind` is exactly `file` or `directory`; directories
-have size zero and null digest. Unknown fields are rejected. `manifest_id` is
+have size zero and a null digest. Every entry must contain the `sha256` key;
+files require 64 lowercase hexadecimal characters and directories require
+explicit JSON `null`. Unknown fields are rejected. `manifest_id` is
 the lowercase SHA-256 of the manifest file's exact raw bytes, with no JSON
 re-serialization or canonicalization. It identifies the prepared base's
 content; callers needing another source identity record it separately.
@@ -259,9 +279,12 @@ Inside the container the bootstrap:
    tree, sizes and SHA-256 values with its canonical manifest. Missing, changed
    and extra content all fail. This is actual guest content verification, not
    marker-only evidence.
-4. For `read-only`, attempts to create one unpredictable probe file and
-   requires denial. This supplements mountinfo; it does not replace it.
-5. For `read-write`, creates, fsyncs and removes the probe successfully.
+4. Resolves the image's final guest identity before readiness and verifies
+   binding traversal and file access under that identity. Root-only access does
+   not satisfy this check.
+5. For `read-only`, attempts to create one unpredictable probe file as that
+   identity and requires denial. This supplements mountinfo; it does not replace
+   it. For `read-write`, it creates, fsyncs and removes the probe successfully.
 6. Generates a cryptographically random 256-bit nonce, atomically writes one
    `ready.json` containing the nonce and every verified binding, and emits
    `AWMAN_STARTUP_GATE_READY <nonce>`.
@@ -288,12 +311,14 @@ parse_manifest(raw_bytes, expected_digest)
 validate_mount(binding, mountinfo_text)
 verify_tree(root_path, manifest)
 probe_access(binding)
+resolve_runtime_identity(run_as)
+verify_binding_as(binding, manifest, runtime_identity)
 await_release(control_dir, ready, timeout,
               cancel_check=lambda: False,
               clock=time.monotonic, sleep=time.sleep)
 run_gate(control_dir, original_argv, original_env, mountinfo_text,
          cancel_check=lambda: False, clock=time.monotonic,
-         sleep=time.sleep, exec_fn=os.execvpe)
+         sleep=time.sleep, exec_fn=os.execvpe, runtime_identity=None)
 ```
 
 These parameters are ordinary Python call arguments used by unit tests, not
@@ -301,15 +326,29 @@ environment variables or command-line switches. The production `__main__`
 path supplies the fixed operational paths, reads real `/proc/self/mountinfo`,
 uses the real filesystem and monotonic clock, and retains `os.execvpe` as the
 execution function. It exposes no test-mode environment or CLI bypass.
+`run_gate` retains a default `runtime_identity=None` only so its existing
+importable unit tests can exercise their in-process tree and access helpers.
+The production `main` path always resolves and supplies an immutable runtime
+identity before entering the gate.
+`RuntimeIdentity` is an immutable tuple record with fields `uid`, `gid`,
+`groups`, and `drop`; `groups` is an immutable tuple. `verify_binding_as` owns
+both pipe descriptors and, after a successful fork, the exact child PID until
+it has been reaped. Pipe, fork, wait, and read `OSError` failures become
+`GateError("identity-probe")` only after owned descriptors are closed and any
+live child is killed and reaped. A `BaseException` such as `KeyboardInterrupt`
+performs the same cleanup and then propagates the original interruption.
 Internal protocol failures raise `GateError` with a stable string `code`;
-cancellation while awaiting release uses exactly `code == "cancelled"` and
-writes that same code to `failure.json`.
+an explicitly supplied cooperative cancellation callback while awaiting
+release uses exactly `code == "cancelled"` and writes that same code to
+`failure.json`. The production entrypoint does not currently supply such a
+callback.
 
 Any validation, probe, timeout or I/O failure atomically writes `failure.json`,
 emits `AWMAN_STARTUP_GATE_FAILED <code>`, and exits nonzero without executing
-the original argv. If the process is canceled, the existing container stop and
-reap path remains authoritative; cleanup removes only awman-owned bootstrap
-staging and never the caller's control directory or workspace.
+the original argv. External host cancellation uses the existing container stop
+and reap path and may leave no new failure record; cleanup removes only
+awman-owned bootstrap staging and never the caller's control directory or
+workspace.
 
 ## Credential refresh ordering
 
@@ -476,3 +515,13 @@ group uses the account's default and supplementary memberships. A wholly
 numeric UID without a guest password entry remains supported when an explicit
 GID is present. The default GID for a numeric UID with no explicit group is not
 expanded by this clarification and still requires backend-parity evidence.
+
+User, group, and supplementary memberships are resolved exactly once before
+binding verification and `ready.json`. The immutable numeric UID, primary GID,
+and supplementary-group tuple is used both by the target-identity binding
+verifier and by final exec after release. A passwd-backed user with no explicit
+group uses `getgrouplist` during that resolution and `setgroups` with the
+stored tuple after release; it does not call `initgroups` or repeat name lookup
+after readiness. This changes the previously frozen mechanism assertion from a
+post-release `initgroups` call while preserving the previously approved final
+Docker/OCI membership semantics.

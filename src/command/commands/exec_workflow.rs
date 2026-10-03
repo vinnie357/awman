@@ -467,6 +467,7 @@ pub struct ExecWorkflowCommand {
     flags: ExecWorkflowCommandFlags,
     engines: Engines,
     session: Session,
+    startup_gate: Option<crate::data::startup_gate::StartupGateSpec>,
     /// When set (only for squad-generated workflows), every container this
     /// command launches is stamped with the task's squad name + labels so
     /// prefix discovery finds the workflow's step containers, not just the
@@ -492,6 +493,7 @@ impl ExecWorkflowCommand {
             flags,
             engines,
             session,
+            startup_gate: None,
             squad_identity: None,
             task_workspace: None,
             workflow_state_root: None,
@@ -556,7 +558,17 @@ impl ExecWorkflowCommand {
                 "workflow",
             ));
         }
-        Ok(Self::new(flags, ctx.engines.clone(), ctx.session.clone()))
+        let command = Self::new(flags, ctx.engines.clone(), ctx.session.clone());
+        let startup_gate = crate::command::commands::preflight_startup_gate(
+            "exec workflow",
+            command.flags.startup_gate_control.as_deref(),
+            command.flags.startup_gate_timeout,
+            command.flags.allow_docker,
+        )?;
+        Ok(Self {
+            startup_gate,
+            ..command
+        })
     }
 
     /// Carry a squad container identity so every generated-workflow step
@@ -918,6 +930,7 @@ struct CommandLayerFactory {
     shared: Arc<Mutex<Box<dyn ExecWorkflowCommandFrontend>>>,
     engines: Engines,
     flags: Arc<ExecWorkflowCommandFlags>,
+    startup_gate: Option<crate::data::startup_gate::StartupGateSpec>,
     cli_typed_overlays: Vec<TypedOverlay>,
     work_item_context: Option<WorkItemContext>,
     /// The original repository git root (not the worktree). Used for image tag
@@ -1040,18 +1053,7 @@ impl AgentExecutionFactory for CommandLayerFactory {
             runtime.step_agent.as_str(),
         );
         let run_opts = AgentRunOptions {
-            startup_gate: self
-                .flags
-                .startup_gate_control
-                .as_ref()
-                .map(|path| {
-                    crate::data::startup_gate::load_startup_gate(
-                        path,
-                        Duration::from_secs(self.flags.startup_gate_timeout),
-                    )
-                })
-                .transpose()
-                .map_err(|error| EngineError::Config(format!("startup gate: {error}")))?,
+            startup_gate: self.startup_gate.clone(),
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),
@@ -1223,9 +1225,17 @@ impl Command for ExecWorkflowCommand {
     type Outcome = ExecWorkflowOutcome;
 
     async fn run_with_frontend(
-        self,
+        mut self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        if self.startup_gate.is_none() {
+            self.startup_gate = crate::command::commands::preflight_startup_gate(
+                "exec workflow",
+                self.flags.startup_gate_control.as_deref(),
+                self.flags.startup_gate_timeout,
+                self.flags.allow_docker,
+            )?;
+        }
         // Early flag validation (Layer 2) — runs before any IO for both the
         // dynamic and non-dynamic paths. Surfaces an error message and aborts.
         if let Err(e) = validate_dynamic_flags(&self.flags) {
@@ -1695,6 +1705,7 @@ impl Command for ExecWorkflowCommand {
         };
         execute_prepared(
             &self.flags,
+            self.startup_gate.clone(),
             &self.engines,
             prepared,
             frontend,
@@ -1744,6 +1755,7 @@ struct PreparedRun {
 #[allow(clippy::too_many_arguments)]
 async fn execute_prepared(
     flags: &ExecWorkflowCommandFlags,
+    startup_gate: Option<crate::data::startup_gate::StartupGateSpec>,
     engines: &Engines,
     prepared: PreparedRun,
     frontend: Box<dyn ExecWorkflowCommandFrontend>,
@@ -1940,6 +1952,7 @@ async fn execute_prepared(
             shared: Arc::clone(&shared),
             engines: engines.clone(),
             flags: Arc::clone(&flags_arc),
+            startup_gate,
             cli_typed_overlays: cli_typed.clone(),
             work_item_context,
             image_git_root: git_root_for_scope.clone(),
@@ -3539,6 +3552,7 @@ impl ExecWorkflowCommand {
         };
         execute_prepared(
             &effective_flags,
+            self.startup_gate.clone(),
             &self.engines,
             prepared,
             frontend,
@@ -3569,18 +3583,7 @@ impl ExecWorkflowCommand {
         use crate::engine::agent_runtime::execution::{StuckEvent, KILLED_EXIT_CODE};
 
         let run_opts = AgentRunOptions {
-            startup_gate: self
-                .flags
-                .startup_gate_control
-                .as_ref()
-                .map(|path| {
-                    crate::data::startup_gate::load_startup_gate(
-                        path,
-                        Duration::from_secs(self.flags.startup_gate_timeout),
-                    )
-                })
-                .transpose()
-                .map_err(|error| CommandError::Other(format!("startup gate: {error}")))?,
+            startup_gate: self.startup_gate.clone(),
             yolo: Some(YoloMode::Enabled),
             initial_prompt: Some(prompt.to_string()),
             model: model.map(|m| m.to_string()),

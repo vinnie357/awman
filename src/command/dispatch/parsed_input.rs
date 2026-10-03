@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::command::dispatch::catalogue::{ArgumentKind, CommandCatalogue, CommandSpec, FlagKind};
+use crate::command::dispatch::catalogue::{
+    ArgumentKind, CommandCatalogue, CommandSpec, FlagKind, FrontendVisibility,
+};
 use crate::command::error::CommandError;
 
 /// Result of `parse_command_box_input`. `path` is the resolved canonical
@@ -94,6 +96,15 @@ pub fn parse(
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                 CommandError::unknown_flag(&path_strs, name)
             })?;
+            if !matches!(
+                flag_spec.frontends,
+                FrontendVisibility::All
+                    | FrontendVisibility::TuiOnly
+                    | FrontendVisibility::CliAndTui
+            ) {
+                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                return Err(CommandError::unknown_flag(&path_strs, name));
+            }
             // Helper closure to read a value: prefer inline; otherwise advance idx.
             let mut read_value =
                 |inline: Option<String>, msg: &str| -> Result<String, CommandError> {
@@ -151,7 +162,15 @@ pub fn parse(
             let flag_spec = current
                 .flags
                 .iter()
-                .find(|f| f.short == Some(ch))
+                .find(|f| {
+                    f.short == Some(ch)
+                        && matches!(
+                            f.frontends,
+                            FrontendVisibility::All
+                                | FrontendVisibility::TuiOnly
+                                | FrontendVisibility::CliAndTui
+                        )
+                })
                 .ok_or_else(|| {
                     let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                     CommandError::unknown_flag(&path_strs, format!("-{ch}"))
@@ -352,5 +371,22 @@ mod tests {
             ),
             "-n must map to non-interactive flag"
         );
+    }
+
+    #[test]
+    fn command_box_rejects_cli_only_startup_gate_flags() {
+        let cat = CommandCatalogue::get();
+        for raw in [
+            "chat --startup-gate-control /orchestrator/gate",
+            "exec prompt --startup-gate-timeout 30 review",
+            "exec workflow workflow.toml --startup-gate-control /orchestrator/gate",
+        ] {
+            let error = parse(raw, cat)
+                .expect_err("the TUI command box must reject CLI-only startup-gate flags");
+            assert!(
+                matches!(error, CommandError::UnknownFlag { .. }),
+                "a TUI-invisible flag must behave as unavailable for {raw:?}: {error:?}"
+            );
+        }
     }
 }

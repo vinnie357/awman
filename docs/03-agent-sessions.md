@@ -1019,8 +1019,14 @@ manifest trees. The orchestrator then writes a nonce-matched `release.json`.
 Until that release arrives, the agent process has not started.
 
 `--startup-gate-timeout SECONDS` defaults to 120 and accepts 1 through 3600.
-Failure, cancellation, or timeout writes `failure.json` and exits without
-running the agent. A control directory is single-use.
+Validation failures and gate timeouts write `failure.json` and exit without
+running the agent. The bootstrap's cooperative cancellation hook does the same,
+but production host stop/reap does not call that hook and may terminate the
+container without a new failure record. A control directory is single-use.
+
+`--allow-docker` is currently unsupported with `--startup-gate-control`.
+Awman rejects that combination before agent setup, image build, or launch.
+Ungated `--allow-docker` behavior is unchanged.
 
 For `exec workflow`, the initial fork extension accepts exactly one agent step,
 with no setup, teardown, or dynamic leader. Retries require a fresh control

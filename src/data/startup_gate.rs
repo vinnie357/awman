@@ -67,7 +67,49 @@ struct ManifestEntry {
     path: String,
     kind: String,
     size: u64,
-    sha256: Option<String>,
+    sha256: RequiredNullableDigest,
+}
+
+struct RequiredNullableDigest(Option<String>);
+
+impl<'de> Deserialize<'de> for RequiredNullableDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct DigestVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DigestVisitor {
+            type Value = RequiredNullableDigest;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a SHA-256 string or null")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(RequiredNullableDigest(None))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(RequiredNullableDigest(Some(value.to_owned())))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(RequiredNullableDigest(Some(value)))
+            }
+        }
+
+        deserializer.deserialize_any(DigestVisitor)
+    }
 }
 
 fn invalid(message: impl Into<String>) -> StartupGateError {
@@ -202,8 +244,8 @@ fn validate_manifest(raw: &[u8]) -> Result<(), StartupGateError> {
         }
         previous = Some(bytes);
         match entry.kind.as_str() {
-            "directory" if entry.size == 0 && entry.sha256.is_none() => {}
-            "file" if entry.sha256.as_deref().is_some_and(hex64) => {}
+            "directory" if entry.size == 0 && entry.sha256.0.is_none() => {}
+            "file" if entry.sha256.0.as_deref().is_some_and(hex64) => {}
             _ => return Err(invalid("invalid manifest entry")),
         }
     }

@@ -107,6 +107,7 @@ pub struct ExecPromptCommand {
     flags: ExecPromptCommandFlags,
     engines: Engines,
     session: Session,
+    startup_gate: Option<crate::data::startup_gate::StartupGateSpec>,
 }
 
 impl ExecPromptCommand {
@@ -115,6 +116,7 @@ impl ExecPromptCommand {
             flags,
             engines,
             session,
+            startup_gate: None,
         }
     }
 
@@ -133,7 +135,7 @@ impl ExecPromptCommand {
             Some(prompt) if prompt.trim().is_empty() => None,
             other => other.map(str::to_string),
         };
-        Ok(Self::new(
+        let command = Self::new(
             ExecPromptCommandFlags {
                 startup_gate_control: ctx.flags.path("startup-gate-control"),
                 startup_gate_timeout: ctx
@@ -167,7 +169,17 @@ impl ExecPromptCommand {
             },
             ctx.engines.clone(),
             ctx.session.clone(),
-        ))
+        );
+        let startup_gate = crate::command::commands::preflight_startup_gate(
+            "exec prompt",
+            command.flags.startup_gate_control.as_deref(),
+            command.flags.startup_gate_timeout,
+            command.flags.allow_docker,
+        )?;
+        Ok(Self {
+            startup_gate,
+            ..command
+        })
     }
 
     pub fn flags(&self) -> &ExecPromptCommandFlags {
@@ -184,6 +196,15 @@ impl Command for ExecPromptCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        let startup_gate = match self.startup_gate.clone() {
+            Some(gate) => Some(gate),
+            None => crate::command::commands::preflight_startup_gate(
+                "exec prompt",
+                self.flags.startup_gate_control.as_deref(),
+                self.flags.startup_gate_timeout,
+                self.flags.allow_docker,
+            )?,
+        };
         let session = self.session;
 
         // Validate that at least one of prompt and --issue is provided.
@@ -369,18 +390,7 @@ impl Command for ExecPromptCommand {
         )?;
 
         let run_opts = AgentRunOptions {
-            startup_gate: self
-                .flags
-                .startup_gate_control
-                .as_ref()
-                .map(|path| {
-                    crate::data::startup_gate::load_startup_gate(
-                        path,
-                        std::time::Duration::from_secs(self.flags.startup_gate_timeout),
-                    )
-                })
-                .transpose()
-                .map_err(|e| CommandError::Other(format!("exec prompt: {e}")))?,
+            startup_gate,
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),

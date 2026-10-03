@@ -796,6 +796,7 @@ impl WorkflowEngine {
                     return Ok(IterationOutcome::Continue);
                 }
                 NextAction::RestartCurrentStep => {
+                    self.reject_single_attempt_restart()?;
                     if let Some(name) = self.current_step_name.clone() {
                         self.state.set_status(&name, StepState::Pending);
                         self.persist()?;
@@ -1401,18 +1402,28 @@ impl WorkflowEngine {
             .next();
         let previous_step = self.previous_step_name();
 
+        let restart_allowed = self.retry_policy != WorkflowRetryPolicy::SingleAttempt;
+        let previous_allowed = restart_allowed && previous_step.is_some();
         Ok(AvailableActions {
             can_launch_next: next_step.is_some(),
-            can_restart_current_step: true,
-            can_cancel_to_previous_step: previous_step.is_some(),
+            can_restart_current_step: restart_allowed,
+            can_cancel_to_previous_step: previous_allowed,
             can_pause: true,
             can_abort: true,
             can_finish_workflow: false,
             can_dismiss: false,
             cancel_to_previous_unavailable_reason: previous_step
                 .is_none()
-                .then(|| "this is the first step".to_string()),
+                .then(|| "this is the first step".to_string())
+                .or_else(|| {
+                    (!restart_allowed).then(|| {
+                        "Returning to a previous step is unavailable because the startup gate is single-use"
+                            .into()
+                    })
+                }),
             continue_unavailable_reason: Some("the failed step's container has exited".into()),
+            restart_unavailable_reason: (!restart_allowed)
+                .then(|| "Restart is unavailable because the startup gate is single-use".into()),
             finish_workflow_unavailable_reason: Some(
                 "a step failed; choose a recovery action or Ctrl-C to cancel".into(),
             ),
@@ -1472,12 +1483,14 @@ impl WorkflowEngine {
                 .show_workflow_control_board(&self.state, &available)?;
             match action {
                 NextAction::RestartCurrentStep => {
+                    self.reject_single_attempt_restart()?;
                     self.msg_info(format!("Restarting failed step '{step_name}'"));
                     self.state.set_status(step_name, StepState::Pending);
                     self.persist()?;
                     return Ok(IterationOutcome::Continue);
                 }
                 NextAction::CancelToPreviousStep => {
+                    self.reject_single_attempt_cancel_to_previous()?;
                     let Some(prev) = available
                         .step_failure
                         .as_ref()
@@ -2025,6 +2038,7 @@ impl WorkflowEngine {
                 if already_finished.is_none() {
                     self.kill_current_container(cancel_handle);
                 }
+                self.reject_single_attempt_restart()?;
                 self.state.set_status(step_name, StepState::Pending);
                 self.persist()?;
                 Ok(MidStepOutcome::LoopContinue)
@@ -2033,6 +2047,7 @@ impl WorkflowEngine {
                 if already_finished.is_none() {
                     self.kill_current_container(cancel_handle);
                 }
+                self.reject_single_attempt_cancel_to_previous()?;
                 if let Some(prev) = self.previous_step_name() {
                     self.state.set_status(step_name, StepState::Cancelled);
                     self.state.set_status(&prev, StepState::Pending);
@@ -2290,6 +2305,7 @@ impl WorkflowEngine {
                 Ok(InterruptibleStepResult::WorkflowEnded(wo))
             }
             NextAction::RestartCurrentStep => {
+                self.reject_single_attempt_restart()?;
                 if let Some(name) = self.current_step_name.clone() {
                     self.state.set_status(&name, StepState::Pending);
                     self.persist()?;
@@ -2305,6 +2321,25 @@ impl WorkflowEngine {
                 Ok(InterruptibleStepResult::LoopContinue)
             }
         }
+    }
+
+    fn reject_single_attempt_restart(&self) -> Result<(), EngineError> {
+        if self.retry_policy == WorkflowRetryPolicy::SingleAttempt {
+            return Err(EngineError::InvalidAdvanceAction(
+                "restart is unavailable because the startup gate is single-use".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reject_single_attempt_cancel_to_previous(&self) -> Result<(), EngineError> {
+        if self.retry_policy == WorkflowRetryPolicy::SingleAttempt {
+            return Err(EngineError::InvalidAdvanceAction(
+                "returning to a previous step is unavailable because the startup gate is single-use"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     fn handle_finish_workflow(&mut self) -> Result<WorkflowOutcome, EngineError> {
@@ -2378,6 +2413,7 @@ impl WorkflowEngine {
     }
 
     fn handle_cancel_to_previous(&mut self) -> Result<(), EngineError> {
+        self.reject_single_attempt_cancel_to_previous()?;
         let prev = self.previous_step_name();
         match prev {
             Some(prev) => {
@@ -2496,6 +2532,16 @@ impl WorkflowEngine {
             a.can_finish_workflow = false;
             a.finish_workflow_unavailable_reason =
                 Some("Cannot finish while other agents in this group are still running.".into());
+        }
+        if self.retry_policy == WorkflowRetryPolicy::SingleAttempt {
+            a.can_restart_current_step = false;
+            a.restart_unavailable_reason =
+                Some("Restart is unavailable because the startup gate is single-use".into());
+            a.can_cancel_to_previous_step = false;
+            a.cancel_to_previous_unavailable_reason = Some(
+                "Returning to a previous step is unavailable because the startup gate is single-use"
+                    .into(),
+            );
         }
         Ok(a)
     }
@@ -8297,5 +8343,385 @@ mod tests {
         let b = engine.compute_available_actions().unwrap();
         assert_eq!(b.parallel_peers_running, 0);
         assert!(b.restart_unavailable_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn single_attempt_policy_hides_restart_after_a_successful_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-actions"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let factory = FakeAgentExecutionFactory::new([0]);
+        let mut engine = make_engine_with_frontend_and_retry_policy(
+            &session,
+            workflow,
+            factory,
+            FakeWorkflowFrontend::new([]),
+            WorkflowRetryPolicy::SingleAttempt,
+        );
+
+        let outcome = engine.step_once().await.expect("initial launch succeeds");
+        assert_eq!(outcome.step_name, "a");
+        let available = engine
+            .compute_available_actions()
+            .expect("available actions");
+        assert!(
+            !available.can_restart_current_step,
+            "a single-use startup gate cannot offer a fresh-container restart"
+        );
+        assert!(
+            available.restart_unavailable_reason.is_some(),
+            "the frontend needs an explicit reason for the disabled action"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_attempt_policy_rejects_injected_restart_without_second_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-injected-restart"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let factory = FakeAgentExecutionFactory::new([0, 0]);
+        let starts = factory.execution_call_counter();
+        let frontend = FakeWorkflowFrontend::new([NextAction::RestartCurrentStep]);
+        let mut engine = make_engine_with_frontend_and_retry_policy(
+            &session,
+            workflow,
+            factory,
+            frontend,
+            WorkflowRetryPolicy::SingleAttempt,
+        );
+
+        let error = engine
+            .run_to_completion()
+            .await
+            .expect_err("a frontend cannot inject a gated restart");
+        assert!(
+            matches!(error, EngineError::InvalidAdvanceAction(_)),
+            "unexpected restart rejection: {error:?}"
+        );
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            1,
+            "the injected restart must be rejected before a second launch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_attempt_policy_rejects_mid_step_restart_and_cleans_up_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-mid-step-restart"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let (cancel_flag, completion) = make_blocking_entry();
+        let engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>> =
+            Arc::new(Mutex::new(None));
+        let factory = BlockingFactory::new([(cancel_flag.clone(), completion.clone())]);
+        let starts = factory.execution_count.clone();
+        let frontend = CapturingFrontend::new([NextAction::RestartCurrentStep], engine_tx.clone());
+        let mut engine = WorkflowEngine::new_with_retry_policy(
+            &session,
+            workflow,
+            None,
+            Box::new(frontend),
+            Box::new(factory),
+            WorkflowRetryPolicy::SingleAttempt,
+        )
+        .expect("engine");
+        let tx = engine_tx.clone();
+        let mut task = tokio::spawn(async move { engine.run_to_completion().await });
+
+        let sender = match tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(sender) = tx.lock().unwrap().clone() {
+                    break sender;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        {
+            Ok(sender) => sender,
+            Err(_) => {
+                signal_completion(&completion, 1);
+                task.abort();
+                let _ = task.await;
+                panic!("engine sender must be installed");
+            }
+        };
+        if sender
+            .send(EngineRequest::OpenControlBoard {
+                step_name: "a".to_string(),
+            })
+            .is_err()
+        {
+            signal_completion(&completion, 1);
+            task.abort();
+            let _ = task.await;
+            panic!("open control board");
+        }
+
+        let joined = match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                signal_completion(&completion, 1);
+                task.abort();
+                let _ = task.await;
+                panic!("single-attempt restart rejection did not finish");
+            }
+        };
+        let error = joined
+            .expect("workflow task")
+            .expect_err("a frontend cannot inject a mid-step gated restart");
+        assert!(
+            matches!(error, EngineError::InvalidAdvanceAction(_)),
+            "unexpected mid-step restart rejection: {error:?}"
+        );
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            1,
+            "the invalid action must not consume the single-use gate twice"
+        );
+        assert!(
+            cancel_flag.load(Ordering::Relaxed),
+            "the owned first execution must still be stopped on rejection"
+        );
+    }
+
+    #[test]
+    fn single_attempt_policy_hides_cancel_to_previous_everywhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-cancel-actions"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let factory = FakeAgentExecutionFactory::always_success();
+        let mut engine = make_engine_with_frontend_and_retry_policy(
+            &session,
+            workflow,
+            factory,
+            FakeWorkflowFrontend::new([]),
+            WorkflowRetryPolicy::SingleAttempt,
+        );
+        engine.state.set_status("a", StepState::Succeeded);
+        engine.current_step_name = Some("b".to_string());
+
+        let ordinary = engine
+            .compute_available_actions()
+            .expect("ordinary available actions");
+        assert!(
+            !ordinary.can_cancel_to_previous_step,
+            "returning to a previous step would consume the single-use gate again"
+        );
+        assert!(ordinary.cancel_to_previous_unavailable_reason.is_some());
+
+        let failure = engine
+            .compute_failure_actions("b", 17)
+            .expect("failure available actions");
+        assert!(
+            !failure.can_cancel_to_previous_step,
+            "failure recovery cannot offer a previous-step relaunch"
+        );
+        assert!(failure.cancel_to_previous_unavailable_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn single_attempt_policy_rejects_injected_cancel_to_previous_without_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-injected-cancel-previous"),
+            Some("claude"),
+            vec![
+                make_step("a", &[], None),
+                make_step("b", &["a"], None),
+                make_step("c", &["b"], None),
+            ],
+        );
+        let factory = FakeAgentExecutionFactory::new([0, 0, 0]);
+        let starts = factory.execution_call_counter();
+        let frontend =
+            FakeWorkflowFrontend::new([NextAction::LaunchNext, NextAction::CancelToPreviousStep]);
+        let mut engine = make_engine_with_frontend_and_retry_policy(
+            &session,
+            workflow,
+            factory,
+            frontend,
+            WorkflowRetryPolicy::SingleAttempt,
+        );
+
+        let result = engine.run_to_completion().await;
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            2,
+            "only the original launches of a and b may occur"
+        );
+        assert!(matches!(
+            engine.state().status_of("a"),
+            Some(StepState::Succeeded)
+        ));
+        assert!(matches!(
+            engine.state().status_of("b"),
+            Some(StepState::Succeeded)
+        ));
+        let error = result.expect_err("an injected previous-step relaunch must be rejected");
+        assert!(matches!(error, EngineError::InvalidAdvanceAction(_)));
+    }
+
+    #[tokio::test]
+    async fn single_attempt_failure_board_rejects_cancel_to_previous_without_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-failure-cancel-previous"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let factory = FakeAgentExecutionFactory::new([0, 17]);
+        let starts = factory.execution_call_counter();
+        let frontend = FakeWorkflowFrontend::new([NextAction::CancelToPreviousStep]);
+        let boards = frontend.boards();
+        let mut engine = make_engine_with_frontend_and_retry_policy(
+            &session,
+            workflow,
+            factory,
+            frontend,
+            WorkflowRetryPolicy::SingleAttempt,
+        );
+
+        let first = engine.step_once().await.expect("launch a");
+        assert!(matches!(first.status, WorkflowStepStatus::Succeeded));
+        let second = engine.step_once().await.expect("launch b");
+        assert!(matches!(
+            second.status,
+            WorkflowStepStatus::Failed { exit_code: 17 }
+        ));
+        // SingleAttempt intentionally terminates a public run immediately on
+        // failure. Exercise the private failure-board injection boundary here
+        // without claiming that the public path displays this board.
+        let result = engine.handle_step_failure_interactive("b", 17);
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            2,
+            "failure recovery must not launch a again"
+        );
+        assert!(matches!(
+            engine.state().status_of("a"),
+            Some(StepState::Succeeded)
+        ));
+        assert!(matches!(
+            engine.state().status_of("b"),
+            Some(StepState::Failed { exit_code: 17, .. })
+        ));
+        let shown = boards.lock().unwrap();
+        let failure_board = shown.last().expect("failure board");
+        assert!(!failure_board.can_cancel_to_previous_step);
+        assert!(failure_board
+            .cancel_to_previous_unavailable_reason
+            .is_some());
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("failure recovery accepted a previous-step relaunch"),
+        };
+        assert!(matches!(error, EngineError::InvalidAdvanceAction(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_attempt_mid_step_cancel_to_previous_cleans_up_without_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-mid-cancel-previous"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let (cancel_flag, completion) = make_blocking_entry();
+        let engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>> =
+            Arc::new(Mutex::new(None));
+        let factory = BlockingFactory::new([(cancel_flag.clone(), completion.clone())]);
+        let starts = factory.execution_count.clone();
+        let frontend =
+            CapturingFrontend::new([NextAction::CancelToPreviousStep], engine_tx.clone());
+        let mut engine = WorkflowEngine::new_with_retry_policy(
+            &session,
+            workflow,
+            None,
+            Box::new(frontend),
+            Box::new(factory),
+            WorkflowRetryPolicy::SingleAttempt,
+        )
+        .expect("engine");
+        engine.state.set_status("a", StepState::Succeeded);
+        engine.persist().expect("persist initial completed step");
+        let tx = engine_tx.clone();
+        let mut task = tokio::spawn(async move { engine.run_to_completion().await });
+
+        let sender = match tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(sender) = tx.lock().unwrap().clone() {
+                    break sender;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        {
+            Ok(sender) => sender,
+            Err(_) => {
+                signal_completion(&completion, 1);
+                task.abort();
+                let _ = task.await;
+                panic!("engine sender must be installed");
+            }
+        };
+        if sender
+            .send(EngineRequest::OpenControlBoard {
+                step_name: "b".to_string(),
+            })
+            .is_err()
+        {
+            signal_completion(&completion, 1);
+            task.abort();
+            let _ = task.await;
+            panic!("open control board");
+        }
+
+        let joined = match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                signal_completion(&completion, 1);
+                task.abort();
+                let _ = task.await;
+                panic!("single-attempt previous-step rejection did not finish");
+            }
+        };
+        let result = joined.expect("workflow task");
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            1,
+            "the live b execution is the only launch in this invocation"
+        );
+        assert!(
+            cancel_flag.load(Ordering::Relaxed),
+            "the owned b execution must be stopped before rejection returns"
+        );
+        let saved = WorkflowStateStore::at_git_root(tmp.path())
+            .load(None, "wf-gated-mid-cancel-previous")
+            .expect("load persisted state")
+            .expect("persisted workflow state");
+        assert!(matches!(saved.status_of("a"), Some(StepState::Succeeded)));
+        let error = result.expect_err("mid-step previous-step relaunch must be rejected");
+        assert!(matches!(error, EngineError::InvalidAdvanceAction(_)));
     }
 }

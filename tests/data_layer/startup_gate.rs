@@ -348,3 +348,42 @@ fn modes_symlinks_hardlinks_and_stale_status_files_fail_before_launch() {
         assert_rejected(&fixture.control, stale);
     }
 }
+
+#[test]
+fn manifest_sha256_key_is_required_and_nullable_only_for_directories() {
+    let invalid_entries = [
+        serde_json::json!({"path":"README.md","kind":"file","size":3}),
+        serde_json::json!({"path":"README.md","kind":"file","size":3,"sha256":null}),
+        serde_json::json!({"path":"src","kind":"directory","size":0}),
+        serde_json::json!({
+            "path":"src",
+            "kind":"directory",
+            "size":0,
+            "sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        }),
+    ];
+    for entry in invalid_entries {
+        let fixture = GateFixture::valid();
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "entries": [entry],
+        }))
+        .expect("serialize manifest");
+        fs::write(fixture.control.join("review.manifest.json"), &manifest).expect("manifest");
+        let mut request = fixture.request_value();
+        request["bindings"][0]["manifest_id"] = serde_json::json!(sha256_hex(&manifest));
+        fixture.rewrite_request(request);
+        assert_rejected(&fixture.control, "sha256 presence and kind");
+    }
+
+    let fixture = GateFixture::valid();
+    let manifest =
+        br#"{"version":1,"entries":[{"path":"src","kind":"directory","size":0,"sha256":null}]}"#;
+    fs::write(fixture.control.join("review.manifest.json"), manifest).expect("manifest");
+    let mut request = fixture.request_value();
+    request["bindings"][0]["manifest_id"] = serde_json::json!(sha256_hex(manifest));
+    fixture.rewrite_request(request);
+    fixture
+        .load()
+        .expect("an explicit null digest is valid for a directory");
+}

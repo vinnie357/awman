@@ -1154,10 +1154,10 @@ mod tests {
     #[test]
     fn flag_bool_presence_sets_true() {
         // Bools are `SetTrue` (clap parity): presence implies true; no value
-        // token is consumed. `--background` is a real flag on `api start`.
-        let f = make_frontend("api start", &["--background"]);
+        // token is consumed. `--background` is visible on `squad start`.
+        let f = make_frontend("squad start", &["--background"]);
         assert_eq!(
-            f.flag_bool(&["api", "start"], "background").unwrap(),
+            f.flag_bool(&["squad", "start"], "background").unwrap(),
             Some(true)
         );
     }
@@ -1204,9 +1204,16 @@ mod tests {
     // ─── flag_u16 ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn flag_u16_parses_port_value() {
-        let f = make_frontend("api start", &["--port", "9876"]);
-        assert_eq!(f.flag_u16(&["api", "start"], "port").unwrap(), Some(9876));
+    fn flag_u16_parses_visible_port_and_rejects_out_of_range() {
+        let f = make_frontend("squad start", &["--port", "9876"]);
+        assert_eq!(f.flag_u16(&["squad", "start"], "port").unwrap(), Some(9876));
+
+        let invalid = make_frontend("squad start", &["--port", "65536"]);
+        let error = invalid.flag_u16(&["squad", "start"], "port").unwrap_err();
+        assert!(matches!(
+            error,
+            CommandError::InvalidFlagValue { flag, .. } if flag == "port"
+        ));
     }
 
     // ─── argument (positional) ────────────────────────────────────────────────
@@ -1248,10 +1255,35 @@ mod tests {
 
     #[test]
     fn flag_strings_collects_multiple_values() {
-        let f = make_frontend("api start", &["--workdirs", "/a", "--workdirs", "/b"]);
-        let dirs = f.flag_strings(&["api", "start"], "workdirs").unwrap();
-        assert!(dirs.contains(&"/a".to_string()));
-        assert!(dirs.contains(&"/b".to_string()));
+        let f = make_frontend(
+            "exec prompt",
+            &["--overlay", "dir(/a)", "--overlay", "dir(/b)"],
+        );
+        let dirs = f.flag_strings(&["exec", "prompt"], "overlay").unwrap();
+        assert!(dirs.contains(&"dir(/a)".to_string()));
+        assert!(dirs.contains(&"dir(/b)".to_string()));
+    }
+
+    #[test]
+    fn api_start_cli_only_flags_are_rejected_instead_of_silently_deleted() {
+        for (flag, args) in [
+            ("background", &["--background"][..]),
+            ("port", &["--port", "9876"][..]),
+            ("workdirs", &["--workdirs", "/a"][..]),
+        ] {
+            let f = make_frontend("api start", args);
+            let error = f.flag_bool(&["api", "start"], "background").unwrap_err();
+            match error {
+                CommandError::UnknownFlag {
+                    command,
+                    flag: actual,
+                } => {
+                    assert_eq!(command, vec!["api".to_string(), "start".to_string()]);
+                    assert_eq!(actual, flag);
+                }
+                other => panic!("expected exact API visibility rejection, got {other:?}"),
+            }
+        }
     }
 
     // ─── Drop emits Done and flushes partial lines ─────────────────────────────

@@ -43,6 +43,34 @@ pub mod worktree_lifecycle;
 
 pub use command_trait::Command;
 
+pub(crate) fn preflight_startup_gate(
+    command: &'static str,
+    control: Option<&std::path::Path>,
+    timeout_seconds: u64,
+    allow_docker: bool,
+) -> Result<Option<crate::data::startup_gate::StartupGateSpec>, crate::command::error::CommandError>
+{
+    let Some(control) = control else {
+        return Ok(None);
+    };
+    if !(1..=3600).contains(&timeout_seconds) {
+        return Err(crate::command::error::CommandError::Other(format!(
+            "{command}: --startup-gate-timeout must be an integer in 1..=3600"
+        )));
+    }
+    if allow_docker {
+        return Err(crate::command::error::CommandError::Other(format!(
+            "{command}: --allow-docker is unsupported with --startup-gate-control"
+        )));
+    }
+    crate::data::startup_gate::load_startup_gate(
+        control,
+        std::time::Duration::from_secs(timeout_seconds),
+    )
+    .map(Some)
+    .map_err(|error| crate::command::error::CommandError::Other(format!("{command}: {error}")))
+}
+
 /// Result of resolving an ACP request for a concrete agent.
 ///
 /// This is deliberately command-layer policy: the engine remains the final

@@ -19,3 +19,25 @@ group and a resolved named explicit group. All other assertions from the
 pre-correction file remain unchanged. The final corrected candidate
 `tests/startup_gate_bootstrap_test.py` is SHA-256
 `f65df666c51bd20aa40c9d14cf626e8b6087f251a1e875d72ba98dc1cbc79685`.
+
+## Resolve-once identity amendment
+
+After the second Gate 4 rejection and operator approval of the repair plan and
+reset, the P1 planner source-approved the independent test author's following
+mechanism amendment to the frozen file above. For a passwd-backed user with no
+explicit group, the bootstrap now resolves `getgrouplist("agent-user", 2345)`
+before readiness and stores `[2345, 5678]`. After release it applies that exact
+stored tuple with
+`setgroups([2345, 5678])`, followed by `setgid(2345)` and `setuid(1234)`.
+The former post-release `initgroups("agent-user", 2345)` assertion is removed
+because it would resolve mutable guest account data after readiness. Final
+group membership is unchanged.
+
+All other assertions from the prior corrected file remain frozen. The
+additive regressions require production `main` to pass the one resolved
+identity into the gate, require binding verification as that identity before
+`ready.json`, and reject a root-only binding for an unprivileged target in a
+bounded child. Existing importable unit tests may omit the identity only to
+retain their in-process verification mocks. The amended and additive candidate
+`tests/startup_gate_bootstrap_test.py` is SHA-256
+`ebff4b92cf28528c511ad27c86ec6e76428f4a95929bdb4b54bb19c7cdf99669`.
