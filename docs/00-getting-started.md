@@ -85,13 +85,13 @@ That's it — you have an isolated agent working in your repo.
 | GitHub Releases | Download the asset for your platform, `chmod +x`, move onto `PATH` |
 | From source | `git clone https://github.com/prettysmartdev/awman.git && cd awman && make install` (Rust 1.94+) |
 
-## Altana startup-gate fork
+## Altana startup-gate fork candidate
 
 The upstream `0.12.0` release does not include the orchestrator startup gate.
-Install the Altana fork from its reviewed startup-gate commit rather than
-installing or relabelling upstream `0.12.0`; deployment records should retain
-both the upstream base (`c730732b`) and the exact fork commit used to build the
-binary.
+The `vinnie357/awman` fork identifies its reviewed candidate as `0.12.1`, based
+on upstream commit `c730732b`. This candidate has not been tagged or published;
+deployment records should retain both that upstream base and the exact fork
+commit used to build the binary.
 
 Callers should detect the extension from CLI metadata already exposed by awman:
 
@@ -102,8 +102,13 @@ awman exec workflow --help | grep -- --startup-gate-control
 ```
 
 All three checks must succeed before an orchestrator sends gate flags. Do not
-infer support from `awman --version`: the fork currently retains the upstream
-`0.12.0` package version for source compatibility.
+infer support from `awman --version` alone: the downstream package version
+identifies the fork candidate, while the command capability check establishes
+that a particular binary exposes the extension.
+
+After a reviewed `v0.12.1` tag and release assets exist, the intended fork
+installation form is `mise use -g github:vinnie357/awman@0.12.1`. Do not use
+that command as evidence that the unpublished candidate is available.
 
 Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-amd64`, `awman-macos-arm64`, `awman-windows-amd64.exe`.
 

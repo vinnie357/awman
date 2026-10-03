@@ -25,6 +25,11 @@ capability surface, downstream callers can query each supported command's
 existing `--help` output for `--startup-gate-control`; no new speculative API
 is required.
 
+The downstream fork carries the candidate package version `0.12.1` so it is
+not mistaken for upstream `0.12.0`. That version is fork metadata, not a claim
+that upstream has accepted the proposal or that a downstream tag or release
+asset has been published.
+
 ## Ownership across mount namespaces
 
 The opt-in startup gate exposed a concrete ownership mismatch on Apple
