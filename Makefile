@@ -34,13 +34,16 @@ test:
 			exit 1; \
 		fi; \
 		trap 'rm -rf "$$awman_test_tmpdir"' EXIT; \
-		TMPDIR="$$awman_test_tmpdir" cargo test --quiet
+		TMPDIR="$$awman_test_tmpdir" cargo test --quiet; \
+		python3 -m unittest tests/startup_gate_bootstrap_test.py
 
 test-fast:
 	cargo test --quiet -- --skip docker --skip real_git --skip real_network
+	python3 -m unittest tests/startup_gate_bootstrap_test.py
 
 test-full:
 	cargo test --quiet
+	python3 -m unittest tests/startup_gate_bootstrap_test.py
 
 architecture-lint:
 	@bash tools/architecture-lint.sh
@@ -49,6 +52,7 @@ pre-push: architecture-lint
 	cargo fmt --check
 	cargo clippy --all-targets -- -D warnings
 	cargo test --quiet
+	python3 -m unittest tests/startup_gate_bootstrap_test.py
 
 clean:
 	cargo clean
