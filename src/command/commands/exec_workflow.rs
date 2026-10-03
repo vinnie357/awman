@@ -5281,6 +5281,21 @@ prompt = "do something"
         }
     }
 
+    #[test]
+    fn startup_gate_flag_selects_single_attempt_engine_policy() {
+        let mut flags = make_dynamic_flags(false, Some("workflow.toml"), None, None, false, None);
+        assert_eq!(
+            flags.workflow_retry_policy(),
+            crate::engine::workflow::WorkflowRetryPolicy::Legacy,
+        );
+
+        flags.startup_gate_control = Some(PathBuf::from("/orchestrator/gate"));
+        assert_eq!(
+            flags.workflow_retry_policy(),
+            crate::engine::workflow::WorkflowRetryPolicy::SingleAttempt,
+        );
+    }
+
     fn make_session_simple(tmp: &tempfile::TempDir) -> crate::data::session::Session {
         make_session_with_default_agent(tmp, None)
     }

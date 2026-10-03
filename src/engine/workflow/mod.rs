@@ -3644,7 +3644,7 @@ mod tests {
 
     struct FakeAgentExecutionFactory {
         exit_codes: Mutex<VecDeque<i32>>,
-        pub execution_call_count: AtomicUsize,
+        pub execution_call_count: Arc<AtomicUsize>,
         pub inject_call_count: AtomicUsize,
         pub recorded_contexts: Mutex<Vec<WorkflowRuntimeContext>>,
         inject_result: Option<()>,
@@ -3659,7 +3659,7 @@ mod tests {
         fn new(exit_codes: impl IntoIterator<Item = i32>) -> Self {
             Self {
                 exit_codes: Mutex::new(exit_codes.into_iter().collect()),
-                execution_call_count: AtomicUsize::new(0),
+                execution_call_count: Arc::new(AtomicUsize::new(0)),
                 inject_call_count: AtomicUsize::new(0),
                 recorded_contexts: Mutex::new(Vec::new()),
                 inject_result: None,
@@ -3670,6 +3670,10 @@ mod tests {
 
         fn always_success() -> Self {
             Self::new(std::iter::repeat_n(0, 100))
+        }
+
+        fn execution_call_counter(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.execution_call_count)
         }
 
         /// Produce executions whose output tail is pre-filled with `lines` and
@@ -3824,6 +3828,24 @@ mod tests {
             None,
             Box::new(frontend),
             Box::new(factory),
+        )
+        .unwrap()
+    }
+
+    fn make_engine_with_frontend_and_retry_policy(
+        session: &Session,
+        workflow: Workflow,
+        factory: FakeAgentExecutionFactory,
+        frontend: FakeWorkflowFrontend,
+        retry_policy: WorkflowRetryPolicy,
+    ) -> WorkflowEngine {
+        WorkflowEngine::new_with_retry_policy(
+            session,
+            workflow,
+            None,
+            Box::new(frontend),
+            Box::new(factory),
+            retry_policy,
         )
         .unwrap()
     }
@@ -4294,6 +4316,74 @@ mod tests {
     }
 
     // ── WI-0115 §3: unattended countdown-and-retry ───────────────────────
+
+    #[tokio::test]
+    async fn single_attempt_policy_launches_once_and_fails_before_automatic_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-startup-gated-single-attempt"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        // A second success is deliberately available: consuming it would prove
+        // the normal unattended retry path ran despite the single-use gate.
+        let factory = FakeAgentExecutionFactory::new([17, 0]);
+        let starts = factory.execution_call_counter();
+        let frontend = FakeWorkflowFrontend::new([])
+            .unattended()
+            .with_yolo_tick(YoloTickOutcome::AdvanceNow);
+        let mut engine = make_engine_with_frontend_and_retry_policy(
+            &session,
+            workflow,
+            factory,
+            frontend,
+            WorkflowRetryPolicy::SingleAttempt,
+        );
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(
+            result,
+            WorkflowOutcome::Failed {
+                last_step: "a".to_string(),
+                exit_code: 17,
+            }
+        );
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            1,
+            "the initial gated launch must occur exactly once"
+        );
+        assert!(matches!(
+            engine.state().status_of("a"),
+            Some(StepState::Failed { exit_code: 17, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_constructor_still_retries_once_without_waiting_for_real_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-legacy-retry-policy"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        let factory = FakeAgentExecutionFactory::new([17, 0]);
+        let starts = factory.execution_call_counter();
+        let frontend = FakeWorkflowFrontend::new([])
+            .unattended()
+            .with_yolo_tick(YoloTickOutcome::AdvanceNow);
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            2,
+            "the legacy constructor must preserve its one automatic retry"
+        );
+    }
 
     #[tokio::test]
     async fn unattended_step_failure_retries_once_then_succeeds() {

@@ -184,6 +184,15 @@ This fork's first `exec workflow` integration accepts a single agent step and
 no setup, teardown, or dynamic leader. It rejects other workflow shapes before
 agent dispatch because one control directory is single-use.
 
+`exec workflow` derives its engine retry policy from the startup-gate flag at
+the shared `execute_prepared` boundary. A startup-gated workflow uses
+`SingleAttempt`: after the initial container has finished its normal wait,
+trusted-stop, and cleanup bookkeeping, any failed agent step becomes terminal
+before credential refresh, remediation, a retry countdown, or another
+container launch. Retrying requires a fresh control directory and invocation.
+Workflows without a startup gate retain the existing interactive recovery and
+unattended one-retry behavior through the legacy engine constructors.
+
 ### Validated host snapshot
 
 The host loader returns the parsed request together with the exact manifest
