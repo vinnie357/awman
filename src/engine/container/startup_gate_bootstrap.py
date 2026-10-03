@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """Fixed, dependency-free awman startup-gate bootstrap."""
 
-import errno, hashlib, json, os, pwd, secrets, stat, sys, time
+import errno, grp, hashlib, json, os, pwd, secrets, stat, sys, time
 from pathlib import Path
 
 class GateError(Exception):
@@ -50,8 +50,15 @@ def _fail(code, message):
     raise GateError(code, message)
 
 def _json(raw, allowed, code):
+    def strict_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                _fail(code, "duplicate object field")
+            value[key] = item
+        return value
     try:
-        value = json.loads(raw.decode("utf-8"))
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=strict_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         _fail(code, str(exc))
     if not isinstance(value, dict) or set(value) != set(allowed):
@@ -65,7 +72,7 @@ def parse_manifest(raw_bytes, expected_digest):
     if raw_bytes.startswith(b"\xef\xbb\xbf") or hashlib.sha256(raw_bytes).hexdigest() != expected_digest:
         _fail("manifest-invalid", "manifest identity mismatch")
     value = _json(raw_bytes, ("version", "entries"), "manifest-invalid")
-    if value["version"] != 1 or not isinstance(value["entries"], list):
+    if type(value["version"]) is not int or value["version"] != 1 or not isinstance(value["entries"], list):
         _fail("manifest-invalid", "unsupported manifest")
     previous = None
     for entry in value["entries"]:
@@ -78,10 +85,12 @@ def parse_manifest(raw_bytes, expected_digest):
         if previous is not None and previous >= encoded:
             _fail("manifest-invalid", "entries not strictly sorted")
         previous = encoded
+        if type(entry["size"]) is not int or entry["size"] < 0:
+            _fail("manifest-invalid", "invalid entry size")
         if entry["kind"] == "directory":
             if entry["size"] != 0 or entry["sha256"] is not None: _fail("manifest-invalid", "invalid directory")
         elif entry["kind"] == "file":
-            if not isinstance(entry["size"], int) or entry["size"] < 0 or not _hex64(entry["sha256"]): _fail("manifest-invalid", "invalid file")
+            if not _hex64(entry["sha256"]): _fail("manifest-invalid", "invalid file")
         else: _fail("manifest-invalid", "invalid kind")
     return value
 
@@ -263,6 +272,7 @@ def await_release(control_dir, ready, timeout, cancel_check=lambda: False, clock
     try:
         while True:
             if cancel_check(): _fail("cancelled", "startup gate cancelled")
+            if clock() - start >= timeout: _fail("timeout", "startup gate timeout")
             try:
                 os.stat("release.json", dir_fd=control.fd, follow_symlinks=False)
                 release_present = True
@@ -273,10 +283,10 @@ def await_release(control_dir, ready, timeout, cancel_check=lambda: False, clock
             if release_present:
                 raw = _read_control_record(control, "release.json", 4096, "release-invalid")
                 release = _json(raw, ("version", "nonce"), "release-invalid")
-                if release["version"] != 1 or release["nonce"] != ready["nonce"]: _fail("release-invalid", "release does not match ready nonce")
+                if type(release["version"]) is not int or release["version"] != 1 or not _hex64(release["nonce"]) or release["nonce"] != ready["nonce"]: _fail("release-invalid", "release does not match ready nonce")
+                if clock() - start >= timeout: _fail("timeout", "startup gate timeout")
                 _unlink_control_record(control, "release.json", "release-invalid")
                 return
-            if clock() - start >= timeout: _fail("timeout", "startup gate timeout")
             sleep(0.05)
     finally:
         if owns_control: control.close()
@@ -290,7 +300,7 @@ def _read_bounded_regular(path, maximum, code, protected_owner=None, protected_m
             _fail(code, "unexpected file owner")
         if protected_mode is not None and stat.S_IMODE(info.st_mode) != protected_mode:
             _fail(code, "unexpected file mode")
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
         fd = os.open(path, flags)
         opened = os.fstat(fd)
         if (opened.st_dev, opened.st_ino, opened.st_mode, opened.st_size, opened.st_nlink) != (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_nlink):
@@ -403,11 +413,27 @@ def main(argv):
         if run_as is not None:
             user_name, _, group_text = run_as.partition(":")
             try:
-                record = pwd.getpwuid(int(user_name)) if user_name.isdigit() else pwd.getpwnam(user_name)
-                gid = int(group_text) if group_text.isdigit() else record.pw_gid
-                os.initgroups(record.pw_name, gid)
+                if user_name.isdigit():
+                    uid = int(user_name)
+                    try:
+                        record = pwd.getpwuid(uid)
+                    except KeyError:
+                        record = None
+                else:
+                    record = pwd.getpwnam(user_name)
+                    uid = record.pw_uid
+                if group_text:
+                    gid = int(group_text) if group_text.isdigit() else grp.getgrnam(group_text).gr_gid
+                    os.setgroups([])
+                else:
+                    if record is None:
+                        _fail("runtime-user", "numeric user without passwd entry requires an explicit group")
+                    gid = record.pw_gid
+                    os.initgroups(record.pw_name, gid)
                 os.setgid(gid)
-                os.setuid(record.pw_uid)
+                os.setuid(uid)
+                if os.geteuid() != uid or os.getegid() != gid:
+                    _fail("runtime-user", "effective identity differs after restoration")
             except (KeyError, ValueError, OSError) as exc: _fail("runtime-user", str(exc))
         os.execvpe(file, args, env)
     run_gate(control, original, original_env, mountinfo, timeout=timeout, approved_dir=Path(__file__).resolve().parent, exec_fn=final_exec, container_name=container_name)

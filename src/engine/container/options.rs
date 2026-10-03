@@ -600,6 +600,7 @@ impl ResolvedContainerOptions {
                 "/.awman/startup-gate",
             ];
             for overlay in &self.overlays {
+                validate_gated_guest_path(&overlay.container_path)?;
                 if forbidden
                     .iter()
                     .any(|root| paths_overlap(&overlay.container_path, Path::new(root)))
@@ -626,6 +627,48 @@ impl ResolvedContainerOptions {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn validate_gated_guest_path(path: &Path) -> Result<(), ResolveError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let raw = path.as_os_str().as_bytes();
+    if raw == b"/" {
+        return Ok(());
+    }
+    if !raw.starts_with(b"/")
+        || raw.ends_with(b"/")
+        || raw[1..]
+            .split(|byte| *byte == b'/')
+            .any(|part| part.is_empty() || part == b"." || part == b"..")
+    {
+        return Err(ResolveError::Conflict(format!(
+            "startup gate overlay destination is not normalized: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_gated_guest_path(path: &Path) -> Result<(), ResolveError> {
+    let raw = path.to_string_lossy();
+    if raw == "/" {
+        return Ok(());
+    }
+    if !raw.starts_with('/')
+        || raw.ends_with('/')
+        || raw[1..]
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(ResolveError::Conflict(format!(
+            "startup gate overlay destination is not normalized: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn paths_overlap(a: &Path, b: &Path) -> bool {

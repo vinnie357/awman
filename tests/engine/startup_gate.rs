@@ -331,3 +331,58 @@ fn staged_snapshot_is_immutable_after_caller_control_changes() {
         manifest_before
     );
 }
+
+#[test]
+fn gated_overlay_destinations_require_raw_normalized_spelling_only_for_gated_launches() {
+    for guest_path in [
+        "/x/../.awman/startup-gate",
+        "/review/safe//nested",
+        "/review/safe/./nested",
+        "/review/safe/../nested",
+        "/review/safe/",
+    ] {
+        let control = tempfile::tempdir().expect("control");
+        let result = ResolvedContainerOptions::resolve([
+            ContainerOption::StartupGate(gate_spec(control.path().to_path_buf())),
+            ContainerOption::Overlay(OverlaySpec {
+                host_path: PathBuf::from("/host/input"),
+                container_path: PathBuf::from(guest_path),
+                permission: OverlayPermission::ReadOnly,
+            }),
+        ]);
+        assert!(
+            result.is_err(),
+            "gated guest overlay must reject noncanonical spelling {guest_path}"
+        );
+    }
+
+    let control = tempfile::tempdir().expect("control");
+    let gated = ResolvedContainerOptions::resolve([
+        ContainerOption::StartupGate(gate_spec(control.path().to_path_buf())),
+        ContainerOption::Overlay(OverlaySpec {
+            host_path: PathBuf::from("/host/source/../original"),
+            container_path: PathBuf::from("/review/safe"),
+            permission: OverlayPermission::ReadOnly,
+        }),
+    ])
+    .expect("normalized unrelated guest path remains valid");
+    assert_eq!(
+        gated.overlays[0].host_path,
+        PathBuf::from("/host/source/../original")
+    );
+    assert_eq!(
+        gated.overlays[0].container_path,
+        PathBuf::from("/review/safe")
+    );
+
+    let legacy = ResolvedContainerOptions::resolve([ContainerOption::Overlay(OverlaySpec {
+        host_path: PathBuf::from("/host/input"),
+        container_path: PathBuf::from("/review/safe/../nested"),
+        permission: OverlayPermission::ReadOnly,
+    })])
+    .expect("ungated overlay spelling keeps legacy behavior");
+    assert_eq!(
+        legacy.overlays[0].container_path,
+        PathBuf::from("/review/safe/../nested")
+    );
+}

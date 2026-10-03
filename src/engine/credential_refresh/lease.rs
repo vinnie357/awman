@@ -819,4 +819,75 @@ mod tests {
         assert!(!active, "shutdown must report inactive, not a live lease");
         waiter.join().unwrap();
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_gate_records_require_strict_json_before_release_latches() {
+        let manifest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let binding = format!(
+            "{{\"id\":\"review-input\",\"workspace_path\":\"/review/input\",\"manifest_id\":\"{manifest}\",\"manifest_file\":\"review.manifest.json\",\"access\":\"read-only\"}}"
+        );
+        let invalid_requests = [
+            format!("{{\"version\":2,\"version\":1,\"bindings\":[{binding}]}}"),
+            format!(
+                "{{\"version\":1,\"bindings\":[{{\"id\":\"other\",\"id\":\"review-input\",\"workspace_path\":\"/review/input\",\"manifest_id\":\"{manifest}\",\"manifest_file\":\"review.manifest.json\",\"access\":\"read-only\"}}]}}"
+            ),
+            format!("{{\"version\":true,\"bindings\":[{binding}]}}"),
+            format!("{{\"version\":1.0,\"bindings\":[{binding}]}}"),
+            format!("{{\"version\":1e0,\"bindings\":[{binding}]}}"),
+            format!("{{\"version\":1,\"bindings\":[{binding}],\"extra\":false}}"),
+            format!("{{\"version\":1,\"bindings\":[{binding}]}} {{}}"),
+        ];
+        for raw in invalid_requests {
+            let fixture = PendingGateFixture::new();
+            write_protected(&fixture.control.path().join("request.json"), raw.as_bytes());
+            fixture.write_release(READY_NONCE);
+            assert!(
+                fixture.gate_pending(),
+                "invalid request released gate: {raw}"
+            );
+        }
+
+        let ready_binding = format!(
+            "{{\"id\":\"review-input\",\"workspace_path\":\"/review/input\",\"manifest_id\":\"{manifest}\",\"access\":\"read-only\"}}"
+        );
+        let invalid_ready = [
+            format!("{{\"version\":2,\"version\":1,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}]}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{{\"id\":\"other\",\"id\":\"review-input\",\"workspace_path\":\"/review/input\",\"manifest_id\":\"{manifest}\",\"access\":\"read-only\"}}]}}"),
+            format!("{{\"version\":true,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}]}}"),
+            format!("{{\"version\":1.0,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}]}}"),
+            format!("{{\"version\":1e0,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}]}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}0\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}]}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}],\"extra\":false}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}]}} {{}}"),
+        ];
+        for raw in invalid_ready {
+            let fixture = PendingGateFixture::new();
+            write_protected(&fixture.control.path().join("ready.json"), raw.as_bytes());
+            fixture.write_release(READY_NONCE);
+            assert!(fixture.gate_pending(), "invalid ready released gate: {raw}");
+        }
+
+        let invalid_receipts = [
+            format!("{{\"version\":2,\"version\":1,\"nonce\":\"{READY_NONCE}\"}}"),
+            format!(
+                "{{\"version\":1,\"nonce\":\"{}\",\"nonce\":\"{READY_NONCE}\"}}",
+                "c".repeat(64)
+            ),
+            format!("{{\"version\":true,\"nonce\":\"{READY_NONCE}\"}}"),
+            format!("{{\"version\":1.0,\"nonce\":\"{READY_NONCE}\"}}"),
+            format!("{{\"version\":1e0,\"nonce\":\"{READY_NONCE}\"}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}0\"}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}\",\"extra\":false}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}\"}} {{}}"),
+        ];
+        for raw in invalid_receipts {
+            let fixture = PendingGateFixture::new();
+            write_protected(&fixture.control.path().join(".released"), raw.as_bytes());
+            assert!(
+                fixture.gate_pending(),
+                "invalid receipt released gate: {raw}"
+            );
+        }
+    }
 }

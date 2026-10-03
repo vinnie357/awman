@@ -450,3 +450,29 @@ replacement fail closed; replacing the control pathname cannot redirect
 ready, release, receipt or failure operations; host-side exact verification is
 unchanged; and the configured unprivileged identity transition occurs only
 after the matching release.
+
+## Approved final image-user identity semantics
+
+The startup gate preserves the selected image's Linux `USER` contract when it
+returns from the privileged bootstrap to the original agent. User and group
+components may each be a decimal ID or a name; a digit-leading token that is
+not wholly decimal remains a name and is resolved through the guest account
+database.
+
+When the image user omits a group and resolves through the guest password
+database, the bootstrap applies that account's primary and supplementary group
+memberships before setting its final UID. When the image user supplies either
+a numeric or named group, the bootstrap resolves that group independently,
+clears supplementary groups, then sets exactly the requested GID and UID. It
+verifies the effective GID and UID before executing the original argv. Unknown
+users or groups fail before any supplementary-group, GID, UID, or agent-exec
+effect.
+
+This follows the Docker [`USER` instruction reference](https://docs.docker.com/reference/dockerfile/#user),
+which specifies that an explicit group is the user's only group membership,
+and the OCI Image Configuration [`config.User` contract](https://github.com/opencontainers/image-spec/blob/main/config.md#properties),
+which says an explicit group ignores supplementary groups while an omitted
+group uses the account's default and supplementary memberships. A wholly
+numeric UID without a guest password entry remains supported when an explicit
+GID is present. The default GID for a numeric UID with no explicit group is not
+expanded by this clarification and still requires backend-parity evidence.

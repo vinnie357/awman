@@ -806,9 +806,17 @@ class StartupGateGuestControlTest(unittest.TestCase):
                 "initgroups",
                 side_effect=lambda name, gid: events.append(("initgroups", name, gid)),
             ), mock.patch.object(
+                bootstrap.os,
+                "setgroups",
+                side_effect=lambda groups: events.append(("setgroups", list(groups))),
+            ), mock.patch.object(
                 bootstrap.os, "setgid", side_effect=lambda gid: events.append(("setgid", gid))
             ), mock.patch.object(
                 bootstrap.os, "setuid", side_effect=lambda uid: events.append(("setuid", uid))
+            ), mock.patch.object(
+                bootstrap.os, "geteuid", return_value=1234
+            ), mock.patch.object(
+                bootstrap.os, "getegid", return_value=3456
             ), mock.patch.object(
                 bootstrap.os,
                 "execvpe",
@@ -835,7 +843,7 @@ class StartupGateGuestControlTest(unittest.TestCase):
                 events,
                 [
                     "released",
-                    ("initgroups", "agent-user", 3456),
+                    ("setgroups", []),
                     ("setgid", 3456),
                     ("setuid", 1234),
                     ("exec", "agent", ["agent", "space value"], {"SAFE": "kept"}),
@@ -933,6 +941,372 @@ class StartupGateRegressionTest(unittest.TestCase):
                             )
                     self.assertEqual(raised.exception.code, expected_code)
                     self.assertFalse((control_path / "ready.json").exists())
+
+    def test_request_release_and_manifest_json_use_strict_records_and_exact_integers(self):
+        nonce = "a" * 64
+        binding = (
+            '{"id":"review-input","workspace_path":"/review/input",'
+            '"manifest_id":"' + "b" * 64 + '",'
+            '"manifest_file":"review.manifest.json","access":"read-only"}'
+        )
+        invalid_requests = [
+            ('{"version":2,"version":1,"bindings":[' + binding + ']}').encode(),
+            ('{"version":1,"bindings":[' + binding.replace(
+                '"id":"review-input"',
+                '"id":"other","id":"review-input"',
+            ) + ']}').encode(),
+            ('{"version":true,"bindings":[' + binding + ']}').encode(),
+            ('{"version":1.0,"bindings":[' + binding + ']}').encode(),
+            ('{"version":1e0,"bindings":[' + binding + ']}').encode(),
+            ('{"version":1,"bindings":[' + binding + '],"extra":false}').encode(),
+            ('{"version":1,"bindings":[' + binding + ']} {}').encode(),
+        ]
+        for raw in invalid_requests:
+            with self.subTest(record="request", raw=raw), tempfile.TemporaryDirectory() as control:
+                control_path = Path(control)
+                (control_path / "request.json").write_bytes(raw)
+                (control_path / "request.json").chmod(0o600)
+                with self.assertRaises(bootstrap.GateError) as raised:
+                    bootstrap.run_gate(
+                        control_path,
+                        ["agent"],
+                        {},
+                        self.VALID_MOUNTINFO,
+                        container_name="fixture-container",
+                    )
+                self.assertEqual(raised.exception.code, "request-invalid")
+                self.assertFalse((control_path / "ready.json").exists())
+
+        invalid_manifests = [
+            b'{"version":2,"version":1,"entries":[]}',
+            b'{"version":true,"entries":[]}',
+            b'{"version":1.0,"entries":[]}',
+            b'{"version":1e0,"entries":[]}',
+            b'{"version":1,"entries":[{"path":"a","kind":"file","size":true,"sha256":"' + EMPTY_SHA.encode() + b'"}]}',
+            b'{"version":1,"entries":[{"path":"a","kind":"file","size":1.0,"sha256":"' + EMPTY_SHA.encode() + b'"}]}',
+            b'{"version":1,"entries":[{"path":"a","kind":"file","size":1e0,"sha256":"' + EMPTY_SHA.encode() + b'"}]}',
+            b'{"version":1,"entries":[{"path":"a","kind":"directory","size":0.0,"sha256":null}]}',
+            b'{"version":1,"entries":[{"path":"a","kind":"file","size":0,"size":0,"sha256":"' + EMPTY_SHA.encode() + b'"}]}',
+            b'{"version":1,"entries":[],"extra":false}',
+            b'{"version":1,"entries":[]} {}',
+        ]
+        for raw in invalid_manifests:
+            with self.subTest(record="manifest", raw=raw):
+                with self.assertRaises(bootstrap.GateError) as raised:
+                    bootstrap.parse_manifest(raw, hashlib.sha256(raw).hexdigest())
+                self.assertEqual(raised.exception.code, "manifest-invalid")
+
+        invalid_releases = [
+            ('{"version":1,"nonce":"' + "b" * 64 + '","nonce":"' + nonce + '"}').encode(),
+            ('{"version":2,"version":1,"nonce":"' + nonce + '"}').encode(),
+            ('{"version":true,"nonce":"' + nonce + '"}').encode(),
+            ('{"version":1.0,"nonce":"' + nonce + '"}').encode(),
+            ('{"version":1e0,"nonce":"' + nonce + '"}').encode(),
+            ('{"version":1,"nonce":"' + nonce + '0"}').encode(),
+            ('{"version":1,"nonce":"' + nonce + '","extra":false}').encode(),
+            ('{"version":1,"nonce":"' + nonce + '"} {}').encode(),
+        ]
+        for raw in invalid_releases:
+            with self.subTest(record="release", raw=raw), tempfile.TemporaryDirectory() as control:
+                release = Path(control) / "release.json"
+                release.write_bytes(raw)
+                release.chmod(0o600)
+                with self.assertRaises(bootstrap.GateError) as raised:
+                    bootstrap.await_release(
+                        Path(control),
+                        {"version": 1, "nonce": nonce},
+                        10,
+                        clock=lambda: 0,
+                        sleep=lambda _: None,
+                    )
+                self.assertEqual(raised.exception.code, "release-invalid")
+                self.assertTrue(release.exists(), "invalid release must remain unconsumed")
+
+    def test_release_deadline_is_checked_before_and_after_the_bounded_read(self):
+        nonce = "a" * 64
+        ready = {"version": 1, "nonce": nonce}
+
+        class BoundaryClock:
+            def __init__(self, after_start):
+                self.calls = 0
+                self.after_start = after_start
+
+            def monotonic(self):
+                self.calls += 1
+                return 0.0 if self.calls == 1 else self.after_start
+
+        with tempfile.TemporaryDirectory() as control:
+            release = Path(control) / "release.json"
+            write_protected_json(release, ready)
+            clock = BoundaryClock(0.999)
+            bootstrap.await_release(
+                Path(control),
+                ready,
+                1,
+                clock=clock.monotonic,
+                sleep=lambda _: None,
+            )
+            self.assertFalse(release.exists(), "release before deadline is consumed")
+
+        with tempfile.TemporaryDirectory() as control:
+            release = Path(control) / "release.json"
+            write_protected_json(release, ready)
+            clock = BoundaryClock(1.0)
+            with mock.patch.object(
+                bootstrap,
+                "_read_control_record",
+                side_effect=AssertionError("deadline must be checked before open"),
+            ) as reader:
+                with self.assertRaises(bootstrap.GateError) as raised:
+                    bootstrap.await_release(
+                        Path(control),
+                        ready,
+                        1,
+                        clock=clock.monotonic,
+                        sleep=lambda _: None,
+                    )
+            self.assertEqual(raised.exception.code, "timeout")
+            reader.assert_not_called()
+            self.assertTrue(release.exists(), "release at deadline remains unconsumed")
+
+        with tempfile.TemporaryDirectory() as control:
+            release = Path(control) / "release.json"
+            write_protected_json(release, ready)
+            crossed = [False]
+            original_read = bootstrap._read_control_record
+
+            def clock():
+                return 1.0 if crossed[0] else 0.0
+
+            def read_then_cross(*args):
+                raw = original_read(*args)
+                crossed[0] = True
+                return raw
+
+            with mock.patch.object(
+                bootstrap,
+                "_read_control_record",
+                side_effect=read_then_cross,
+            ):
+                with self.assertRaises(bootstrap.GateError) as raised:
+                    bootstrap.await_release(
+                        Path(control),
+                        ready,
+                        1,
+                        clock=clock,
+                        sleep=lambda _: None,
+                    )
+            self.assertEqual(raised.exception.code, "timeout")
+            self.assertTrue(release.exists(), "release crossing deadline remains unconsumed")
+
+    def test_main_resolves_named_and_numeric_runtime_identities_before_exact_drop(self):
+        account = types.SimpleNamespace(
+            pw_name="agent-user", pw_uid=1234, pw_gid=2345
+        )
+        named_group = types.SimpleNamespace(gr_name="agent-group", gr_gid=4567)
+
+        def run_case(run_as, expected_events):
+            events = []
+            effective = {"uid": 0, "gid": 0}
+
+            def released_then_exec(*_args, **kwargs):
+                events.append("released")
+                kwargs["exec_fn"]("agent", ["agent"], {"SAFE": "kept"})
+
+            def setgroups(groups):
+                events.append(("setgroups", list(groups)))
+
+            def initgroups(name, gid):
+                events.append(("initgroups", name, gid))
+
+            def setgid(gid):
+                events.append(("setgid", gid))
+                effective["gid"] = gid
+
+            def setuid(uid):
+                events.append(("setuid", uid))
+                effective["uid"] = uid
+
+            def getpwuid(uid):
+                if uid == account.pw_uid:
+                    raise KeyError(uid)
+                raise AssertionError(f"unexpected uid lookup {uid}")
+
+            fake_grp = types.SimpleNamespace(
+                getgrnam=lambda name: named_group
+                if name in (named_group.gr_name, "345x")
+                else (_ for _ in ()).throw(KeyError(name))
+            )
+            with tempfile.TemporaryDirectory() as control_name:
+                control = Path(control_name)
+                control.chmod(0o700)
+                with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(
+                    bootstrap, "run_gate", side_effect=released_then_exec
+                ), mock.patch.object(
+                    bootstrap.Path, "read_text", return_value="fixture mountinfo"
+                ), mock.patch.object(
+                    bootstrap.Path, "exists", return_value=False
+                ), mock.patch.object(
+                    bootstrap.pwd, "getpwnam", return_value=account
+                ), mock.patch.object(
+                    bootstrap.pwd, "getpwuid", side_effect=getpwuid
+                ), mock.patch.object(
+                    bootstrap, "grp", fake_grp, create=True
+                ), mock.patch.object(
+                    bootstrap.os, "setgroups", side_effect=setgroups
+                ), mock.patch.object(
+                    bootstrap.os, "initgroups", side_effect=initgroups
+                ), mock.patch.object(
+                    bootstrap.os, "setgid", side_effect=setgid
+                ), mock.patch.object(
+                    bootstrap.os, "setuid", side_effect=setuid
+                ), mock.patch.object(
+                    bootstrap.os, "geteuid", side_effect=lambda: effective["uid"]
+                ) as read_uid, mock.patch.object(
+                    bootstrap.os, "getegid", side_effect=lambda: effective["gid"]
+                ) as read_gid, mock.patch.object(
+                    bootstrap.os,
+                    "execvpe",
+                    side_effect=lambda file, argv, env: events.append(
+                        ("exec", file, list(argv), dict(env))
+                    ),
+                ):
+                    bootstrap.main(
+                        [
+                            "bootstrap.py",
+                            str(control),
+                            "120",
+                            "--run-as",
+                            run_as,
+                            "--container-name",
+                            "fixture-container",
+                            "--",
+                            "agent",
+                        ]
+                    )
+            read_uid.assert_called_once_with()
+            read_gid.assert_called_once_with()
+            self.assertEqual(events, expected_events)
+
+        run_case(
+            "agent-user",
+            [
+                "released",
+                ("initgroups", "agent-user", 2345),
+                ("setgid", 2345),
+                ("setuid", 1234),
+                ("exec", "agent", ["agent"], {"SAFE": "kept"}),
+            ],
+        )
+        run_case(
+            "1234:3456",
+            [
+                "released",
+                ("setgroups", []),
+                ("setgid", 3456),
+                ("setuid", 1234),
+                ("exec", "agent", ["agent"], {"SAFE": "kept"}),
+            ],
+        )
+        run_case(
+            "1234:agent-group",
+            [
+                "released",
+                ("setgroups", []),
+                ("setgid", 4567),
+                ("setuid", 1234),
+                ("exec", "agent", ["agent"], {"SAFE": "kept"}),
+            ],
+        )
+        run_case(
+            "agent-user:agent-group",
+            [
+                "released",
+                ("setgroups", []),
+                ("setgid", 4567),
+                ("setuid", 1234),
+                ("exec", "agent", ["agent"], {"SAFE": "kept"}),
+            ],
+        )
+        run_case(
+            "123x:345x",
+            [
+                "released",
+                ("setgroups", []),
+                ("setgid", 4567),
+                ("setuid", 1234),
+                ("exec", "agent", ["agent"], {"SAFE": "kept"}),
+            ],
+        )
+
+    def test_main_rejects_unknown_named_user_or_group_without_exec(self):
+        account = types.SimpleNamespace(
+            pw_name="agent-user", pw_uid=1234, pw_gid=2345
+        )
+
+        def released_then_exec(*_args, **kwargs):
+            kwargs["exec_fn"]("agent", ["agent"], {})
+
+        for run_as in ("unknown-user:3456", "agent-user:unknown-group"):
+            with self.subTest(run_as=run_as), tempfile.TemporaryDirectory() as control_name:
+                control = Path(control_name)
+                control.chmod(0o700)
+                def getpwnam(name):
+                    if run_as.startswith("agent-user:") and name == "agent-user":
+                        return account
+                    raise KeyError(name)
+
+                fake_grp = types.SimpleNamespace(
+                    getgrnam=mock.Mock(side_effect=KeyError("unknown-group"))
+                )
+                with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(
+                    bootstrap, "run_gate", side_effect=released_then_exec
+                ), mock.patch.object(
+                    bootstrap.Path, "read_text", return_value="fixture mountinfo"
+                ), mock.patch.object(
+                    bootstrap.Path, "exists", return_value=False
+                ), mock.patch.object(
+                    bootstrap.pwd,
+                    "getpwnam",
+                    side_effect=getpwnam,
+                ), mock.patch.object(
+                    bootstrap, "grp", fake_grp, create=True
+                ), mock.patch.object(
+                    bootstrap.os,
+                    "initgroups",
+                    side_effect=AssertionError("unresolved identity changed supplementary groups"),
+                ), mock.patch.object(
+                    bootstrap.os,
+                    "setgroups",
+                    side_effect=AssertionError("unresolved identity changed supplementary groups"),
+                ), mock.patch.object(
+                    bootstrap.os,
+                    "setgid",
+                    side_effect=AssertionError("unresolved identity changed gid"),
+                ), mock.patch.object(
+                    bootstrap.os,
+                    "setuid",
+                    side_effect=AssertionError("unresolved identity changed uid"),
+                ), mock.patch.object(
+                    bootstrap.os,
+                    "execvpe",
+                    side_effect=AssertionError("invalid identity executed agent"),
+                ):
+                    with self.assertRaises(bootstrap.GateError) as raised:
+                        bootstrap.main(
+                            [
+                                "bootstrap.py",
+                                str(control),
+                                "120",
+                                "--run-as",
+                                run_as,
+                                "--container-name",
+                                "fixture-container",
+                                "--",
+                                "agent",
+                            ]
+                        )
+                self.assertEqual(raised.exception.code, "runtime-user")
 
 
 if __name__ == "__main__":
