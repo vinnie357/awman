@@ -133,20 +133,6 @@ pub fn stage_startup_gate(spec: &StartupGateSpec) -> Result<StagedStartupGate, E
         format!("{CONTAINER_GATE_ROOT}/control"),
         spec.timeout.as_secs().to_string(),
     ];
-    let mut wrapper_argv = wrapper_argv;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let metadata =
-            std::fs::metadata(&approved.control_dir).map_err(|source| EngineError::Io {
-                path: approved.control_dir.clone(),
-                source,
-            })?;
-        wrapper_argv.extend([
-            "--control-owner".into(),
-            format!("{}:{}", metadata.uid(), metadata.gid()),
-        ]);
-    }
     Ok(StagedStartupGate {
         overlays,
         wrapper_argv,

@@ -392,3 +392,61 @@ No test uses a real model, network, operator repository or credential.
 After implementation, update `aspec/uxui/cli.md`, `docs/03-agent-sessions.md`,
 `docs/04-security-and-isolation.md` and `docs/08-overlays.md`. Describe the
 feature as an orchestrator startup gate, not as general repository attestation.
+
+## Approved ownership boundary across host and guest namespaces
+
+Numeric ownership is namespace-specific. On the verified Apple Container path,
+the host sees a control directory and its records as UID:GID `501:0`, while the
+guest sees the same mounted objects as `0:0`. Passing a host UID/GID through a
+bootstrap argument therefore rejects a legitimate mount and cannot serve as a
+trustworthy guest ownership assertion.
+
+Host and guest validate ownership independently:
+
+- Host validation remains unchanged. The caller control directory must be a
+  current-host-user-owned, nonsymlink directory with mode `0700`.
+  Host-created and host-read protocol records remain regular, single-link,
+  bounded, mode-`0600` files owned by that host identity.
+- The fixed guest bootstrap receives no host numeric UID/GID argument.
+- At bootstrap start, the guest opens the mounted control directory once with
+  directory and no-follow semantics. It validates the held object is a
+  directory with mode `0700`, records its guest-visible UID and GID, and keeps
+  the descriptor open through release, failure, or final exec.
+- Guest control records are accessed by fixed basenames relative to that held
+  descriptor. `ready.json`, `release.json`, `.released`, and `failure.json`
+  must be regular, single-link, bounded files with mode `0600` and the same
+  guest-visible UID and GID as the held control directory.
+- Guest reads use no-follow and nonblocking flags, compare pre-open metadata
+  with `fstat`, and reject replacement, symlink, hardlink, FIFO, device,
+  socket, wrong owner, wrong mode, empty or oversized records as required by
+  the existing protocol.
+- Guest atomic writes create unpredictable exclusive temporary basenames
+  relative to the held descriptor, fsync the file, replace within the same
+  held directory using descriptor-relative rename, and fsync the directory.
+  Cleanup and release removal are descriptor-relative.
+- A pathname replacement after the control descriptor is acquired cannot
+  redirect any protocol read, write, rename, unlink, or sync.
+- The approved read-only bootstrap/request/manifest mount keeps its separate
+  guest-visible directory-owner validation. Its ownership is not inferred from
+  the writable control mount.
+
+The host lease verifier continues to validate host ownership, mode, link
+count, bounded no-follow reads, request/ready/receipt schemas, container
+identity, binding identity, and nonce. Guest-derived ownership does not weaken
+or replace those checks.
+
+The request, manifest, ready, release, receipt, and failure schemas do not
+change. The ready nonce remains a cryptographically random 256-bit lowercase
+hexadecimal value. Release must contain the exact ready nonce. Binding
+identities and authoritative container identity remain exact. A deprecated
+pure-test ownership argument may remain temporarily for source compatibility,
+but production ignores it as authority and derives guest ownership from the
+held control descriptor on every path.
+
+Regression coverage must prove the staged production argv contains no host
+numeric owner; a correct guest namespace writes and consumes owner-matched
+records; wrong guest UID or GID, mode, links, FIFO, oversize and inode
+replacement fail closed; replacing the control pathname cannot redirect
+ready, release, receipt or failure operations; host-side exact verification is
+unchanged; and the configured unprivileged identity transition occurs only
+after the matching release.

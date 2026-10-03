@@ -92,6 +92,30 @@ fn stage_uses_only_fixed_operational_mounts_and_isolated_absolute_python() {
 }
 
 #[test]
+fn staged_bootstrap_argv_contains_no_host_numeric_owner() {
+    let (_control, spec) = valid_gate();
+    let staged = stage_startup_gate(&spec).expect("stage");
+    assert_eq!(
+        staged.wrapper_argv,
+        [
+            "/usr/bin/python3",
+            "-I",
+            "-S",
+            "/.awman/startup-gate/bin/bootstrap.py",
+            "/.awman/startup-gate/control",
+            "120",
+        ]
+    );
+    assert!(
+        !staged
+            .wrapper_argv
+            .iter()
+            .any(|arg| arg == "--control-owner"),
+        "a host UID/GID is not guest ownership authority"
+    );
+}
+
+#[test]
 fn wrapper_preserves_hostile_original_argv_as_exact_distinct_arguments() {
     let (_control, spec) = valid_gate();
     let staged = stage_startup_gate(&spec).expect("stage");
