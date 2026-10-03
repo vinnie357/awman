@@ -21,6 +21,7 @@ pub mod naming;
 pub mod options;
 mod process;
 pub mod runtime;
+pub mod startup_gate;
 pub mod timing;
 
 pub use background::BackgroundContainer;

@@ -70,12 +70,13 @@ fn stage_uses_only_fixed_operational_mounts_and_isolated_absolute_python() {
     let staged = stage_startup_gate(&spec).expect("stage");
     assert_eq!(staged.overlays.len(), 2);
     assert!(staged.overlays.iter().any(|overlay| {
-        overlay.container_path == PathBuf::from("/.awman/startup-gate/bin")
+        overlay.container_path.as_path() == std::path::Path::new("/.awman/startup-gate/bin")
             && overlay.permission == OverlayPermission::ReadOnly
     }));
     assert!(staged.overlays.iter().any(|overlay| {
         overlay.host_path == control.path()
-            && overlay.container_path == PathBuf::from("/.awman/startup-gate/control")
+            && overlay.container_path.as_path()
+                == std::path::Path::new("/.awman/startup-gate/control")
             && overlay.permission == OverlayPermission::ReadWrite
     }));
     assert_eq!(
@@ -277,7 +278,9 @@ fn staged_snapshot_is_immutable_after_caller_control_changes() {
     let snapshot_root = staged
         .overlays
         .iter()
-        .find(|overlay| overlay.container_path == PathBuf::from("/.awman/startup-gate/bin"))
+        .find(|overlay| {
+            overlay.container_path.as_path() == std::path::Path::new("/.awman/startup-gate/bin")
+        })
         .expect("snapshot overlay")
         .host_path
         .clone();

@@ -4,8 +4,9 @@
 //! becomes one variant here. Adding a new option is one variant + one branch
 //! in `ResolvedContainerOptions::ingest`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::data::startup_gate::StartupGateSpec;
 use crate::engine::auth::RefreshableCredentialDelivery;
 
 /// A reference to a container image (e.g. `awman-myproj-claude:latest`).
@@ -218,6 +219,8 @@ pub enum ContainerOption {
         flag: String,
         container_path: PathBuf,
     },
+    StartupGate(StartupGateSpec),
+    StartupGateTrustedTemplate,
 }
 
 /// Injection-time dedup: drop any entry from `agent_credentials` whose
@@ -447,6 +450,9 @@ pub struct ResolvedContainerOptions {
     pub system_prompt_env_file: Option<(String, PathBuf, PathBuf)>,
     pub system_prompt_inline: Option<(String, String)>,
     pub agent_add_dirs: Vec<(String, PathBuf)>,
+    pub startup_gate: Option<Box<StartupGateSpec>>,
+    pub startup_gate_trusted_template: bool,
+    pub startup_gate_runtime_user: Option<String>,
 }
 
 impl ResolvedContainerOptions {
@@ -542,6 +548,14 @@ impl ResolvedContainerOptions {
             } => {
                 self.agent_add_dirs.push((flag, container_path));
             }
+            ContainerOption::StartupGate(v) => {
+                if self.startup_gate.replace(Box::new(v)).is_some() {
+                    return Err(ResolveError::Conflict("duplicate startup gate".into()));
+                }
+            }
+            ContainerOption::StartupGateTrustedTemplate => {
+                self.startup_gate_trusted_template = true
+            }
         }
         Ok(())
     }
@@ -554,8 +568,68 @@ impl ResolvedContainerOptions {
                 "yolo and plan modes are mutually exclusive".into(),
             ));
         }
+        if let Some(gate) = &self.startup_gate {
+            if self.acp {
+                return Err(ResolveError::Conflict(
+                    "startup gate does not support ACP".into(),
+                ));
+            }
+            for binding in &gate.request.bindings {
+                let path = PathBuf::from(&binding.workspace_path);
+                let allowed = ["/workspace", "/review", "/work", "/data", "/mnt", "/output"];
+                if !allowed
+                    .iter()
+                    .any(|root| path == PathBuf::from(root) || path.starts_with(root))
+                {
+                    return Err(ResolveError::Conflict(format!(
+                        "startup gate binding is outside allowed roots: {}",
+                        binding.workspace_path
+                    )));
+                }
+            }
+            let forbidden = [
+                "/bin",
+                "/sbin",
+                "/usr",
+                "/lib",
+                "/lib64",
+                "/etc",
+                "/proc",
+                "/sys",
+                "/dev",
+                "/.awman/startup-gate",
+            ];
+            for overlay in &self.overlays {
+                if forbidden
+                    .iter()
+                    .any(|root| paths_overlap(&overlay.container_path, Path::new(root)))
+                {
+                    return Err(ResolveError::Conflict(format!(
+                        "startup gate overlay overlaps protected path: {}",
+                        overlay.container_path.display()
+                    )));
+                }
+            }
+            if self
+                .env_passthrough
+                .iter()
+                .any(|v| v.0.starts_with("LD_") || v.0.starts_with("DYLD_"))
+                || self
+                    .env_literal
+                    .iter()
+                    .any(|v| v.key.starts_with("LD_") || v.key.starts_with("DYLD_"))
+            {
+                return Err(ResolveError::Conflict(
+                    "startup gate rejects dynamic-loader environment".into(),
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
 }
 
 #[derive(Debug, thiserror::Error)]

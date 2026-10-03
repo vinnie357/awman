@@ -20,6 +20,8 @@ use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 
 #[derive(Debug, Clone)]
 pub struct ChatCommandFlags {
+    pub startup_gate_control: Option<std::path::PathBuf>,
+    pub startup_gate_timeout: u64,
     pub non_interactive: bool,
     pub plan: bool,
     pub allow_docker: bool,
@@ -79,8 +81,26 @@ impl ChatCommand {
 
     /// Construct from the catalogue-resolved input (WI 0113 F-10).
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        if ctx.flags.supplied("startup-gate-timeout") && !ctx.flags.supplied("startup-gate-control")
+        {
+            return Err(CommandError::Other(
+                "chat: --startup-gate-timeout requires --startup-gate-control".into(),
+            ));
+        }
         Ok(Self::new(
             ChatCommandFlags {
+                startup_gate_control: ctx.flags.path("startup-gate-control"),
+                startup_gate_timeout: ctx
+                    .flags
+                    .string("startup-gate-timeout")
+                    .as_deref()
+                    .unwrap_or("120")
+                    .parse()
+                    .map_err(|_| {
+                        CommandError::Other(
+                            "chat: --startup-gate-timeout must be an integer in 1..=3600".into(),
+                        )
+                    })?,
                 non_interactive: ctx.flags.bool("non-interactive"),
                 plan: ctx.flags.bool("plan"),
                 allow_docker: ctx.flags.bool("allow-docker"),
@@ -286,6 +306,18 @@ impl Command for ChatCommand {
 
         // 6. Build the run options from flags + credentials.
         let run_opts = AgentRunOptions {
+            startup_gate: self
+                .flags
+                .startup_gate_control
+                .as_ref()
+                .map(|path| {
+                    crate::data::startup_gate::load_startup_gate(
+                        path,
+                        std::time::Duration::from_secs(self.flags.startup_gate_timeout),
+                    )
+                })
+                .transpose()
+                .map_err(|e| CommandError::Other(format!("chat: {e}")))?,
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),

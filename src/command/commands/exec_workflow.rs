@@ -35,12 +35,14 @@ use crate::engine::workflow::actions::{
 };
 use crate::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
 use crate::engine::workflow::frontend::WorkflowFrontend;
-use crate::engine::workflow::{EngineRequest, WorkflowEngine};
+use crate::engine::workflow::{EngineRequest, WorkflowEngine, WorkflowRetryPolicy};
 
 use super::dynamic_repair::{RepairDecision, WorkflowRepairLoop};
 
 #[derive(Debug, Clone)]
 pub struct ExecWorkflowCommandFlags {
+    pub startup_gate_control: Option<PathBuf>,
+    pub startup_gate_timeout: u64,
     /// The positional workflow path. `None` is only valid with `--dynamic`,
     /// where the leader agent generates the workflow file. Non-dynamic
     /// invocations with `None` produce the existing missing-required-argument
@@ -65,6 +67,16 @@ pub struct ExecWorkflowCommandFlags {
     /// Raw `agent::model` string for the dynamic leader agent. Only valid with
     /// `--dynamic`.
     pub leader: Option<String>,
+}
+
+impl ExecWorkflowCommandFlags {
+    fn workflow_retry_policy(&self) -> WorkflowRetryPolicy {
+        if self.startup_gate_control.is_some() {
+            WorkflowRetryPolicy::SingleAttempt
+        } else {
+            WorkflowRetryPolicy::Legacy
+        }
+    }
 }
 
 /// Fully-specified leader agent selection parsed from `--leader agent::model`.
@@ -495,7 +507,26 @@ impl ExecWorkflowCommand {
     /// non-dynamic run requires (the catalogue marks it optional so
     /// `--dynamic` may omit it).
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        if ctx.flags.supplied("startup-gate-timeout") && !ctx.flags.supplied("startup-gate-control")
+        {
+            return Err(CommandError::Other(
+                "exec workflow: --startup-gate-timeout requires --startup-gate-control".into(),
+            ));
+        }
         let flags = ExecWorkflowCommandFlags {
+            startup_gate_control: ctx.flags.path("startup-gate-control"),
+            startup_gate_timeout: ctx
+                .flags
+                .string("startup-gate-timeout")
+                .as_deref()
+                .unwrap_or("120")
+                .parse()
+                .map_err(|_| {
+                    CommandError::Other(
+                        "exec workflow: --startup-gate-timeout must be an integer in 1..=3600"
+                            .into(),
+                    )
+                })?,
             workflow: ctx.args.get("workflow").map(PathBuf::from),
             work_item: ctx.flags.string("work-item"),
             non_interactive: ctx.flags.bool("non-interactive"),
@@ -1009,6 +1040,18 @@ impl AgentExecutionFactory for CommandLayerFactory {
             runtime.step_agent.as_str(),
         );
         let run_opts = AgentRunOptions {
+            startup_gate: self
+                .flags
+                .startup_gate_control
+                .as_ref()
+                .map(|path| {
+                    crate::data::startup_gate::load_startup_gate(
+                        path,
+                        Duration::from_secs(self.flags.startup_gate_timeout),
+                    )
+                })
+                .transpose()
+                .map_err(|error| EngineError::Config(format!("startup gate: {error}")))?,
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),
@@ -1055,7 +1098,8 @@ impl AgentExecutionFactory for CommandLayerFactory {
         // container options are built when it is on the edge of expiry. The
         // refresh is bounded and advisory: a stale host credential must not
         // make an otherwise runnable workflow step fail to launch.
-        if !self.engines.runtime.capabilities().kit_declarative
+        if self.flags.startup_gate_control.is_none()
+            && !self.engines.runtime.capabilities().kit_declarative
             && matches!(
                 resolved_credentials.delivery,
                 crate::engine::auth::CredentialDelivery::File(_)
@@ -1190,6 +1234,11 @@ impl Command for ExecWorkflowCommand {
                 text: format!("exec workflow: {e}"),
             });
             return Err(e);
+        }
+        if self.flags.startup_gate_control.is_some() && self.flags.dynamic {
+            return Err(CommandError::Other(
+                "exec workflow: startup gates do not support dynamic workflows".into(),
+            ));
         }
 
         // Dynamic mode: a leader agent designs the workflow, then it executes.
@@ -1720,6 +1769,21 @@ async fn execute_prepared(
     } = prepared;
     let mut frontend = frontend;
 
+    if flags.startup_gate_control.is_some() {
+        if workflow.steps.len() != 1 {
+            return Err(CommandError::Other(format!(
+                "exec workflow: one startup-gate control directory is single-use and requires exactly one agent step; this workflow has {}",
+                workflow.steps.len()
+            )));
+        }
+        if !workflow.setup.is_empty() || !workflow.teardown.is_empty() {
+            return Err(CommandError::Other(
+                "exec workflow: startup gates require a workflow with no setup or teardown steps"
+                    .into(),
+            ));
+        }
+    }
+
     // When the run is inside an isolated worktree (--worktree, or implied by
     // --yolo/--dynamic), any `checkout_create_branch` setup step is redundant:
     // the worktree already put the run on its own branch. Skip-and-warn, not
@@ -1884,13 +1948,14 @@ async fn execute_prepared(
             task_workspace: task_workspace.map(Path::to_path_buf),
             launch_modes: Arc::new(launch_modes),
         };
-        let mut engine = match WorkflowEngine::resume_with_state_root(
+        let mut engine = match WorkflowEngine::resume_with_state_root_and_retry_policy(
             &session,
             workflow,
             engine_work_item_context,
             Box::new(proxy),
             Box::new(factory),
             workflow_state_root.map(Path::to_path_buf),
+            flags.workflow_retry_policy(),
         )
         .await
         {
@@ -3504,6 +3569,18 @@ impl ExecWorkflowCommand {
         use crate::engine::agent_runtime::execution::{StuckEvent, KILLED_EXIT_CODE};
 
         let run_opts = AgentRunOptions {
+            startup_gate: self
+                .flags
+                .startup_gate_control
+                .as_ref()
+                .map(|path| {
+                    crate::data::startup_gate::load_startup_gate(
+                        path,
+                        Duration::from_secs(self.flags.startup_gate_timeout),
+                    )
+                })
+                .transpose()
+                .map_err(|error| CommandError::Other(format!("startup gate: {error}")))?,
             yolo: Some(YoloMode::Enabled),
             initial_prompt: Some(prompt.to_string()),
             model: model.map(|m| m.to_string()),
@@ -4620,6 +4697,8 @@ prompt = "do something"
 
         let flags = ExecWorkflowCommandFlags {
             workflow: Some(wf_path),
+            startup_gate_control: None,
+            startup_gate_timeout: 120,
             work_item: None,
             non_interactive: true,
             plan: false,
@@ -4710,6 +4789,8 @@ prompt = "do something"
         // correctly reflect what dispatch sets.
         let flags = ExecWorkflowCommandFlags {
             workflow: Some(PathBuf::from("wf.toml")),
+            startup_gate_control: None,
+            startup_gate_timeout: 120,
             work_item: None,
             non_interactive: false,
             plan: false,
@@ -4737,6 +4818,8 @@ prompt = "do something"
         // allows that combination.
         let flags = ExecWorkflowCommandFlags {
             workflow: Some(PathBuf::from("wf.toml")),
+            startup_gate_control: None,
+            startup_gate_timeout: 120,
             work_item: None,
             non_interactive: false,
             plan: false,
@@ -5263,6 +5346,8 @@ prompt = "do something"
     ) -> ExecWorkflowCommandFlags {
         ExecWorkflowCommandFlags {
             workflow: workflow.map(PathBuf::from),
+            startup_gate_control: None,
+            startup_gate_timeout: 120,
             work_item: work_item.map(|s| s.to_string()),
             non_interactive: false,
             plan,

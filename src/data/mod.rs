@@ -21,6 +21,7 @@ pub mod repo_dockerfile_paths;
 pub mod session;
 pub mod session_manager;
 pub mod session_setup_event;
+pub mod startup_gate;
 pub mod step_status;
 pub mod templates;
 pub mod workflow_dag;

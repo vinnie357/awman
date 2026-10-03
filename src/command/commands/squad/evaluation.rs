@@ -999,6 +999,8 @@ fn squad_workflow_flags(
 ) -> ExecWorkflowCommandFlags {
     ExecWorkflowCommandFlags {
         workflow: Some(workflow_path.to_path_buf()),
+        startup_gate_control: None,
+        startup_gate_timeout: 120,
         work_item: None,
         non_interactive: false,
         plan: false,

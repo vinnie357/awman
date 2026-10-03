@@ -2279,7 +2279,7 @@ const NEW_SKILL: CommandSpec = CommandSpec {
 /// Agent-run flag set used by `chat` and `exec prompt` (no worktree, no
 /// workflow). All optional. Mode flags `yolo` / `auto` / `plan` are mutually
 /// exclusive.
-const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
+const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 11] = [
     FlagSpec {
         long: "non-interactive",
         short: Some('n'),
@@ -2379,11 +2379,33 @@ const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
         implies: &[],
         optional: true,
     },
+    FlagSpec {
+        long: "startup-gate-control",
+        short: None,
+        help: "Gate agent startup using the request and release files in DIR.",
+        kind: FlagKind::OptionalPath,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "startup-gate-timeout",
+        short: None,
+        help: "Seconds to wait for startup-gate release (default 120, range 1..=3600).",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
 ];
 
 /// Agent-run flags for `exec prompt` — extends `AGENT_RUN_FLAGS_NO_WORKTREE`
 /// with `--issue`. Scoped to `exec prompt` only; `chat` retains the base set.
-const EXEC_PROMPT_FLAGS: [FlagSpec; 10] = [
+const EXEC_PROMPT_FLAGS: [FlagSpec; 12] = [
     FlagSpec {
         long: "non-interactive",
         short: Some('n'),
@@ -2494,9 +2516,31 @@ const EXEC_PROMPT_FLAGS: [FlagSpec; 10] = [
         implies: &[],
         optional: true,
     },
+    FlagSpec {
+        long: "startup-gate-control",
+        short: None,
+        help: "Gate agent startup using the request and release files in DIR.",
+        kind: FlagKind::OptionalPath,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "startup-gate-timeout",
+        short: None,
+        help: "Seconds to wait for startup-gate release (default 120, range 1..=3600).",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
 ];
 
-const EXEC_WORKFLOW_FLAGS: [FlagSpec; 15] = [
+const EXEC_WORKFLOW_FLAGS: [FlagSpec; 17] = [
     FlagSpec {
         long: "work-item",
         short: None,
@@ -2664,6 +2708,28 @@ const EXEC_WORKFLOW_FLAGS: [FlagSpec; 15] = [
         kind: FlagKind::UsizeAtLeastOne,
         default: FlagDefault::None,
         frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "startup-gate-control",
+        short: None,
+        help: "Gate agent startup using the request and release files in DIR.",
+        kind: FlagKind::OptionalPath,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "startup-gate-timeout",
+        short: None,
+        help: "Seconds to wait for startup-gate release (default 120, range 1..=3600).",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
         conflicts_with: &[],
         implies: &[],
         optional: true,

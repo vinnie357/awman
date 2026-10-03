@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
@@ -41,6 +42,8 @@ struct LeaseRecord {
     staged_path: PathBuf,
     staged_root: PathBuf,
     container: String,
+    gate_control_dir: Option<PathBuf>,
+    gate_released: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -159,6 +162,7 @@ pub struct LeaseSnapshot {
     pub staged_path: PathBuf,
     pub staged_root: PathBuf,
     pub container: String,
+    pub gate_pending: bool,
 }
 
 /// The process-wide set of live credential leases.
@@ -197,6 +201,15 @@ impl LeaseRegistry {
         delivery: &RefreshableCredentialDelivery,
         container: &str,
     ) -> CredentialLease {
+        self.register_pending(delivery, container, None)
+    }
+
+    pub fn register_pending(
+        &self,
+        delivery: &RefreshableCredentialDelivery,
+        container: &str,
+        gate_control_dir: Option<PathBuf>,
+    ) -> CredentialLease {
         let mut inner = self.shared.inner.lock().unwrap();
         let was_empty = inner.entries.is_empty();
         let generation = LeaseGeneration(inner.next_gen);
@@ -209,6 +222,8 @@ impl LeaseRegistry {
                 staged_path: delivery.staged_path.clone(),
                 staged_root: delivery.staged_root.clone(),
                 container: container.to_string(),
+                gate_control_dir,
+                gate_released: Arc::new(AtomicBool::new(false)),
             },
         );
         if was_empty {
@@ -238,6 +253,17 @@ impl LeaseRegistry {
                 staged_path: rec.staged_path.clone(),
                 staged_root: rec.staged_root.clone(),
                 container: rec.container.clone(),
+                gate_pending: rec.gate_control_dir.as_ref().is_some_and(|dir| {
+                    if rec.gate_released.load(Ordering::Acquire) {
+                        return false;
+                    }
+                    if released_marker_matches_ready(dir, &rec.container) {
+                        rec.gate_released.store(true, Ordering::Release);
+                        false
+                    } else {
+                        true
+                    }
+                }),
             })
             .collect()
     }
@@ -271,6 +297,147 @@ impl LeaseRegistry {
     pub(super) fn request_shutdown(&self) {
         self.shared.request_shutdown();
     }
+}
+
+#[derive(serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct GateBindingRecord {
+    id: String,
+    workspace_path: String,
+    manifest_id: String,
+    access: String,
+}
+
+#[derive(serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct GateReadyFile {
+    version: u32,
+    nonce: String,
+    container_name: String,
+    bindings: Vec<GateBindingRecord>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GateRequestBinding {
+    id: String,
+    workspace_path: String,
+    manifest_id: String,
+    manifest_file: String,
+    access: String,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GateRequestFile {
+    version: u32,
+    bindings: Vec<GateRequestBinding>,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GateReceiptFile {
+    version: u32,
+    nonce: String,
+}
+
+fn released_marker_matches_ready(control_dir: &std::path::Path, expected_container: &str) -> bool {
+    #[cfg(unix)]
+    fn read<T: serde::de::DeserializeOwned>(
+        path: &std::path::Path,
+        maximum: u64,
+        owner: u32,
+    ) -> Option<T> {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file()
+            || metadata.len() > maximum
+            || metadata.len() == 0
+            || metadata.nlink() != 1
+            || metadata.uid() != owner
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return None;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = options.open(path).ok()?;
+        let opened = file.metadata().ok()?;
+        if metadata.dev() != opened.dev()
+            || metadata.ino() != opened.ino()
+            || opened.nlink() != 1
+            || !opened.file_type().is_file()
+            || opened.len() > maximum
+        {
+            return None;
+        }
+        let mut raw = Vec::new();
+        file.take(maximum + 1).read_to_end(&mut raw).ok()?;
+        if raw.len() as u64 > maximum {
+            return None;
+        }
+        serde_json::from_slice(&raw).ok()
+    }
+    #[cfg(not(unix))]
+    fn read<T: serde::de::DeserializeOwned>(_: &std::path::Path, _: u64, _: u32) -> Option<T> {
+        None
+    }
+    #[cfg(unix)]
+    let owner = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Ok(metadata) = std::fs::symlink_metadata(control_dir) else {
+            return false;
+        };
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != nix::unistd::Uid::current().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return false;
+        }
+        metadata.uid()
+    };
+    #[cfg(not(unix))]
+    let owner = 0;
+    if std::fs::symlink_metadata(control_dir.join("failure.json")).is_ok() {
+        return false;
+    }
+    let Some(request): Option<GateRequestFile> =
+        read(&control_dir.join("request.json"), 4096, owner)
+    else {
+        return false;
+    };
+    let Some(ready): Option<GateReadyFile> =
+        read(&control_dir.join("ready.json"), 64 * 1024, owner)
+    else {
+        return false;
+    };
+    let Some(released): Option<GateReceiptFile> = read(&control_dir.join(".released"), 4096, owner)
+    else {
+        return false;
+    };
+    if ready.version != 1 || released.version != 1 {
+        return false;
+    }
+    ready.nonce.len() == 64
+        && ready
+            .nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && ready.container_name == expected_container
+        && ready.nonce == released.nonce
+        && request.version == 1
+        && ready.bindings.len() == request.bindings.len()
+        && ready
+            .bindings
+            .iter()
+            .zip(request.bindings.iter())
+            .all(|(a, b)| {
+                a.id == b.id
+                    && a.workspace_path == b.workspace_path
+                    && a.manifest_id == b.manifest_id
+                    && a.access == b.access
+                    && !b.manifest_file.is_empty()
+            })
 }
 
 #[cfg(test)]

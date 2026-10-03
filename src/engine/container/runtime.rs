@@ -56,6 +56,98 @@ pub struct ContainerRuntime {
     backend: Arc<dyn ContainerBackend>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct GateImageConfig {
+    user: String,
+    env: Vec<String>,
+    entrypoint: Vec<String>,
+    trusted: bool,
+}
+
+fn parse_gate_image_config(runtime: &str, raw: &[u8]) -> Result<GateImageConfig, EngineError> {
+    let value: serde_json::Value = serde_json::from_slice(raw).map_err(|error| {
+        EngineError::Container(format!("parse startup-gate image inspection: {error}"))
+    })?;
+    let config = if runtime == "apple-containers" {
+        value
+            .get(0)
+            .and_then(|v| v.get("variants"))
+            .and_then(|v| v.as_array())
+            .and_then(|v| v.first())
+            .and_then(|v| v.get("config"))
+            .and_then(|v| v.get("config"))
+    } else {
+        Some(&value)
+    }
+    .ok_or_else(|| EngineError::Container("startup-gate image has no inspectable config".into()))?;
+    let user = config
+        .get("User")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let env = match config.get("Env") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| {
+                EngineError::Config("startup-gated image has malformed environment".into())
+            })?
+            .iter()
+            .map(|v| {
+                v.as_str().map(str::to_string).ok_or_else(|| {
+                    EngineError::Config("startup-gated image has malformed environment".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let entrypoint = match config.get("Entrypoint") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| {
+                EngineError::Config("startup-gated image has malformed entrypoint".into())
+            })?
+            .iter()
+            .map(|v| {
+                v.as_str().map(str::to_string).ok_or_else(|| {
+                    EngineError::Config("startup-gated image has malformed entrypoint".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let trusted = config
+        .get("Labels")
+        .and_then(|v| v.as_object())
+        .and_then(|labels| labels.get("dev.awman.startup-gate"))
+        .and_then(|v| v.as_str())
+        == Some("1");
+    if !entrypoint.is_empty() {
+        return Err(EngineError::Config(
+            "startup-gated images may not define an entrypoint".into(),
+        ));
+    }
+    if env
+        .iter()
+        .filter_map(|entry| entry.split_once('=').map(|(key, _)| key))
+        .any(|key| {
+            key == "PYTHONHOME"
+                || key == "PYTHONPATH"
+                || key.starts_with("LD_")
+                || key.starts_with("DYLD_")
+        })
+    {
+        return Err(EngineError::Config(
+            "startup-gated images may not define Python or dynamic-loader environment".into(),
+        ));
+    }
+    Ok(GateImageConfig {
+        user,
+        env,
+        entrypoint,
+        trusted,
+    })
+}
+
 impl ContainerRuntime {
     /// Construct with the Docker backend.
     pub fn docker() -> Self {
@@ -95,9 +187,52 @@ impl ContainerRuntime {
     /// Build a fully-configured `AgentInstance` from pre-resolved options.
     pub fn build(
         &self,
-        options: ResolvedContainerOptions,
+        mut options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        if options.startup_gate.is_some() {
+            if !options.startup_gate_trusted_template {
+                return Err(EngineError::Config(
+                    "startup gate requires an awman-supported generated agent image".into(),
+                ));
+            }
+            let image = options
+                .image
+                .as_ref()
+                .ok_or_else(|| EngineError::MissingRequiredOption("startup gate image".into()))?;
+            let inspected = self.inspect_gate_image(image.as_str())?;
+            debug_assert!(inspected.entrypoint.is_empty());
+            debug_assert!(inspected.env.iter().all(|entry| !entry.is_empty()));
+            if !inspected.trusted {
+                return Err(EngineError::Config("startup-gated image was not built from an awman startup-gate template; rebuild the project and agent images with `awman ready --no-cache`".into()));
+            }
+            options.startup_gate_runtime_user =
+                (!inspected.user.is_empty() && inspected.user != "0" && inspected.user != "root")
+                    .then_some(inspected.user);
+        }
         self.backend.build(options)
+    }
+
+    fn inspect_gate_image(&self, image: &str) -> Result<GateImageConfig, EngineError> {
+        use std::process::{Command, Stdio};
+        let output = match self.backend.name() {
+            "apple-containers" => Command::new("container")
+                .args(["image", "inspect", image])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+            _ => Command::new("docker")
+                .args(["image", "inspect", "--format", "{{json .Config}}", image])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        }
+        .map_err(|error| EngineError::Container(format!("inspect startup-gate image: {error}")))?;
+        if !output.status.success() {
+            return Err(EngineError::Container(
+                "could not inspect startup-gate image".into(),
+            ));
+        }
+        parse_gate_image_config(self.backend.name(), &output.stdout)
     }
 
     pub fn list_running(&self, session: &Session) -> Result<Vec<AgentHandle>, EngineError> {

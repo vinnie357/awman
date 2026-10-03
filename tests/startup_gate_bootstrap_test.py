@@ -272,6 +272,7 @@ class StartupGateBootstrapTest(unittest.TestCase):
                         ["agent", "space value", "line\nbreak", "--leading"],
                         {"PYTHONHOME": "/original/home", "PYTHONPATH": "/original/path"},
                         "fixture mountinfo",
+                        container_name="fixture-container",
                         cancel_check=cancel_after_ready,
                         clock=clock.monotonic,
                         sleep=clock.sleep,
@@ -330,6 +331,7 @@ class StartupGateBootstrapTest(unittest.TestCase):
                     original_argv,
                     original_env,
                     "fixture mountinfo",
+                    container_name="fixture-container",
                     exec_fn=capture_exec,
                 )
 

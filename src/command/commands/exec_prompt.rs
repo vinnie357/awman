@@ -19,6 +19,8 @@ use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 
 #[derive(Debug, Clone)]
 pub struct ExecPromptCommandFlags {
+    pub startup_gate_control: Option<std::path::PathBuf>,
+    pub startup_gate_timeout: u64,
     pub prompt: Option<String>,
     pub non_interactive: bool,
     pub plan: bool,
@@ -121,12 +123,31 @@ impl ExecPromptCommand {
     /// prompt-or-issue requirement is checked at run time, where `--issue`
     /// can still supply the text.
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        if ctx.flags.supplied("startup-gate-timeout") && !ctx.flags.supplied("startup-gate-control")
+        {
+            return Err(CommandError::Other(
+                "exec prompt: --startup-gate-timeout requires --startup-gate-control".into(),
+            ));
+        }
         let prompt = match ctx.args.get("prompt") {
             Some(prompt) if prompt.trim().is_empty() => None,
             other => other.map(str::to_string),
         };
         Ok(Self::new(
             ExecPromptCommandFlags {
+                startup_gate_control: ctx.flags.path("startup-gate-control"),
+                startup_gate_timeout: ctx
+                    .flags
+                    .string("startup-gate-timeout")
+                    .as_deref()
+                    .unwrap_or("120")
+                    .parse()
+                    .map_err(|_| {
+                        CommandError::Other(
+                            "exec prompt: --startup-gate-timeout must be an integer in 1..=3600"
+                                .into(),
+                        )
+                    })?,
                 prompt,
                 non_interactive: ctx.flags.bool("non-interactive"),
                 plan: ctx.flags.bool("plan"),
@@ -348,6 +369,18 @@ impl Command for ExecPromptCommand {
         )?;
 
         let run_opts = AgentRunOptions {
+            startup_gate: self
+                .flags
+                .startup_gate_control
+                .as_ref()
+                .map(|path| {
+                    crate::data::startup_gate::load_startup_gate(
+                        path,
+                        std::time::Duration::from_secs(self.flags.startup_gate_timeout),
+                    )
+                })
+                .transpose()
+                .map_err(|e| CommandError::Other(format!("exec prompt: {e}")))?,
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),

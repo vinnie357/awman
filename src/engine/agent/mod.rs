@@ -38,6 +38,7 @@ pub enum AutoMode {
 /// Options governing how an agent container is invoked.
 #[derive(Debug, Default, Clone)]
 pub struct AgentRunOptions {
+    pub startup_gate: Option<crate::data::startup_gate::StartupGateSpec>,
     pub yolo: Option<crate::engine::container::options::YoloMode>,
     pub auto: Option<crate::engine::container::options::AutoMode>,
     pub plan: Option<crate::engine::container::options::PlanMode>,
@@ -265,6 +266,10 @@ impl AgentEngine {
                 value: session.id().to_string(),
             },
         ];
+        if let Some(gate) = &run.startup_gate {
+            options.push(ContainerOption::StartupGateTrustedTemplate);
+            options.push(ContainerOption::StartupGate(gate.clone()));
+        }
 
         // Select the persistent piped-stdio (`-i`, no PTY) container path when
         // launching over ACP. Emitted only when actually ACP so ordinary stdio
@@ -476,6 +481,12 @@ impl AgentEngine {
         runtime: &dyn AgentRuntimeEngine,
     ) -> Result<ResolvedAgentOptions, EngineError> {
         if runtime.capabilities().kit_declarative {
+            if run.startup_gate.is_some() {
+                return Err(EngineError::OptionNotSupportedByBackend {
+                    option: "startup gate".into(),
+                    backend: runtime.runtime_name().into(),
+                });
+            }
             let mut options = self.build_sandbox_options(session, agent, run)?;
             if !credentials.env_vars.is_empty() {
                 options.push(SandboxOption::AgentCredentials {

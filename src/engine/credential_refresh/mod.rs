@@ -38,7 +38,12 @@ pub(crate) fn register_container_leases(
         Some(monitor) => options
             .refreshable_credentials
             .iter()
-            .map(|delivery| monitor.register(delivery, container))
+            .map(|delivery| match &options.startup_gate {
+                Some(gate) => {
+                    monitor.register_gate_pending(delivery, container, gate.control_dir.clone())
+                }
+                None => monitor.register(delivery, container),
+            })
             .collect(),
         None => Vec::new(),
     }

@@ -94,6 +94,12 @@ type ParallelWaits = FuturesUnordered<
 /// per-step stuck broadcast into a single fixed-arity `select!` branch.
 type StuckFanIn = tokio::sync::mpsc::UnboundedSender<(String, StuckEvent)>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowRetryPolicy {
+    Legacy,
+    SingleAttempt,
+}
+
 /// Result of `run_parallel_group`.
 enum GroupOutcome {
     /// The whole group reached a terminal state. `failed` carries every
@@ -214,6 +220,7 @@ pub struct WorkflowEngine {
     /// separate from `auth_retries_used` so a credential refresh and a failure
     /// retry cannot consume each other.
     auto_retried_steps: HashSet<String>,
+    retry_policy: WorkflowRetryPolicy,
     engine_rx: Option<tokio::sync::mpsc::UnboundedReceiver<EngineRequest>>,
 }
 
@@ -323,8 +330,26 @@ impl WorkflowEngine {
         session: &Session,
         workflow: Workflow,
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
+        frontend: Box<dyn WorkflowFrontend>,
+        agent_factory: Box<dyn AgentExecutionFactory>,
+    ) -> Result<Self, EngineError> {
+        Self::new_with_retry_policy(
+            session,
+            workflow,
+            work_item_context,
+            frontend,
+            agent_factory,
+            WorkflowRetryPolicy::Legacy,
+        )
+    }
+
+    pub fn new_with_retry_policy(
+        session: &Session,
+        workflow: Workflow,
+        work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
         agent_factory: Box<dyn AgentExecutionFactory>,
+        retry_policy: WorkflowRetryPolicy,
     ) -> Result<Self, EngineError> {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
         let workflow_context_permission =
@@ -367,6 +392,7 @@ impl WorkflowEngine {
             last_exit_info: None,
             auth_retries_used: HashSet::new(),
             auto_retried_steps: HashSet::new(),
+            retry_policy,
             engine_rx: Some(rx),
         })
     }
@@ -449,9 +475,30 @@ impl WorkflowEngine {
         session: &Session,
         workflow: Workflow,
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
+        frontend: Box<dyn WorkflowFrontend>,
+        agent_factory: Box<dyn AgentExecutionFactory>,
+        state_root: Option<std::path::PathBuf>,
+    ) -> Result<Self, EngineError> {
+        Self::resume_with_state_root_and_retry_policy(
+            session,
+            workflow,
+            work_item_context,
+            frontend,
+            agent_factory,
+            state_root,
+            WorkflowRetryPolicy::Legacy,
+        )
+        .await
+    }
+
+    pub async fn resume_with_state_root_and_retry_policy(
+        session: &Session,
+        workflow: Workflow,
+        work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
         agent_factory: Box<dyn AgentExecutionFactory>,
         state_root: Option<std::path::PathBuf>,
+        retry_policy: WorkflowRetryPolicy,
     ) -> Result<Self, EngineError> {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
         let workflow_context_permission =
@@ -581,6 +628,7 @@ impl WorkflowEngine {
             last_exit_info: None,
             auth_retries_used: HashSet::new(),
             auto_retried_steps: HashSet::new(),
+            retry_policy,
             engine_rx: Some(rx),
         })
     }
@@ -674,6 +722,15 @@ impl WorkflowEngine {
         if let WorkflowStepStatus::Failed { exit_code } = outcome.status {
             let progress = self.workflow_progress_info();
             self.frontend.report_workflow_progress(&progress);
+
+            if self.retry_policy == WorkflowRetryPolicy::SingleAttempt {
+                let failed = WorkflowOutcome::Failed {
+                    last_step: outcome.step_name.clone(),
+                    exit_code,
+                };
+                self.frontend.report_workflow_completed(&failed);
+                return Ok(IterationOutcome::Ended(failed));
+            }
 
             if self.recover_auth_failure(&outcome.step_name)? {
                 self.state

@@ -1,5 +1,7 @@
 FROM debian:bookworm-slim
 
+LABEL dev.awman.startup-gate="1"
+
 # System packages required for building, testing, and running this project.
 # Add language runtimes, compilers, and tool dependencies here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -7,6 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     make \
+    python3-minimal \
     && rm -rf /var/lib/apt/lists/*
+
+RUN test -x /usr/bin/python3
 
 WORKDIR /workspace

@@ -760,6 +760,9 @@ pub(super) fn build_run_argv(
 
     args.push("--name".into());
     args.push(name.0.clone());
+    if options.startup_gate.is_some() && options.startup_gate_runtime_user.is_some() {
+        args.extend(["--user".into(), "0".into()]);
+    }
 
     // Standard awman label so `list_running` can filter.
     args.push("--label".into());

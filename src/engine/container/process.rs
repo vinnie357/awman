@@ -188,6 +188,7 @@ pub(super) struct ContainerInstance {
     /// Backend hook for the PTY path. `Some` only for Apple, whose CLI has no
     /// native attach. See [`AttachHook`].
     pub post_bridge: Option<AttachHook>,
+    pub gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
 }
 
 impl ContainerInstance {
@@ -207,6 +208,7 @@ impl ContainerInstance {
             options,
             leases,
             post_bridge,
+            gate_cleanup: None,
         }
     }
 }
@@ -221,11 +223,55 @@ impl AgentInstance for ContainerInstance {
     }
 
     fn run_with_frontend(
-        self: Box<Self>,
+        mut self: Box<Self>,
         mut frontend: Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend>,
     ) -> Result<AgentExecution, EngineError> {
         let cli = self.cli;
         let post_bridge = self.post_bridge;
+        if let Some(spec) = self.options.startup_gate.clone() {
+            let mut staged = super::startup_gate::stage_startup_gate(&spec)?;
+            staged
+                .wrapper_argv
+                .extend(["--container-name".into(), self.name.0.clone()]);
+            if let Some(user) = &self.options.startup_gate_runtime_user {
+                staged
+                    .wrapper_argv
+                    .extend(["--run-as".into(), user.clone()]);
+            }
+            let mut python_env = std::collections::BTreeMap::new();
+            for variable in &self.options.env_passthrough {
+                if matches!(variable.0.as_str(), "PYTHONHOME" | "PYTHONPATH") {
+                    if let Some(value) = crate::data::config::env::host_var(&variable.0) {
+                        python_env.insert(variable.0.clone(), value);
+                    }
+                }
+            }
+            for literal in &self.options.env_literal {
+                if matches!(literal.key.as_str(), "PYTHONHOME" | "PYTHONPATH") {
+                    python_env.insert(literal.key.clone(), literal.value.clone());
+                }
+            }
+            staged.preserve_python_environment(&python_env)?;
+            self.options
+                .env_passthrough
+                .retain(|variable| !matches!(variable.0.as_str(), "PYTHONHOME" | "PYTHONPATH"));
+            self.options
+                .env_literal
+                .retain(|literal| !matches!(literal.key.as_str(), "PYTHONHOME" | "PYTHONPATH"));
+            let original = self
+                .options
+                .entrypoint
+                .as_ref()
+                .ok_or_else(|| {
+                    EngineError::MissingRequiredOption("startup gate entrypoint".into())
+                })?
+                .0
+                .clone();
+            let wrapped = super::startup_gate::wrap_entrypoint(&staged, &original)?;
+            self.options.overlays.extend(staged.overlays.clone());
+            self.options.entrypoint = Some(crate::engine::container::options::Entrypoint(wrapped));
+            self.gate_cleanup = Some(staged.cleanup);
+        }
         let argv = super::docker::build_run_argv(&self.name, &self.image, &self.options);
         let started_at = chrono::Utc::now();
         let seeded = self.options.seeded_prompt.clone();
@@ -374,6 +420,7 @@ pub(super) fn spawn_pty_bridged(
     // returns) and into the execution backend, so each lease brackets the child
     // process it credentials.
     let leases = std::mem::take(&mut instance.leases);
+    let gate_cleanup = instance.gate_cleanup.take();
 
     let (cols, rows) = io.initial_size.expect("PTY path requires initial_size");
     let pty_system = native_pty_system();
@@ -448,6 +495,7 @@ pub(super) fn spawn_pty_bridged(
         started_at,
         attach_socket,
         leases,
+        gate_cleanup,
     };
     Ok(AgentExecution::new(
         handle,
@@ -476,6 +524,7 @@ pub(super) fn spawn_piped(
 
     // Move leases into the backend; assert one exists before spawn (INV-6).
     let leases = std::mem::take(&mut instance.leases);
+    let gate_cleanup = instance.gate_cleanup.take();
     assert_leases_before_spawn(&instance.options, &leases);
 
     let mut child = spawn_child(cli, &mut cmd)?;
@@ -507,6 +556,7 @@ pub(super) fn spawn_piped(
         started_at,
         attach_socket: None,
         leases,
+        gate_cleanup,
     };
     Ok(AgentExecution::new(
         handle,
@@ -555,6 +605,7 @@ pub(super) fn spawn_piped_interactive(
 
     // Move leases into the backend; assert one exists before spawn (INV-6).
     let leases = std::mem::take(&mut instance.leases);
+    let gate_cleanup = instance.gate_cleanup.take();
     assert_leases_before_spawn(&instance.options, &leases);
 
     let mut child = spawn_child(cli, &mut cmd)?;
@@ -575,6 +626,7 @@ pub(super) fn spawn_piped_interactive(
         started_at,
         attach_socket: None,
         leases,
+        gate_cleanup,
     };
     Ok(AgentExecution::new(
         handle,
@@ -637,6 +689,8 @@ pub(super) struct ContainerExecution {
     /// drop. Not read directly — held purely for its `Drop`.
     #[allow(dead_code)]
     leases: Vec<CredentialLease>,
+    #[allow(dead_code)]
+    gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
 }
 
 impl ExecutionBackend for ContainerExecution {
