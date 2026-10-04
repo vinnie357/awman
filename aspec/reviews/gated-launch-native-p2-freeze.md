@@ -230,3 +230,137 @@ Source lineage for Root review before worktree application:
 No formatter, compiler, test, full gate, probe, or scan was run while preparing
 this candidate. It becomes an authorized fixture migration only after Root's
 full source review.
+# Gated launch native P2 Packet 1B freeze candidate
+
+Status: source-only candidate for Root full test review. No packet file is in
+the AWMan worktree. No formatter, compiler, test, CI, runtime, provider, or raw
+execution-log workload has run.
+
+## Authority
+
+- concrete P1: `eb00e22c1399637294f904d6dd630399e4fb3a2a44e59ba60ea7e8740f713266`;
+- identity P1: `ead26429abf89f0dab24cbe40421bbd93929105b5cb74e72bf586ffaea6f132e`;
+- split-control P1: `76eacc8614a4e1a18ce782b3c5f3cb37ba8b997452ad717ef8d88dd2e26b4b4b`;
+- committed matrix: `76d2b295463e6c94fb2d18082620665945a452cf54b93c7ea5df9f64f577f8b0`;
+- packet base HEAD: `69ecd05790a0f93a3b17a44222d4d24f42316696`;
+- Packet 1A freeze record:
+  `e885b97d1bc2d2f79ccdfe0842c7b573670126fbf737b357a2abe51d613e2653`;
+- production-layer disposition:
+  `fe694574e789d9894ac06b5130bf5616ed3e38b7085b3f53230c6659e8204776`;
+- Packet 1A seam disposition:
+  `2f14713286540bd82b5fe266a70c1f759b2edd7b26eb8e36694775dd26db6cf1`.
+
+Candidate Packet 1B pins:
+
+- minimal seam disposition:
+  `1e53c09756f4e8b0dd936b847e36ea5225c4b939791a0b9ee66212b2074439ff`;
+- additive engine test:
+  `1d7c049fb54f4961d128e258cc1f21606518a8f8c529f9d78b740d03c8939209`;
+- module-wiring patch:
+  `e502d9ceb9ccbb0f78d31514c83a5371a2df0c7858e29cc64c6de08b4ea988de`;
+- Packet 1B work item:
+  `60f89f4c38d73a17947b4957fe737eb33a66665df0aae0b019a3f97937535cb1`.
+
+## Review requirements
+
+Root must verify that the test source:
+
+1. compares Docker image `.Id` only with container `.Image`, after exact
+   lowercase `sha256:<hex64>` normalization;
+2. treats image references as diagnostic and never immutable identity;
+3. hashes only the fixed normalized tuple, preserves fractional creation time,
+   ignores raw JSON, and digests an unrecognized state before canonicalization;
+4. checks the exact 256-KiB/64-KiB limits and actual reap rather than trusting a
+   self-reported boolean;
+5. starts no process for an expired deadline, and never expects raw provider
+   output in an error;
+6. distinguishes a reaped provider parent from descendant-held drain EOF and
+   imposes a bounded return without an unbounded join;
+7. reaches the immediate barrier through the actual loader, held controls,
+   durable plan, adapter, and fresh second absence rather than constructing
+   authority in the test;
+8. rejects present, ambiguous, unavailable, mismatched, and substituted inputs
+   without obtaining a spawn token;
+9. makes no Docker-orchestrated support or full native readiness claim; and
+10. preserves all four Packet 1A test hashes and changes no existing assertion.
+
+## Expected-red boundary
+
+After approved application, missing Packet 1B production types and functions
+are expected compilation reds. Test syntax/import failures, architecture-layer
+violations, modifications to Packet 1A, real provider invocation, leaked child
+processes, or a test exceeding the repository time budget are unexpected.
+
+## Freeze rule
+
+After Root and the authorized independent reviewer approve the exact source,
+the new test and wiring hashes are frozen. The native production implementer
+must not read or modify this test. Formatter-only or fixture-only changes
+require this original P2 author, a located reason, source review, and appended
+lineage hashes.
+
+## Fixture correction pending source review
+
+The initial test candidate
+`1d7c049fb54f4961d128e258cc1f21606518a8f8c529f9d78b740d03c8939209`
+used the Docker canonical fixture name in the real orchestrated loader fixture.
+Identity P1 requires the `awman-altana-` prefix. The original P2 author changed
+only the launch-intent fixture to the separate valid
+`awman-altana-p2b-exact`; the Docker fixture name, canonical digest,
+assertions, production seams, and build wiring are unchanged. Root withdrew
+the initial approval pending review of this exact fixture-only delta.
+The corrected test SHA-256 is
+`9e3f21f0242c00f7ff57e7a01a532455c5076ad18c42826ad50824288aa70b53`;
+the amended work-item SHA-256 is
+`f62019d8bedb17c62a195ae4816c11d3ee7242563b007138c46ae58ed9f506ae`.
+
+## Packet 1A data-fixture lineage update pending application
+
+Packet 1B was authored against the then-current formatted Packet 1A data-test
+pin
+`7911c42a939dba206c9612accd88b25f2ef9881419a88d707cc86484d8524347`.
+Rust 1.94 later reached a fixture-only return-type mismatch in
+`ControlFixture::rewrite_intent`. The original Packet 1A author changed only the
+helper body to propagate `write_private(...)` with `?` and return `Ok(())` in
+its declared `Result<(), Box<dyn Error>>` type. The source-approved corrected
+Packet 1A data-test pin is
+`5d0f872875cac1d6fab463d784d52a1ffea1d8726af5a2cfb8c8a32185ed59ba`;
+Root's durable source review is
+`/private/tmp/awman-native-p2-fixture-result-root-review.md`, SHA-256
+`765d8cf066dbc923ba34b2d915c83b6e30eab2d49b3f54125e36f83f3eb98d98`.
+
+Accordingly, review requirement 10's old `7911...` data-test preservation pin
+is historical after that separately authorized Packet 1A fixture application.
+The requirement then means preserving `5d0...` plus the other three Packet 1A
+test pins byte-exact. Packet 1B's test remains byte-exact at
+`9e3f21f0242c00f7ff57e7a01a532455c5076ad18c42826ad50824288aa70b53`;
+this appendix changes no Packet 1B source, assertion, fixture, seam, or wiring.
+
+## Packet 1B Rust 1.94 formatter lineage pending review
+
+At revision `62e2b02a2949802e4aa5b1e4daef2240ce14a70d`, an actual Rust 1.94
+`make pre-push` run stopped at `cargo fmt --check` before Packet 1B API
+compilation. The structured evidence identified eleven formatting hunks solely
+in `src/engine/container/gated_launch_p2b_test.rs`; the raw-log SHA-256 is
+`399b06bea4fc2a321e7bfda8d68a9b8119eca2180c16ae38d229fad173588e1e`.
+No expected missing-API red or runtime result was reached.
+
+The original Packet 1B test author ran only Rust 1.94's
+`rustfmt 1.8.0-stable (4a4ef493e3 2026-03-02)` with edition 2021 against a
+temporary copy of that one test. The source lineage is:
+
+- pre-format test:
+  `9e3f21f0242c00f7ff57e7a01a532455c5076ad18c42826ad50824288aa70b53`;
+- exact formatter diff:
+  `63311c7d4134d2fadc4859044810dbe48dcf3f79fd88ddd3a2b443d8dd0132dc`;
+- formatted candidate:
+  `b9de2b38197d21e381fa1b7a9f6d0c39c29fd2173176960f2cdf1aee0cf2ea59`;
+- cumulative freeze before this appendix:
+  `434a3f70a21d60dc96068291edfb08648746d6ae32f810e0276c4c7066e4272d`.
+
+The diff changes import ordering and layout only. Assertions, fixture values,
+canonical bytes and digest, production seams, Packet 1A tests, the external
+legacy fixture, and Packet 1B wiring remain unchanged. This formatted candidate
+and lineage appendix await Root source review before worktree application. No
+compiler, test, full gate, provider, runtime, stage, commit, or push followed the
+temporary formatting operation.
