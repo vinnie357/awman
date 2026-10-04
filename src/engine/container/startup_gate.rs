@@ -162,3 +162,7 @@ impl Drop for StartupGateCleanup {
         let _ = self.directory.take();
     }
 }
+
+#[cfg(test)]
+#[path = "startup_gate_native_p2_test.rs"]
+mod native_p2;

@@ -15,6 +15,7 @@ mod backend;
 pub mod background;
 pub mod display;
 mod docker;
+pub(crate) mod gated_launch;
 pub mod instance;
 pub mod io_bridge;
 pub mod naming;

@@ -59,6 +59,7 @@ thiserror = "2"
 async-trait = "0.1"
 futures-util = "0.3"
 which = "8"
+zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process", "fs", "poll", "user"] }

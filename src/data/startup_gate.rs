@@ -345,3 +345,7 @@ pub fn load_startup_gate(
 ) -> Result<StartupGateSpec, StartupGateError> {
     Err(StartupGateError::UnsupportedPlatform)
 }
+
+#[cfg(test)]
+#[path = "startup_gate_native_p2_test.rs"]
+mod native_p2;

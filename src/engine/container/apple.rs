@@ -467,6 +467,10 @@ fn serve_attach_socket(ctx: AttachHookCtx<'_>) -> Option<AttachSocketGuard> {
 }
 
 #[cfg(test)]
+#[path = "apple_gated_p2_test.rs"]
+mod gated_p2;
+
+#[cfg(test)]
 mod apple_tests {
     use super::*;
 
