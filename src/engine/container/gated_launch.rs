@@ -1,5 +1,17 @@
 //! Exact provider identity and durable pre-spawn launch planning.
 
+mod provider_cli;
+
+#[allow(unused_imports)]
+// Consumed when the later native-provider packet enables this private seam.
+pub(crate) use provider_cli::{
+    run_bounded_provider_cli, BoundedProviderOutput, ProviderCliCustodyRegistry,
+    ProviderCliCustodyTicket, ProviderCliReapedFailure, ProviderCliReapedFailureKind,
+    ProviderCliRunOutcome, ProviderCliStartFailure, RetainedProviderCli,
+    RetainedProviderCliTermination, MAX_PROVIDER_CUSTODY_SHUTDOWN, MAX_PROVIDER_STDERR,
+    MAX_PROVIDER_STDOUT,
+};
+
 use crate::data::container::ContainerName;
 use crate::data::startup_gate::{
     revalidate_mount_source, GatedLaunchIdentity, OrchestratedControlAuthority, PinnedRegularFile,
@@ -8,7 +20,7 @@ use crate::data::startup_gate::{
 use crate::engine::container::options::ImageRef;
 use crate::engine::error::EngineError;
 use chrono::{DateTime, SecondsFormat, Timelike, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::sync::Arc;
@@ -289,6 +301,14 @@ pub(crate) struct DurableLaunchPlan {
     plan_file: Arc<PinnedRegularFile>,
 }
 
+#[must_use = "the validated barrier must be consumed by the matching spawn"]
+pub(crate) struct ValidatedSpawnBarrier {
+    _plan_file: Arc<PinnedRegularFile>,
+    _controls: Arc<OrchestratedControlAuthority>,
+    _key: ProviderLaunchKey,
+    _absence: AbsenceObservation,
+}
+
 impl fmt::Debug for DurableLaunchPlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -441,6 +461,58 @@ fn unexpired_provider_call_deadline(
     }
 }
 
+#[allow(dead_code)]
+pub(crate) fn validate_immediate_pre_spawn(
+    plan: &DurableLaunchPlan,
+    adapter: &dyn GatedProviderAdapter,
+    enclosing: Instant,
+) -> Result<ValidatedSpawnBarrier, LaunchIdentityError> {
+    if plan.controls.request.request_digest != plan.request_digest {
+        return Err(LaunchIdentityError::UnsafeControl);
+    }
+    if adapter.provider() != plan.key.provider {
+        return Err(LaunchIdentityError::ProviderInspectionUnavailable);
+    }
+    revalidate_mount_source(&plan.controls).map_err(|_| LaunchIdentityError::UnsafeControl)?;
+    if !plan
+        .controls
+        .host_parent
+        .verify_launch_plan(&plan.plan_file)
+    {
+        return Err(LaunchIdentityError::UnsafeControl);
+    }
+    let absence = match adapter.inspect_name_absence(
+        &plan.key.container_name,
+        unexpired_provider_call_deadline(enclosing)?,
+    ) {
+        Ok(absence) => absence,
+        Err(NamePresence::Present) => return Err(LaunchIdentityError::NameCollision),
+        Err(NamePresence::Ambiguous) => {
+            return Err(LaunchIdentityError::ProviderInspectionUnavailable);
+        }
+        Err(NamePresence::Unavailable) => {
+            return Err(LaunchIdentityError::ProviderInspectionUnavailable);
+        }
+    };
+    if absence.provider != plan.key.provider || absence.exact_name != plan.key.container_name {
+        return Err(LaunchIdentityError::ProviderInspectionUnavailable);
+    }
+    revalidate_mount_source(&plan.controls).map_err(|_| LaunchIdentityError::UnsafeControl)?;
+    if !plan
+        .controls
+        .host_parent
+        .verify_launch_plan(&plan.plan_file)
+    {
+        return Err(LaunchIdentityError::UnsafeControl);
+    }
+    Ok(ValidatedSpawnBarrier {
+        _plan_file: Arc::clone(&plan.plan_file),
+        _controls: Arc::clone(&plan.controls),
+        _key: plan.key.clone(),
+        _absence: absence,
+    })
+}
+
 pub(crate) fn canonical_inspection_revision(
     input: CanonicalInspectionRevisionInput<'_>,
 ) -> InspectionRevision {
@@ -549,12 +621,245 @@ fn valid_sha256_id(value: &str) -> bool {
         .is_some()
 }
 
+fn valid_docker_runtime_id(value: &str) -> bool {
+    parse_lower_hex_32(value).is_some()
+        || value
+            .strip_prefix("sha256:")
+            .and_then(parse_lower_hex_32)
+            .is_some()
+}
+
 fn hex_nibble(byte: u8) -> u8 {
     match byte {
         b'0'..=b'9' => byte - b'0',
         b'a'..=b'f' => byte - b'a' + 10,
         _ => 0,
     }
+}
+
+#[derive(Deserialize)]
+struct DockerImageInspection {
+    #[serde(rename = "Id")]
+    id: String,
+}
+
+fn normalize_docker_image_id(value: &str) -> Result<ImmutableImageId, LaunchIdentityError> {
+    if !value
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"sha256:"))
+    {
+        return Err(LaunchIdentityError::ImageIdentityMismatch);
+    }
+    let digest = &value[7..];
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(LaunchIdentityError::ImageIdentityMismatch);
+    }
+    ImmutableImageId::new(format!("sha256:{}", digest.to_ascii_lowercase()))
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_gated_docker_image_inspection(
+    bytes: &[u8],
+) -> Result<ImmutableImageId, LaunchIdentityError> {
+    let mut records: Vec<DockerImageInspection> =
+        serde_json::from_slice(bytes).map_err(|error| {
+            use serde_json::error::Category;
+            match error.classify() {
+                Category::Syntax | Category::Eof | Category::Io => {
+                    LaunchIdentityError::ProviderInspectionUnavailable
+                }
+                Category::Data => LaunchIdentityError::ImageIdentityMismatch,
+            }
+        })?;
+    if records.len() != 1 {
+        return Err(LaunchIdentityError::ImageIdentityMismatch);
+    }
+    normalize_docker_image_id(&records.remove(0).id)
+}
+
+#[derive(Deserialize)]
+struct DockerLaunchInspection {
+    #[serde(rename = "Id")]
+    id: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Image")]
+    image: String,
+    #[serde(rename = "Created")]
+    created: String,
+    #[serde(rename = "State")]
+    state: DockerInspectionState,
+    #[serde(rename = "Config")]
+    config: DockerInspectionConfig,
+}
+
+#[derive(Deserialize)]
+struct DockerInspectionState {
+    #[serde(rename = "Status")]
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct DockerInspectionConfig {
+    #[serde(rename = "Labels")]
+    labels: DockerInspectionLabels,
+}
+
+struct DockerInspectionLabels(std::collections::BTreeMap<String, String>);
+
+impl<'de> Deserialize<'de> for DockerInspectionLabels {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct LabelsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for LabelsVisitor {
+            type Value = DockerInspectionLabels;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a Docker label object without duplicate keys")
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut labels = std::collections::BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, String>()? {
+                    if labels.insert(key, value).is_some() {
+                        return Err(serde::de::Error::custom("duplicate Docker label"));
+                    }
+                }
+                Ok(DockerInspectionLabels(labels))
+            }
+        }
+
+        deserializer.deserialize_map(LabelsVisitor)
+    }
+}
+
+fn docker_state(value: &str) -> Option<DockerProviderState> {
+    match value {
+        "created" => Some(DockerProviderState::Created),
+        "running" => Some(DockerProviderState::Running),
+        "paused" => Some(DockerProviderState::Paused),
+        "restarting" => Some(DockerProviderState::Restarting),
+        "removing" => Some(DockerProviderState::Removing),
+        "exited" => Some(DockerProviderState::Exited),
+        "dead" => Some(DockerProviderState::Dead),
+        _ => None,
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_gated_docker_launch_inspection(
+    bytes: &[u8],
+    key: &ProviderLaunchKey,
+) -> ExactInspection {
+    let records: Vec<DockerLaunchInspection> = match serde_json::from_slice(bytes) {
+        Ok(records) => records,
+        Err(error) => {
+            return match error.classify() {
+                serde_json::error::Category::Syntax
+                | serde_json::error::Category::Eof
+                | serde_json::error::Category::Io => ExactInspection::Unavailable,
+                serde_json::error::Category::Data => ExactInspection::ForeignOrAmbiguous,
+            };
+        }
+    };
+    if key.provider != ProviderKind::Docker {
+        return ExactInspection::ForeignOrAmbiguous;
+    }
+    if records.is_empty() {
+        let checked_at = Utc::now();
+        let revision = canonical_inspection_revision(CanonicalInspectionRevisionInput {
+            kind: InspectionObservationKind::Absent,
+            provider: ProviderKind::Docker,
+            exact_name: &key.container_name,
+            runtime_id: None,
+            token_digest: None,
+            immutable_image_id: None,
+            created_at: None,
+            state: SanitizedProviderStateObservation::Absent,
+        });
+        return ExactInspection::Absent(AbsenceObservation {
+            provider: ProviderKind::Docker,
+            exact_name: key.container_name.clone(),
+            checked_at,
+            revision,
+        });
+    }
+    if records.len() != 1 {
+        return ExactInspection::ForeignOrAmbiguous;
+    }
+    let record = &records[0];
+    let expected_name = format!("/{}", key.container_name.as_str());
+    let image = match normalize_docker_image_id(&record.image) {
+        Ok(image) => image,
+        Err(_) => return ExactInspection::ForeignOrAmbiguous,
+    };
+    let created_at = match DateTime::parse_from_rfc3339(&record.created) {
+        Ok(created) => created.with_timezone(&Utc),
+        Err(_) => return ExactInspection::ForeignOrAmbiguous,
+    };
+    let token_digest = match record
+        .config
+        .labels
+        .0
+        .get("dev.awman.orchestrator-launch")
+        .and_then(|value| parse_lower_hex_32(value))
+    {
+        Some(digest) => digest,
+        None => return ExactInspection::ForeignOrAmbiguous,
+    };
+    if !valid_docker_runtime_id(&record.id)
+        || record.name != expected_name
+        || image != key.immutable_image_id
+        || token_digest != key.token_digest
+        || created_at < key.created_not_before
+    {
+        return ExactInspection::ForeignOrAmbiguous;
+    }
+    let state = match docker_state(&record.state.status) {
+        Some(state) => state,
+        None => {
+            let digest = Sha256::digest(record.state.status.as_bytes()).into();
+            let _ = canonical_inspection_revision(CanonicalInspectionRevisionInput {
+                kind: InspectionObservationKind::PresentUnusable,
+                provider: ProviderKind::Docker,
+                exact_name: &key.container_name,
+                runtime_id: Some(&record.id),
+                token_digest: Some(token_digest),
+                immutable_image_id: Some(&image),
+                created_at: Some(created_at),
+                state: SanitizedProviderStateObservation::UnrecognizedDigest(digest),
+            });
+            return ExactInspection::ForeignOrAmbiguous;
+        }
+    };
+    let provider_state = ProviderState::Docker(state);
+    let revision = canonical_inspection_revision(CanonicalInspectionRevisionInput {
+        kind: InspectionObservationKind::Matching,
+        provider: ProviderKind::Docker,
+        exact_name: &key.container_name,
+        runtime_id: Some(&record.id),
+        token_digest: Some(token_digest),
+        immutable_image_id: Some(&image),
+        created_at: Some(created_at),
+        state: SanitizedProviderStateObservation::Known(provider_state.clone()),
+    });
+    ExactInspection::Matching(ProviderLaunchInspection {
+        provider: ProviderKind::Docker,
+        runtime_id: record.id.clone(),
+        exact_name: key.container_name.clone(),
+        token_digest,
+        immutable_image_id: image,
+        created_at,
+        state: provider_state,
+        revision,
+    })
 }
 
 #[cfg(test)]

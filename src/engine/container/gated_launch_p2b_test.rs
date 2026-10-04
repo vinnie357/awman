@@ -644,6 +644,9 @@ fn exited_provider_is_not_completed_while_descendant_holds_drain_pipes() {
     assert_deadline_reaps_without_waiting_for_descendant("exited-descendant-holds-pipes");
 }
 
+// These modes deliberately leave a descendant holding inherited pipes until its
+// natural one-second exit so the bounded drain path cannot assume parent exit is EOF.
+#[allow(clippy::zombie_processes)]
 #[test]
 #[ignore = "subprocess fixture invoked by bounded-provider tests"]
 fn provider_cli_fixture_child() {

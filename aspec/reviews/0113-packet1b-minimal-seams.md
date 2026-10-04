@@ -127,8 +127,9 @@ pub(crate) struct ProviderCliReapedFailure {
 
 #[must_use = "an unreaped provider CLI child remains owned recovery state"]
 pub(crate) struct RetainedProviderCli {
-    // References the pre-spawn custody actor that owns the exact Child and
-    // both bounded drain states/threads.
+    // References the prestarted custody actor that owns the exact invocation.
+    // During native spawn it owns Command with no invented Child; after a
+    // successful spawn it owns the exact Child and bounded drain states.
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -136,6 +137,7 @@ pub(crate) struct ProviderCliCustodyTicket(uuid::Uuid);
 
 #[must_use]
 pub(crate) enum RetainedProviderCliTermination {
+    NotStarted(ProviderCliStartFailure),
     Reaped(ProviderCliReapedFailure),
     Retained(RetainedProviderCli),
 }
@@ -146,10 +148,7 @@ impl RetainedProviderCli {
         deadline: ProviderCallDeadline,
     ) -> RetainedProviderCliTermination;
 
-    pub(crate) fn transfer(
-        self,
-        registry: &ProviderCliCustodyRegistry,
-    ) -> ProviderCliCustodyTicket;
+    pub(crate) fn transfer(self) -> ProviderCliCustodyTicket;
 }
 
 pub(crate) struct ProviderCliCustodyRegistry {
@@ -184,15 +183,20 @@ expired deadline returns `NotStarted(DeadlineExpired)` before `spawn`.
 
 The runner forces stdin null and stdout/stderr piped. Before calling `spawn`,
 it allocates both bounded buffers, reserves a custody-registry ticket/capacity,
-and prepares the custody actor/command path needed to own a started child.
+and starts the custody actor that owns the exact `Command` and single native
+spawn attempt. Until the OS returns successfully, no `Child`, PID, or exit
+status exists and none may be invented.
 Buffer allocation, ticket reservation, or custody-thread failure at that point
 is `NotStarted(ResourceUnavailable)`. `SpawnFailed` is reserved for an actual
 OS spawn failure where no child exists. After `spawn`, startup or drain setup
 failure must actually kill and wait or return `RetainedFailure` through the
 already prepared custody. It can never report `NotStarted` after a child
 exists. `ProviderCliCustodyRegistry::try_new` is fallible and runs before any
-provider helper is spawned. A later `transfer` is infallible because its ticket
-and registry capacity were reserved before the child spawn.
+provider helper is spawned. If the caller's absolute deadline expires while the
+actor is still inside the one native spawn attempt, the returned retained handle
+owns that same in-flight invocation and no retry may spawn again. A later
+`transfer()` is allocation-free and infallible because its ticket and capacity
+were reserved in the handle's originating registry before the spawn attempt.
 
 After spawn, stdout and stderr drain concurrently. Reaching either cap plus
 one byte, reaching the absolute deadline, or a pipe read failure initiates
@@ -216,10 +220,14 @@ detaches the bounded drain custody and returns
 `ReapedFailure(DeadlineExceeded)` because the provider child itself was
 actually reaped; no raw partial output enters that failure.
 
-`retry_terminate` consumes the handle and returns either verified reaped
-evidence or the same custody in a new retained value. `transfer` consumes it
-into the application-lifetime `ProviderCliCustodyRegistry` and returns only a
-non-secret ticket. Last-owner registry/retained-handle shutdown is bounded; if
+`retry_terminate` consumes the handle and returns actual `NotStarted` evidence
+when its retained in-flight spawn later finishes with no child, verified reaped
+evidence when a real child is waited, or the same custody in a new retained
+value. `transfer()` consumes the handle into its already reserved originating
+application-lifetime `ProviderCliCustodyRegistry` and returns only a non-secret
+ticket. It accepts no destination registry, cannot silently reroute custody,
+and never retries the spawn attempt. Last-owner registry/retained-handle
+shutdown is bounded; if
 the deadline expires, the custody worker detaches while still owning the child
 until actual reap or process termination. This helper custody never calls a
 provider inspect, stop, or remove operation and never creates provider-launch,

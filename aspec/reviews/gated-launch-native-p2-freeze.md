@@ -364,3 +364,74 @@ legacy fixture, and Packet 1B wiring remain unchanged. This formatted candidate
 and lineage appendix await Root source review before worktree application. No
 compiler, test, full gate, provider, runtime, stage, commit, or push followed the
 temporary formatting operation.
+
+## Origin-only retained-custody contract amendment
+
+Root's production source review found that `transfer(self, registry)` silently
+ignored an unrelated destination registry. The durable corrective review
+SHA-256 is
+`fd82c9a607a5e40f2135dfb2b79a789b0eb651736547aecb3fbc06ecc10f1678`.
+
+The amended private seam exposes only
+`transfer(self) -> ProviderCliCustodyTicket`. It consumes into the retained
+handle's already reserved originating registry without allocation, accepts no
+caller-selected destination, and never retries spawn. The prestarted actor owns
+the exact `Command` during its one native spawn attempt; no `Child`, PID, or exit
+status exists until the OS returns successfully. If a caller deadline first
+returns retained custody and that same in-flight attempt later fails with no
+child, `RetainedProviderCliTermination::NotStarted(ProviderCliStartFailure)`
+records the actually observed terminal result. It does not fabricate reaped
+status or leave resolved no-child custody perpetually retained.
+
+The formatted Packet 1B test contains no `transfer`, `retry_terminate`, or
+retained-termination callsite, consistent with its explicit deferral of forced
+OS spawn/kill/reap faults. It therefore remains byte-exact; no process success or
+custody behavior was invented. The lineage is:
+
+- Packet 1B test:
+  `b9de2b38197d21e381fa1b7a9f6d0c39c29fd2173176960f2cdf1aee0cf2ea59`;
+- preceding minimal seam:
+  `1e53c09756f4e8b0dd936b847e36ea5225c4b939791a0b9ee66212b2074439ff`;
+- amended minimal seam:
+  `7279443236ee02d6561a8bac35d978590231b7e161728fb26e7ff089f925cf36`;
+- preceding amended work item:
+  `f62019d8bedb17c62a195ae4816c11d3ee7242563b007138c46ae58ed9f506ae`;
+- amended work item:
+  `661925fbd50a983f6602aa2279ad6140f4558010076f539088788256da24392a`;
+- cumulative freeze before this appendix:
+  `f5059a0bf52bc66cb5d18ea0de2762f79e08ef5535481eb22da7f6583178aa42`.
+
+This source-only amendment awaits Root's full diff review. It changes no test,
+assertion, fixture, canonical digest, build wiring, production source, or runtime
+claim. No formatter, compiler, test, full gate, provider, runtime, stage, commit,
+or push was run.
+
+## Rust 1.94 fixture-only zombie-process lint amendment
+
+The post-application Rust 1.94 gate reached Clippy and reported
+`clippy::zombie_processes` at the two deliberate descendant spawns inside the
+single ignored `provider_cli_fixture_child` subprocess fixture. The structured
+evidence SHA-256 is
+`102c41729f61f627d00f5f68e391d2b17d0c738d4bbb5745ec1105c268b51af2`.
+
+The original independent test author added one function-scoped
+`#[allow(clippy::zombie_processes)]` with a source comment explaining the exact
+fixture need. Both modes intentionally let the descendant hold inherited stdout
+and stderr until its natural one-second exit: one keeps the fixture parent alive,
+and one lets the fixture parent exit first. Waiting in the fixture would erase
+the condition exercised by the bounded drain behavior. No module/crate lint
+suppression, process behavior, timeout, byte, assertion, fixture mode, or
+expected value changed.
+
+Lineage:
+
+- preceding formatted Packet 1B test:
+  `b9de2b38197d21e381fa1b7a9f6d0c39c29fd2173176960f2cdf1aee0cf2ea59`;
+- fixture-only amended test:
+  `047c370f3e2c94099c1af936e8361adbd0f9f54655398663d646d8e384d375ed`;
+- cumulative freeze before this appendix:
+  `515bd8990778b1b46fe9310debb9009137e345123965a832b52efc0049bedc55`.
+
+This source-only amendment awaits Root's full diff review before worktree
+application. No formatter, compiler, test, full gate, provider, runtime, stage,
+commit, or push followed the edit.

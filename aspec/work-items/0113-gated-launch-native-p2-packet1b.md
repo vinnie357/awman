@@ -76,6 +76,32 @@ kill/wait and output-limit behavior; forced OS kill/wait failure and detached
 custody are source-audit and later lifecycle-packet concerns, with no invented
 fault selector.
 
+The retained exceptional path uses origin-only custody. A prestarted actor owns
+the exact `Command` during its single native spawn attempt; it owns no `Child`,
+PID, or exit status until the OS returns successfully. If the caller deadline
+expires while that attempt remains in flight, the returned handle retains the
+same invocation and never retries spawn. Its exact contract is:
+
+```rust
+pub(crate) enum RetainedProviderCliTermination {
+    NotStarted(ProviderCliStartFailure),
+    Reaped(ProviderCliReapedFailure),
+    Retained(RetainedProviderCli),
+}
+
+impl RetainedProviderCli {
+    pub(crate) fn transfer(self) -> ProviderCliCustodyTicket;
+}
+```
+
+`NotStarted` is terminal evidence only after the retained actor observes the
+actual spawn attempt fail with no child. `transfer()` is allocation-free and
+consumes into the handle's pre-reserved originating registry; callers cannot
+name another registry. The frozen Packet 1B test has no retained-custody
+callsite or controlled OS spawn-failure seam, so this contract correction adds
+no fabricated process-success assertion. Exceptional retention remains an
+implementation source-audit and later lifecycle-test boundary.
+
 ### Immediate pre-spawn barrier — case 16
 
 10. A real private parent/guest-control/request/manifest/intention fixture is
