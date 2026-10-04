@@ -177,3 +177,56 @@ warnings that follow from those missing symbols. Log SHA-256:
 `7ab6c1020d8988f04720ba3009ccfc1d025d3072d441971c7787f531c0d5674a`.
 This establishes expected-red compilation only; it is not production
 implementation or runtime proof.
+
+## Original-author fixture result-conversion amendment
+
+Rust 1.94 type checking located one fixture-only mismatch in
+`src/data/startup_gate_native_p2_test.rs`: `ControlFixture::rewrite_intent`
+declares `Result<(), Box<dyn Error>>` but returned the narrower
+`std::io::Result<()>` from `write_private` directly. The original Packet 1A
+test author changed only that helper body to propagate the I/O result with `?`
+and then return `Ok(())` in its declared error type. No assertion, expected
+value, fixture bytes, production interface, or test coverage changed.
+
+Source lineage for Root review before worktree application:
+
+- current frozen data test:
+  `7911c42a939dba206c9612accd88b25f2ef9881419a88d707cc86484d8524347`;
+- fixture-corrected candidate:
+  `5d0f872875cac1d6fab463d784d52a1ffea1d8726af5a2cfb8c8a32185ed59ba`.
+
+This amendment records a source-only candidate. No formatter, compile, test,
+runtime, or full-gate workload was executed, and nothing in the worktree was
+changed. The candidate becomes the frozen data-test pin only after Root reviews
+the exact two-line fixture conversion and authorizes application.
+
+## Legacy external-test control-layout migration candidate
+
+Revision-matched Rust 1.94 full-gate evidence showed that the pre-existing
+external test `tests/engine/startup_gate.rs` still initialized and projected the
+removed `StartupGateSpec.control_dir` field. The gate passed formatting and
+library compilation reached the external-test target; all-target Clippy
+remained blocked by this external-test compile failure. Raw-log SHA-256:
+`6457c6877a54fd7cd7af853bd3278824c82b655f6b1704bd1242b635dda74bd5`.
+
+This source-only fixture migration imports the current public
+`StartupGateControlLayout`, wraps the same owned control path with
+`StartupGateControlLayout::legacy`, serializes the exact existing fixture request
+bytes, and fills `request_digest` with their real SHA-256. The former path
+equality assertion now compares the public `Eq` control values, which preserves
+the path check and also requires the exact legacy layout variant. Every other
+fixture value, assertion, and expected byte remains unchanged; no production API
+was widened.
+
+Source lineage for Root review before worktree application:
+
+- existing legacy external test:
+  `8f80aa894fb2499b205eacda6e80e8682b5b345d39ba56727cb6fe1abeab6cd3`;
+- migrated candidate:
+  `d7c793e2065025a3995fda0d79a70f0bc0911ed260f6e18683a5e280f0c1032b`;
+- preceding freeze record:
+  `285bc43b0cfc5132db7e52f529bda953386d6446f9f6dcccca64d874b7193d0b`.
+
+No formatter, compiler, test, full gate, probe, or scan was run while preparing
+this candidate. It becomes an authorized fixture migration only after Root's
+full source review.

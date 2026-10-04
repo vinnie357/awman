@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use crate::data::startup_gate::StartupGateSpec;
 use crate::engine::auth::RefreshableCredentialDelivery;
 
+pub use crate::data::container::ContainerName;
+
 /// A reference to a container image (e.g. `awman-myproj-claude:latest`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageRef(pub String);
@@ -30,19 +32,6 @@ pub struct Entrypoint(pub Vec<String>);
 impl Entrypoint {
     pub fn new(parts: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self(parts.into_iter().map(Into::into).collect())
-    }
-}
-
-/// Stable name for a container (e.g. `awman-abc123`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContainerName(pub String);
-
-impl ContainerName {
-    pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
-    }
-    pub fn as_str(&self) -> &str {
-        &self.0
     }
 }
 
@@ -468,6 +457,14 @@ impl ResolvedContainerOptions {
         };
         for opt in options {
             r.ingest(opt)?;
+        }
+        if r.startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some())
+        {
+            return Err(ResolveError::Conflict(
+                "orchestrated startup gates are not enabled for container launch".into(),
+            ));
         }
         // Part A: drop agent_credentials that duplicate a service already covered
         // by a harness-declared env var.  Applies to ALL container runtimes.

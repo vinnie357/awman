@@ -62,7 +62,8 @@ impl GateFixture {
     }
 
     fn rewrite_intent(&self, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
-        write_private(&self.parent.join("launch-intent.json"), bytes)
+        write_private(&self.parent.join("launch-intent.json"), bytes)?;
+        Ok(())
     }
 }
 

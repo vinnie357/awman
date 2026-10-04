@@ -8,10 +8,193 @@ use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::execution::{AgentInstance, AgentStats};
 use crate::engine::container::attach_socket::AttachSocketGuard;
 use crate::engine::container::backend::ContainerBackend;
+use crate::engine::container::gated_launch::{
+    canonical_inspection_revision, parse_lower_hex_32, AppleProviderState,
+    CanonicalInspectionRevisionInput, ExactInspection, ImmutableImageId, InspectionObservationKind,
+    ProviderKind, ProviderLaunchInspection, ProviderLaunchKey, ProviderState,
+    SanitizedProviderStateObservation,
+};
 use crate::engine::container::options::{ContainerName, ResolvedContainerOptions};
 use crate::engine::container::process::{AttachHookCtx, ContainerCli, ContainerInstance};
 use crate::engine::credential_refresh::register_container_leases;
 use crate::engine::error::EngineError;
+
+#[derive(Debug, thiserror::Error)]
+enum AppleProviderError {
+    #[error("invalid Apple provider inspection")]
+    InvalidInspection,
+}
+
+#[derive(serde::Deserialize)]
+struct AppleDescriptor {
+    digest: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AppleImageConfiguration {
+    descriptor: AppleDescriptor,
+}
+
+#[derive(serde::Deserialize)]
+struct AppleImageInspection {
+    configuration: AppleImageConfiguration,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum AppleImageInspectionEnvelope {
+    One(AppleImageInspection),
+    Many(Vec<AppleImageInspection>),
+}
+
+#[derive(serde::Deserialize)]
+struct AppleContainerImage {
+    descriptor: AppleDescriptor,
+}
+
+struct UniqueLabels(std::collections::BTreeMap<String, String>);
+
+impl<'de> serde::Deserialize<'de> for UniqueLabels {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct LabelsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for LabelsVisitor {
+            type Value = UniqueLabels;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a provider label object")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                use serde::de::Error as _;
+
+                let mut labels = std::collections::BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, String>()? {
+                    if labels.insert(key, value).is_some() {
+                        return Err(M::Error::custom("duplicate provider label"));
+                    }
+                }
+                Ok(UniqueLabels(labels))
+            }
+        }
+
+        deserializer.deserialize_map(LabelsVisitor)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AppleContainerConfiguration {
+    id: String,
+    labels: UniqueLabels,
+    image: AppleContainerImage,
+    #[serde(rename = "creationDate")]
+    creation_date: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AppleContainerStatus {
+    state: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AppleContainerInspection {
+    id: String,
+    configuration: AppleContainerConfiguration,
+    status: AppleContainerStatus,
+}
+
+#[allow(dead_code)]
+fn parse_gated_image_inspection(bytes: &[u8]) -> Result<ImmutableImageId, AppleProviderError> {
+    let envelope: AppleImageInspectionEnvelope =
+        serde_json::from_slice(bytes).map_err(|_| AppleProviderError::InvalidInspection)?;
+    let inspection = match envelope {
+        AppleImageInspectionEnvelope::One(inspection) => inspection,
+        AppleImageInspectionEnvelope::Many(mut inspections) if inspections.len() == 1 => {
+            inspections
+                .pop()
+                .ok_or(AppleProviderError::InvalidInspection)?
+        }
+        AppleImageInspectionEnvelope::Many(_) => return Err(AppleProviderError::InvalidInspection),
+    };
+    ImmutableImageId::new(inspection.configuration.descriptor.digest)
+        .map_err(|_| AppleProviderError::InvalidInspection)
+}
+
+#[allow(dead_code)]
+fn parse_gated_launch_inspection(bytes: &[u8], key: &ProviderLaunchKey) -> ExactInspection {
+    if key.provider != ProviderKind::AppleContainers {
+        return ExactInspection::ForeignOrAmbiguous;
+    }
+    let parsed: AppleContainerInspection = match serde_json::from_slice(bytes) {
+        Ok(parsed) => parsed,
+        Err(_) => return ExactInspection::ForeignOrAmbiguous,
+    };
+    if parsed.id != key.container_name.as_str()
+        || parsed.configuration.id != key.container_name.as_str()
+    {
+        return ExactInspection::ForeignOrAmbiguous;
+    }
+    let token_digest = match parsed
+        .configuration
+        .labels
+        .0
+        .get("dev.awman.orchestrator-launch")
+        .and_then(|value| parse_lower_hex_32(value))
+    {
+        Some(digest) if digest == key.token_digest => digest,
+        _ => return ExactInspection::ForeignOrAmbiguous,
+    };
+    let immutable_image_id =
+        match ImmutableImageId::new(parsed.configuration.image.descriptor.digest) {
+            Ok(image) if image == key.immutable_image_id => image,
+            _ => return ExactInspection::ForeignOrAmbiguous,
+        };
+    let created_at = match chrono::DateTime::parse_from_rfc3339(&parsed.configuration.creation_date)
+    {
+        Ok(created)
+            if created.offset().local_minus_utc() == 0
+                && chrono::Timelike::nanosecond(&created) == 0 =>
+        {
+            created.with_timezone(&chrono::Utc)
+        }
+        _ => return ExactInspection::ForeignOrAmbiguous,
+    };
+    if created_at < key.created_not_before {
+        return ExactInspection::ForeignOrAmbiguous;
+    }
+    let state = match parsed.status.state.as_str() {
+        "running" => ProviderState::Apple(AppleProviderState::Running),
+        "stopped" => ProviderState::Apple(AppleProviderState::Stopped),
+        _ => return ExactInspection::ForeignOrAmbiguous,
+    };
+    let revision = canonical_inspection_revision(CanonicalInspectionRevisionInput {
+        kind: InspectionObservationKind::Matching,
+        provider: ProviderKind::AppleContainers,
+        exact_name: &key.container_name,
+        runtime_id: Some(&parsed.configuration.id),
+        token_digest: Some(token_digest),
+        immutable_image_id: Some(&immutable_image_id),
+        created_at: Some(created_at),
+        state: SanitizedProviderStateObservation::Known(state.clone()),
+    });
+    let inspection = ProviderLaunchInspection {
+        provider: ProviderKind::AppleContainers,
+        runtime_id: parsed.configuration.id,
+        exact_name: key.container_name.clone(),
+        token_digest,
+        immutable_image_id,
+        created_at,
+        state,
+        revision,
+    };
+    ExactInspection::Matching(inspection)
+}
 
 /// Extract the container name from an Apple Containers JSON row.
 ///

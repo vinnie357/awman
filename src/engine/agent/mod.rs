@@ -211,6 +211,15 @@ impl AgentEngine {
         run: &AgentRunOptions,
         credentials: &AgentCredentials,
     ) -> Result<Vec<ContainerOption>, EngineError> {
+        if run
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some())
+        {
+            return Err(EngineError::Config(
+                "orchestrated startup gates are not enabled for container launch".into(),
+            ));
+        }
         let matrix = agent_matrix::matrix_for(agent.as_str())?;
 
         // Validate plan mode support.

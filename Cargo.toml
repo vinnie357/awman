@@ -64,6 +64,7 @@ zeroize = "1"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", features = ["signal", "process", "fs", "poll", "user"] }
 libc = "0.2"
+rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }

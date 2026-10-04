@@ -38,11 +38,14 @@ pub(crate) fn register_container_leases(
         Some(monitor) => options
             .refreshable_credentials
             .iter()
-            .map(|delivery| match &options.startup_gate {
-                Some(gate) => {
-                    monitor.register_gate_pending(delivery, container, gate.control_dir.clone())
-                }
-                None => monitor.register(delivery, container),
+            .filter_map(|delivery| match &options.startup_gate {
+                // Orchestrated gates are rejected during option resolution until
+                // Packet 3 installs a pending-registration authority that does not
+                // depend on a mutable host path.
+                Some(gate) => gate.control.legacy_control_dir().map(|control_dir| {
+                    monitor.register_gate_pending(delivery, container, control_dir.to_path_buf())
+                }),
+                None => Some(monitor.register(delivery, container)),
             })
             .collect(),
         None => Vec::new(),

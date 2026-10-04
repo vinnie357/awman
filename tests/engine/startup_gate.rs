@@ -1,7 +1,8 @@
 //! WI 0118 Layer 1 startup-gate option and wrapper contract tests.
 
 use awman::data::startup_gate::{
-    load_startup_gate, StartupGateAccess, StartupGateBinding, StartupGateRequest, StartupGateSpec,
+    load_startup_gate, StartupGateAccess, StartupGateBinding, StartupGateControlLayout,
+    StartupGateRequest, StartupGateSpec,
 };
 use awman::engine::container::options::{
     ContainerOption, EnvLiteral, EnvVar, ImageRef, OverlayPermission, OverlaySpec,
@@ -47,18 +48,22 @@ fn valid_gate() -> (tempfile::TempDir, StartupGateSpec) {
 }
 
 fn gate_spec(control_dir: PathBuf) -> StartupGateSpec {
+    let request = StartupGateRequest {
+        version: 1,
+        bindings: vec![StartupGateBinding {
+            id: "review-input".into(),
+            workspace_path: "/review/input".into(),
+            manifest_id: "0".repeat(64),
+            manifest_file: "review.manifest.json".into(),
+            access: StartupGateAccess::ReadOnly,
+        }],
+    };
+    let request_bytes = serde_json::to_vec(&request).expect("request bytes");
+    let request_digest: [u8; 32] = Sha256::digest(&request_bytes).into();
     StartupGateSpec {
-        control_dir,
-        request: StartupGateRequest {
-            version: 1,
-            bindings: vec![StartupGateBinding {
-                id: "review-input".into(),
-                workspace_path: "/review/input".into(),
-                manifest_id: "0".repeat(64),
-                manifest_file: "review.manifest.json".into(),
-                access: StartupGateAccess::ReadOnly,
-            }],
-        },
+        control: StartupGateControlLayout::legacy(control_dir),
+        request,
+        request_digest,
         timeout: Duration::from_secs(120),
         validated_manifests: Default::default(),
     }
@@ -146,7 +151,7 @@ fn startup_gate_option_is_single_typed_value_and_absent_path_is_legacy_default()
     ])
     .expect("one gate");
     let resolved_gate = gated.startup_gate.as_ref().expect("resolved gate");
-    assert_eq!(resolved_gate.control_dir, spec.control_dir);
+    assert_eq!(resolved_gate.control, spec.control);
     assert_eq!(resolved_gate.request, spec.request);
     assert_eq!(resolved_gate.timeout, spec.timeout);
 
