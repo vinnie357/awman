@@ -9,9 +9,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     make \
-    python3-minimal \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN test -x /usr/bin/python3
+RUN /usr/bin/python3 -I -S -c \
+    'import errno, grp, hashlib, json, os, pwd, secrets, stat, sys, time; from collections import namedtuple; from pathlib import Path'
 
 WORKDIR /workspace

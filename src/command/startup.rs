@@ -87,16 +87,11 @@ impl Startup {
             },
         )
         .context("failed to open session")?;
-        // The ordinary path intentionally enters through the public builder.
-        // The bare-TUI unknown-runtime path already has an inert fallback
-        // runtime from `Engines::detect`, so it must retain that exact handle
-        // to reach the fatal modal.
-        let engines = if fatal_runtime_error.is_some() {
-            Engines::from_detected(detected, &session)
-        } else {
-            Engines::build(&global_config, &session)
-        }
-        .context("failed to construct engines")?;
+        // Retain the exact handle selected by `Engines::detect`. Detection has
+        // already applied the catalogue fallback and command-specific runtime
+        // policy, so rebuilding here could select a different runtime.
+        let engines =
+            Engines::from_detected(detected, &session).context("failed to construct engines")?;
 
         Ok(StartupOutcome::new(
             session,
@@ -133,5 +128,223 @@ impl StartupOutcome {
     /// Messages collected during startup in the order they must be presented.
     pub fn messages(&self) -> &[String] {
         &self.messages
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::config::env::AWMAN_CONFIG_HOME;
+
+    const HOME_FIXTURE_CHILD: &str = "AWMAN_STARTUP_HOME_FIXTURE_CHILD";
+    const HOME_FIXTURE_ENTRY: &str = "AWMAN_STARTUP_HOME_FIXTURE_ENTRY";
+    const HOME_FIXTURE_COMPLETION: &str = "AWMAN_STARTUP_HOME_FIXTURE_COMPLETION";
+
+    fn enter_isolated_home_child(exact_test: &str) -> bool {
+        if std::env::var(HOME_FIXTURE_CHILD).ok().as_deref() == Some(exact_test) {
+            let entry =
+                std::env::var_os(HOME_FIXTURE_ENTRY).expect("isolated Startup fixture entry path");
+            std::fs::write(entry, exact_test).expect("record isolated Startup fixture entry");
+            return true;
+        }
+
+        let proof = tempfile::tempdir().expect("isolated Startup proof directory");
+        let home = proof.path().join("home");
+        std::fs::create_dir(&home).expect("isolated Startup HOME");
+        let entry = proof.path().join("entered");
+        let completion = proof.path().join("completed");
+        let mut child = std::process::Command::new(
+            std::env::current_exe().expect("current Startup unit-test binary"),
+        );
+        child
+            .args(["--exact", exact_test, "--nocapture"])
+            .env(HOME_FIXTURE_CHILD, exact_test)
+            .env(HOME_FIXTURE_ENTRY, &entry)
+            .env(HOME_FIXTURE_COMPLETION, &completion)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home);
+        for legacy in [
+            "AMUX_CONFIG_HOME",
+            "AMUX_API_ROOT",
+            "AMUX_OVERLAYS",
+            "AMUX_REMOTE_ADDR",
+            "AMUX_REMOTE_SESSION",
+            "AMUX_API_KEY",
+        ] {
+            child.env_remove(legacy);
+        }
+        let mut child = child.spawn().expect("spawn isolated Startup fixture");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match child.try_wait().expect("poll isolated Startup fixture") {
+                Some(status) => {
+                    assert!(
+                        status.success(),
+                        "isolated Startup fixture failed: {exact_test}"
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(&entry)
+                            .expect("isolated Startup fixture entry proof"),
+                        exact_test,
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(&completion)
+                            .expect("isolated Startup fixture completion proof"),
+                        exact_test,
+                    );
+                    return false;
+                }
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated Startup fixture timed out: {exact_test}");
+                }
+            }
+        }
+    }
+
+    fn complete_isolated_home_child(exact_test: &str) {
+        assert_eq!(
+            std::env::var(HOME_FIXTURE_CHILD).ok().as_deref(),
+            Some(exact_test),
+        );
+        let completion = std::env::var_os(HOME_FIXTURE_COMPLETION)
+            .expect("isolated Startup fixture completion path");
+        std::fs::write(completion, exact_test).expect("record isolated Startup fixture completion");
+    }
+
+    struct StartupFixture {
+        root: tempfile::TempDir,
+        env: EnvSnapshot,
+    }
+
+    impl StartupFixture {
+        fn with_runtime(runtime: Option<&str>) -> Self {
+            let root = tempfile::tempdir().expect("temporary startup fixture");
+            let config_home = root.path().join("config-home");
+            let working_dir = root.path().join("workspace");
+            std::fs::create_dir_all(&working_dir).expect("create isolated working directory");
+            let env = EnvSnapshot::with_overrides([(
+                AWMAN_CONFIG_HOME,
+                config_home.to_str().expect("UTF-8 temporary path"),
+            )]);
+            if let Some(runtime) = runtime {
+                GlobalConfig {
+                    runtime: Some(runtime.to_owned()),
+                    ..Default::default()
+                }
+                .save_with(&env)
+                .expect("write isolated global config");
+            }
+            Self { root, env }
+        }
+
+        fn working_dir(&self) -> PathBuf {
+            self.root.path().join("workspace")
+        }
+    }
+
+    #[test]
+    fn startup_default_config_command_uses_detected_default_runtime() {
+        const EXACT: &str =
+            "command::startup::tests::startup_default_config_command_uses_detected_default_runtime";
+        if !enter_isolated_home_child(EXACT) {
+            return;
+        }
+        let fixture = StartupFixture::with_runtime(None);
+        let outcome = Startup::new(vec!["config".into(), "show".into()])
+            .run(fixture.working_dir(), fixture.env.clone())
+            .expect("ordinary config startup with defaults");
+
+        assert_eq!(outcome.engines.runtime.runtime_name(), "docker");
+        assert!(outcome.fatal_runtime_error.is_none());
+        complete_isolated_home_child(EXACT);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_config_command_reuses_detected_fallback_for_unavailable_apple_runtime() {
+        const EXACT: &str = "command::startup::tests::startup_config_command_reuses_detected_fallback_for_unavailable_apple_runtime";
+        if !enter_isolated_home_child(EXACT) {
+            return;
+        }
+        let fixture = StartupFixture::with_runtime(Some("apple-containers"));
+        let outcome = Startup::new(vec!["config".into(), "show".into()])
+            .run(fixture.working_dir(), fixture.env.clone())
+            .expect("config must remain available through the detected fallback");
+
+        assert_eq!(
+            outcome.engines.runtime.runtime_name(),
+            "docker",
+            "Startup must assemble engines from Engines::detect's fallback handle"
+        );
+        assert!(outcome.fatal_runtime_error.is_none());
+        complete_isolated_home_child(EXACT);
+    }
+
+    #[test]
+    fn startup_unknown_runtime_cli_remains_fatal() {
+        const EXACT: &str = "command::startup::tests::startup_unknown_runtime_cli_remains_fatal";
+        if !enter_isolated_home_child(EXACT) {
+            return;
+        }
+        let fixture = StartupFixture::with_runtime(Some("not-a-runtime"));
+        let error = match Startup::new(vec!["config".into(), "show".into()])
+            .run(fixture.working_dir(), fixture.env.clone())
+        {
+            Err(error) => error,
+            Ok(_) => panic!("unknown CLI runtime must be rejected"),
+        };
+
+        assert!(matches!(
+            error.downcast_ref::<EngineError>(),
+            Some(EngineError::UnknownRuntime { value, .. }) if value == "not-a-runtime"
+        ));
+        complete_isolated_home_child(EXACT);
+    }
+
+    #[test]
+    fn startup_unknown_runtime_bare_tui_preserves_fatal_modal_and_inert_runtime() {
+        const EXACT: &str = "command::startup::tests::startup_unknown_runtime_bare_tui_preserves_fatal_modal_and_inert_runtime";
+        if !enter_isolated_home_child(EXACT) {
+            return;
+        }
+        let fixture = StartupFixture::with_runtime(Some("not-a-runtime"));
+        let outcome = Startup::new(Vec::new())
+            .run(fixture.working_dir(), fixture.env.clone())
+            .expect("bare TUI must start only far enough to show the fatal modal");
+
+        assert_eq!(outcome.engines.runtime.runtime_name(), "docker");
+        let fatal = outcome
+            .fatal_runtime_error
+            .expect("bare TUI must retain a fatal runtime message");
+        assert!(fatal.contains("not-a-runtime"), "fatal message: {fatal}");
+        complete_isolated_home_child(EXACT);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_runtime_required_command_rejects_unavailable_apple_runtime() {
+        const EXACT: &str = "command::startup::tests::startup_runtime_required_command_rejects_unavailable_apple_runtime";
+        if !enter_isolated_home_child(EXACT) {
+            return;
+        }
+        let fixture = StartupFixture::with_runtime(Some("apple-containers"));
+        let error = match Startup::new(vec!["status".into()])
+            .run(fixture.working_dir(), fixture.env.clone())
+        {
+            Err(error) => error,
+            Ok(_) => panic!("runtime-required command must reject unavailable Apple Containers"),
+        };
+
+        assert!(matches!(
+            error.downcast_ref::<EngineError>(),
+            Some(EngineError::BackendUnsupportedOnPlatform { backend, platform })
+                if backend == "apple-containers" && platform == "linux"
+        ));
+        complete_isolated_home_child(EXACT);
     }
 }
