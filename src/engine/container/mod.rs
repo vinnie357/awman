@@ -18,6 +18,8 @@ mod docker;
 pub(crate) mod gated_launch;
 #[cfg(test)]
 mod gated_launch_p2b_test;
+#[cfg(test)]
+mod gated_launch_p2c_test;
 pub mod instance;
 pub mod io_bridge;
 pub mod naming;

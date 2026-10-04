@@ -51,6 +51,8 @@ use crate::engine::sandbox::SandboxRuntime;
 
 pub mod build;
 pub mod catalogue;
+#[cfg(test)]
+mod gated_launch_retention_p2c_test;
 pub mod parsed_input;
 pub mod projections;
 pub mod resolved;
