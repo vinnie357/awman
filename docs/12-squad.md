@@ -1097,15 +1097,16 @@ with the shell snippet that makes it usable:
 ```
 ╔════════════════════════════════════════════════════════════════════╗
 ║  squad API key (store this — it will not be shown again)            ║
-║  954ec30c6719074e0ea952588461d079f97675424b8ecb53b5cbe76a9f06c96b  ║
+║  <generated-api-key>                                               ║
 ╚════════════════════════════════════════════════════════════════════╝
 
 Add this to ~/.zshrc so the awman CLI and TUI can authenticate to squad:
 
-    export AWMAN_SQUAD_KEY=954ec30c6719074e0ea952588461d079f97675424b8ecb53b5cbe76a9f06c96b
+    export AWMAN_SQUAD_KEY='<generated-api-key>'
 ```
 
-Add that line to your shell startup file and reload it. Every later
+Replace `<generated-api-key>` with the key printed by the daemon. Add the
+resulting line to your shell startup file and reload it. Every later
 `awman squad` command — and the squad TUI tab — reads `AWMAN_SQUAD_KEY` from the
 environment and sends it as the bearer token. Without it the daemon answers
 `401 Unauthorized`.
