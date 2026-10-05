@@ -19,23 +19,25 @@ fn runtime_and_engine_clones_share_the_application_registry_arc() -> Result<(), 
     let root = tempfile::tempdir()?;
     let engines = Engines::for_tests(root.path());
     let from_bundle = engines
-        .launch_retention
+        .container_runtime
         .as_ref()
-        .ok_or("container engine bundle omitted retention")?;
+        .ok_or("container engine bundle omitted runtime")?
+        .launch_retention()
+        .map_err(|_| "engine bundle registry unavailable")?;
     let from_runtime = engines
         .container_runtime
         .as_ref()
         .ok_or("container runtime missing")?
         .launch_retention()
         .map_err(|_| "engine runtime registry unavailable")?;
-    assert!(Arc::ptr_eq(from_bundle, &from_runtime));
+    assert!(Arc::ptr_eq(&from_bundle, &from_runtime));
     let cloned = engines.clone();
-    assert!(Arc::ptr_eq(
-        from_bundle,
-        cloned
-            .launch_retention
-            .as_ref()
-            .ok_or("cloned engine bundle omitted retention")?
-    ));
+    let from_clone = cloned
+        .container_runtime
+        .as_ref()
+        .ok_or("cloned engine bundle omitted runtime")?
+        .launch_retention()
+        .map_err(|_| "cloned engine runtime registry unavailable")?;
+    assert!(Arc::ptr_eq(&from_bundle, &from_clone));
     Ok(())
 }

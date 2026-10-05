@@ -1965,7 +1965,7 @@ Remote mode settings live under a `remote` key in the global config (`~/.awman/c
 {
   "remote": {
     "defaultAddr": "http://build-server.example.com:9876",
-    "defaultAPIKey": "a3f8b2c1...64-char-hex...",
+    "defaultAPIKey": "<64-character hex API key>",
     "savedDirs": [
       "/home/user/my-project",
       "/home/user/other-project"

@@ -17,7 +17,7 @@ compiler, test, build, CI, scan, provider, network, model, or runtime workload.
   `aae31f972ccb58263d98a167967de157de9e75bffbd91c512d40d3bb59a074e4`.
 - Concrete addendum:
   `eb00e22c1399637294f904d6dd630399e4fb3a2a44e59ba60ea7e8740f713266`.
-- Identity API:
+- Identity interface:
   `ead26429abf89f0dab24cbe40421bbd93929105b5cb74e72bf586ffaea6f132e`.
 - Existing 35-case matrix:
   `76d2b295463e6c94fb2d18082620665945a452cf54b93c7ea5df9f64f577f8b0`.

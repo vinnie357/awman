@@ -203,7 +203,7 @@ impl Engines {
         let agent_engine = Arc::new(AgentEngine::new(overlay_engine.clone(), runtime.clone()));
         Self {
             runtime: runtime.clone(),
-            container_runtime: Some(runtime),
+            container_runtime: Some(runtime.clone()),
             sandbox_runtime: None,
             git_engine: Arc::new(GitEngine::new()),
             overlay_engine,

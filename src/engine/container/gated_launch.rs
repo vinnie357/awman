@@ -1,6 +1,25 @@
 //! Exact provider identity and durable pre-spawn launch planning.
 
+mod child_lifecycle;
 mod provider_cli;
+mod retention;
+
+#[allow(unused_imports)]
+pub(crate) use child_lifecycle::{
+    BindStartedChildError, ChildLifecycleAuthority, ChildLifecycleSlot, ChildLifecycleState,
+    PreparedChildLifecycle, RetainedExecution, SpawnStageError, SpawnedCreateCli,
+    UnboundStartedCli,
+};
+#[allow(unused_imports)]
+pub(crate) use retention::{
+    LaunchRetentionInitError, LaunchRetentionReason, LaunchRetentionRegistry,
+    LaunchRetentionTicket, NotCreatedProof, RetainedAgentLaunch, REGISTRY_SHUTDOWN_GRACE,
+};
+
+#[cfg(test)]
+pub(crate) use child_lifecycle::test_support as child_lifecycle_test_support;
+#[cfg(test)]
+pub(crate) use retention::test_support as retention_test_support;
 
 #[allow(unused_imports)]
 // Consumed when the later native-provider packet enables this private seam.
@@ -309,6 +328,21 @@ pub(crate) struct ValidatedSpawnBarrier {
     _absence: AbsenceObservation,
 }
 
+impl ValidatedSpawnBarrier {
+    pub(crate) fn consume_for_spawn(
+        self,
+        plan: DurableLaunchPlan,
+    ) -> Result<DurableLaunchPlan, LaunchIdentityError> {
+        if !Arc::ptr_eq(&self._plan_file, &plan.plan_file)
+            || !Arc::ptr_eq(&self._controls, &plan.controls)
+            || self._key != plan.key
+        {
+            return Err(LaunchIdentityError::UnsafeControl);
+        }
+        Ok(plan)
+    }
+}
+
 impl fmt::Debug for DurableLaunchPlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -511,6 +545,64 @@ pub(crate) fn validate_immediate_pre_spawn(
         _key: plan.key.clone(),
         _absence: absence,
     })
+}
+
+pub(crate) fn revalidate_post_spawn(plan: &DurableLaunchPlan) -> Result<(), LaunchIdentityError> {
+    revalidate_mount_source(&plan.controls).map_err(|_| LaunchIdentityError::UnsafeControl)?;
+    if plan.controls.request.request_digest != plan.request_digest
+        || !plan
+            .controls
+            .host_parent
+            .verify_launch_plan(&plan.plan_file)
+    {
+        return Err(LaunchIdentityError::UnsafeControl);
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) enum StartedCreateObservation {
+    Matching(ProviderLaunchInspection),
+    Retained(LaunchRetentionReason),
+}
+
+#[allow(dead_code)]
+pub(crate) fn observe_started_create(
+    plan: &DurableLaunchPlan,
+    adapter: &dyn GatedProviderAdapter,
+    lifecycle: &ChildLifecycleAuthority,
+    enclosing: Instant,
+) -> StartedCreateObservation {
+    if Instant::now() >= enclosing {
+        return StartedCreateObservation::Retained(LaunchRetentionReason::SpawnResultUnknown);
+    }
+    match lifecycle.state() {
+        Ok(ChildLifecycleState::Running) => {}
+        Ok(ChildLifecycleState::Exited(info)) if info.exit_code != 0 => {
+            return StartedCreateObservation::Retained(LaunchRetentionReason::SpawnResultUnknown);
+        }
+        Ok(ChildLifecycleState::Exited(_)) => {}
+        _ => {
+            return StartedCreateObservation::Retained(LaunchRetentionReason::ChildStateUnknown);
+        }
+    }
+    let deadline = provider_call_deadline(enclosing);
+    match adapter.inspect_launch(&plan.key, deadline) {
+        ExactInspection::Matching(inspection) => {
+            if matches!(lifecycle.state(), Ok(ChildLifecycleState::Running)) {
+                StartedCreateObservation::Matching(inspection)
+            } else {
+                StartedCreateObservation::Retained(LaunchRetentionReason::SpawnResultUnknown)
+            }
+        }
+        ExactInspection::Unavailable => {
+            StartedCreateObservation::Retained(LaunchRetentionReason::InspectionUnavailable)
+        }
+        ExactInspection::Absent(_) | ExactInspection::ForeignOrAmbiguous => {
+            StartedCreateObservation::Retained(LaunchRetentionReason::SpawnResultUnknown)
+        }
+    }
 }
 
 pub(crate) fn canonical_inspection_revision(

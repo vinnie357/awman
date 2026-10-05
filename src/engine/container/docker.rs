@@ -17,6 +17,7 @@ use crate::engine::agent_runtime::execution::{
     AgentExecution, AgentExitInfo, AgentHandlePreview, AgentInstance, AgentStats, ExecutionBackend,
 };
 use crate::engine::container::backend::ContainerBackend;
+use crate::engine::container::gated_launch::LaunchRetentionRegistry;
 use crate::engine::container::options::{ContainerName, ImageRef, ResolvedContainerOptions};
 use crate::engine::container::process::{ContainerCli, ContainerInstance};
 use crate::engine::credential_refresh::register_container_leases;
@@ -30,11 +31,22 @@ const AWMAN_LABEL: &str = ContainerCli::DOCKER.label;
 #[derive(Debug, Default)]
 pub(super) struct DockerBackend;
 
-impl ContainerBackend for DockerBackend {
-    fn build(
+impl DockerBackend {
+    fn build_common(
         &self,
         options: ResolvedContainerOptions,
+        launch_retention: Option<std::sync::Arc<LaunchRetentionRegistry>>,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        if options
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some())
+            && launch_retention.is_none()
+        {
+            return Err(EngineError::Config(
+                "orchestrated launch retention is unavailable".into(),
+            ));
+        }
         let image = options
             .image
             .clone()
@@ -42,21 +54,33 @@ impl ContainerBackend for DockerBackend {
         let name = options.name.clone().unwrap_or_else(|| {
             ContainerName::new(crate::engine::container::naming::generate_container_name())
         });
-        // Register a refresh lease for every file-delivered credential BEFORE
-        // the container is built and its child spawned — the single choke point
-        // (INV-6). No-op for every launch that carries no such credential.
         let leases = register_container_leases(&options, &name.0);
-        // Docker's CLI has a native `attach` verb, so no attach-rendezvous
-        // hook is needed (`ContainerBackend::attach` below opens
-        // `docker attach`). Apple, which has no such verb, passes one.
-        Ok(Box::new(ContainerInstance::new(
+        Ok(Box::new(ContainerInstance::new_with_launch_retention(
             ContainerCli::DOCKER,
             image,
             name,
             options,
             leases,
             None,
+            launch_retention,
         )))
+    }
+}
+
+impl ContainerBackend for DockerBackend {
+    fn build(
+        &self,
+        options: ResolvedContainerOptions,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.build_common(options, None)
+    }
+
+    fn build_with_launch_retention(
+        &self,
+        options: ResolvedContainerOptions,
+        launch_retention: Option<std::sync::Arc<LaunchRetentionRegistry>>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.build_common(options, launch_retention)
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {

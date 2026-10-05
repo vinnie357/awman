@@ -22,6 +22,7 @@ use crate::engine::container::apple::AppleBackend;
 use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::background::BackgroundContainer;
 use crate::engine::container::docker::DockerBackend;
+use crate::engine::container::gated_launch::{LaunchRetentionInitError, LaunchRetentionRegistry};
 use crate::engine::container::options::{OverlaySpec, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
 
@@ -54,6 +55,7 @@ static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
 
 pub struct ContainerRuntime {
     backend: Arc<dyn ContainerBackend>,
+    launch_retention: Result<Arc<LaunchRetentionRegistry>, LaunchRetentionInitError>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -153,6 +155,7 @@ impl ContainerRuntime {
     pub fn docker() -> Self {
         Self {
             backend: Arc::new(DockerBackend),
+            launch_retention: LaunchRetentionRegistry::try_new(),
         }
     }
 
@@ -162,6 +165,7 @@ impl ContainerRuntime {
     pub fn apple() -> Self {
         Self {
             backend: Arc::new(AppleBackend),
+            launch_retention: LaunchRetentionRegistry::try_new(),
         }
     }
 
@@ -184,11 +188,30 @@ impl ContainerRuntime {
         &CONTAINER_CAPABILITIES
     }
 
+    pub(crate) fn launch_retention(
+        &self,
+    ) -> Result<Arc<LaunchRetentionRegistry>, LaunchRetentionInitError> {
+        self.launch_retention.clone()
+    }
+
     /// Build a fully-configured `AgentInstance` from pre-resolved options.
     pub fn build(
         &self,
         mut options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        let orchestrated = options
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some());
+        let launch_retention = match self.launch_retention() {
+            Ok(registry) => Some(registry),
+            Err(_) if orchestrated => {
+                return Err(EngineError::Config(
+                    "orchestrated launch retention is unavailable".into(),
+                ));
+            }
+            Err(_) => None,
+        };
         if options.startup_gate.is_some() {
             if !options.startup_gate_trusted_template {
                 return Err(EngineError::Config(
@@ -209,7 +232,8 @@ impl ContainerRuntime {
                 (!inspected.user.is_empty() && inspected.user != "0" && inspected.user != "root")
                     .then_some(inspected.user);
         }
-        self.backend.build(options)
+        self.backend
+            .build_with_launch_retention(options, launch_retention)
     }
 
     fn inspect_gate_image(&self, image: &str) -> Result<GateImageConfig, EngineError> {

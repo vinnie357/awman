@@ -540,6 +540,7 @@ async fn all_three_real_spawn_functions_bind_once_and_publish_one_actual_exit(
             slot,
             mut stdout,
             stderr: _,
+            ..
         } = spawned;
         let mut execution = result.map_err(|_| "trusted fixture spawn failed")?;
         let authority = slot.authority().ok_or("spawn returned without lifecycle")?;
@@ -648,7 +649,13 @@ fn bind_failures_return_each_exact_raw_child_variant_for_synchronous_retention(
                 EngineError::Container(ref message) if message == "create CLI state unknown"
             ));
             let unbound = match &owned {
-                RetainedExecution::Unbound(unbound) => unbound,
+                RetainedExecution::OwnedUnbound { child, resources } => {
+                    let _ = resources;
+                    child
+                }
+                RetainedExecution::Unbound(_) => {
+                    return Err("bind fault returned child without resource custody".into());
+                }
                 RetainedExecution::Managed { .. } => {
                     return Err("bind fault returned managed custody".into());
                 }
@@ -847,10 +854,16 @@ fn genuine_missing_executable_is_the_only_fixture_path_with_no_child_custody(
         fault: None,
         replies: vec![],
     })?;
-    assert!(matches!(
-        spawned.result,
-        Err(SpawnStageError::BeforeCliStart(EngineError::Container(_)))
-    ));
+    match spawned.result {
+        Err(SpawnStageError::BeforeCliStart(EngineError::ContainerRuntimeUnavailable {
+            binary,
+        })) => assert_eq!(binary, MISSING_EXECUTABLE),
+        _ => {
+            return Err(
+                "missing executable did not return its binary-specific no-child error".into(),
+            )
+        }
+    }
     assert!(spawned.slot.authority().is_none());
     assert_eq!(local.starts()?, 0);
     assert_eq!(
@@ -999,7 +1012,9 @@ fn retention_is_synchronous_recovers_poison_and_remains_responsive_while_actor_i
     )?;
     let authority = match &owned {
         RetainedExecution::Managed { lifecycle, .. } => lifecycle.clone(),
-        RetainedExecution::Unbound(_) => return Err("expected managed lifecycle".into()),
+        RetainedExecution::Unbound(_) | RetainedExecution::OwnedUnbound { .. } => {
+            return Err("expected managed lifecycle".into());
+        }
     };
     let lifecycle = lifecycle_probe(&authority);
     let pause = lifecycle.pause_before_next_poll();
@@ -1062,8 +1077,10 @@ fn default_backend_method_rejects_orchestrated_input_before_legacy_build(
     let controls = ControlFixture::new()?;
     let spec = load_startup_gate(&controls.parent, Duration::from_secs(30))?;
     assert!(spec.control.orchestrated_parts().is_some());
-    let mut orchestrated = ResolvedContainerOptions::default();
-    orchestrated.startup_gate = Some(Box::new(spec));
+    let orchestrated = ResolvedContainerOptions {
+        startup_gate: Some(Box::new(spec)),
+        ..Default::default()
+    };
     let registry = LaunchRetentionRegistry::try_new()
         .map_err(|_| "default-backend registry failed to start")?;
     let backend = LegacyBackend::default();
@@ -1136,15 +1153,19 @@ async fn last_owner_drop_detaches_managed_custody_without_provider_actions(
     let snapshot = retained.snapshot();
     assert!(snapshot.shutdown_requested);
     assert!(snapshot.worker_detached);
+    assert_eq!(snapshot.retained, 1);
     assert!(snapshot.unreaped >= 1);
+    assert!(!snapshot.worker_finished);
     assert_eq!(adapter.calls(), before_calls);
 
     local.release()?;
     drop(pause);
     assert!(wait_until(Instant::now() + Duration::from_secs(3), || {
-        let snapshot = retained.snapshot();
-        snapshot.unreaped == 0 && snapshot.worker_finished
+        retained.snapshot().unreaped == 0
     }));
+    let reaped = retained.snapshot();
+    assert_eq!(reaped.retained, 1);
+    assert!(!reaped.worker_finished);
     assert_eq!(adapter.destructive_calls(), 0);
     Ok(())
 }
@@ -1174,7 +1195,7 @@ fn last_owner_drop_bounds_unbound_raw_custody_and_never_self_joins() -> Result<(
             .err()
             .ok_or("bind-full fixture unexpectedly succeeded")?,
     )?;
-    assert!(matches!(&owned, RetainedExecution::Unbound(_)));
+    assert!(matches!(&owned, RetainedExecution::OwnedUnbound { .. }));
     let retained = registry_probe(&registry);
     let ticket = registry.retain(RetainedAgentLaunch {
         plan,
@@ -1191,18 +1212,18 @@ fn last_owner_drop_bounds_unbound_raw_custody_and_never_self_joins() -> Result<(
     assert!(weak.upgrade().is_none());
     let shutdown = retained.snapshot();
     assert!(shutdown.shutdown_requested);
-    assert!(shutdown.worker_detached || shutdown.worker_finished);
-    if shutdown.worker_detached {
-        assert!(shutdown.unreaped >= 1);
-    } else {
-        assert_eq!(shutdown.unreaped, 0);
-    }
+    assert!(shutdown.worker_detached);
+    assert_eq!(shutdown.retained, 1);
+    assert!(shutdown.unreaped <= 1);
+    assert!(!shutdown.worker_finished);
     assert_eq!(adapter.calls(), before_calls);
     local.release()?;
     assert!(wait_until(Instant::now() + Duration::from_secs(3), || {
-        let snapshot = retained.snapshot();
-        snapshot.unreaped == 0 && snapshot.worker_finished
+        retained.snapshot().unreaped == 0
     }));
+    let reaped = retained.snapshot();
+    assert_eq!(reaped.retained, 1);
+    assert!(!reaped.worker_finished);
     assert_eq!(adapter.destructive_calls(), 0);
 
     let self_drop_registry =

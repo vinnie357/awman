@@ -8,6 +8,7 @@ use std::path::Path;
 use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::background::ExecOutput;
 use crate::engine::agent_runtime::execution::{AgentInstance, AgentStats};
+use crate::engine::container::gated_launch::LaunchRetentionRegistry;
 use crate::engine::container::options::{OverlaySpec, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
 
@@ -21,6 +22,24 @@ pub(super) trait ContainerBackend: Send + Sync {
         &self,
         options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError>;
+
+    fn build_with_launch_retention(
+        &self,
+        options: ResolvedContainerOptions,
+        launch_retention: Option<std::sync::Arc<LaunchRetentionRegistry>>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        if options
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some())
+        {
+            return Err(EngineError::Config(
+                "orchestrated launch retention is unavailable".into(),
+            ));
+        }
+        let _ = launch_retention;
+        self.build(options)
+    }
 
     fn list_running(&self, session: &Session) -> Result<Vec<AgentHandle>, EngineError>;
 

@@ -11,8 +11,8 @@ use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::gated_launch::{
     canonical_inspection_revision, parse_lower_hex_32, AppleProviderState,
     CanonicalInspectionRevisionInput, ExactInspection, ImmutableImageId, InspectionObservationKind,
-    ProviderKind, ProviderLaunchInspection, ProviderLaunchKey, ProviderState,
-    SanitizedProviderStateObservation,
+    LaunchRetentionRegistry, ProviderKind, ProviderLaunchInspection, ProviderLaunchKey,
+    ProviderState, SanitizedProviderStateObservation,
 };
 use crate::engine::container::options::{ContainerName, ResolvedContainerOptions};
 use crate::engine::container::process::{AttachHookCtx, ContainerCli, ContainerInstance};
@@ -351,31 +351,55 @@ fn parse_apple_list_output(stdout: &str, name_prefix: Option<&str>) -> Vec<Agent
 #[derive(Debug, Default)]
 pub(super) struct AppleBackend;
 
-impl ContainerBackend for AppleBackend {
-    fn build(
+impl AppleBackend {
+    fn build_common(
         &self,
         options: ResolvedContainerOptions,
+        launch_retention: Option<std::sync::Arc<LaunchRetentionRegistry>>,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        if options
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some())
+            && launch_retention.is_none()
+        {
+            return Err(EngineError::Config(
+                "orchestrated launch retention is unavailable".into(),
+            ));
+        }
         let image = options.image.clone().ok_or_else(|| {
             EngineError::ConflictingOptions("missing required Image option".into())
         })?;
         let name = options.name.clone().unwrap_or_else(|| {
             ContainerName::new(crate::engine::container::naming::generate_container_name())
         });
-        // Register a refresh lease for every file-delivered credential BEFORE
-        // the container is built and its child spawned — the single choke point
-        // (INV-6). No-op for every launch that carries no such credential.
         let leases = register_container_leases(&options, &name.0);
-        // Apple's CLI has no `attach` verb, so the launching process must
-        // serve the container's PTY itself; `serve_attach_socket` is that hook.
-        Ok(Box::new(ContainerInstance::new(
+        Ok(Box::new(ContainerInstance::new_with_launch_retention(
             ContainerCli::APPLE,
             image,
             name,
             options,
             leases,
             Some(serve_attach_socket),
+            launch_retention,
         )))
+    }
+}
+
+impl ContainerBackend for AppleBackend {
+    fn build(
+        &self,
+        options: ResolvedContainerOptions,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.build_common(options, None)
+    }
+
+    fn build_with_launch_retention(
+        &self,
+        options: ResolvedContainerOptions,
+        launch_retention: Option<std::sync::Arc<LaunchRetentionRegistry>>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.build_common(options, launch_retention)
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {

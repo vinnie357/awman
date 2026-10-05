@@ -67,15 +67,16 @@ child and lifecycle actor.
 | --- | --- |
 | 17 | PTY, one-shot piped, and persistent-piped each enter their real production spawn function with a fresh barrier and the same owned durable plan; after real bridged output synchronizes script execution, each unique script has started exactly once, bound a lifecycle slot, and publishes one actual exit. |
 | 18 | Injected actor-thread startup failure is `BeforeCliStart`, obtains no slot authority, performs no second absence, and starts no fixture. Both disconnected and full bind channels return the exact PTY/piped/persistent raw-child kind and original bounded timestamp, with no bound slot. Each raw owner is synchronously inserted in retention before release and reaches actual `unreaped == 0`. Its post-reap marker count is at most one solely as a no-retry guard; user-code execution is not required to prove native spawn/custody. The after-bind bridge fault returns `Managed { execution: None, lifecycle }` for all three representations and the slot exposes that same lifecycle state. Its actor-published actual exit is preserved exactly, with one native reap and no guessed successful code or PTY signal. |
-| 19 safe subset | A real zero exit followed by absence and a real nonzero exit followed by a matching tuple both return `Retained(SpawnResultUnknown)`, start once, and perform no destructive provider call. A live matching tuple returns only `StartedCreateObservation::Matching`. A genuinely missing executable is the sole fixture path with `BeforeCliStart`, no child authority, and no start marker. No diagnostic input or positive collision assertion exists in this packet. |
+| 19 safe subset | A real zero exit followed by absence and a real nonzero exit followed by a matching tuple both return `Retained(SpawnResultUnknown)`, start once, and perform no destructive provider call. A live matching tuple returns only `StartedCreateObservation::Matching`. A genuinely missing executable is the sole fixture path with exact `BeforeCliStart(ContainerRuntimeUnavailable { binary })`, where `binary` equals the requested missing fixture executable; it has no child authority and no start marker. No diagnostic input or positive collision assertion exists in this packet. |
 | 29 | Normal `AgentExecution::wait`, lifecycle legacy wait, bounded wait, pre-extracted cancel handle, direct cancel, and grace expiry agree on the actor's byte-identical actual exit. The lifecycle probe reports exactly one native reap. Provider stop/remove is never used as local-child cancellation. |
-| 30 | Retention tickets are observable immediately after `retain` returns. `ContainerRuntime::launch_retention`, the container runtime stored by `Engines`, and cloned `Engines` values expose pointer-identical application registry Arcs. An old backend implementing only required `build` remains source-compatible: the new default rejects orchestrated input before calling it even when given a registry Arc, while legacy input still delegates once. |
+| 30 | Retention tickets are observable immediately after `retain` returns. `ContainerRuntime` owns the application registry; the `Arc<ContainerRuntime>` stored by `Engines` and cloned `Engines` values reach pointer-identical application registry Arcs through crate-private `ContainerRuntime::launch_retention()`, without a duplicate registry field on `Engines`. An old backend implementing only required `build` remains source-compatible: the new default rejects orchestrated input before calling it even when given a registry Arc, while legacy input still delegates once. |
 | 31 | Injected registry thread failure returns `SupervisorThreadUnavailable` before any fixture can start. Poison recovery preserves the pre-poison ticket and accepts a second owner while marking supervisor failure. Registry insertion and lifecycle state query remain bounded while the actor is paused immediately before a native poll. |
-| 32 | Last-owner Drop returns within the two-second shutdown grace plus test scheduling allowance for both managed and raw-unbound custody and destroys the wrapper Arc. A paused managed actor must report detached unreaped custody and later actual reap/worker finish. Raw-unbound custody may already be actually reaped by its permitted shutdown kill; otherwise it must report detached ownership before later finish. Provider call history is unchanged. The worker-owned drop helper exercises the real no-self-join path. |
+| 32 | Last-owner Drop returns within the two-second shutdown grace plus test scheduling allowance for both managed and raw-unbound custody and destroys the wrapper Arc. A paused managed actor reports detached unreaped custody; raw-unbound custody may already be actually reaped by its permitted shutdown kill. After either local child is actually reaped, the snapshot distinguishes `unreaped == 0` from the still-unresolved gated entry: `retained == 1` and `worker_finished == false`. Local reap clears execution custody only and never discards the durable plan, inspection, or reason. Provider call history is unchanged. The worker-owned empty-registry drop helper exercises the real no-self-join path. |
 
-The case-30 runtime/`Engines` pointer-identity assertions live unchanged in
-`src/command/dispatch/gated_launch_retention_p2c_test.rs`. The other fourteen
-tests remain in `src/engine/container/gated_launch_p2c_test.rs`. A Rust 1.94
+The case-30 runtime/`Engines` test retains all three pointer-identity assertions in
+`src/command/dispatch/gated_launch_retention_p2c_test.rs`; registry access now
+uses each bundle's canonical `container_runtime`. The other fourteen tests remain
+in `src/engine/container/gated_launch_p2c_test.rs`. A Rust 1.94
 full-gate attempt against the original single-file placement stopped at the
 architecture lint before formatting or compilation; evidence SHA-256
 `756d7641ed4b006aa3a8a3a9100e1eda0d08cdf0424234620979e6d36d1e9fd7`.
@@ -134,9 +135,11 @@ questions rather than acceptance claims:
 2. Enumerate every production native `try_wait`, wait, and kill. After bind,
    only the lifecycle actor may perform them. Test helpers, bridge readers,
    retention, cancellation, and cleanup must not introduce a second waiter.
-3. Trace every `SpawnStageError` construction. A proven OS spawn failure is
-   `BeforeCliStart`; bind failures own `Unbound`; every later error owns
-   `Managed`, including post-spawn control change and PTY bridge failure.
+3. Trace every `SpawnStageError` construction. A proven missing-executable OS
+   spawn failure is exact `BeforeCliStart(ContainerRuntimeUnavailable {
+   binary })`, preserving the requested binary; bind failures own `Unbound`;
+   every later error owns `Managed`, including post-spawn control change and
+   PTY bridge failure.
 4. Trace chat, exec prompt, and the single-attempt exec workflow through the
    unchanged common `AgentEngine` call path. Confirm the existing native
    orchestrated rejection remains enabled.
@@ -154,7 +157,9 @@ questions rather than acceptance claims:
    before lifecycle work; hold no registry/lifecycle/control mutex across
    polling, termination, timed waits, or join; never self-join; join another
    thread only after `is_finished`; detach at the one absolute deadline; and
-   never call provider inspect/stop/remove or create evidence.
+   never call provider inspect/stop/remove or create evidence. A gated local
+   reap clears only execution custody: snapshot accounting must then report
+   `unreaped == 0`, retain the unresolved entry, and keep the worker alive.
 8. Confirm `AgentEngine` native rejection and Docker/profile guards still
    block production native invocation. The `/bin/sh` fixture selection must
    exist only in `cfg(test)` support and must not alter `ContainerCli::DOCKER`
