@@ -344,7 +344,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             return Err(EngineError::Other(format!(
                 "unknown agent '{other}'; supported: {}",
                 SUPPORTED_AGENTS.join(", ")
-            )))
+            )));
         }
     })
 }
@@ -445,6 +445,40 @@ mod tests {
     }
 
     #[test]
+    fn agy_is_the_canonical_matrix_identity_and_antigravity_is_an_input_alias() {
+        assert!(SUPPORTED_AGENTS.contains(&"agy"));
+        assert!(!SUPPORTED_AGENTS.contains(&"antigravity"));
+
+        for input in ["agy", "antigravity"] {
+            let matrix =
+                matrix_for(input).expect("canonical name and migration alias must resolve");
+            assert_eq!(matrix.agent, "agy", "input {input} must canonicalize");
+            assert_eq!(matrix.interactive_entrypoint, vec!["agy"]);
+            assert_eq!(matrix.non_interactive_flag, Some("--print"));
+            assert_eq!(
+                model_flag_for(&matrix, "gemini-3.5-pro").unwrap(),
+                ModelFlagForm::Argument("gemini-3.5-pro".to_string()),
+                "input {input} must deliver the explicit model as `--model MODEL`"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_agent_error_lists_only_the_canonical_agy_name() {
+        let message = matrix_for("actualagy").unwrap_err().to_string();
+        assert!(message.contains("unknown agent 'actualagy'"), "{message}");
+        let supported = message
+            .split_once("supported: ")
+            .expect("unknown-agent error must carry the supported catalogue")
+            .1;
+        assert!(supported.split(", ").any(|name| name == "agy"), "{message}");
+        assert!(
+            !supported.split(", ").any(|name| name == "antigravity"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn opencode_plan_unsupported() {
         let m = matrix_for("opencode").unwrap();
         assert!(m.plan_flag.is_none());
@@ -521,21 +555,13 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_model_flag_unsupported_returns_err() {
+    fn legacy_antigravity_alias_delivers_model_as_space_argument() {
         let m = matrix_for("antigravity").unwrap();
-        let result = model_flag_for(&m, "gemini-3.5-flash");
-        assert!(
-            result.is_err(),
-            "model_flag_for antigravity must return Err (Unsupported); got {result:?}"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("antigravity"),
-            "error must name the agent; got: {msg}"
-        );
-        assert!(
-            msg.contains("does not support a model flag"),
-            "error must say 'does not support a model flag'; got: {msg}"
+        assert_eq!(m.agent, "agy");
+        assert_eq!(
+            model_flag_for(&m, "gemini-3.5-flash").unwrap(),
+            ModelFlagForm::Argument("gemini-3.5-flash".to_string()),
+            "the migration alias must retain an explicit model through canonical agy SpaceArg delivery"
         );
     }
 

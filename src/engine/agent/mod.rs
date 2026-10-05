@@ -1367,7 +1367,7 @@ mod tests {
     }
 
     #[test]
-    fn build_options_antigravity_model_flag_returns_error() {
+    fn build_options_legacy_antigravity_model_becomes_canonical_agy_space_arg() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = make_agent_engine(tmp.path());
         let agent = crate::data::session::AgentName::new("antigravity").unwrap();
@@ -1375,19 +1375,15 @@ mod tests {
             model: Some("gemini-3.5-flash".to_string()),
             ..Default::default()
         };
-        let result = engine.build_options(&session, &agent, &run);
+        let options = engine.build_options(&session, &agent, &run).unwrap();
         assert!(
-            result.is_err(),
-            "build_options with model for antigravity must return Err; got {result:?}"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("antigravity"),
-            "error must name the agent 'antigravity'; got: {msg}"
-        );
-        assert!(
-            msg.contains("does not support a model flag"),
-            "error must say 'does not support a model flag'; got: {msg}"
+            options.iter().any(|option| matches!(
+                option,
+                ContainerOption::Model {
+                    flag: crate::engine::container::options::ModelFlagForm::Argument(model),
+                } if model == "gemini-3.5-flash"
+            )),
+            "legacy input must emit the canonical agy `--model gemini-3.5-flash` option: {options:?}"
         );
     }
 

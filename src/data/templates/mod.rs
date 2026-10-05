@@ -76,3 +76,34 @@ pub fn sbx_apply_script_for(agent: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agy_uses_the_existing_legacy_named_assets_for_both_input_spellings() {
+        assert_eq!(
+            agent_dockerfile_for("agy"),
+            agent_dockerfile_for("antigravity")
+        );
+        assert_eq!(
+            sbx_kit_template_for("agy"),
+            sbx_kit_template_for("antigravity")
+        );
+        assert_eq!(
+            sbx_apply_script_for("agy"),
+            sbx_apply_script_for("antigravity")
+        );
+        assert!(agent_dockerfile_for("agy").is_some());
+        assert!(sbx_kit_template_for("agy").is_some());
+        assert!(sbx_apply_script_for("agy").is_some());
+    }
+
+    #[test]
+    fn unknown_agent_has_no_legacy_asset_mapping() {
+        assert!(agent_dockerfile_for("actualagy").is_none());
+        assert!(sbx_kit_template_for("actualagy").is_none());
+        assert!(sbx_apply_script_for("actualagy").is_none());
+    }
+}

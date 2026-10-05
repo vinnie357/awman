@@ -1343,6 +1343,16 @@ mod tests {
     }
 
     #[test]
+    fn validate_and_coerce_agy_canonicalizes_the_legacy_config_alias() {
+        for field in ["agent", "default_agent"] {
+            let canonical = validate_and_coerce(field, "agy").unwrap();
+            let migrated = validate_and_coerce(field, "antigravity").unwrap();
+            assert_eq!(canonical, serde_json::Value::String("agy".into()));
+            assert_eq!(migrated, canonical, "legacy value must migrate in {field}");
+        }
+    }
+
+    #[test]
     fn validate_and_coerce_agent_invalid() {
         let err = validate_and_coerce("agent", "notareal").unwrap_err();
         assert!(err.contains("not a known agent"));

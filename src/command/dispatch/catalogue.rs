@@ -1332,7 +1332,7 @@ const SQUAD_ADD: CommandSpec = CommandSpec {
         },
     ],
     api_allowed: true,
-     build: crate::command::dispatch::build::squad,
+    build: crate::command::dispatch::build::squad,
     gateway_need: GatewayNeed::Running,
     requires_container_tier: true,
     subcommands: &[],
@@ -2268,7 +2268,7 @@ const NEW_SKILL: CommandSpec = CommandSpec {
         },
     ],
     api_allowed: false,
-     build: crate::command::dispatch::build::new,
+    build: crate::command::dispatch::build::new,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
     subcommands: &[],
@@ -2807,6 +2807,25 @@ mod tests {
         let cat = CommandCatalogue::get();
         let spec = cat.lookup(&["init"]).expect("init must be present");
         assert_eq!(spec.name, "init");
+    }
+
+    #[test]
+    fn init_agent_catalogue_exposes_agy_and_accepts_the_legacy_input_alias() {
+        let init = CommandCatalogue::get()
+            .lookup(&["init"])
+            .expect("init must be present");
+        let agent = init.find_flag("agent").expect("init must expose --agent");
+        let FlagKind::Enum(values) = agent.kind else {
+            panic!("init --agent must remain an enum")
+        };
+        assert!(
+            values.contains(&"agy"),
+            "canonical agy value missing: {values:?}"
+        );
+        assert!(
+            values.contains(&"antigravity"),
+            "migration alias must remain accepted as input: {values:?}"
+        );
     }
 
     #[test]

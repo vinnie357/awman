@@ -1434,6 +1434,66 @@ mod tests {
     }
 
     #[test]
+    fn agy_and_legacy_alias_build_canonical_chat_and_exec_argv_with_model() {
+        use crate::engine::agent::agent_matrix::{entrypoint_for, matrix_for, model_flag_for};
+
+        for input in ["agy", "antigravity"] {
+            let matrix = matrix_for(input).expect("agy input spelling must resolve");
+
+            let chat = resolve(vec![
+                ContainerOption::Image(ImageRef::new("img:latest")),
+                ContainerOption::Entrypoint(entrypoint_for(&matrix, false)),
+                ContainerOption::Interactive(true),
+                ContainerOption::Model {
+                    flag: model_flag_for(&matrix, "gemini-3.5-pro").unwrap(),
+                },
+                ContainerOption::SeededPrompt("review this".into()),
+            ]);
+            let chat_argv = build_run_argv(
+                &ContainerName::new("ctr"),
+                &ImageRef::new("img:latest"),
+                &chat,
+            );
+            let chat_image = chat_argv
+                .iter()
+                .position(|arg| arg == "img:latest")
+                .unwrap();
+            assert_eq!(
+                &chat_argv[chat_image + 1..],
+                &["agy", "--model", "gemini-3.5-pro", "review this"],
+                "chat argv must use the canonical executable and SpaceArg model for {input}"
+            );
+
+            let exec = resolve(vec![
+                ContainerOption::Image(ImageRef::new("img:latest")),
+                ContainerOption::Entrypoint(entrypoint_for(&matrix, true)),
+                ContainerOption::Model {
+                    flag: model_flag_for(&matrix, "gemini-3.5-pro").unwrap(),
+                },
+                ContainerOption::SeededPrompt("review this".into()),
+            ]);
+            let exec_argv = build_run_argv(
+                &ContainerName::new("ctr"),
+                &ImageRef::new("img:latest"),
+                &exec,
+            );
+            let exec_image = exec_argv
+                .iter()
+                .position(|arg| arg == "img:latest")
+                .unwrap();
+            assert_eq!(
+                &exec_argv[exec_image + 1..],
+                &["agy", "--print", "--model", "gemini-3.5-pro"],
+                "exec prompt argv must use the canonical executable and SpaceArg model for {input}"
+            );
+            assert!(
+                !exec_argv.iter().any(|arg| arg == "antigravity"),
+                "the removed executable name must never reach argv: {exec_argv:?}"
+            );
+        }
+    }
+
+    #[test]
     fn build_run_argv_rw_overlay_has_no_ro_suffix() {
         let resolved = resolve(vec![
             ContainerOption::Image(ImageRef::new("img:latest")),
