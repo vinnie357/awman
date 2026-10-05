@@ -59,9 +59,19 @@ struct LifecycleState {
     #[cfg(test)]
     terminate_commands: usize,
     #[cfg(test)]
+    terminate_enqueued: usize,
+    #[cfg(test)]
+    barrier_commands: usize,
+    #[cfg(test)]
+    resource_retain_calls: usize,
+    #[cfg(test)]
+    resource_handoffs_in_flight: usize,
+    #[cfg(test)]
     actor_finished: bool,
     #[cfg(test)]
     pause: Option<Arc<PollPauseState>>,
+    #[cfg(test)]
+    before_command_pause: Option<Arc<PollPauseState>>,
 }
 
 struct LifecycleShared {
@@ -84,6 +94,10 @@ enum ActorCommand {
         result: mpsc::SyncSender<Option<Box<dyn Any + Send>>>,
     },
     RetainResources(Box<dyn Any + Send>),
+    #[cfg(test)]
+    Barrier {
+        observed: mpsc::SyncSender<()>,
+    },
 }
 
 enum TerminateResult {
@@ -207,6 +221,8 @@ impl ChildLifecycleAuthority {
         prepare_inner(
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            None,
         )
     }
 
@@ -268,7 +284,7 @@ impl ChildLifecycleAuthority {
         match self.state()? {
             ChildLifecycleState::Exited(info) => return Ok(info),
             ChildLifecycleState::Failed | ChildLifecycleState::Prepared => {
-                return Err(state_unknown())
+                return Err(state_unknown());
             }
             ChildLifecycleState::Running => {}
         }
@@ -286,6 +302,8 @@ impl ChildLifecycleAuthority {
                 }
                 mpsc::TrySendError::Disconnected(_) => state_unknown(),
             })?;
+        #[cfg(test)]
+        record_terminate_enqueued(&self.shared);
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
             return Err(EngineError::Container(
                 "create CLI deadline exceeded".into(),
@@ -332,6 +350,8 @@ impl ChildLifecycleAuthority {
     }
 
     pub(in crate::engine::container) fn retain_resources<T: Any + Send>(&self, resources: T) {
+        #[cfg(test)]
+        record_resource_retain_started(&self.shared);
         let resources: Box<dyn Any + Send> = Box::new(resources);
         match self.commands.send(ActorCommand::RetainResources(resources)) {
             Ok(()) => {}
@@ -418,6 +438,7 @@ impl ChildLifecycleSlot {
 
 fn prepare_inner(
     #[cfg(test)] fault: Option<test_support::PrepareFault>,
+    #[cfg(test)] initial_pause: Option<test_support::ActorPausePoint>,
 ) -> Result<PreparedChildLifecycle, EngineError> {
     #[cfg(test)]
     if fault == Some(test_support::PrepareFault::ThreadStart) {
@@ -450,9 +471,23 @@ fn prepare_inner(
             #[cfg(test)]
             terminate_commands: 0,
             #[cfg(test)]
+            terminate_enqueued: 0,
+            #[cfg(test)]
+            barrier_commands: 0,
+            #[cfg(test)]
+            resource_retain_calls: 0,
+            #[cfg(test)]
+            resource_handoffs_in_flight: 0,
+            #[cfg(test)]
             actor_finished: false,
             #[cfg(test)]
-            pause: None,
+            pause: initial_pause
+                .filter(|point| *point == test_support::ActorPausePoint::BeforePoll)
+                .map(|_| new_pause_state()),
+            #[cfg(test)]
+            before_command_pause: initial_pause
+                .filter(|point| *point == test_support::ActorPausePoint::BeforeFirstCommand)
+                .map(|_| new_pause_state()),
         }),
         changed: Condvar::new(),
         actor_thread: Mutex::new(None),
@@ -484,6 +519,8 @@ fn actor_loop(receiver: mpsc::Receiver<ActorCommand>, shared: Arc<LifecycleShare
     let mut disconnected = false;
     let mut resources: Option<Box<dyn Any + Send>> = None;
     loop {
+        #[cfg(test)]
+        pause_before_command(&shared);
         let command = if disconnected {
             std::thread::sleep(ACTOR_POLL_INTERVAL);
             Err(mpsc::RecvTimeoutError::Disconnected)
@@ -549,7 +586,15 @@ fn actor_loop(receiver: mpsc::Receiver<ActorCommand>, shared: Arc<LifecycleShare
                     resources = Some(owned);
                 }
                 #[cfg(test)]
-                record_resources_present(&shared, resources.is_some());
+                {
+                    record_resource_handoff_finished(&shared);
+                    record_resources_present(&shared, resources.is_some());
+                }
+            }
+            #[cfg(test)]
+            Ok(ActorCommand::Barrier { observed }) => {
+                record_barrier_command(&shared);
+                let _ = observed.try_send(());
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => disconnected = true,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -777,6 +822,49 @@ fn record_terminate_command(shared: &LifecycleShared) {
 }
 
 #[cfg(test)]
+fn record_terminate_enqueued(shared: &LifecycleShared) {
+    let mut guard = lock_state(shared);
+    guard.terminate_enqueued = guard.terminate_enqueued.saturating_add(1);
+}
+
+#[cfg(test)]
+fn record_barrier_command(shared: &LifecycleShared) {
+    let mut guard = lock_state(shared);
+    guard.barrier_commands = guard.barrier_commands.saturating_add(1);
+}
+
+#[cfg(test)]
+fn record_resource_retain_started(shared: &LifecycleShared) {
+    let mut guard = lock_state(shared);
+    guard.resource_retain_calls = guard.resource_retain_calls.saturating_add(1);
+    guard.resource_handoffs_in_flight = guard.resource_handoffs_in_flight.saturating_add(1);
+}
+
+#[cfg(test)]
+fn record_resource_handoff_finished(shared: &LifecycleShared) {
+    let mut guard = lock_state(shared);
+    guard.resource_handoffs_in_flight = guard.resource_handoffs_in_flight.saturating_sub(1);
+}
+
+#[cfg(test)]
+fn new_pause_state() -> Arc<PollPauseState> {
+    Arc::new(PollPauseState {
+        flags: Mutex::new(PollPauseFlags {
+            requested: true,
+            actor_paused: false,
+        }),
+        paused: Condvar::new(),
+        resume: Condvar::new(),
+    })
+}
+
+#[cfg(test)]
+fn pause_before_command(shared: &LifecycleShared) {
+    let pause = lock_state(shared).before_command_pause.clone();
+    pause_on_request(pause);
+}
+
+#[cfg(test)]
 fn record_actor_finished(shared: &LifecycleShared) {
     let mut guard = lock_state(shared);
     guard.resources_present = false;
@@ -802,6 +890,11 @@ struct PollPauseFlags {
 #[cfg(test)]
 fn pause_before_poll(shared: &LifecycleShared) {
     let pause = lock_state(shared).pause.clone();
+    pause_on_request(pause);
+}
+
+#[cfg(test)]
+fn pause_on_request(pause: Option<Arc<PollPauseState>>) {
     let Some(pause) = pause else { return };
     let mut flags = pause.flags.lock().unwrap_or_else(|p| p.into_inner());
     if !flags.requested {
@@ -827,6 +920,12 @@ pub(crate) mod test_support {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum ActorPausePoint {
+        BeforeFirstCommand,
+        BeforePoll,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum CreateCliKind {
         Pty,
         Piped,
@@ -836,7 +935,22 @@ pub(crate) mod test_support {
     pub(crate) fn prepare_with_fault(
         fault: PrepareFault,
     ) -> Result<PreparedChildLifecycle, EngineError> {
-        prepare_inner(Some(fault))
+        prepare_inner(Some(fault), None)
+    }
+
+    pub(crate) fn prepare_with_pause(
+        point: ActorPausePoint,
+    ) -> Result<(PreparedChildLifecycle, PollPause), EngineError> {
+        let prepared = prepare_inner(None, Some(point))?;
+        let pause = {
+            let guard = lock_state(&prepared.authority.shared);
+            match point {
+                ActorPausePoint::BeforeFirstCommand => guard.before_command_pause.clone(),
+                ActorPausePoint::BeforePoll => guard.pause.clone(),
+            }
+            .expect("initial lifecycle pause installed")
+        };
+        Ok((prepared, PollPause { state: pause }))
     }
 
     pub(crate) fn unbound_kind_and_started_at(
@@ -873,6 +987,10 @@ pub(crate) mod test_support {
         pub resources_present: bool,
         pub terminate_calls: usize,
         pub terminate_commands: usize,
+        pub terminate_enqueued: usize,
+        pub barrier_commands: usize,
+        pub resource_retain_calls: usize,
+        pub resource_handoffs_in_flight: usize,
         pub actor_finished: bool,
     }
 
@@ -936,22 +1054,45 @@ pub(crate) mod test_support {
                 resources_present: guard.resources_present,
                 terminate_calls: guard.terminate_calls,
                 terminate_commands: guard.terminate_commands,
+                terminate_enqueued: guard.terminate_enqueued,
+                barrier_commands: guard.barrier_commands,
+                resource_retain_calls: guard.resource_retain_calls,
+                resource_handoffs_in_flight: guard.resource_handoffs_in_flight,
                 actor_finished: guard.actor_finished,
             }
         }
 
         pub(crate) fn pause_before_next_poll(&self) -> PollPause {
-            let state = Arc::new(PollPauseState {
-                flags: Mutex::new(PollPauseFlags {
-                    requested: true,
-                    actor_paused: false,
-                }),
-                paused: Condvar::new(),
-                resume: Condvar::new(),
-            });
+            let state = new_pause_state();
             lock_state(&self.shared).pause = Some(Arc::clone(&state));
             PollPause { state }
         }
+    }
+
+    pub(crate) struct QueuedBarrier {
+        observed: mpsc::Receiver<()>,
+    }
+
+    impl QueuedBarrier {
+        pub(crate) fn wait_until_consumed(&self, deadline: Instant) -> bool {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            self.observed.recv_timeout(remaining).is_ok()
+        }
+    }
+
+    pub(crate) fn queue_barrier(
+        authority: &ChildLifecycleAuthority,
+    ) -> Result<QueuedBarrier, EngineError> {
+        let (observed_tx, observed) = mpsc::sync_channel(1);
+        authority
+            .commands
+            .try_send(ActorCommand::Barrier {
+                observed: observed_tx,
+            })
+            .map_err(|_| state_unknown())?;
+        Ok(QueuedBarrier { observed })
     }
 
     pub(crate) fn lifecycle_probe(authority: &ChildLifecycleAuthority) -> LifecycleProbe {

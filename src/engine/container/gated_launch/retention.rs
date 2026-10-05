@@ -618,6 +618,19 @@ pub(crate) mod test_support {
             }
         }
 
+        pub(crate) fn only_termination_authorized(&self) -> Option<bool> {
+            let entries = self
+                .shared
+                .entries
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if entries.len() == 1 {
+                entries.values().next().map(|entry| entry.signal_authorized)
+            } else {
+                None
+            }
+        }
+
         pub(crate) fn poison_entries(&self) {
             let shared = Arc::clone(&self.shared);
             let _ = std::thread::spawn(move || {

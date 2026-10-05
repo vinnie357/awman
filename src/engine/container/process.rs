@@ -452,6 +452,8 @@ struct SpawnCustodyResources {
     gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
     post_wait: PostWaitHook,
     run_post_wait: bool,
+    #[cfg(test)]
+    custody_witness: Option<test_support::CustodyWitness>,
 }
 
 impl SpawnCustodyResources {
@@ -488,6 +490,8 @@ struct ExecutionResources {
     attach_socket: Option<AttachSocketGuard>,
     leases: Vec<CredentialLease>,
     gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
+    #[cfg(test)]
+    _custody_witness: Option<test_support::CustodyWitness>,
 }
 
 struct FailedPtyBridgeResources {
@@ -803,6 +807,8 @@ pub(super) fn spawn_pty_bridged(
         gate_cleanup,
         post_wait: cli.post_wait,
         run_post_wait: true,
+        #[cfg(test)]
+        custody_witness: test_support::take_custody_witness(),
     });
 
     let mut cmd = CommandBuilder::new(cli.bin);
@@ -918,6 +924,10 @@ pub(super) fn spawn_pty_bridged(
                 LaunchRetentionReason::ChildStateUnknown,
             )
         })?;
+    #[cfg(test)]
+    let mut custody = custody;
+    #[cfg(test)]
+    let custody_witness = custody.custody_witness.take();
     let (io_resources, leases, gate_cleanup, post_wait) = custody.into_execution_parts();
     let SpawnIoResources::Pty(pair) = io_resources else {
         unreachable!("PTY lifecycle owns PTY resources")
@@ -945,6 +955,8 @@ pub(super) fn spawn_pty_bridged(
                         gate_cleanup,
                         post_wait,
                         run_post_wait: true,
+                        #[cfg(test)]
+                        custody_witness,
                     },
                 });
                 return Err(after_cli_start(
@@ -986,6 +998,8 @@ pub(super) fn spawn_pty_bridged(
             attach_socket,
             leases,
             gate_cleanup,
+            #[cfg(test)]
+            _custody_witness: custody_witness,
         }),
     };
     Ok(AgentExecution::new(
@@ -1037,6 +1051,8 @@ pub(super) fn spawn_piped(
         gate_cleanup,
         post_wait: cli.post_wait,
         run_post_wait: true,
+        #[cfg(test)]
+        custody_witness: test_support::take_custody_witness(),
     });
 
     let (plan, adapter, enclosing) = prepare_spawn_gate(gated).map_err(before_cli_start)?;
@@ -1111,6 +1127,10 @@ pub(super) fn spawn_piped(
                 LaunchRetentionReason::ChildStateUnknown,
             )
         })?;
+    #[cfg(test)]
+    let mut custody = custody;
+    #[cfg(test)]
+    let custody_witness = custody.custody_witness.take();
     let (io_resources, leases, gate_cleanup, post_wait) = custody.into_execution_parts();
     let SpawnIoResources::Piped(pipes) = io_resources else {
         unreachable!("piped lifecycle owns pipe resources")
@@ -1150,6 +1170,8 @@ pub(super) fn spawn_piped(
             attach_socket: None,
             leases,
             gate_cleanup,
+            #[cfg(test)]
+            _custody_witness: custody_witness,
         }),
     };
     Ok(AgentExecution::new(
@@ -1221,6 +1243,8 @@ pub(super) fn spawn_piped_interactive(
         gate_cleanup,
         post_wait: cli.post_wait,
         run_post_wait: true,
+        #[cfg(test)]
+        custody_witness: test_support::take_custody_witness(),
     });
 
     let (plan, adapter, enclosing) = prepare_spawn_gate(gated).map_err(before_cli_start)?;
@@ -1299,6 +1323,10 @@ pub(super) fn spawn_piped_interactive(
                 LaunchRetentionReason::ChildStateUnknown,
             )
         })?;
+    #[cfg(test)]
+    let mut custody = custody;
+    #[cfg(test)]
+    let custody_witness = custody.custody_witness.take();
     let (io_resources, leases, gate_cleanup, post_wait) = custody.into_execution_parts();
     let SpawnIoResources::Piped(pipes) = io_resources else {
         unreachable!("persistent piped lifecycle owns pipe resources")
@@ -1327,6 +1355,8 @@ pub(super) fn spawn_piped_interactive(
             attach_socket: None,
             leases,
             gate_cleanup,
+            #[cfg(test)]
+            _custody_witness: custody_witness,
         }),
     };
     Ok(AgentExecution::new(
@@ -1450,8 +1480,52 @@ impl ExecutionBackend for ContainerExecution {
 pub(crate) mod test_support {
     use super::*;
     use crate::engine::container::gated_launch::child_lifecycle_test_support::{
-        prepare_with_fault, PrepareFault,
+        prepare_with_fault, prepare_with_pause, ActorPausePoint, PollPause, PrepareFault,
     };
+    use crate::engine::container::gated_launch::PreparedChildLifecycle;
+    use std::cell::RefCell;
+
+    thread_local! {
+        static PREPARED_OVERRIDE: RefCell<Option<(PreparedChildLifecycle, Arc<ChildLifecycleSlot>)>> =
+            const { RefCell::new(None) };
+        static CUSTODY_WITNESS: RefCell<Option<CustodyWitness>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) struct CustodyWitness {
+        releases: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Drop for CustodyWitness {
+        fn drop(&mut self) {
+            self.releases
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct CustodyWitnessProbe {
+        releases: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CustodyWitnessProbe {
+        pub(crate) fn releases(&self) -> usize {
+            self.releases.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    fn custody_witness_pair() -> (CustodyWitness, CustodyWitnessProbe) {
+        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            CustodyWitness {
+                releases: Arc::clone(&releases),
+            },
+            CustodyWitnessProbe { releases },
+        )
+    }
+
+    pub(crate) fn take_custody_witness() -> Option<CustodyWitness> {
+        CUSTODY_WITNESS.with(|witness| witness.borrow_mut().take())
+    }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum FixtureIoMode {
@@ -1495,6 +1569,108 @@ pub(crate) mod test_support {
         retention: Arc<SpawnRetentionContext>,
     }
 
+    pub(crate) struct PausedFixtureSpawn {
+        pause: Option<PollPause>,
+        pub slot: Arc<ChildLifecycleSlot>,
+        result: std::sync::mpsc::Receiver<FixtureSpawnResult>,
+        worker: Option<std::thread::JoinHandle<()>>,
+        custody: CustodyWitnessProbe,
+    }
+
+    impl PausedFixtureSpawn {
+        pub(crate) fn wait_until_paused(&self, deadline: Instant) -> bool {
+            self.pause
+                .as_ref()
+                .is_some_and(|pause| pause.wait_until_paused(deadline))
+        }
+
+        pub(crate) fn resume(&mut self) {
+            drop(self.pause.take());
+        }
+
+        pub(crate) fn result_until(&self, deadline: Instant) -> Option<FixtureSpawnResult> {
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            self.result.recv_timeout(remaining).ok()
+        }
+
+        pub(crate) fn join_finished(&mut self) -> bool {
+            let Some(worker) = self.worker.take() else {
+                return true;
+            };
+            if worker.is_finished() {
+                let _ = worker.join();
+                true
+            } else {
+                self.worker = Some(worker);
+                false
+            }
+        }
+
+        pub(crate) fn custody_probe(&self) -> CustodyWitnessProbe {
+            self.custody.clone()
+        }
+    }
+
+    impl Drop for PausedFixtureSpawn {
+        fn drop(&mut self) {
+            self.resume();
+            if let Some(authority) = self.slot.authority() {
+                let _ = authority.terminate_local_cli(Instant::now() + Duration::from_secs(2));
+            }
+            if let Ok(result) = self.result.recv_timeout(Duration::from_secs(3)) {
+                drop(result);
+            }
+            if let Some(worker) = self.worker.take() {
+                if worker.is_finished() {
+                    let _ = worker.join();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn spawn_fixture_paused(
+        spec: FixtureSpawnSpec,
+        registry: Arc<LaunchRetentionRegistry>,
+        point: ActorPausePoint,
+    ) -> Result<PausedFixtureSpawn, EngineError> {
+        let (prepared, pause) = prepare_with_pause(point)?;
+        let (custody_witness, custody) = custody_witness_pair();
+        let slot = Arc::new(ChildLifecycleSlot::new());
+        let worker_slot = Arc::clone(&slot);
+        let runtime = tokio::runtime::Handle::try_current().ok();
+        let (result_tx, result) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::Builder::new()
+            .name("awman-paused-fixture".into())
+            .spawn(move || {
+                let _runtime_guard = runtime.as_ref().map(tokio::runtime::Handle::enter);
+                PREPARED_OVERRIDE.with(|prepared_override| {
+                    *prepared_override.borrow_mut() = Some((prepared, worker_slot));
+                });
+                CUSTODY_WITNESS.with(|witness| {
+                    *witness.borrow_mut() = Some(custody_witness);
+                });
+                let fixture = spawn_fixture(spec, registry);
+                let _ = result_tx.send(fixture);
+            })
+            .map_err(|_| EngineError::Container("paused fixture thread unavailable".into()))?;
+        Ok(PausedFixtureSpawn {
+            pause: Some(pause),
+            slot,
+            result,
+            worker: Some(worker),
+            custody,
+        })
+    }
+
+    pub(crate) fn spawn_fixture_with_custody_witness(
+        spec: FixtureSpawnSpec,
+        registry: Arc<LaunchRetentionRegistry>,
+    ) -> (FixtureSpawnResult, CustodyWitnessProbe) {
+        let (witness, probe) = custody_witness_pair();
+        CUSTODY_WITNESS.with(|slot| *slot.borrow_mut() = Some(witness));
+        (spawn_fixture(spec, registry), probe)
+    }
+
     impl FixtureSpawnResult {
         pub(crate) fn finish(
             self,
@@ -1508,7 +1684,11 @@ pub(crate) mod test_support {
         spec: FixtureSpawnSpec,
         registry: Arc<LaunchRetentionRegistry>,
     ) -> FixtureSpawnResult {
-        let slot = Arc::new(ChildLifecycleSlot::new());
+        let prepared_override = PREPARED_OVERRIDE.with(|prepared| prepared.borrow_mut().take());
+        let slot = prepared_override
+            .as_ref()
+            .map(|(_, slot)| Arc::clone(slot))
+            .unwrap_or_else(|| Arc::new(ChildLifecycleSlot::new()));
         let retention = SpawnRetentionContext::new(None);
         let prepare_fault = match spec.fault {
             Some(FixtureSpawnFault::ActorThreadStart) => Some(PrepareFault::ThreadStart),
@@ -1516,9 +1696,12 @@ pub(crate) mod test_support {
             Some(FixtureSpawnFault::BindFull) => Some(PrepareFault::BindFull),
             _ => None,
         };
-        let prepared = match prepare_fault {
-            Some(fault) => prepare_with_fault(fault),
-            None => ChildLifecycleAuthority::prepare(),
+        let prepared = match prepared_override {
+            Some((prepared, _)) => Ok(prepared),
+            None => match prepare_fault {
+                Some(fault) => prepare_with_fault(fault),
+                None => ChildLifecycleAuthority::prepare(),
+            },
         };
         let prepared = match prepared {
             Ok(prepared) => prepared,

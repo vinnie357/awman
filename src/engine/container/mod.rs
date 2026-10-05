@@ -23,6 +23,8 @@ mod gated_launch_p2b_test;
 #[cfg(test)]
 mod gated_launch_p2c_test;
 #[cfg(all(test, unix))]
+mod gated_launch_retention_acceptance_test;
+#[cfg(all(test, unix))]
 mod gated_launch_retention_quiescence_test;
 pub mod instance;
 pub mod io_bridge;
