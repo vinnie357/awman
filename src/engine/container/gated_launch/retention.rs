@@ -6,7 +6,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::child_lifecycle::{
-    ChildLifecycleState, RetainedExecution, SpawnedCreateCli, UnboundStartedCli,
+    ChildLifecycleState, RawCustodyCapability, RawCustodyOutcome, RetainedExecution,
+    TerminateRequestOutcome,
 };
 use super::{DurableLaunchPlan, ProviderLaunchInspection};
 #[cfg(test)]
@@ -52,7 +53,7 @@ impl fmt::Debug for RetainedAgentLaunch {
 
 enum RetainedRegistryEnvelope {
     Gated(Box<RetainedAgentLaunch>),
-    Legacy(RetainedExecution),
+    Legacy(Option<RetainedExecution>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -81,6 +82,9 @@ struct Shared {
 
 struct RetainedEntry {
     launch: RetainedRegistryEnvelope,
+    raw_custody: Option<RawCustodyCapability>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    raw_counters: (usize, usize, usize, usize),
     signal_authorized: bool,
     owns_unreaped_child: bool,
 }
@@ -168,7 +172,7 @@ impl LaunchRetentionRegistry {
         &self,
         execution: RetainedExecution,
     ) -> LaunchRetentionTicket {
-        self.retain_envelope(RetainedRegistryEnvelope::Legacy(execution))
+        self.retain_envelope(RetainedRegistryEnvelope::Legacy(Some(execution)))
     }
 
     fn retain_envelope(&self, launch: RetainedRegistryEnvelope) -> LaunchRetentionTicket {
@@ -185,6 +189,8 @@ impl LaunchRetentionRegistry {
             ticket,
             RetainedEntry {
                 launch,
+                raw_custody: None,
+                raw_counters: (0, 0, 0, 0),
                 signal_authorized: true,
                 owns_unreaped_child,
             },
@@ -315,7 +321,7 @@ enum RetainedChildPoll {
 fn initially_owns_unreaped_child(launch: &RetainedRegistryEnvelope) -> bool {
     let execution = match launch {
         RetainedRegistryEnvelope::Gated(launch) => launch.execution.as_ref(),
-        RetainedRegistryEnvelope::Legacy(execution) => Some(execution),
+        RetainedRegistryEnvelope::Legacy(execution) => execution.as_ref(),
     };
     execution.is_some_and(|execution| match execution {
         RetainedExecution::Managed { lifecycle, .. } => {
@@ -362,19 +368,14 @@ fn poll_retained_entry(
 ) -> RetainedEntryPoll {
     match &mut entry.launch {
         RetainedRegistryEnvelope::Gated(launch) => {
-            let mut child_reaped = false;
-            if let Some(execution) = launch.execution.as_mut() {
-                if poll_retained_execution(
-                    shared,
-                    execution,
-                    shutdown,
-                    &mut entry.signal_authorized,
-                ) == RetainedChildPoll::Reaped
-                {
-                    launch.execution = None;
-                    child_reaped = true;
-                }
-            }
+            let child_reaped = poll_execution_slot(
+                shared,
+                &mut launch.execution,
+                &mut entry.raw_custody,
+                &mut entry.raw_counters,
+                shutdown,
+                &mut entry.signal_authorized,
+            ) == RetainedChildPoll::Reaped;
             // Reaping the local CLI does not discharge provider, control,
             // journal, plan, pin, inspection, or reason custody.
             RetainedEntryPoll {
@@ -383,8 +384,14 @@ fn poll_retained_entry(
             }
         }
         RetainedRegistryEnvelope::Legacy(execution) => {
-            match poll_retained_execution(shared, execution, shutdown, &mut entry.signal_authorized)
-            {
+            match poll_execution_slot(
+                shared,
+                execution,
+                &mut entry.raw_custody,
+                &mut entry.raw_counters,
+                shutdown,
+                &mut entry.signal_authorized,
+            ) {
                 RetainedChildPoll::Pending | RetainedChildPoll::UnknownError => RetainedEntryPoll {
                     child_reaped: false,
                     resolved: false,
@@ -398,26 +405,92 @@ fn poll_retained_entry(
     }
 }
 
-fn poll_retained_execution(
+fn poll_execution_slot(
+    shared: &Shared,
+    execution: &mut Option<RetainedExecution>,
+    raw_custody: &mut Option<RawCustodyCapability>,
+    raw_counters: &mut (usize, usize, usize, usize),
+    shutdown: bool,
+    signal_authorized: &mut bool,
+) -> RetainedChildPoll {
+    if let Some(raw) = raw_custody.as_ref() {
+        return poll_raw_custody(shared, raw, raw_counters, signal_authorized);
+    }
+    let is_raw = matches!(
+        execution,
+        Some(RetainedExecution::Unbound(_) | RetainedExecution::OwnedUnbound { .. })
+    );
+    if is_raw {
+        let Some(owned) = execution.take() else {
+            return RetainedChildPoll::Pending;
+        };
+        let handed_off = match owned {
+            RetainedExecution::Unbound(child) => child.handoff_raw(None),
+            RetainedExecution::OwnedUnbound { child, resources } => {
+                child.handoff_raw(Some(resources))
+            }
+            managed @ RetainedExecution::Managed { .. } => {
+                *execution = Some(managed);
+                return RetainedChildPoll::Pending;
+            }
+        };
+        *raw_custody = Some(handed_off);
+        let Some(raw) = raw_custody.as_ref() else {
+            return RetainedChildPoll::Pending;
+        };
+        return poll_raw_custody(shared, raw, raw_counters, signal_authorized);
+    }
+    let Some(managed) = execution.as_mut() else {
+        return RetainedChildPoll::Reaped;
+    };
+    let outcome = poll_managed_execution(shared, managed, shutdown, signal_authorized);
+    if outcome == RetainedChildPoll::Reaped {
+        *execution = None;
+    }
+    outcome
+}
+
+fn poll_managed_execution(
     _shared: &Shared,
     execution: &mut RetainedExecution,
     _shutdown: bool,
     signal_authorized: &mut bool,
 ) -> RetainedChildPoll {
-    #[cfg(test)]
-    let resources_present = matches!(execution, RetainedExecution::OwnedUnbound { .. });
     match execution {
-        RetainedExecution::Managed { lifecycle, .. } => {
+        RetainedExecution::Managed {
+            execution: managed_execution,
+            lifecycle,
+        } => {
             if *signal_authorized {
-                *signal_authorized = false;
-                let _ = lifecycle
-                    .terminate_local_cli(Instant::now() + RETAINED_LOCAL_CLI_TERMINATE_BOUND);
+                match lifecycle.request_terminate_local_cli(
+                    Instant::now() + RETAINED_LOCAL_CLI_TERMINATE_BOUND,
+                ) {
+                    TerminateRequestOutcome::Exited(_)
+                    | TerminateRequestOutcome::AcceptedPending(_) => {
+                        *signal_authorized = false;
+                    }
+                    TerminateRequestOutcome::NotAccepted(_) => {}
+                }
             }
             let state = lifecycle.state();
             #[cfg(test)]
             record_managed_observation(_shared, state.as_ref().ok());
             match state {
-                Ok(ChildLifecycleState::Exited(_)) => RetainedChildPoll::Reaped,
+                Ok(ChildLifecycleState::Exited(_)) => {
+                    // Dropping a successful execution returns its unique loan.
+                    // Keep the lifecycle entry until the custody worker has
+                    // synchronously completed the owned resource teardown.
+                    // A pre-execution retained value has no loan; resolving it
+                    // drops this registry's command authority so the actor can
+                    // finish, after which the no-loan custody path may clean up.
+                    *managed_execution = None;
+                    if lifecycle.execution_loan_was_issued() && !lifecycle.resources_are_released()
+                    {
+                        RetainedChildPoll::Pending
+                    } else {
+                        RetainedChildPoll::Reaped
+                    }
+                }
                 Ok(
                     ChildLifecycleState::Prepared
                     | ChildLifecycleState::Running
@@ -426,87 +499,71 @@ fn poll_retained_execution(
                 | Err(_) => RetainedChildPoll::Pending,
             }
         }
-        RetainedExecution::Unbound(child) | RetainedExecution::OwnedUnbound { child, .. } => {
-            if *signal_authorized {
-                let _ = kill_unbound_observed(_shared, child);
-                *signal_authorized = false;
-            }
-            let poll = poll_unbound(child);
-            #[cfg(test)]
-            record_unbound_observation(_shared, &poll, resources_present);
-            match poll.outcome {
-                UnboundPollOutcome::Reaped => RetainedChildPoll::Reaped,
-                UnboundPollOutcome::Pending => RetainedChildPoll::Pending,
-                UnboundPollOutcome::UnknownError { .. } => {
-                    *signal_authorized = false;
-                    RetainedChildPoll::UnknownError
-                }
-            }
+        RetainedExecution::Unbound(_) | RetainedExecution::OwnedUnbound { .. } => {
+            RetainedChildPoll::Pending
         }
     }
 }
 
-#[derive(Clone, Copy)]
-struct UnboundPoll {
-    #[cfg_attr(not(test), allow(dead_code))]
-    pid: Option<u32>,
-    outcome: UnboundPollOutcome,
-}
-
-#[derive(Clone, Copy)]
-enum UnboundPollOutcome {
-    Pending,
-    Reaped,
-    UnknownError {
-        #[cfg_attr(not(test), allow(dead_code))]
-        errno: Option<i32>,
-    },
-}
-
-fn poll_unbound(unbound: &mut UnboundStartedCli) -> UnboundPoll {
-    let (pid, outcome) = match &mut unbound.child {
-        SpawnedCreateCli::Pty(child) => {
-            (child.process_id(), classify_unbound_poll(child.try_wait()))
+fn poll_raw_custody(
+    _shared: &Shared,
+    raw: &RawCustodyCapability,
+    _raw_counters: &mut (usize, usize, usize, usize),
+    signal_authorized: &mut bool,
+) -> RetainedChildPoll {
+    if *signal_authorized {
+        let first_request = raw.request_kill();
+        #[cfg(test)]
+        if first_request {
+            let mut observation = _shared.observation.lock().unwrap_or_else(|poisoned| {
+                _shared.supervisor_failed.store(true, Ordering::Release);
+                poisoned.into_inner()
+            });
+            observation.unbound_kill_calls = observation.unbound_kill_calls.saturating_add(1);
         }
-        SpawnedCreateCli::Piped(child) | SpawnedCreateCli::PersistentPiped(child) => {
-            (Some(child.id()), classify_unbound_poll(child.try_wait()))
-        }
-    };
-    UnboundPoll { pid, outcome }
-}
-
-fn classify_unbound_poll<T>(result: std::io::Result<Option<T>>) -> UnboundPollOutcome {
-    match result {
-        Ok(Some(_)) => UnboundPollOutcome::Reaped,
-        Ok(None) => UnboundPollOutcome::Pending,
-        Err(error) => UnboundPollOutcome::UnknownError {
-            errno: error.raw_os_error(),
-        },
+        #[cfg(not(test))]
+        let _ = first_request;
+        *signal_authorized = false;
+    }
+    let snapshot = raw.snapshot();
+    #[cfg(test)]
+    record_unbound_observation(_shared, raw, _raw_counters, snapshot);
+    match snapshot.outcome {
+        RawCustodyOutcome::Pending => RetainedChildPoll::Pending,
+        RawCustodyOutcome::Reaped => RetainedChildPoll::Reaped,
+        RawCustodyOutcome::UnknownError { .. } => RetainedChildPoll::UnknownError,
     }
 }
 
 #[cfg(test)]
-fn record_unbound_observation(shared: &Shared, poll: &UnboundPoll, resources_present: bool) {
+fn record_unbound_observation(
+    shared: &Shared,
+    raw: &RawCustodyCapability,
+    raw_counters: &mut (usize, usize, usize, usize),
+    snapshot: super::child_lifecycle::RawCustodySnapshot,
+) {
+    let current = raw.counters();
+    let delta = (
+        current.0.saturating_sub(raw_counters.0),
+        current.1.saturating_sub(raw_counters.1),
+        current.2.saturating_sub(raw_counters.2),
+        current.3.saturating_sub(raw_counters.3),
+    );
+    *raw_counters = current;
     let mut observation = shared.observation.lock().unwrap_or_else(|poisoned| {
         shared.supervisor_failed.store(true, Ordering::Release);
         poisoned.into_inner()
     });
-    observation.unbound_attempts = observation.unbound_attempts.saturating_add(1);
-    observation.last_pid = poll.pid;
-    observation.last_resources_present = resources_present;
-    observation.last_errno = None;
-    match poll.outcome {
-        UnboundPollOutcome::Pending => {
-            observation.unbound_pending = observation.unbound_pending.saturating_add(1)
-        }
-        UnboundPollOutcome::Reaped => {
-            observation.unbound_reaped = observation.unbound_reaped.saturating_add(1)
-        }
-        UnboundPollOutcome::UnknownError { errno } => {
-            observation.unbound_errors = observation.unbound_errors.saturating_add(1);
-            observation.last_errno = errno;
-        }
-    }
+    observation.unbound_attempts = observation.unbound_attempts.saturating_add(delta.0);
+    observation.unbound_pending = observation.unbound_pending.saturating_add(delta.1);
+    observation.unbound_errors = observation.unbound_errors.saturating_add(delta.2);
+    observation.unbound_reaped = observation.unbound_reaped.saturating_add(delta.3);
+    observation.last_pid = snapshot.pid;
+    observation.last_resources_present = snapshot.resources_present;
+    observation.last_errno = match snapshot.outcome {
+        RawCustodyOutcome::UnknownError { errno } => errno,
+        RawCustodyOutcome::Pending | RawCustodyOutcome::Reaped => None,
+    };
 }
 
 #[cfg(test)]
@@ -530,27 +587,6 @@ fn record_managed_observation(shared: &Shared, state: Option<&ChildLifecycleStat
         }
         None => {}
     }
-}
-
-fn kill_unbound(unbound: &mut UnboundStartedCli) -> Result<(), ()> {
-    match &mut unbound.child {
-        SpawnedCreateCli::Pty(child) => child.kill().map_err(|_| ()),
-        SpawnedCreateCli::Piped(child) | SpawnedCreateCli::PersistentPiped(child) => {
-            child.kill().map_err(|_| ())
-        }
-    }
-}
-
-fn kill_unbound_observed(_shared: &Shared, unbound: &mut UnboundStartedCli) -> Result<(), ()> {
-    #[cfg(test)]
-    {
-        let mut observation = _shared.observation.lock().unwrap_or_else(|poisoned| {
-            _shared.supervisor_failed.store(true, Ordering::Release);
-            poisoned.into_inner()
-        });
-        observation.unbound_kill_calls = observation.unbound_kill_calls.saturating_add(1);
-    }
-    kill_unbound(unbound)
 }
 
 #[cfg(test)]

@@ -33,7 +33,7 @@
 //! genuinely differ.
 
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::data::session::AgentHandle;
@@ -44,9 +44,10 @@ use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::container::attach_socket::AttachSocketGuard;
 use crate::engine::container::gated_launch::LaunchRetentionRegistry;
 use crate::engine::container::gated_launch::{
-    validate_immediate_pre_spawn, ChildLifecycleAuthority, ChildLifecycleSlot, ChildLifecycleState,
-    DurableLaunchPlan, GatedProviderAdapter, LaunchRetentionReason, RetainedAgentLaunch,
-    RetainedExecution, SpawnStageError, SpawnedCreateCli,
+    retain_detached_after_error, validate_immediate_pre_spawn, ChildLifecycleAuthority,
+    ChildLifecycleSlot, DurableLaunchPlan, ExecutionResourceLoan, GatedProviderAdapter,
+    LaunchRetentionReason, RetainedAgentLaunch, RetainedExecution, SpawnStageError,
+    SpawnedCreateCli,
 };
 use crate::engine::container::instance::{handle_now, ContainerId};
 use crate::engine::container::io_bridge::{BridgeConfig, CancelFn};
@@ -452,26 +453,53 @@ struct SpawnCustodyResources {
     gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
     post_wait: PostWaitHook,
     run_post_wait: bool,
+    attach_store: Arc<PreallocatedAttachStore>,
+    attach_permit: Option<AttachStorePermit>,
+    #[cfg(test)]
+    custody_witness: Option<test_support::CustodyWitness>,
+}
+
+struct SpawnExecutionParts {
+    io: SpawnIoResources,
+    leases: Vec<CredentialLease>,
+    gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
+    post_wait: PostWaitHook,
+    attach_store: Arc<PreallocatedAttachStore>,
+    attach_permit: AttachStorePermit,
     #[cfg(test)]
     custody_witness: Option<test_support::CustodyWitness>,
 }
 
 impl SpawnCustodyResources {
-    fn into_execution_parts(
-        mut self,
-    ) -> (
-        SpawnIoResources,
-        Vec<CredentialLease>,
-        Option<super::startup_gate::StartupGateCleanup>,
-        PostWaitHook,
-    ) {
+    fn take_execution_parts(&mut self) -> Option<SpawnExecutionParts> {
+        if self.io.is_none() || self.leases.is_none() || self.attach_permit.is_none() {
+            return None;
+        }
         self.run_post_wait = false;
-        (
-            self.io.take().expect("bound spawn resources include I/O"),
-            self.leases.take().unwrap_or_default(),
-            self.gate_cleanup.take(),
-            self.post_wait,
-        )
+        Some(SpawnExecutionParts {
+            io: self.io.take()?,
+            leases: self.leases.take()?,
+            gate_cleanup: self.gate_cleanup.take(),
+            post_wait: self.post_wait,
+            attach_store: Arc::clone(&self.attach_store),
+            attach_permit: self.attach_permit.take()?,
+            #[cfg(test)]
+            custody_witness: self.custody_witness.take(),
+        })
+    }
+
+    fn restore_execution_parts(&mut self, parts: SpawnExecutionParts) {
+        self.io = Some(parts.io);
+        self.leases = Some(parts.leases);
+        self.gate_cleanup = parts.gate_cleanup;
+        self.post_wait = parts.post_wait;
+        self.attach_store = parts.attach_store;
+        self.attach_permit = Some(parts.attach_permit);
+        self.run_post_wait = true;
+        #[cfg(test)]
+        {
+            self.custody_witness = parts.custody_witness;
+        }
     }
 }
 
@@ -487,11 +515,40 @@ struct ExecutionResources {
     post_wait: PostWaitHook,
     pty_master: Option<PtyMaster>,
     stdin_injector: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
-    attach_socket: Option<AttachSocketGuard>,
+    _attach_store: Arc<PreallocatedAttachStore>,
     leases: Vec<CredentialLease>,
     gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
     #[cfg(test)]
     _custody_witness: Option<test_support::CustodyWitness>,
+}
+
+struct PreallocatedAttachStore {
+    value: OnceLock<AttachSocketGuard>,
+}
+
+struct AttachStorePermit {
+    store: Arc<PreallocatedAttachStore>,
+}
+
+impl PreallocatedAttachStore {
+    fn pair() -> (Arc<Self>, AttachStorePermit) {
+        let store = Arc::new(Self {
+            value: OnceLock::new(),
+        });
+        let permit = AttachStorePermit {
+            store: Arc::clone(&store),
+        };
+        (store, permit)
+    }
+}
+
+impl AttachStorePermit {
+    fn store(self, guard: AttachSocketGuard) {
+        // The non-clonable permit is created beside a fresh OnceLock before
+        // launch. Its sole get_or_init call therefore runs this non-allocating
+        // initializer exactly once; Arc drop later runs the guard destructor.
+        self.store.value.get_or_init(|| guard);
+    }
 }
 
 struct FailedPtyBridgeResources {
@@ -502,15 +559,127 @@ struct FailedPtyBridgeResources {
     _custody: SpawnCustodyResources,
 }
 
+enum LifecycleResources {
+    Spawn(SpawnCustodyResources),
+    Execution(ExecutionResources),
+    #[allow(dead_code)]
+    FailedPty(FailedPtyBridgeResources),
+}
+
+struct ExecutionBridgeArtifacts {
+    stuck_tx: Arc<tokio::sync::broadcast::Sender<crate::engine::agent_runtime::StuckEvent>>,
+    output_tail: Arc<crate::engine::agent_runtime::output_tail::OutputTail>,
+    attach: Option<(AttachStorePermit, AttachHookCtxOwned)>,
+}
+
+struct AttachHookCtxOwned {
+    output_broadcast: Arc<tokio::sync::broadcast::Sender<Vec<u8>>>,
+    stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    pty_master: Weak<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+}
+
+impl LifecycleResources {
+    fn spawn(&self) -> Option<&SpawnCustodyResources> {
+        match self {
+            Self::Spawn(resources) => Some(resources),
+            Self::Execution(_) | Self::FailedPty(_) => None,
+        }
+    }
+
+    fn spawn_mut(&mut self) -> Option<&mut SpawnCustodyResources> {
+        match self {
+            Self::Spawn(resources) => Some(resources),
+            Self::Execution(_) | Self::FailedPty(_) => None,
+        }
+    }
+
+    fn execution(&self) -> Option<&ExecutionResources> {
+        match self {
+            Self::Execution(resources) => Some(resources),
+            Self::Spawn(_) | Self::FailedPty(_) => None,
+        }
+    }
+}
+
 impl Drop for ExecutionResources {
     fn drop(&mut self) {
         (self.post_wait)();
         self.pty_master = None;
         drop(self.stdin_injector.take());
-        drop(self.attach_socket.take());
         self.leases.clear();
         drop(self.gate_cleanup.take());
     }
+}
+
+fn bridge_piped_resources(
+    lifecycle: &ChildLifecycleAuthority,
+    io: AgentIo,
+    bridge_cfg: BridgeConfig,
+    keep_stdin_injector: bool,
+) -> Result<(ExecutionBridgeArtifacts, ExecutionResourceLoan), EngineError> {
+    lifecycle.transform_resources::<LifecycleResources, _>(move |resources| {
+        let LifecycleResources::Spawn(spawn) = resources else {
+            return Err(EngineError::Container(
+                "create CLI piped resource transformation failed".into(),
+            ));
+        };
+        let Some(parts) = spawn.take_execution_parts() else {
+            return Err(EngineError::Container(
+                "create CLI piped resource transformation failed".into(),
+            ));
+        };
+        let SpawnExecutionParts {
+            io: io_resources,
+            leases,
+            gate_cleanup,
+            post_wait,
+            attach_store,
+            attach_permit,
+            #[cfg(test)]
+            custody_witness,
+        } = parts;
+        let pipes = match io_resources {
+            SpawnIoResources::Piped(pipes) => pipes,
+            wrong_kind => {
+                spawn.restore_execution_parts(SpawnExecutionParts {
+                    io: wrong_kind,
+                    leases,
+                    gate_cleanup,
+                    post_wait,
+                    attach_store,
+                    attach_permit,
+                    #[cfg(test)]
+                    custody_witness,
+                });
+                return Err(EngineError::Container(
+                    "create CLI piped resource kind changed".into(),
+                ));
+            }
+        };
+        let bridge = crate::engine::container::io_bridge::bridge_piped_io(io, pipes, bridge_cfg);
+        let crate::engine::container::io_bridge::BridgeResult {
+            stdin_injector,
+            stuck_tx,
+            output_tail,
+        } = bridge;
+        let stdin_injector = keep_stdin_injector.then_some(stdin_injector);
+        drop(attach_permit);
+        *resources = LifecycleResources::Execution(ExecutionResources {
+            post_wait,
+            pty_master: None,
+            stdin_injector,
+            _attach_store: attach_store,
+            leases,
+            gate_cleanup,
+            #[cfg(test)]
+            _custody_witness: custody_witness,
+        });
+        Ok(ExecutionBridgeArtifacts {
+            stuck_tx,
+            output_tail,
+            attach: None,
+        })
+    })
 }
 
 fn finish_spawn(
@@ -539,80 +708,6 @@ fn finish_spawn(
                 retain_detached_after_error(owned);
             }
             Err(source)
-        }
-    }
-}
-
-fn retain_detached_after_error(owned: RetainedExecution) {
-    let holder = Arc::new(Mutex::new(Some(owned)));
-    let worker_holder = Arc::clone(&holder);
-    let spawned = std::thread::Builder::new()
-        .name("awman-create-cli-detached".into())
-        .spawn(move || {
-            let owned = worker_holder
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take();
-            let Some(owned) = owned else { return };
-            match owned {
-                RetainedExecution::Managed {
-                    execution,
-                    lifecycle,
-                } => {
-                    loop {
-                        if matches!(
-                            lifecycle.state(),
-                            Ok(super::gated_launch::ChildLifecycleState::Exited(_))
-                        ) {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    drop(execution);
-                }
-                RetainedExecution::Unbound(mut child) => loop {
-                    let reaped = match &mut child.child {
-                        SpawnedCreateCli::Pty(child) => child.try_wait().ok().flatten().is_some(),
-                        SpawnedCreateCli::Piped(child)
-                        | SpawnedCreateCli::PersistentPiped(child) => {
-                            child.try_wait().ok().flatten().is_some()
-                        }
-                    };
-                    if reaped {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                },
-                RetainedExecution::OwnedUnbound {
-                    mut child,
-                    resources,
-                } => {
-                    loop {
-                        let reaped = match &mut child.child {
-                            SpawnedCreateCli::Pty(child) => {
-                                child.try_wait().ok().flatten().is_some()
-                            }
-                            SpawnedCreateCli::Piped(child)
-                            | SpawnedCreateCli::PersistentPiped(child) => {
-                                child.try_wait().ok().flatten().is_some()
-                            }
-                        };
-                        if reaped {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    drop(resources);
-                }
-            }
-        });
-    if spawned.is_err() {
-        if let Some(owned) = holder
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
-        {
-            std::mem::forget(owned);
         }
     }
 }
@@ -801,15 +896,19 @@ pub(super) fn spawn_pty_bridged(
             pixel_height: 0,
         })
         .map_err(|e| before_cli_start(EngineError::Container(format!("openpty: {e}"))))?;
-    let custody = Box::new(SpawnCustodyResources {
+    assert_leases_before_spawn(&instance.options, &leases);
+    let (attach_store, attach_permit) = PreallocatedAttachStore::pair();
+    let custody = Box::new(LifecycleResources::Spawn(SpawnCustodyResources {
         io: Some(SpawnIoResources::Pty(pair)),
         leases: Some(leases),
         gate_cleanup,
         post_wait: cli.post_wait,
         run_post_wait: true,
+        attach_store,
+        attach_permit: Some(attach_permit),
         #[cfg(test)]
         custody_witness: test_support::take_custody_witness(),
-    });
+    }));
 
     let mut cmd = CommandBuilder::new(cli.bin);
     for arg in &argv {
@@ -828,21 +927,30 @@ pub(super) fn spawn_pty_bridged(
         cmd.env(k, v);
     }
 
-    assert_leases_before_spawn(
-        &instance.options,
-        custody.leases.as_deref().unwrap_or_default(),
-    );
-
     let (plan, adapter, enclosing) = prepare_spawn_gate(gated).map_err(before_cli_start)?;
 
-    let child = match custody.io.as_ref().expect("preallocated PTY custody") {
-        SpawnIoResources::Pty(pair) => pair.slave.spawn_command(cmd).map_err(|e| {
+    let spawn_custody = custody.spawn().ok_or_else(|| {
+        before_cli_start(EngineError::Container(
+            "preallocated PTY custody unavailable".into(),
+        ))
+    })?;
+    let child = match spawn_custody.io.as_ref() {
+        None => {
+            return Err(before_cli_start(EngineError::Container(
+                "preallocated PTY custody unavailable".into(),
+            )))
+        }
+        Some(SpawnIoResources::Pty(pair)) => pair.slave.spawn_command(cmd).map_err(|e| {
             before_cli_start(EngineError::Container(format!(
                 "spawn {} via pty: {e}",
                 cli.bin
             )))
         })?,
-        SpawnIoResources::Piped(_) => unreachable!("PTY path has PTY resources"),
+        Some(SpawnIoResources::Piped(_)) => {
+            return Err(before_cli_start(EngineError::Container(
+                "preallocated PTY custody has wrong I/O kind".into(),
+            )))
+        }
     };
     let lifecycle = prepared
         .bind_started_child_with_resources(SpawnedCreateCli::Pty(child), started_at, custody)
@@ -911,8 +1019,114 @@ pub(super) fn spawn_pty_bridged(
         bridge_cfg.output_broadcast = Some(Arc::clone(tx));
     }
 
-    let custody = lifecycle
-        .take_resources::<SpawnCustodyResources>()
+    let wants_attach = post_bridge.is_some();
+    let (bridge, resource_loan) = lifecycle
+        .transform_resources::<LifecycleResources, _>(move |resources| {
+            let LifecycleResources::Spawn(spawn) = resources else {
+                return Err(EngineError::Container(
+                    "create CLI PTY resource transformation failed".into(),
+                ));
+            };
+            let Some(parts) = spawn.take_execution_parts() else {
+                return Err(EngineError::Container(
+                    "create CLI PTY resource transformation failed".into(),
+                ));
+            };
+            let SpawnExecutionParts {
+                io: io_resources,
+                leases,
+                gate_cleanup,
+                post_wait,
+                attach_store,
+                attach_permit,
+                #[cfg(test)]
+                custody_witness,
+            } = parts;
+            let pair = match io_resources {
+                SpawnIoResources::Pty(pair) => pair,
+                wrong_kind => {
+                    spawn.restore_execution_parts(SpawnExecutionParts {
+                        io: wrong_kind,
+                        leases,
+                        gate_cleanup,
+                        post_wait,
+                        attach_store,
+                        attach_permit,
+                        #[cfg(test)]
+                        custody_witness,
+                    });
+                    return Err(EngineError::Container(
+                        "create CLI PTY resource kind changed".into(),
+                    ));
+                }
+            };
+            let (master_arc, bridge) =
+                match crate::engine::container::io_bridge::bridge_pty_owned(io, pair, bridge_cfg) {
+                    Ok(bridge) => bridge,
+                    Err(failure) => {
+                        let crate::engine::container::io_bridge::PtyBridgeFailure {
+                            error,
+                            pair,
+                            reader,
+                            io,
+                            mut config,
+                        } = failure;
+                        config.cancel_on_grace_expired = None;
+                        *resources = LifecycleResources::FailedPty(FailedPtyBridgeResources {
+                            _pair: pair,
+                            _reader: reader,
+                            _io: io,
+                            _config: config,
+                            _custody: SpawnCustodyResources {
+                                io: None,
+                                leases: Some(leases),
+                                gate_cleanup,
+                                post_wait,
+                                run_post_wait: true,
+                                attach_store,
+                                attach_permit: Some(attach_permit),
+                                #[cfg(test)]
+                                custody_witness,
+                            },
+                        });
+                        return Err(error);
+                    }
+                };
+            let crate::engine::container::io_bridge::BridgeResult {
+                stdin_injector,
+                stuck_tx,
+                output_tail,
+            } = bridge;
+            let attach = match (wants_attach, output_broadcast) {
+                (true, Some(output_broadcast)) => Some((
+                    attach_permit,
+                    AttachHookCtxOwned {
+                        output_broadcast,
+                        stdin_injector: stdin_injector.clone(),
+                        pty_master: Arc::downgrade(&master_arc),
+                    },
+                )),
+                _ => {
+                    drop(attach_permit);
+                    None
+                }
+            };
+            *resources = LifecycleResources::Execution(ExecutionResources {
+                post_wait,
+                pty_master: Some(master_arc),
+                stdin_injector: Some(stdin_injector),
+                _attach_store: attach_store,
+                leases,
+                gate_cleanup,
+                #[cfg(test)]
+                _custody_witness: custody_witness,
+            });
+            Ok(ExecutionBridgeArtifacts {
+                stuck_tx,
+                output_tail,
+                attach,
+            })
+        })
         .map_err(|source| {
             after_cli_start(
                 &retention,
@@ -921,65 +1135,20 @@ pub(super) fn spawn_pty_bridged(
                     execution: None,
                     lifecycle: lifecycle.clone(),
                 },
-                LaunchRetentionReason::ChildStateUnknown,
+                LaunchRetentionReason::BridgeSetupFailed,
             )
         })?;
-    #[cfg(test)]
-    let mut custody = custody;
-    #[cfg(test)]
-    let custody_witness = custody.custody_witness.take();
-    let (io_resources, leases, gate_cleanup, post_wait) = custody.into_execution_parts();
-    let SpawnIoResources::Pty(pair) = io_resources else {
-        unreachable!("PTY lifecycle owns PTY resources")
-    };
-    let (master_arc, bridge) =
-        match crate::engine::container::io_bridge::bridge_pty_owned(io, pair, bridge_cfg) {
-            Ok(bridge) => bridge,
-            Err(failure) => {
-                let crate::engine::container::io_bridge::PtyBridgeFailure {
-                    error,
-                    pair,
-                    reader,
-                    io,
-                    mut config,
-                } = failure;
-                config.cancel_on_grace_expired = None;
-                lifecycle.retain_resources(FailedPtyBridgeResources {
-                    _pair: pair,
-                    _reader: reader,
-                    _io: io,
-                    _config: config,
-                    _custody: SpawnCustodyResources {
-                        io: None,
-                        leases: Some(leases),
-                        gate_cleanup,
-                        post_wait,
-                        run_post_wait: true,
-                        #[cfg(test)]
-                        custody_witness,
-                    },
-                });
-                return Err(after_cli_start(
-                    &retention,
-                    error,
-                    RetainedExecution::Managed {
-                        execution: None,
-                        lifecycle,
-                    },
-                    LaunchRetentionReason::BridgeSetupFailed,
-                ));
-            }
-        };
 
-    let attach_socket = match (post_bridge, output_broadcast) {
-        (Some(hook), Some(output_broadcast)) => hook(AttachHookCtx {
+    if let (Some(hook), Some((permit, attach))) = (post_bridge, bridge.attach) {
+        if let Some(guard) = hook(AttachHookCtx {
             container_name: &instance.name.0,
-            output_broadcast,
-            stdin_injector: bridge.stdin_injector.clone(),
-            pty_master: Arc::downgrade(&master_arc),
-        }),
-        _ => None,
-    };
+            output_broadcast: attach.output_broadcast,
+            stdin_injector: attach.stdin_injector,
+            pty_master: attach.pty_master,
+        }) {
+            permit.store(guard);
+        }
+    }
 
     let backend = ContainerExecution {
         cli,
@@ -991,16 +1160,7 @@ pub(super) fn spawn_pty_bridged(
         gated_enclosing: enclosing,
         launch_retention: instance.launch_retention.as_ref().map(Arc::downgrade),
         container_name: instance.name.0.clone(),
-        resources: Some(ExecutionResources {
-            post_wait,
-            pty_master: Some(master_arc),
-            stdin_injector: Some(bridge.stdin_injector),
-            attach_socket,
-            leases,
-            gate_cleanup,
-            #[cfg(test)]
-            _custody_witness: custody_witness,
-        }),
+        resource_loan: Some(resource_loan),
     };
     Ok(AgentExecution::new(
         handle,
@@ -1043,7 +1203,8 @@ pub(super) fn spawn_piped(
     let gate_cleanup = instance.gate_cleanup.take();
     assert_leases_before_spawn(&instance.options, &leases);
 
-    let mut custody = Box::new(SpawnCustodyResources {
+    let (attach_store, attach_permit) = PreallocatedAttachStore::pair();
+    let mut custody = Box::new(LifecycleResources::Spawn(SpawnCustodyResources {
         io: Some(SpawnIoResources::Piped(
             crate::engine::container::io_bridge::PipedChildIo::empty(),
         )),
@@ -1051,16 +1212,25 @@ pub(super) fn spawn_piped(
         gate_cleanup,
         post_wait: cli.post_wait,
         run_post_wait: true,
+        attach_store,
+        attach_permit: Some(attach_permit),
         #[cfg(test)]
         custody_witness: test_support::take_custody_witness(),
-    });
+    }));
 
     let (plan, adapter, enclosing) = prepare_spawn_gate(gated).map_err(before_cli_start)?;
-    let mut child = spawn_child(cli, &mut cmd).map_err(before_cli_start)?;
-    let SpawnIoResources::Piped(pipes) = custody.io.as_mut().expect("preallocated pipe custody")
-    else {
-        unreachable!("piped path has pipe resources")
+    let pipes = match custody
+        .spawn_mut()
+        .and_then(|resources| resources.io.as_mut())
+    {
+        Some(SpawnIoResources::Piped(pipes)) => pipes,
+        Some(SpawnIoResources::Pty(_)) | None => {
+            return Err(before_cli_start(EngineError::Container(
+                "preallocated pipe custody unavailable".into(),
+            )))
+        }
     };
+    let mut child = spawn_child(cli, &mut cmd).map_err(before_cli_start)?;
     pipes.take_from(&mut child);
     let lifecycle = prepared
         .bind_started_child_with_resources(SpawnedCreateCli::Piped(child), started_at, custody)
@@ -1114,8 +1284,13 @@ pub(super) fn spawn_piped(
         ));
     }
 
-    let custody = lifecycle
-        .take_resources::<SpawnCustodyResources>()
+    // Write seeded prompt into stdin channel before the writer task starts.
+    if let Some(prompt) = seeded {
+        let _ = io.stdin_tx.send(prompt.into_bytes());
+        let _ = io.stdin_tx.send(b"\n".to_vec());
+    }
+
+    let (bridge, resource_loan) = bridge_piped_resources(&lifecycle, io, bridge_cfg, false)
         .map_err(|source| {
             after_cli_start(
                 &retention,
@@ -1127,32 +1302,14 @@ pub(super) fn spawn_piped(
                 LaunchRetentionReason::ChildStateUnknown,
             )
         })?;
-    #[cfg(test)]
-    let mut custody = custody;
-    #[cfg(test)]
-    let custody_witness = custody.custody_witness.take();
-    let (io_resources, leases, gate_cleanup, post_wait) = custody.into_execution_parts();
-    let SpawnIoResources::Piped(pipes) = io_resources else {
-        unreachable!("piped lifecycle owns pipe resources")
-    };
 
-    // Write seeded prompt into stdin channel before the writer task starts.
-    if let Some(prompt) = seeded {
-        let _ = io.stdin_tx.send(prompt.into_bytes());
-        let _ = io.stdin_tx.send(b"\n".to_vec());
-    }
-
-    let bridge = crate::engine::container::io_bridge::bridge_piped_io(io, pipes, bridge_cfg);
-
-    // Non-interactive (piped) path: drop the engine's stdin_injector so the
+    // Non-interactive (piped) path does not retain the stdin injector, so the
     // writer task sees EOF after draining the seeded prompt and closes the
     // child's stdin pipe. Without this, an agent that probes stdin for EOF
     // would hang waiting for input that will never come.
     // `try_inject_stdin` falls back to launching a fresh container — which
     // is the correct behaviour for a non-interactive run that has already
     // consumed its single prompt.
-    drop(bridge.stdin_injector);
-
     let backend = ContainerExecution {
         cli,
         lifecycle: lifecycle.clone(),
@@ -1163,16 +1320,7 @@ pub(super) fn spawn_piped(
         gated_enclosing: enclosing,
         launch_retention: instance.launch_retention.as_ref().map(Arc::downgrade),
         container_name: instance.name.0.clone(),
-        resources: Some(ExecutionResources {
-            post_wait,
-            pty_master: None,
-            stdin_injector: None,
-            attach_socket: None,
-            leases,
-            gate_cleanup,
-            #[cfg(test)]
-            _custody_witness: custody_witness,
-        }),
+        resource_loan: Some(resource_loan),
     };
     Ok(AgentExecution::new(
         handle,
@@ -1235,7 +1383,8 @@ pub(super) fn spawn_piped_interactive(
     let gate_cleanup = instance.gate_cleanup.take();
     assert_leases_before_spawn(&instance.options, &leases);
 
-    let mut custody = Box::new(SpawnCustodyResources {
+    let (attach_store, attach_permit) = PreallocatedAttachStore::pair();
+    let mut custody = Box::new(LifecycleResources::Spawn(SpawnCustodyResources {
         io: Some(SpawnIoResources::Piped(
             crate::engine::container::io_bridge::PipedChildIo::empty(),
         )),
@@ -1243,16 +1392,25 @@ pub(super) fn spawn_piped_interactive(
         gate_cleanup,
         post_wait: cli.post_wait,
         run_post_wait: true,
+        attach_store,
+        attach_permit: Some(attach_permit),
         #[cfg(test)]
         custody_witness: test_support::take_custody_witness(),
-    });
+    }));
 
     let (plan, adapter, enclosing) = prepare_spawn_gate(gated).map_err(before_cli_start)?;
-    let mut child = spawn_child(cli, &mut cmd).map_err(before_cli_start)?;
-    let SpawnIoResources::Piped(pipes) = custody.io.as_mut().expect("preallocated pipe custody")
-    else {
-        unreachable!("persistent piped path has pipe resources")
+    let pipes = match custody
+        .spawn_mut()
+        .and_then(|resources| resources.io.as_mut())
+    {
+        Some(SpawnIoResources::Piped(pipes)) => pipes,
+        Some(SpawnIoResources::Pty(_)) | None => {
+            return Err(before_cli_start(EngineError::Container(
+                "preallocated persistent pipe custody unavailable".into(),
+            )))
+        }
     };
+    let mut child = spawn_child(cli, &mut cmd).map_err(before_cli_start)?;
     pipes.take_from(&mut child);
     let lifecycle = prepared
         .bind_started_child_with_resources(
@@ -1310,8 +1468,7 @@ pub(super) fn spawn_piped_interactive(
         ));
     }
 
-    let custody = lifecycle
-        .take_resources::<SpawnCustodyResources>()
+    let (bridge, resource_loan) = bridge_piped_resources(&lifecycle, io, bridge_cfg, true)
         .map_err(|source| {
             after_cli_start(
                 &retention,
@@ -1323,16 +1480,6 @@ pub(super) fn spawn_piped_interactive(
                 LaunchRetentionReason::ChildStateUnknown,
             )
         })?;
-    #[cfg(test)]
-    let mut custody = custody;
-    #[cfg(test)]
-    let custody_witness = custody.custody_witness.take();
-    let (io_resources, leases, gate_cleanup, post_wait) = custody.into_execution_parts();
-    let SpawnIoResources::Piped(pipes) = io_resources else {
-        unreachable!("persistent piped lifecycle owns pipe resources")
-    };
-
-    let bridge = crate::engine::container::io_bridge::bridge_piped_io(io, pipes, bridge_cfg);
 
     // Persistent-piped (ACP) path: KEEP the stdin_injector alive (do NOT drop
     // it, unlike `spawn_piped`). Retaining the sender both enables
@@ -1348,16 +1495,7 @@ pub(super) fn spawn_piped_interactive(
         gated_enclosing: enclosing,
         launch_retention: instance.launch_retention.as_ref().map(Arc::downgrade),
         container_name: instance.name.0.clone(),
-        resources: Some(ExecutionResources {
-            post_wait,
-            pty_master: None,
-            stdin_injector: Some(bridge.stdin_injector),
-            attach_socket: None,
-            leases,
-            gate_cleanup,
-            #[cfg(test)]
-            _custody_witness: custody_witness,
-        }),
+        resource_loan: Some(resource_loan),
     };
     Ok(AgentExecution::new(
         handle,
@@ -1406,35 +1544,33 @@ pub(super) struct ContainerExecution {
     container_name: String,
     #[allow(dead_code)]
     launch_retention: Option<Weak<LaunchRetentionRegistry>>,
-    resources: Option<ExecutionResources>,
+    resource_loan: Option<ExecutionResourceLoan>,
 }
 
 impl Drop for ContainerExecution {
     fn drop(&mut self) {
-        let Some(resources) = self.resources.take() else {
-            return;
-        };
-        if matches!(self.lifecycle.state(), Ok(ChildLifecycleState::Exited(_))) {
-            drop(resources);
-        } else {
-            self.lifecycle.retain_resources(resources);
-        }
+        drop(self.resource_loan.take());
     }
 }
 
 impl ExecutionBackend for ContainerExecution {
     fn wait_blocking(mut self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
         let info = self.lifecycle.wait_actual()?;
-        drop(self.resources.take());
+        if let Some(resource_loan) = self.resource_loan.take() {
+            resource_loan.release_and_wait();
+        }
         Ok(info)
     }
 
     fn try_inject_stdin(&self, bytes: &[u8]) -> Result<bool, EngineError> {
-        if let Some(tx) = self
-            .resources
-            .as_ref()
-            .and_then(|resources| resources.stdin_injector.as_ref())
-        {
+        let tx = self
+            .lifecycle
+            .with_execution_resources::<LifecycleResources, _>(|resources| {
+                resources
+                    .execution()
+                    .and_then(|resources| resources.stdin_injector.clone())
+            })?;
+        if let Some(tx) = tx {
             tx.send(bytes.to_vec())
                 .map_err(|e| EngineError::Container(format!("inject stdin: {e}")))?;
             return Ok(true);

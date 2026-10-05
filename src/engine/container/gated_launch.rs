@@ -6,9 +6,9 @@ mod retention;
 
 #[allow(unused_imports)]
 pub(crate) use child_lifecycle::{
-    BindStartedChildError, ChildLifecycleAuthority, ChildLifecycleSlot, ChildLifecycleState,
-    PreparedChildLifecycle, RetainedExecution, SpawnStageError, SpawnedCreateCli,
-    UnboundStartedCli,
+    retain_detached_after_error, BindStartedChildError, ChildLifecycleAuthority,
+    ChildLifecycleSlot, ChildLifecycleState, ExecutionResourceLoan, PreparedChildLifecycle,
+    RetainedExecution, SpawnStageError, SpawnedCreateCli, UnboundStartedCli,
 };
 #[allow(unused_imports)]
 pub(crate) use retention::{

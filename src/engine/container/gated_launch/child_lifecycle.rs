@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -53,8 +53,6 @@ struct LifecycleState {
     #[cfg(test)]
     bound_pid: Option<u32>,
     #[cfg(test)]
-    resources_present: bool,
-    #[cfg(test)]
     terminate_calls: usize,
     #[cfg(test)]
     terminate_commands: usize,
@@ -62,10 +60,6 @@ struct LifecycleState {
     terminate_enqueued: usize,
     #[cfg(test)]
     barrier_commands: usize,
-    #[cfg(test)]
-    resource_retain_calls: usize,
-    #[cfg(test)]
-    resource_handoffs_in_flight: usize,
     #[cfg(test)]
     actor_finished: bool,
     #[cfg(test)]
@@ -79,25 +73,72 @@ struct LifecycleShared {
     changed: Condvar,
     actor_thread: Mutex<Option<std::thread::ThreadId>>,
     signal_authorized: AtomicBool,
+    custody: Arc<ResourceCustody>,
 }
 
+struct ResourceCustody {
+    slot: Mutex<Option<Box<dyn Any + Send>>>,
+    actual_reaped: AtomicBool,
+    loan_issued: AtomicBool,
+    loan_released: AtomicBool,
+    actor_finished: AtomicBool,
+    may_have_child: AtomicBool,
+    bind_decided: AtomicBool,
+    resources_present: AtomicBool,
+    raw_job: OnceLock<Mutex<RawCustodyJob>>,
+    raw_ready: AtomicBool,
+    raw_had_resources: AtomicBool,
+    raw_kill_requested: AtomicBool,
+    raw_kill_issued: AtomicBool,
+    raw_outcome: AtomicU8,
+    raw_pid: AtomicU32,
+    raw_pid_present: AtomicBool,
+    raw_errno: AtomicI32,
+    raw_errno_present: AtomicBool,
+    raw_attempts: AtomicUsize,
+    raw_pending: AtomicUsize,
+    raw_errors: AtomicUsize,
+    raw_reaped: AtomicUsize,
+    changed: Condvar,
+    changed_state: Mutex<()>,
+    #[cfg(test)]
+    resource_retain_calls: AtomicUsize,
+    #[cfg(test)]
+    resource_handoffs_in_flight: AtomicUsize,
+}
+
+struct RawCustodyJob {
+    child: UnboundStartedCliOwner,
+    resources: Option<Box<dyn Any + Send>>,
+}
+
+struct UnboundStartedCliOwner {
+    child: SpawnedCreateCli,
+    started_at: DateTime<Utc>,
+}
+
+// `raw_job` has one unique producer (`RawHandoffPermit`) and one consumer
+// (the prelaunch custody worker). The non-clonable permit is created beside a
+// fresh OnceLock before launch, so its sole get_or_init closure necessarily
+// installs the complete job without allocation. The producer publishes
+// `raw_ready` only afterward; the worker calls get only after an Acquire
+// load and is the sole locker/mutator for the rest of the job's lifetime.
+
+const RAW_PENDING: u8 = 0;
+const RAW_REAPED: u8 = 1;
+const RAW_UNKNOWN: u8 = 2;
+
 enum ActorCommand {
-    Bind {
-        child: SpawnedCreateCli,
-        started_at: DateTime<Utc>,
-        resources: Box<dyn Any + Send>,
-    },
     Terminate {
         result: mpsc::SyncSender<TerminateResult>,
     },
-    TakeResources {
-        result: mpsc::SyncSender<Option<Box<dyn Any + Send>>>,
-    },
-    RetainResources(Box<dyn Any + Send>),
     #[cfg(test)]
-    Barrier {
-        observed: mpsc::SyncSender<()>,
-    },
+    Barrier { observed: mpsc::SyncSender<()> },
+}
+
+struct BindCommand {
+    child: SpawnedCreateCli,
+    started_at: DateTime<Utc>,
 }
 
 enum TerminateResult {
@@ -106,10 +147,68 @@ enum TerminateResult {
     StateUnknown,
 }
 
-#[derive(Clone)]
+pub(super) enum TerminateRequestOutcome {
+    Exited(AgentExitInfo),
+    AcceptedPending(EngineError),
+    NotAccepted(EngineError),
+}
+
 pub(crate) struct ChildLifecycleAuthority {
     commands: mpsc::SyncSender<ActorCommand>,
     shared: Arc<LifecycleShared>,
+}
+
+impl Clone for ChildLifecycleAuthority {
+    fn clone(&self) -> Self {
+        Self {
+            commands: self.commands.clone(),
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+pub(crate) struct ExecutionResourceLoan {
+    custody: Arc<ResourceCustody>,
+    released: bool,
+}
+
+impl Drop for ExecutionResourceLoan {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl ExecutionResourceLoan {
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        #[cfg(test)]
+        {
+            self.custody
+                .resource_retain_calls
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        self.custody.loan_released.store(true, Ordering::Release);
+        self.custody.changed.notify_all();
+    }
+
+    pub(in crate::engine::container) fn release_and_wait(mut self) {
+        self.release();
+        let mut changed = self
+            .custody
+            .changed_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while self.custody.resources_present.load(Ordering::Acquire) {
+            changed = self
+                .custody
+                .changed
+                .wait(changed)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
 }
 
 impl fmt::Debug for ChildLifecycleAuthority {
@@ -120,6 +219,7 @@ impl fmt::Debug for ChildLifecycleAuthority {
 
 pub(crate) struct PreparedChildLifecycle {
     authority: ChildLifecycleAuthority,
+    bind: mpsc::SyncSender<BindCommand>,
     #[cfg(test)]
     bind_fault: Option<test_support::PrepareFault>,
 }
@@ -130,17 +230,51 @@ impl fmt::Debug for PreparedChildLifecycle {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct UnboundStartedCli {
     pub(crate) child: SpawnedCreateCli,
     // Retained with raw-child custody for exact future lifecycle accounting.
     #[allow(dead_code)]
     pub(crate) started_at: DateTime<Utc>,
+    raw_permit: RawHandoffPermit,
+}
+
+impl fmt::Debug for UnboundStartedCli {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnboundStartedCli")
+            .field("child", &self.child)
+            .field("started_at", &self.started_at)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct RawCustodyCapability {
+    custody: Arc<ResourceCustody>,
+}
+
+struct RawHandoffPermit {
+    custody: Arc<ResourceCustody>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct RawCustodySnapshot {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub pid: Option<u32>,
+    pub outcome: RawCustodyOutcome,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub resources_present: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum RawCustodyOutcome {
+    Pending,
+    Reaped,
+    UnknownError { errno: Option<i32> },
 }
 
 pub(crate) struct BindStartedChildError {
     unbound: UnboundStartedCli,
-    resources: Box<dyn Any + Send>,
+    resources: Option<Box<dyn Any + Send>>,
 }
 
 impl fmt::Debug for BindStartedChildError {
@@ -150,16 +284,13 @@ impl fmt::Debug for BindStartedChildError {
 }
 
 impl BindStartedChildError {
-    // Packet 1 compatibility accessor; production retains the resource bundle too.
-    #[allow(dead_code)]
-    pub(crate) fn into_unbound(self) -> UnboundStartedCli {
-        self.unbound
-    }
-
     pub(in crate::engine::container) fn into_retained(self) -> RetainedExecution {
-        RetainedExecution::OwnedUnbound {
-            child: self.unbound,
-            resources: self.resources,
+        match self.resources {
+            Some(resources) => RetainedExecution::OwnedUnbound {
+                child: self.unbound,
+                resources,
+            },
+            None => RetainedExecution::Unbound(self.unbound),
         }
     }
 }
@@ -213,6 +344,98 @@ impl fmt::Debug for SpawnStageError {
                 .field("owned", &"[redacted custody]")
                 .finish(),
         }
+    }
+}
+
+pub(crate) fn retain_detached_after_error(owned: RetainedExecution) {
+    match owned {
+        RetainedExecution::Managed {
+            execution,
+            lifecycle,
+        } => {
+            drop(execution);
+            drop(lifecycle);
+        }
+        RetainedExecution::Unbound(child) => {
+            child.handoff_raw(None).request_kill();
+        }
+        RetainedExecution::OwnedUnbound { child, resources } => {
+            child.handoff_raw(Some(resources)).request_kill();
+        }
+    }
+}
+
+impl UnboundStartedCli {
+    pub(super) fn handoff_raw(
+        self,
+        resources: Option<Box<dyn Any + Send>>,
+    ) -> RawCustodyCapability {
+        let Self {
+            child,
+            started_at,
+            raw_permit,
+        } = self;
+        let custody = raw_permit.custody;
+        let had_resources = resources.is_some();
+        let job = RawCustodyJob {
+            child: UnboundStartedCliOwner { child, started_at },
+            resources,
+        };
+        custody.raw_job.get_or_init(|| Mutex::new(job));
+        custody
+            .resources_present
+            .store(had_resources, Ordering::Release);
+        custody
+            .raw_had_resources
+            .store(had_resources, Ordering::Release);
+        custody.raw_ready.store(true, Ordering::Release);
+        custody.changed.notify_all();
+        RawCustodyCapability { custody }
+    }
+}
+
+impl RawCustodyCapability {
+    pub(super) fn request_kill(&self) -> bool {
+        let first = !self.custody.raw_kill_requested.swap(true, Ordering::AcqRel);
+        self.custody.changed.notify_all();
+        first
+    }
+
+    pub(super) fn snapshot(&self) -> RawCustodySnapshot {
+        let outcome = match self.custody.raw_outcome.load(Ordering::Acquire) {
+            RAW_REAPED => RawCustodyOutcome::Reaped,
+            RAW_UNKNOWN => RawCustodyOutcome::UnknownError {
+                errno: self
+                    .custody
+                    .raw_errno_present
+                    .load(Ordering::Acquire)
+                    .then(|| self.custody.raw_errno.load(Ordering::Acquire)),
+            },
+            _ => RawCustodyOutcome::Pending,
+        };
+        RawCustodySnapshot {
+            pid: self
+                .custody
+                .raw_pid_present
+                .load(Ordering::Acquire)
+                .then(|| self.custody.raw_pid.load(Ordering::Acquire)),
+            outcome,
+            // Preserve the frozen registry-observation meaning: whether the
+            // handed-off unbound value carried a resource bundle. Lifecycle
+            // cleanup uses `ResourceCustody::resources_present`, which flips
+            // only after that bundle is actually dropped.
+            resources_present: self.custody.raw_had_resources.load(Ordering::Acquire),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn counters(&self) -> (usize, usize, usize, usize) {
+        (
+            self.custody.raw_attempts.load(Ordering::Acquire),
+            self.custody.raw_pending.load(Ordering::Acquire),
+            self.custody.raw_errors.load(Ordering::Acquire),
+            self.custody.raw_reaped.load(Ordering::Acquire),
+        )
     }
 }
 
@@ -274,89 +497,151 @@ impl ChildLifecycleAuthority {
         &self,
         deadline: Instant,
     ) -> Result<AgentExitInfo, EngineError> {
+        match self.request_terminate_local_cli(deadline) {
+            TerminateRequestOutcome::Exited(info) => Ok(info),
+            TerminateRequestOutcome::AcceptedPending(error)
+            | TerminateRequestOutcome::NotAccepted(error) => Err(error),
+        }
+    }
+
+    pub(super) fn request_terminate_local_cli(&self, deadline: Instant) -> TerminateRequestOutcome {
         #[cfg(test)]
         record_terminate_call(&self.shared);
         if Instant::now() >= deadline {
-            return Err(EngineError::Container(
+            return TerminateRequestOutcome::NotAccepted(EngineError::Container(
                 "create CLI deadline exceeded".into(),
             ));
         }
-        match self.state()? {
-            ChildLifecycleState::Exited(info) => return Ok(info),
-            ChildLifecycleState::Failed | ChildLifecycleState::Prepared => {
-                return Err(state_unknown());
+        match self.state() {
+            Ok(ChildLifecycleState::Exited(info)) => {
+                return TerminateRequestOutcome::Exited(info);
             }
-            ChildLifecycleState::Running => {}
+            Ok(ChildLifecycleState::Running) => {}
+            Ok(ChildLifecycleState::Failed | ChildLifecycleState::Prepared) | Err(_) => {
+                return TerminateRequestOutcome::NotAccepted(state_unknown());
+            }
         }
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         if Instant::now() >= deadline {
-            return Err(EngineError::Container(
+            return TerminateRequestOutcome::NotAccepted(EngineError::Container(
                 "create CLI deadline exceeded".into(),
             ));
         }
-        self.commands
+        if let Err(error) = self
+            .commands
             .try_send(ActorCommand::Terminate { result: result_tx })
-            .map_err(|error| match error {
+        {
+            return TerminateRequestOutcome::NotAccepted(match error {
                 mpsc::TrySendError::Full(_) => {
                     EngineError::Container("create CLI deadline exceeded".into())
                 }
                 mpsc::TrySendError::Disconnected(_) => state_unknown(),
-            })?;
+            });
+        }
         #[cfg(test)]
         record_terminate_enqueued(&self.shared);
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            return Err(EngineError::Container(
+            return TerminateRequestOutcome::AcceptedPending(EngineError::Container(
                 "create CLI deadline exceeded".into(),
             ));
         };
         match result_rx.recv_timeout(remaining) {
             Ok(TerminateResult::Accepted) => {}
             Ok(TerminateResult::Failed) => {
-                return Err(EngineError::Container(
+                return TerminateRequestOutcome::AcceptedPending(EngineError::Container(
                     "create CLI termination failed".into(),
                 ));
             }
-            Ok(TerminateResult::StateUnknown) => return Err(state_unknown()),
+            Ok(TerminateResult::StateUnknown) => {
+                return TerminateRequestOutcome::AcceptedPending(state_unknown());
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                return Err(EngineError::Container(
+                return TerminateRequestOutcome::AcceptedPending(EngineError::Container(
                     "create CLI deadline exceeded".into(),
                 ));
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(state_unknown()),
-        }
-        match self.wait_actual_until(deadline)? {
-            Some(info) => Ok(info),
-            None => Err(EngineError::Container(
-                "create CLI deadline exceeded".into(),
-            )),
-        }
-    }
-
-    pub(in crate::engine::container) fn take_resources<T: Any + Send>(
-        &self,
-    ) -> Result<T, EngineError> {
-        let (result_tx, result_rx) = mpsc::sync_channel(1);
-        self.commands
-            .send(ActorCommand::TakeResources { result: result_tx })
-            .map_err(|_| state_unknown())?;
-        let resources = result_rx.recv().map_err(|_| state_unknown())?;
-        match resources.ok_or_else(state_unknown)?.downcast::<T>() {
-            Ok(resources) => Ok(*resources),
-            Err(resources) => {
-                std::mem::forget(resources);
-                Err(state_unknown())
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return TerminateRequestOutcome::AcceptedPending(state_unknown());
             }
         }
+        match self.wait_actual_until(deadline) {
+            Ok(Some(info)) => TerminateRequestOutcome::Exited(info),
+            Ok(None) => TerminateRequestOutcome::AcceptedPending(EngineError::Container(
+                "create CLI deadline exceeded".into(),
+            )),
+            Err(error) => TerminateRequestOutcome::AcceptedPending(error),
+        }
     }
 
-    pub(in crate::engine::container) fn retain_resources<T: Any + Send>(&self, resources: T) {
-        #[cfg(test)]
-        record_resource_retain_started(&self.shared);
-        let resources: Box<dyn Any + Send> = Box::new(resources);
-        match self.commands.send(ActorCommand::RetainResources(resources)) {
-            Ok(()) => {}
-            Err(error) => std::mem::forget(error.0),
+    pub(in crate::engine::container) fn transform_resources<T, R>(
+        &self,
+        transform: impl FnOnce(&mut T) -> Result<R, EngineError>,
+    ) -> Result<(R, ExecutionResourceLoan), EngineError>
+    where
+        T: Any + Send,
+    {
+        let mut slot = try_lock_resource_slot(&self.shared.custody)?;
+        if self.shared.custody.loan_issued.load(Ordering::Acquire) {
+            return Err(state_unknown());
         }
+        let resources = slot
+            .as_mut()
+            .and_then(|resources| resources.downcast_mut::<T>())
+            .ok_or_else(state_unknown)?;
+        let result = transform(resources)?;
+        // The slot guard serializes every transformation. Publish the unique
+        // execution loan only after the transformation succeeds, so lock
+        // contention, a type mismatch, or a typed transform failure leaves
+        // the still-owned bundle eligible for the retained cleanup path.
+        self.shared
+            .custody
+            .loan_issued
+            .store(true, Ordering::Release);
+        Ok((
+            result,
+            ExecutionResourceLoan {
+                custody: Arc::clone(&self.shared.custody),
+                released: false,
+            },
+        ))
+    }
+
+    pub(in crate::engine::container) fn with_execution_resources<T, R>(
+        &self,
+        access: impl FnOnce(&T) -> R,
+    ) -> Result<R, EngineError>
+    where
+        T: Any + Send,
+    {
+        let slot = try_lock_resource_slot(&self.shared.custody)?;
+        let resources = slot
+            .as_ref()
+            .and_then(|resources| resources.downcast_ref::<T>())
+            .ok_or_else(state_unknown)?;
+        Ok(access(resources))
+    }
+
+    pub(in crate::engine::container) fn resources_are_released(&self) -> bool {
+        !self
+            .shared
+            .custody
+            .resources_present
+            .load(Ordering::Acquire)
+    }
+
+    pub(super) fn execution_loan_was_issued(&self) -> bool {
+        self.shared.custody.loan_issued.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for PreparedChildLifecycle {
+    fn drop(&mut self) {
+        self.authority
+            .shared
+            .custody
+            .bind_decided
+            .store(true, Ordering::Release);
+        self.authority.shared.custody.changed.notify_all();
     }
 }
 
@@ -377,6 +662,40 @@ impl PreparedChildLifecycle {
         started_at: DateTime<Utc>,
         resources: Box<dyn Any + Send>,
     ) -> Result<ChildLifecycleAuthority, BindStartedChildError> {
+        let authority = self.authority.clone();
+        let custody = &authority.shared.custody;
+        custody.may_have_child.store(true, Ordering::Release);
+        let mut slot = match try_lock_resource_slot(custody) {
+            Ok(slot) => slot,
+            Err(_) => {
+                return Err(BindStartedChildError {
+                    unbound: UnboundStartedCli {
+                        child,
+                        started_at,
+                        raw_permit: RawHandoffPermit {
+                            custody: Arc::clone(custody),
+                        },
+                    },
+                    resources: Some(resources),
+                });
+            }
+        };
+        if slot.is_some() {
+            return Err(BindStartedChildError {
+                unbound: UnboundStartedCli {
+                    child,
+                    started_at,
+                    raw_permit: RawHandoffPermit {
+                        custody: Arc::clone(custody),
+                    },
+                },
+                resources: Some(resources),
+            });
+        }
+        *slot = Some(resources);
+        custody.resources_present.store(true, Ordering::Release);
+        custody.changed.notify_all();
+
         #[cfg(test)]
         if matches!(
             self.bind_fault,
@@ -384,35 +703,42 @@ impl PreparedChildLifecycle {
                 test_support::PrepareFault::BindDisconnected | test_support::PrepareFault::BindFull
             )
         ) {
+            let resources = slot.take();
+            custody.resources_present.store(false, Ordering::Release);
             return Err(BindStartedChildError {
-                unbound: UnboundStartedCli { child, started_at },
+                unbound: UnboundStartedCli {
+                    child,
+                    started_at,
+                    raw_permit: RawHandoffPermit {
+                        custody: Arc::clone(custody),
+                    },
+                },
                 resources,
             });
         }
-        self.authority
-            .commands
-            .try_send(ActorCommand::Bind {
-                child,
-                started_at,
-                resources,
-            })
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(ActorCommand::Bind {
-                    child,
-                    started_at,
+        match self.bind.try_send(BindCommand { child, started_at }) {
+            Ok(()) => {
+                drop(slot);
+                Ok(authority)
+            }
+            Err(
+                mpsc::TrySendError::Full(BindCommand { child, started_at })
+                | mpsc::TrySendError::Disconnected(BindCommand { child, started_at }),
+            ) => {
+                let resources = slot.take();
+                custody.resources_present.store(false, Ordering::Release);
+                Err(BindStartedChildError {
+                    unbound: UnboundStartedCli {
+                        child,
+                        started_at,
+                        raw_permit: RawHandoffPermit {
+                            custody: Arc::clone(custody),
+                        },
+                    },
                     resources,
                 })
-                | mpsc::TrySendError::Disconnected(ActorCommand::Bind {
-                    child,
-                    started_at,
-                    resources,
-                }) => BindStartedChildError {
-                    unbound: UnboundStartedCli { child, started_at },
-                    resources,
-                },
-                _ => unreachable!("bind sends only a bind command"),
-            })?;
-        Ok(self.authority)
+            }
+        }
     }
 }
 
@@ -447,6 +773,43 @@ fn prepare_inner(
         ));
     }
     let (commands, receiver) = mpsc::sync_channel(1);
+    let (bind, bind_receiver) = mpsc::sync_channel(1);
+    let custody = Arc::new(ResourceCustody {
+        slot: Mutex::new(None),
+        actual_reaped: AtomicBool::new(false),
+        loan_issued: AtomicBool::new(false),
+        loan_released: AtomicBool::new(false),
+        actor_finished: AtomicBool::new(false),
+        may_have_child: AtomicBool::new(false),
+        bind_decided: AtomicBool::new(false),
+        resources_present: AtomicBool::new(false),
+        raw_job: OnceLock::new(),
+        raw_ready: AtomicBool::new(false),
+        raw_had_resources: AtomicBool::new(false),
+        raw_kill_requested: AtomicBool::new(false),
+        raw_kill_issued: AtomicBool::new(false),
+        raw_outcome: AtomicU8::new(RAW_PENDING),
+        raw_pid: AtomicU32::new(0),
+        raw_pid_present: AtomicBool::new(false),
+        raw_errno: AtomicI32::new(0),
+        raw_errno_present: AtomicBool::new(false),
+        raw_attempts: AtomicUsize::new(0),
+        raw_pending: AtomicUsize::new(0),
+        raw_errors: AtomicUsize::new(0),
+        raw_reaped: AtomicUsize::new(0),
+        changed: Condvar::new(),
+        changed_state: Mutex::new(()),
+        #[cfg(test)]
+        resource_retain_calls: AtomicUsize::new(0),
+        #[cfg(test)]
+        resource_handoffs_in_flight: AtomicUsize::new(0),
+    });
+    let worker_custody = Arc::clone(&custody);
+    let custody_worker = std::thread::Builder::new()
+        .name("awman-create-cli-resources".into())
+        .spawn(move || resource_custody_loop(worker_custody))
+        .map_err(|_| EngineError::Container("create CLI resource custody unavailable".into()))?;
+    drop(custody_worker);
     let shared = Arc::new(LifecycleShared {
         state: Mutex::new(LifecycleState {
             state: ChildLifecycleState::Prepared,
@@ -465,8 +828,6 @@ fn prepare_inner(
             #[cfg(test)]
             bound_pid: None,
             #[cfg(test)]
-            resources_present: false,
-            #[cfg(test)]
             terminate_calls: 0,
             #[cfg(test)]
             terminate_commands: 0,
@@ -474,10 +835,6 @@ fn prepare_inner(
             terminate_enqueued: 0,
             #[cfg(test)]
             barrier_commands: 0,
-            #[cfg(test)]
-            resource_retain_calls: 0,
-            #[cfg(test)]
-            resource_handoffs_in_flight: 0,
             #[cfg(test)]
             actor_finished: false,
             #[cfg(test)]
@@ -492,12 +849,22 @@ fn prepare_inner(
         changed: Condvar::new(),
         actor_thread: Mutex::new(None),
         signal_authorized: AtomicBool::new(true),
+        custody: Arc::clone(&custody),
     });
     let actor_shared = Arc::clone(&shared);
-    let actor = std::thread::Builder::new()
+    let actor = match std::thread::Builder::new()
         .name("awman-create-cli".into())
-        .spawn(move || actor_loop(receiver, actor_shared))
-        .map_err(|_| EngineError::Container("create CLI actor unavailable".into()))?;
+        .spawn(move || actor_loop(bind_receiver, receiver, actor_shared))
+    {
+        Ok(actor) => actor,
+        Err(_) => {
+            custody.bind_decided.store(true, Ordering::Release);
+            custody.changed.notify_all();
+            return Err(EngineError::Container(
+                "create CLI actor unavailable".into(),
+            ));
+        }
+    };
     *shared
         .actor_thread
         .lock()
@@ -505,22 +872,38 @@ fn prepare_inner(
     drop(actor);
     Ok(PreparedChildLifecycle {
         authority: ChildLifecycleAuthority { commands, shared },
+        bind,
         #[cfg(test)]
         bind_fault: fault,
     })
 }
 
-fn actor_loop(receiver: mpsc::Receiver<ActorCommand>, shared: Arc<LifecycleShared>) {
+fn actor_loop(
+    bind_receiver: mpsc::Receiver<BindCommand>,
+    receiver: mpsc::Receiver<ActorCommand>,
+    shared: Arc<LifecycleShared>,
+) {
     if let Ok(mut actor_thread) = shared.actor_thread.lock() {
         *actor_thread = Some(std::thread::current().id());
     }
-    let mut child: Option<SpawnedCreateCli> = None;
-    let mut started_at = None;
+    #[cfg(test)]
+    pause_before_command(&shared);
+    let BindCommand {
+        child: bound,
+        started_at,
+    } = match bind_receiver.recv() {
+        Ok(bound) => bound,
+        Err(_) => {
+            record_actor_finished(&shared);
+            return;
+        }
+    };
+    #[cfg(test)]
+    record_bound_custody(&shared, process_id(&bound), true);
+    let mut child = Some(bound);
+    update_state(&shared, ChildLifecycleState::Running, true);
     let mut disconnected = false;
-    let mut resources: Option<Box<dyn Any + Send>> = None;
     loop {
-        #[cfg(test)]
-        pause_before_command(&shared);
         let command = if disconnected {
             std::thread::sleep(ACTOR_POLL_INTERVAL);
             Err(mpsc::RecvTimeoutError::Disconnected)
@@ -528,25 +911,13 @@ fn actor_loop(receiver: mpsc::Receiver<ActorCommand>, shared: Arc<LifecycleShare
             receiver.recv_timeout(ACTOR_POLL_INTERVAL)
         };
         match command {
-            Ok(ActorCommand::Bind {
-                child: bound,
-                started_at: started,
-                resources: owned,
-            }) => {
-                #[cfg(test)]
-                record_bound_custody(&shared, process_id(&bound), true);
-                child = Some(bound);
-                started_at = Some(started);
-                resources = Some(owned);
-                update_state(&shared, ChildLifecycleState::Running, true);
-            }
             Ok(ActorCommand::Terminate { result }) => {
                 #[cfg(test)]
                 record_terminate_command(&shared);
                 if shared.signal_authorized.load(Ordering::Acquire) {
                     if let Some(owned) = child.as_mut() {
                         if native_kill(owned).is_err() {
-                            let poll = native_try_wait(owned, started_at);
+                            let poll = native_try_wait(owned, Some(started_at));
                             #[cfg(test)]
                             record_native_poll(&shared, &poll);
                             match poll {
@@ -574,23 +945,6 @@ fn actor_loop(receiver: mpsc::Receiver<ActorCommand>, shared: Arc<LifecycleShare
                     let _ = result.try_send(TerminateResult::StateUnknown);
                 }
             }
-            Ok(ActorCommand::TakeResources { result }) => {
-                let _ = result.try_send(resources.take());
-                #[cfg(test)]
-                record_resources_present(&shared, resources.is_some());
-            }
-            Ok(ActorCommand::RetainResources(owned)) => {
-                if resources.is_some() {
-                    std::mem::forget(owned);
-                } else {
-                    resources = Some(owned);
-                }
-                #[cfg(test)]
-                {
-                    record_resource_handoff_finished(&shared);
-                    record_resources_present(&shared, resources.is_some());
-                }
-            }
             #[cfg(test)]
             Ok(ActorCommand::Barrier { observed }) => {
                 record_barrier_command(&shared);
@@ -607,7 +961,10 @@ fn actor_loop(receiver: mpsc::Receiver<ActorCommand>, shared: Arc<LifecycleShare
         }
         #[cfg(test)]
         pause_before_poll(&shared);
-        let result = native_try_wait(child.as_mut().expect("checked"), started_at);
+        let Some(owned_child) = child.as_mut() else {
+            continue;
+        };
+        let result = native_try_wait(owned_child, Some(started_at));
         #[cfg(test)]
         record_native_poll(&shared, &result);
         match result {
@@ -625,10 +982,107 @@ fn actor_loop(receiver: mpsc::Receiver<ActorCommand>, shared: Arc<LifecycleShare
             }
         }
     }
-    #[cfg(test)]
-    {
-        drop(resources.take());
-        record_actor_finished(&shared);
+    record_actor_finished(&shared);
+}
+
+fn resource_custody_loop(custody: Arc<ResourceCustody>) {
+    let mut changed = custody
+        .changed_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    loop {
+        if custody.raw_ready.load(Ordering::Acquire) {
+            if !custody.raw_kill_requested.load(Ordering::Acquire) {
+                let (next, _) = custody
+                    .changed
+                    .wait_timeout(changed, ACTOR_POLL_INTERVAL)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                changed = next;
+                continue;
+            }
+            // `raw_ready` was acquired above. The unique permit completed the
+            // OnceLock initialization before its Release publication, and this
+            // worker is the only locker/mutator for the job's lifetime.
+            let Some(job_slot) = custody.raw_job.get() else {
+                custody.raw_errno_present.store(false, Ordering::Release);
+                custody.raw_outcome.store(RAW_UNKNOWN, Ordering::Release);
+                custody.changed.notify_all();
+                let (next, _) = custody
+                    .changed
+                    .wait_timeout(changed, ACTOR_POLL_INTERVAL)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                changed = next;
+                continue;
+            };
+            let mut job = job_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let pid = process_id(&job.child.child);
+            if let Some(pid) = pid {
+                custody.raw_pid.store(pid, Ordering::Release);
+                custody.raw_pid_present.store(true, Ordering::Release);
+            }
+            if custody.raw_kill_requested.load(Ordering::Acquire)
+                && !custody.raw_kill_issued.swap(true, Ordering::AcqRel)
+            {
+                let _ = native_kill(&mut job.child.child);
+            }
+            let started_at = job.child.started_at;
+            let poll = native_try_wait(&mut job.child.child, Some(started_at));
+            custody.raw_attempts.fetch_add(1, Ordering::AcqRel);
+            match poll {
+                Ok(Some(_)) => {
+                    custody.raw_reaped.fetch_add(1, Ordering::AcqRel);
+                    custody.raw_errno_present.store(false, Ordering::Release);
+                    let resources = job.resources.take();
+                    drop(resources);
+                    custody.resources_present.store(false, Ordering::Release);
+                    custody.raw_outcome.store(RAW_REAPED, Ordering::Release);
+                    custody.changed.notify_all();
+                    return;
+                }
+                Ok(None) => {
+                    custody.raw_pending.fetch_add(1, Ordering::AcqRel);
+                    custody.raw_errno_present.store(false, Ordering::Release);
+                    custody.raw_outcome.store(RAW_PENDING, Ordering::Release);
+                }
+                Err(error) => {
+                    custody.raw_errors.fetch_add(1, Ordering::AcqRel);
+                    if let Some(errno) = error.errno {
+                        custody.raw_errno.store(errno, Ordering::Release);
+                        custody.raw_errno_present.store(true, Ordering::Release);
+                    } else {
+                        custody.raw_errno_present.store(false, Ordering::Release);
+                    }
+                    custody.raw_outcome.store(RAW_UNKNOWN, Ordering::Release);
+                }
+            }
+        }
+        let execution_cleanup_ready = if custody.loan_issued.load(Ordering::Acquire) {
+            custody.loan_released.load(Ordering::Acquire)
+        } else {
+            custody.actor_finished.load(Ordering::Acquire)
+        };
+        if custody.actual_reaped.load(Ordering::Acquire) && execution_cleanup_ready {
+            if let Ok(mut slot) = try_lock_resource_slot(&custody) {
+                let resources = slot.take();
+                drop(slot);
+                drop(resources);
+                custody.resources_present.store(false, Ordering::Release);
+                custody.changed.notify_all();
+                return;
+            }
+        }
+        if custody.bind_decided.load(Ordering::Acquire)
+            && !custody.may_have_child.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let (next, _) = custody
+            .changed
+            .wait_timeout(changed, ACTOR_POLL_INTERVAL)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        changed = next;
     }
 }
 
@@ -638,7 +1092,6 @@ struct NativePollError {
     errno: Option<i32>,
 }
 
-#[cfg(test)]
 fn process_id(child: &SpawnedCreateCli) -> Option<u32> {
     match child {
         SpawnedCreateCli::Pty(child) => child.process_id(),
@@ -719,12 +1172,10 @@ fn record_native_poll(
 fn record_bound_custody(shared: &LifecycleShared, pid: Option<u32>, resources_present: bool) {
     let mut guard = lock_state(shared);
     guard.bound_pid = pid;
-    guard.resources_present = resources_present;
-}
-
-#[cfg(test)]
-fn record_resources_present(shared: &LifecycleShared, resources_present: bool) {
-    lock_state(shared).resources_present = resources_present;
+    shared
+        .custody
+        .resources_present
+        .store(resources_present, Ordering::Release);
 }
 
 fn native_kill(child: &mut SpawnedCreateCli) -> Result<(), ()> {
@@ -737,11 +1188,15 @@ fn native_kill(child: &mut SpawnedCreateCli) -> Result<(), ()> {
 }
 
 fn publish_exit(shared: &LifecycleShared, info: AgentExitInfo) {
-    let mut guard = lock_state(shared);
-    guard.native_reaps += 1;
-    guard.owns_unreaped_child = false;
-    guard.state = ChildLifecycleState::Exited(info);
+    {
+        let mut guard = lock_state(shared);
+        guard.native_reaps += 1;
+        guard.owns_unreaped_child = false;
+        guard.state = ChildLifecycleState::Exited(info);
+    }
+    shared.custody.actual_reaped.store(true, Ordering::Release);
     shared.changed.notify_all();
+    shared.custody.changed.notify_all();
 }
 
 fn update_state(shared: &LifecycleShared, state: ChildLifecycleState, owns: bool) {
@@ -768,6 +1223,16 @@ fn lock_state(shared: &LifecycleShared) -> std::sync::MutexGuard<'_, LifecycleSt
             shared.changed.notify_all();
             guard
         }
+    }
+}
+
+fn try_lock_resource_slot(
+    custody: &ResourceCustody,
+) -> Result<std::sync::MutexGuard<'_, Option<Box<dyn Any + Send>>>, EngineError> {
+    match custody.slot.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => Err(state_unknown()),
     }
 }
 
@@ -834,19 +1299,6 @@ fn record_barrier_command(shared: &LifecycleShared) {
 }
 
 #[cfg(test)]
-fn record_resource_retain_started(shared: &LifecycleShared) {
-    let mut guard = lock_state(shared);
-    guard.resource_retain_calls = guard.resource_retain_calls.saturating_add(1);
-    guard.resource_handoffs_in_flight = guard.resource_handoffs_in_flight.saturating_add(1);
-}
-
-#[cfg(test)]
-fn record_resource_handoff_finished(shared: &LifecycleShared) {
-    let mut guard = lock_state(shared);
-    guard.resource_handoffs_in_flight = guard.resource_handoffs_in_flight.saturating_sub(1);
-}
-
-#[cfg(test)]
 fn new_pause_state() -> Arc<PollPauseState> {
     Arc::new(PollPauseState {
         flags: Mutex::new(PollPauseFlags {
@@ -864,12 +1316,15 @@ fn pause_before_command(shared: &LifecycleShared) {
     pause_on_request(pause);
 }
 
-#[cfg(test)]
 fn record_actor_finished(shared: &LifecycleShared) {
-    let mut guard = lock_state(shared);
-    guard.resources_present = false;
-    guard.actor_finished = true;
-    shared.changed.notify_all();
+    shared.custody.actor_finished.store(true, Ordering::Release);
+    shared.custody.changed.notify_all();
+    #[cfg(test)]
+    {
+        let mut guard = lock_state(shared);
+        guard.actor_finished = true;
+        shared.changed.notify_all();
+    }
 }
 
 #[cfg(test)]
@@ -1051,13 +1506,25 @@ pub(crate) mod test_support {
                 native_poll_reaped: guard.native_poll_reaped,
                 last_poll_errno: guard.last_poll_errno,
                 bound_pid: guard.bound_pid,
-                resources_present: guard.resources_present,
+                resources_present: self
+                    .shared
+                    .custody
+                    .resources_present
+                    .load(Ordering::Acquire),
                 terminate_calls: guard.terminate_calls,
                 terminate_commands: guard.terminate_commands,
                 terminate_enqueued: guard.terminate_enqueued,
                 barrier_commands: guard.barrier_commands,
-                resource_retain_calls: guard.resource_retain_calls,
-                resource_handoffs_in_flight: guard.resource_handoffs_in_flight,
+                resource_retain_calls: self
+                    .shared
+                    .custody
+                    .resource_retain_calls
+                    .load(Ordering::Acquire),
+                resource_handoffs_in_flight: self
+                    .shared
+                    .custody
+                    .resource_handoffs_in_flight
+                    .load(Ordering::Acquire),
                 actor_finished: guard.actor_finished,
             }
         }
