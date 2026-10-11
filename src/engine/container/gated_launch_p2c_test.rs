@@ -539,7 +539,6 @@ async fn all_three_real_spawn_functions_bind_once_and_publish_one_actual_exit(
             result,
             slot,
             mut stdout,
-            stderr: _,
             ..
         } = spawned;
         let mut execution = result.map_err(|_| "trusted fixture spawn failed")?;

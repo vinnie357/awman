@@ -97,7 +97,7 @@ impl SquadSlotDriver {
         }
 
         let mut running: Vec<_> = state.step_states.iter().collect();
-        running.sort_by(|(left, _), (right, _)| left.cmp(right));
+        running.sort_by_key(|(step_name, _)| *step_name);
         for (step_name, step_state) in running {
             let StepState::Running {
                 container_id: Some(container_id),

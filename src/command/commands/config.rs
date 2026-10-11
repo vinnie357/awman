@@ -141,15 +141,7 @@ fn field_scope(name: &str) -> Option<FieldScope> {
 /// this list is checked at config-write time so unsupported values are rejected
 /// before they reach the engine.
 const VALID_AGENT_VALUES: &[&str] = &[
-    "claude",
-    "codex",
-    "gemini",
-    "opencode",
-    "crush",
-    "cline",
-    "copilot",
-    "maki",
-    "antigravity",
+    "claude", "codex", "gemini", "opencode", "crush", "cline", "copilot", "maki", "agy",
 ];
 
 /// Validate and coerce a string value into the appropriate JSON type for the
@@ -194,6 +186,7 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
     }
     match field {
         "agent" | "default_agent" => {
+            let value = if value == "antigravity" { "agy" } else { value };
             if !VALID_AGENT_VALUES.contains(&value) {
                 return Err(format!(
                     "'{}' is not a known agent; valid agents: {}",

@@ -7,15 +7,7 @@ use crate::engine::error::EngineError;
 /// Supported agent names — derived from the legacy `Agent` enum in
 /// `oldsrc/cli.rs`.
 pub const SUPPORTED_AGENTS: &[&str] = &[
-    "claude",
-    "codex",
-    "opencode",
-    "maki",
-    "gemini",
-    "copilot",
-    "crush",
-    "cline",
-    "antigravity",
+    "claude", "codex", "opencode", "maki", "gemini", "copilot", "crush", "cline", "agy",
 ];
 
 /// How awman injects the combined context system prompt into an agent.
@@ -304,7 +296,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             system_prompt_flag: Some("--system"),
             sbx_kit_kind: SbxKitKind::Agent,
         },
-        "antigravity" => AgentMatrix {
+        "agy" | "antigravity" => AgentMatrix {
             // Verified against `agy --help` (v1.0.x). Flags actually accepted:
             //   --print / -p / --prompt           (non-interactive)
             //   --prompt-interactive / -i         (interactive seed)
@@ -319,7 +311,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             // Don't emit them; the binary just dumps `--help` and treats the
             // prompt as the agy executable name. Leaving plan/auto as `None`
             // keeps non-yolo modes a silent no-op (matches opencode/maki).
-            agent: "antigravity",
+            agent: "agy",
             interactive_entrypoint: vec!["agy"],
             non_interactive_flag: Some("--print"),
             plan_flag: None,
@@ -327,7 +319,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             auto_flag: None,
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
-            model_flag: ModelFlagDelivery::Unsupported,
+            model_flag: ModelFlagDelivery::SpaceArg,
             // agy accepts `--prompt-interactive`/`-i` for an interactive seed,
             // but awman has always seeded it positionally; keep that behavior
             // until the flag form is verified end-to-end.

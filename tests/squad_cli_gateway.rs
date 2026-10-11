@@ -971,7 +971,7 @@ fn newest_real_cli_deps_binary(top_level: &Path) -> Option<std::path::PathBuf> {
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         candidates.push((mtime, entry.path()));
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     candidates
         .into_iter()
         .map(|(_, path)| path)

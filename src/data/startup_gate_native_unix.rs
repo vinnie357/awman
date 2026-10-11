@@ -532,7 +532,14 @@ fn parse_launch_intent(
             return Err(invalid("invalid launch token"));
         }
         let mut decoded = Zeroizing::new([0u8; 32]);
-        for (index, pair) in intent.launch_token.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in intent
+            .launch_token
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+        {
             decoded[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
         }
         let mut hasher = Sha256::new();

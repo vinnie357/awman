@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use awman::data::fs::auth_paths::AuthPathResolver;
 use awman::data::message::{UserMessage, UserMessageSink};
@@ -511,13 +511,28 @@ fn integration_monitor_refreshes_near_expiry_and_advances_expiry() {
     let delivery = materialized_delivery(&home, staged.path());
     let monitor = monitor();
     let lease = monitor.register(&delivery, "awman-expiring");
-    let _outcome = tokio::runtime::Runtime::new()
+    let started = Instant::now();
+    let outcome = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(monitor.refresh_now(&AgentName::new("claude").unwrap(), Duration::from_secs(2)));
+    let elapsed = started.elapsed();
+    let outcome_variant = match &outcome {
+        RefreshOutcome::NotNeeded { .. } => "NotNeeded",
+        RefreshOutcome::Refreshed { .. } => "Refreshed",
+        RefreshOutcome::Stale { .. } => "Stale",
+        RefreshOutcome::Unavailable { .. } => "Unavailable",
+    };
     let refreshed = std::fs::read_to_string(&delivery.staged_path).unwrap();
-    assert!(refreshed.contains("fixture-access-token-refreshed"));
-    let status = monitor
-        .status()
+    let monitor_status = monitor.status();
+    let refresh_log_bytes =
+        std::fs::read(std::env::var_os("AWMAN_0107_REFRESH_LOG").expect("refresh log path"))
+            .unwrap_or_default()
+            .len();
+    assert!(
+        refreshed.contains("fixture-access-token-refreshed"),
+        "staged credential must contain refreshed fixture token: outcome={outcome_variant}, elapsed={elapsed:?}, monitor_status={monitor_status:?}, refresh_log_bytes={refresh_log_bytes}"
+    );
+    let status = monitor_status
         .into_iter()
         .find(|s| s.agent.as_str() == "claude")
         .unwrap();

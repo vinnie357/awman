@@ -124,7 +124,7 @@ impl Command for InitCommand {
         };
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
-            text: format!("init: configuring agent '{}'", &self.flags.agent),
+            text: format!("init: configuring agent '{}'", self.flags.agent),
         });
         let mut engine = InitEngine::new(
             std::sync::Arc::new(session),

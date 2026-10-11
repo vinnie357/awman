@@ -52,8 +52,15 @@ pub fn agent_keychain_credentials(agent: &AgentName) -> Vec<(String, String)> {
 /// File-form credentials for the agent. Empty when the platform has no
 /// keychain integration, the entry is missing, or the payload fails to decode.
 pub fn agent_keychain_files(agent: &AgentName) -> Vec<AgentSecretFile> {
+    agent_keychain_files_with(agent, antigravity_keychain_files)
+}
+
+fn agent_keychain_files_with(
+    agent: &AgentName,
+    antigravity_files: impl FnOnce() -> Vec<AgentSecretFile>,
+) -> Vec<AgentSecretFile> {
     match agent.as_str() {
-        "antigravity" => antigravity_keychain_files(),
+        "agy" | "antigravity" => antigravity_files(),
         _ => Vec::new(),
     }
 }
@@ -599,6 +606,41 @@ mod tests {
     fn agent_keychain_files_for_unknown_agent_is_empty() {
         let agent = AgentName::new("totallymadeup").unwrap();
         assert!(agent_keychain_files(&agent).is_empty());
+    }
+
+    #[test]
+    fn agy_and_legacy_alias_select_the_antigravity_keychain_file_provider() {
+        for input in ["agy", "antigravity"] {
+            let agent = AgentName::new(input).unwrap();
+            let calls = std::cell::Cell::new(0);
+            let expected = AgentSecretFile {
+                relative_path: PathBuf::from("antigravity-cli").join("antigravity-oauth-token"),
+                contents: b"fixture-only".to_vec(),
+                mode: 0o600,
+            };
+
+            let selected = agent_keychain_files_with(&agent, || {
+                calls.set(calls.get() + 1);
+                vec![expected.clone()]
+            });
+
+            assert_eq!(calls.get(), 1, "input {input} must select the provider");
+            assert_eq!(selected, vec![expected]);
+        }
+    }
+
+    #[test]
+    fn unknown_agent_does_not_read_the_antigravity_keychain_file_provider() {
+        let agent = AgentName::new("totallymadeup").unwrap();
+        let calls = std::cell::Cell::new(0);
+
+        let selected = agent_keychain_files_with(&agent, || {
+            calls.set(calls.get() + 1);
+            Vec::new()
+        });
+
+        assert!(selected.is_empty());
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]

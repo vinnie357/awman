@@ -494,6 +494,7 @@ const AGENT_VALUES: &[&str] = &[
     "copilot",
     "crush",
     "cline",
+    "agy",
     "antigravity",
 ];
 
