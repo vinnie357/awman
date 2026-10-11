@@ -4,11 +4,41 @@
 //! preserved for forward and backward compatibility — users upgrading from a
 //! prior release must continue to read their existing files.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::data::error::DataError;
+use crate::data::fs::daemon_env::EnvPersistenceSetting;
+
+/// Optional live credential-refresh settings. This intentionally remains a
+/// sibling of the scalar `auth` setting so existing configuration files keep
+/// their wire shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthRefreshConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threshold_minutes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tick_seconds: Option<u64>,
+}
+
+pub(crate) fn validate_auth_refresh(config: &AuthRefreshConfig) -> Result<(), DataError> {
+    if config.threshold_minutes == Some(0) {
+        return Err(DataError::Other(
+            "authRefresh.thresholdMinutes must be >= 1".to_string(),
+        ));
+    }
+    if config.tick_seconds == Some(0) {
+        return Err(DataError::Other(
+            "authRefresh.tickSeconds must be >= 1".to_string(),
+        ));
+    }
+    Ok(())
+}
 
 /// Subdirectory under the git root in which awman stores per-repo state.
 pub const REPO_CONFIG_SUBDIR: &str = ".awman";
@@ -42,6 +72,97 @@ pub struct ApiConfig {
     pub always_non_interactive: Option<bool>,
 }
 
+/// Squad daemon configuration nested inside [`GlobalConfig`](crate::data::config::GlobalConfig).
+///
+/// It lives beside the other shared configuration structs even though it is
+/// global rather than repository-scoped.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SquadConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents_to_models: Option<HashMap<String, Vec<String>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_evaluations: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_leader: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<Vec<String>>,
+    /// Where the squad daemon persists the payload environment its tasks name
+    /// with `env(VAR)` overlays (WI 0116 §5). Absent means
+    /// [`EnvPersistenceSetting::Keychain`] — a squad daemon exists to run
+    /// unattended, so surviving an OS-initiated restart is the normal case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_persistence: Option<EnvPersistenceSetting>,
+}
+
+impl SquadConfig {
+    pub fn validate(&self) -> Result<(), DataError> {
+        if let Some(n) = self.max_concurrent_evaluations {
+            if n < 1 {
+                return Err(DataError::Other(
+                    "squad.maxConcurrentEvaluations must be >= 1".to_string(),
+                ));
+            }
+        }
+        if let Some(leader) = &self.default_leader {
+            validate_leader_spec("squad", leader)?;
+        }
+        if let Some(map) = &self.agents_to_models {
+            validate_agents_to_models("squad", map)?;
+        }
+        if let Some(entries) = &self.guidance {
+            validate_guidance("squad", entries)?;
+        }
+        Ok(())
+    }
+
+    pub fn max_concurrent_evaluations_or_default(&self) -> usize {
+        self.max_concurrent_evaluations.unwrap_or(2)
+    }
+
+    /// The effective persistence backend for this daemon. Absent means
+    /// keychain: default-on persistence is what lets a task scheduled for 3am
+    /// on a machine nobody has touched since yesterday still have its values.
+    ///
+    /// There is deliberately no `validate()` check for this field. It is a
+    /// closed enum, so serde already rejects any spelling other than
+    /// `"keychain"` / `"none"` when the config file is parsed, with the path
+    /// attached — a later check could only restate that.
+    pub fn env_persistence_or_default(&self) -> EnvPersistenceSetting {
+        self.env_persistence.unwrap_or_default()
+    }
+
+    /// Layer this block over `base`, field by field: a field this block sets
+    /// wins, a field it omits is inherited (WI 0110).
+    ///
+    /// This is how a squad task's own `config.json` relates to the global one —
+    /// the same "more specific layer wins per field" rule
+    /// [`EffectiveConfig`](crate::data::config::EffectiveConfig) applies to
+    /// repo-over-global, expressed here because a task is not a session and
+    /// never passes through that merge.
+    ///
+    /// `maxConcurrentEvaluations` is deliberately **not** layered: it bounds
+    /// the daemon's whole in-flight set, so a per-task value would have no
+    /// coherent meaning. It is always the base's.
+    pub fn layered_over(&self, base: &SquadConfig) -> SquadConfig {
+        SquadConfig {
+            agents_to_models: self
+                .agents_to_models
+                .clone()
+                .or_else(|| base.agents_to_models.clone()),
+            max_concurrent_evaluations: base.max_concurrent_evaluations,
+            default_leader: self
+                .default_leader
+                .clone()
+                .or_else(|| base.default_leader.clone()),
+            guidance: self.guidance.clone().or_else(|| base.guidance.clone()),
+            // Persistence describes the daemon process, not a task, so — like
+            // `maxConcurrentEvaluations` — it is always the base's.
+            env_persistence: base.env_persistence,
+        }
+    }
+}
+
 /// Per-repo credential injection mode.
 ///
 /// Controls how awman injects credentials into agent containers.  The default
@@ -65,6 +186,15 @@ pub enum AgentAuthMode {
     None,
 }
 
+/// How an agent process is connected to awman.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LaunchMode {
+    #[default]
+    Stdio,
+    Acp,
+}
+
 /// Work-items configuration nested within `RepoConfig`.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkItemsConfig {
@@ -74,6 +204,159 @@ pub struct WorkItemsConfig {
     /// Path to the work item template file (relative to repo root, or absolute).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
+}
+
+/// Dynamic-workflow configuration nested within `RepoConfig` (WI-0095).
+///
+/// Lets teams pin which agents/models a dynamic workflow's leader may schedule,
+/// cap concurrent steps, and set a default leader — all via version-controlled
+/// repo config rather than per-run CLI flags. Layer 0 owns schema-shape
+/// validation (see [`DynamicWorkflowsConfig::validate`]); Dockerfile-availability
+/// validation lives in the command layer.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DynamicWorkflowsConfig {
+    /// agent name → list of model name strings available for that agent
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agents_to_models: Option<HashMap<String, Vec<String>>>,
+    /// advisory cap on concurrent workflow steps (None = unlimited)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_steps: Option<usize>,
+    /// default leader spec in agent::model format; overridden by --leader flag
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_leader: Option<String>,
+    /// project-specific instructions the leader agent must follow when
+    /// generating a workflow file; rendered as a bullet list in the leader
+    /// prompt (WI-0099). `None` or `[]` injects no guidance block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<Vec<String>>,
+}
+
+/// Maximum number of `dynamicWorkflows.guidance` entries. Caps prompt bloat
+/// (WI-0099).
+pub const GUIDANCE_MAX_ENTRIES: usize = 50;
+
+/// Maximum length of a single `dynamicWorkflows.guidance` entry, in chars.
+/// Prevents one instruction from dominating the leader prompt (WI-0099).
+pub const GUIDANCE_MAX_ENTRY_LEN: usize = 1000;
+
+impl DynamicWorkflowsConfig {
+    /// Layer 0 semantic validation, run by [`RepoConfig::load`] after
+    /// deserialization. Enforces the schema-local invariants that serde cannot
+    /// express; returns [`DataError::Other`] with a user-facing message on the
+    /// first violation. Dockerfile-availability checks are intentionally *not*
+    /// here — they depend on filesystem discovery and belong to the command
+    /// layer.
+    pub fn validate(&self) -> Result<(), DataError> {
+        if let Some(n) = self.max_concurrent_steps {
+            if n < 1 {
+                return Err(DataError::Other(
+                    "dynamicWorkflows.maxConcurrentSteps must be >= 1".to_string(),
+                ));
+            }
+        }
+        if let Some(leader) = &self.default_leader {
+            validate_leader_spec("dynamicWorkflows", leader)?;
+        }
+        if let Some(map) = &self.agents_to_models {
+            validate_agents_to_models("dynamicWorkflows", map)?;
+        }
+        if let Some(entries) = &self.guidance {
+            validate_guidance("dynamicWorkflows", entries)?;
+        }
+        Ok(())
+    }
+}
+
+/// Validate a `dynamicWorkflows.agentsToModels` key against the same lexical
+/// rules as [`crate::data::session::AgentName`] (ASCII alphanumerics, `-`, `_`,
+/// length 1..=64). Returns [`DataError::Other`] so the failure surfaces as a
+/// config-load error rather than a synthesized parse error.
+pub(crate) fn validate_agent_name_key(field_path: &str, key: &str) -> Result<(), DataError> {
+    crate::data::session::AgentName::new(key).map_err(|_| {
+        DataError::Other(format!(
+            "{field_path}.agentsToModels key {key:?} is not a valid agent name: only ASCII \
+             alphanumerics, '-', and '_' are allowed, length 1..=64"
+        ))
+    })?;
+    Ok(())
+}
+
+/// Layer 0 validator for `dynamicWorkflows.defaultLeader`. Enforces the same
+/// `agent::model` syntax as `LeaderSpec::parse` (two non-empty components) plus
+/// no leading/trailing whitespace in either component and an `AgentName`-valid
+/// agent component. Kept in the data layer so the config fails fast at load
+/// without depending on the command layer's `LeaderSpec`.
+pub(crate) fn validate_leader_spec(field_path: &str, raw: &str) -> Result<(), DataError> {
+    let parts: Vec<&str> = raw.split("::").collect();
+    if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(DataError::Other(format!(
+            "{field_path}.defaultLeader {raw:?} is invalid; expected agent::model \
+             (e.g. claude::claude-opus-4-8)"
+        )));
+    }
+    let (agent, model) = (parts[0], parts[1]);
+    if agent != agent.trim() || model != model.trim() {
+        return Err(DataError::Other(format!(
+            "{field_path}.defaultLeader {raw:?} must not have leading or trailing whitespace \
+             in the agent or model component"
+        )));
+    }
+    if crate::data::session::AgentName::new(agent).is_err() {
+        return Err(DataError::Other(format!(
+            "{field_path}.defaultLeader agent component {agent:?} is not a valid agent name: \
+             only ASCII alphanumerics, '-', and '_' are allowed, length 1..=64"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_agents_to_models(
+    field_path: &str,
+    map: &HashMap<String, Vec<String>>,
+) -> Result<(), DataError> {
+    for (agent, models) in map {
+        validate_agent_name_key(field_path, agent)?;
+        if models.is_empty() {
+            return Err(DataError::Other(format!(
+                "{field_path}.agentsToModels.{agent} has an empty model list. \
+                 Provide at least one model name."
+            )));
+        }
+        for model in models {
+            if model.trim().is_empty() {
+                return Err(DataError::Other(format!(
+                    "{field_path}.agentsToModels.{agent} contains an empty model name."
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_guidance(field_path: &str, entries: &[String]) -> Result<(), DataError> {
+    if entries.len() > GUIDANCE_MAX_ENTRIES {
+        return Err(DataError::Other(format!(
+            "{field_path}.guidance has {} entries; the maximum is {GUIDANCE_MAX_ENTRIES}.",
+            entries.len()
+        )));
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        if entry.trim().is_empty() {
+            return Err(DataError::Other(format!(
+                "{field_path}.guidance[{i}] is empty or whitespace-only. \
+                 Remove it or provide a non-empty instruction."
+            )));
+        }
+        if entry.chars().count() > GUIDANCE_MAX_ENTRY_LEN {
+            return Err(DataError::Other(format!(
+                "{field_path}.guidance[{i}] is {} characters; the maximum is \
+                 {GUIDANCE_MAX_ENTRY_LEN}.",
+                entry.chars().count()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Per-repository configuration stored at `<git_root>/.awman/config.json`.
@@ -102,10 +385,25 @@ pub struct RepoConfig {
     pub base_image: Option<String>,
     #[serde(rename = "dockerfile", skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<String>,
+    #[serde(
+        rename = "dynamicWorkflows",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dynamic_workflows: Option<DynamicWorkflowsConfig>,
+    #[serde(
+        rename = "maxConcurrentAgents",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_concurrent_agents: Option<usize>,
     /// Credential injection mode for agent containers. See [`AgentAuthMode`].
     /// Resolved per-repo; `keychain` (default) injects host keychain creds.
     #[serde(rename = "auth", skip_serializing_if = "Option::is_none")]
     pub auth: Option<AgentAuthMode>,
+    #[serde(rename = "authRefresh", skip_serializing_if = "Option::is_none")]
+    pub auth_refresh: Option<AuthRefreshConfig>,
+    #[serde(rename = "launchMode", skip_serializing_if = "Option::is_none")]
+    pub launch_mode: Option<LaunchMode>,
 }
 
 impl RepoConfig {
@@ -124,7 +422,25 @@ impl RepoConfig {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(&path).map_err(|e| DataError::io(&path, e))?;
-        serde_json::from_str(&content).map_err(|e| DataError::config_parse(&path, e))
+        let cfg: Self =
+            serde_json::from_str(&content).map_err(|e| DataError::config_parse(&path, e))?;
+        // Layer 0 semantic validation of the dynamicWorkflows section (WI-0095):
+        // schema shape that serde cannot express is enforced here so malformed
+        // config fails at load, before any UI or workflow starts.
+        if let Some(dw) = &cfg.dynamic_workflows {
+            dw.validate()?;
+        }
+        if let Some(n) = cfg.max_concurrent_agents {
+            if n < 1 {
+                return Err(DataError::Other(
+                    "maxConcurrentAgents must be >= 1".to_string(),
+                ));
+            }
+        }
+        if let Some(auth_refresh) = &cfg.auth_refresh {
+            validate_auth_refresh(auth_refresh)?;
+        }
+        Ok(cfg)
     }
 
     /// Persist this config to disk, creating parent directories if needed.
@@ -453,6 +769,327 @@ mod tests {
         );
     }
 
+    // ─── DynamicWorkflowsConfig serde (WI-0095) ──────────────────────────────
+
+    #[test]
+    fn dynamic_workflows_config_deserializes_with_all_fields() {
+        let json = r#"{
+            "agentsToModels": {"claude": ["claude-opus-4-8", "claude-sonnet-4-6"]},
+            "maxConcurrentSteps": 3,
+            "defaultLeader": "claude::claude-opus-4-8"
+        }"#;
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.agents_to_models,
+            Some(HashMap::from([(
+                "claude".to_string(),
+                vec![
+                    "claude-opus-4-8".to_string(),
+                    "claude-sonnet-4-6".to_string()
+                ]
+            )]))
+        );
+        assert_eq!(cfg.max_concurrent_steps, Some(3));
+        assert_eq!(
+            cfg.default_leader.as_deref(),
+            Some("claude::claude-opus-4-8")
+        );
+    }
+
+    #[test]
+    fn dynamic_workflows_config_deserializes_with_missing_fields() {
+        let json = r#"{"maxConcurrentSteps": 5}"#;
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.max_concurrent_steps, Some(5));
+        assert!(cfg.agents_to_models.is_none());
+        assert!(cfg.default_leader.is_none());
+    }
+
+    #[test]
+    fn dynamic_workflows_config_deserializes_with_extra_unknown_fields() {
+        // deny_unknown_fields must NOT be set on DynamicWorkflowsConfig: unknown
+        // keys are ignored rather than causing a deserialize error, so forward
+        // config files written by newer awman versions still parse.
+        let json = r#"{"maxConcurrentSteps": 2, "someFutureField": "ignored"}"#;
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.max_concurrent_steps, Some(2));
+    }
+
+    #[test]
+    fn dynamic_workflows_config_empty_object_deserializes_to_default() {
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg, DynamicWorkflowsConfig::default());
+    }
+
+    // ─── guidance field deserialization (WI-0099) ────────────────────────────
+
+    #[test]
+    fn guidance_deserializes_with_valid_entries() {
+        let json = r#"{
+            "guidance": [
+                "never spawn more than two agents in parallel",
+                "always include a validation step after each implementation step"
+            ]
+        }"#;
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.guidance,
+            Some(vec![
+                "never spawn more than two agents in parallel".to_string(),
+                "always include a validation step after each implementation step".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn guidance_deserializes_with_empty_array() {
+        let json = r#"{"guidance": []}"#;
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.guidance, Some(Vec::new()));
+    }
+
+    #[test]
+    fn guidance_deserializes_with_missing_field() {
+        let json = r#"{"maxConcurrentSteps": 2}"#;
+        let cfg: DynamicWorkflowsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.guidance.is_none());
+    }
+
+    // ─── guidance validation (WI-0099) ───────────────────────────────────────
+
+    #[test]
+    fn guidance_validate_rejects_entry_over_length_cap() {
+        let cfg = DynamicWorkflowsConfig {
+            guidance: Some(vec!["a".repeat(GUIDANCE_MAX_ENTRY_LEN + 1)]),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&GUIDANCE_MAX_ENTRY_LEN.to_string()),
+            "error must name the length cap, got: {err}"
+        );
+    }
+
+    #[test]
+    fn guidance_validate_rejects_whitespace_only_entry() {
+        let cfg = DynamicWorkflowsConfig {
+            guidance: Some(vec!["   \t  ".to_string()]),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("empty or whitespace-only"),
+            "whitespace-only entries must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn guidance_validate_rejects_array_over_count_cap() {
+        let cfg = DynamicWorkflowsConfig {
+            guidance: Some(
+                (0..GUIDANCE_MAX_ENTRIES + 1)
+                    .map(|i| format!("entry {i}"))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains(&GUIDANCE_MAX_ENTRIES.to_string()),
+            "error must name the count cap, got: {err}"
+        );
+    }
+
+    #[test]
+    fn guidance_validate_accepts_valid_array() {
+        let cfg = DynamicWorkflowsConfig {
+            guidance: Some(vec![
+                "never spawn more than two agents in parallel".to_string(),
+                "always run make test before finishing".to_string(),
+            ]),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn guidance_validate_accepts_empty_array() {
+        let cfg = DynamicWorkflowsConfig {
+            guidance: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn load_rejects_guidance_whitespace_only_entry_via_config_json() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"guidance": ["  "]}}"#,
+        )
+        .unwrap();
+
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("empty or whitespace-only"),
+            "error must explain the whitespace-only rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_guidance_valid_array_via_config_json() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"guidance": ["entry one", "entry two"]}}"#,
+        )
+        .unwrap();
+
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
+        assert_eq!(
+            cfg.dynamic_workflows.and_then(|dw| dw.guidance),
+            Some(vec!["entry one".to_string(), "entry two".to_string()])
+        );
+    }
+
+    // ─── RepoConfig::load semantic validation (WI-0095) ──────────────────────
+
+    #[test]
+    fn load_rejects_max_concurrent_steps_zero() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"maxConcurrentSteps": 0}}"#,
+        )
+        .unwrap();
+
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("maxConcurrentSteps must be >= 1"),
+            "error must explain the >= 1 requirement, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_max_concurrent_agents_zero() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"maxConcurrentAgents": 0}"#,
+        )
+        .unwrap();
+
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("maxConcurrentAgents must be >= 1"),
+            "error must explain the >= 1 requirement, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_max_concurrent_agents_positive() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"maxConcurrentAgents": 4}"#,
+        )
+        .unwrap();
+
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
+        assert_eq!(cfg.max_concurrent_agents, Some(4));
+    }
+
+    #[test]
+    fn load_rejects_default_leader_missing_double_colon() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"defaultLeader": "claude"}}"#,
+        )
+        .unwrap();
+
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("expected agent::model"),
+            "error must explain the expected agent::model format, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_default_leader_empty_component() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"defaultLeader": "claude::"}}"#,
+        )
+        .unwrap();
+
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("expected agent::model"),
+            "empty model component must be rejected, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_valid_default_leader() {
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"defaultLeader": "claude::claude-opus-4-8"}}"#,
+        )
+        .unwrap();
+
+        let cfg = RepoConfig::load(tmp.path()).unwrap();
+        assert_eq!(
+            cfg.dynamic_workflows
+                .as_ref()
+                .and_then(|dw| dw.default_leader.as_deref()),
+            Some("claude::claude-opus-4-8")
+        );
+    }
+
+    #[test]
+    fn load_rejects_empty_model_list_for_one_agent() {
+        // Edge case from the WI-0095 spec: an agent key with an empty model
+        // list is a configuration error, not a silent no-op.
+        let tmp = make_git_root();
+        let awman_dir = tmp.path().join(REPO_CONFIG_SUBDIR);
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join(REPO_CONFIG_FILENAME),
+            r#"{"dynamicWorkflows": {"agentsToModels": {"claude": []}}}"#,
+        )
+        .unwrap();
+
+        let err = RepoConfig::load(tmp.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("dynamicWorkflows.agentsToModels.claude has an empty model list"),
+            "error must name the empty-model-list agent, got: {err}"
+        );
+    }
+
     #[test]
     fn legacy_env_passthrough_is_not_serialized_in_save() {
         // legacy_env_passthrough has skip_serializing — it must not appear in the
@@ -473,6 +1110,163 @@ mod tests {
         assert!(
             !written.contains("envPassthrough"),
             "legacy envPassthrough must not be re-serialized by save(); got: {written}"
+        );
+    }
+
+    #[test]
+    fn squad_config_uses_camel_case_and_validates_shared_agent_rules() {
+        let config = SquadConfig {
+            agents_to_models: Some(HashMap::from([(
+                "claude".to_string(),
+                vec!["claude-opus-4-8".to_string()],
+            )])),
+            max_concurrent_evaluations: Some(3),
+            default_leader: Some("claude::claude-opus-4-8".to_string()),
+            guidance: Some(vec!["Use focused workflows.".to_string()]),
+            env_persistence: None,
+        };
+        config.validate().unwrap();
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert!(serialized.get("maxConcurrentEvaluations").is_some());
+        assert!(serialized.get("defaultLeader").is_some());
+    }
+
+    #[test]
+    fn squad_config_rejects_zero_and_malformed_leader() {
+        let zero = SquadConfig {
+            max_concurrent_evaluations: Some(0),
+            ..Default::default()
+        };
+        assert!(zero
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("squad.maxConcurrentEvaluations must be >= 1"));
+
+        let malformed = SquadConfig {
+            default_leader: Some(" claude::model".to_string()),
+            ..Default::default()
+        };
+        assert!(malformed
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("squad.defaultLeader"));
+    }
+
+    /// WI 0110: a task's own `squad` block overrides the global one per field.
+    /// A field the task omits must be inherited, not reset to empty — that is
+    /// what lets a task narrow its agent pool while keeping the standing
+    /// guidance every task gets.
+    #[test]
+    fn a_task_squad_block_overrides_the_global_one_field_by_field() {
+        let global = SquadConfig {
+            agents_to_models: Some(HashMap::from([(
+                "claude".to_string(),
+                vec!["claude-opus-4-8".to_string()],
+            )])),
+            max_concurrent_evaluations: Some(4),
+            default_leader: Some("claude::claude-opus-4-8".to_string()),
+            guidance: Some(vec!["Keep changes focused.".to_string()]),
+            env_persistence: None,
+        };
+        let task = SquadConfig {
+            agents_to_models: Some(HashMap::from([(
+                "codex".to_string(),
+                vec!["gpt-5".to_string()],
+            )])),
+            ..Default::default()
+        };
+
+        let effective = task.layered_over(&global);
+        assert_eq!(
+            effective
+                .agents_to_models
+                .as_ref()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["codex"],
+            "the task's pool replaces the global pool outright, not merged into it"
+        );
+        assert_eq!(
+            effective.default_leader.as_deref(),
+            Some("claude::claude-opus-4-8"),
+            "a field the task omits is inherited"
+        );
+        assert_eq!(effective.guidance, global.guidance);
+    }
+
+    /// `maxConcurrentEvaluations` bounds the daemon's whole in-flight set, so a
+    /// per-task value would mean nothing. It always comes from the global block,
+    /// even when a task file names one.
+    #[test]
+    fn max_concurrent_evaluations_is_never_taken_from_a_task_block() {
+        let global = SquadConfig {
+            max_concurrent_evaluations: Some(4),
+            ..Default::default()
+        };
+        let task = SquadConfig {
+            max_concurrent_evaluations: Some(99),
+            ..Default::default()
+        };
+        assert_eq!(
+            task.layered_over(&global).max_concurrent_evaluations,
+            Some(4)
+        );
+    }
+
+    /// An empty task block is the same as no task block at all: everything is
+    /// inherited.
+    #[test]
+    fn an_empty_task_block_inherits_the_whole_global_block() {
+        let global = SquadConfig {
+            agents_to_models: Some(HashMap::from([(
+                "claude".to_string(),
+                vec!["claude-opus-4-8".to_string()],
+            )])),
+            max_concurrent_evaluations: Some(2),
+            default_leader: Some("claude::claude-opus-4-8".to_string()),
+            guidance: Some(vec!["Be careful.".to_string()]),
+            env_persistence: None,
+        };
+        assert_eq!(SquadConfig::default().layered_over(&global), global);
+    }
+
+    /// WI 0116 §2.3: the default is keychain, and it must hold independently
+    /// of `#[derive(Default)]` — a future reader swapping the derive for a
+    /// hand-written `Default` that picks `None` must not silently flip the
+    /// default persistence behaviour without a test noticing.
+    #[test]
+    fn env_persistence_defaults_to_keychain_when_the_config_omits_it() {
+        let omitted = SquadConfig::default();
+        assert_eq!(omitted.env_persistence, None);
+        assert_eq!(
+            omitted.env_persistence_or_default(),
+            EnvPersistenceSetting::Keychain
+        );
+
+        // And the layered form keeps inheriting it as `None` (→ still
+        // Keychain via the accessor), exactly like maxConcurrentEvaluations.
+        let task = SquadConfig::default();
+        let effective = task.layered_over(&omitted);
+        assert_eq!(effective.env_persistence, None);
+        assert_eq!(
+            effective.env_persistence_or_default(),
+            EnvPersistenceSetting::Keychain
+        );
+
+        // An explicit "none" must round-trip through serde with the
+        // struct-level camelCase rename (no per-field #[serde(rename)]).
+        let explicit_none = SquadConfig {
+            env_persistence: Some(EnvPersistenceSetting::None),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&explicit_none).unwrap();
+        assert_eq!(json.get("envPersistence").unwrap(), "none");
+        assert_eq!(
+            explicit_none.env_persistence_or_default(),
+            EnvPersistenceSetting::None
         );
     }
 }

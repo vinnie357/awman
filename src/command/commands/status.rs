@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::command::commands::Command;
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 
@@ -16,6 +16,18 @@ pub struct StatusCommandFlags {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ContainerKind {
     Agent,
+}
+
+/// Where a container came from, derived from its **name** — never a label —
+/// so the marker works identically on every runtime tier (Apple cannot read
+/// labels back).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "value")]
+pub enum ContainerSource {
+    /// An interactive `awman` session container: today's behaviour, unmarked.
+    Session,
+    /// Launched by squad for the named task.
+    Squad(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,6 +45,7 @@ pub struct StatusContainerRow {
     pub image: String,
     pub started_at: String,
     pub kind: ContainerKind,
+    pub source: ContainerSource,
     pub tab_number: Option<u32>,
     pub stuck: bool,
     pub command_label: Option<String>,
@@ -44,8 +57,25 @@ pub struct StatusContainerRow {
     pub memory_mb: Option<f64>,
 }
 
-fn classify_container(_name: &str) -> ContainerKind {
-    ContainerKind::Agent
+impl StatusContainerRow {
+    /// `None` for a plain session container (today's behaviour, unmarked);
+    /// `Some("squad:<slug>")` for one squad launched.
+    pub fn source_label(&self) -> Option<String> {
+        match &self.source {
+            ContainerSource::Session => None,
+            ContainerSource::Squad(slug) => Some(format!("squad:{slug}")),
+        }
+    }
+}
+
+/// Derive a container's source from its **name**, the one identity channel
+/// every runtime tier honours (Docker `--filter name=`, Apple client-side
+/// prefix, sandbox `sbx ls` prefix) — never from a label.
+fn classify_source(name: &str) -> ContainerSource {
+    match crate::engine::container::naming::parse_squad_task_slug(name) {
+        Some(slug) => ContainerSource::Squad(slug.to_string()),
+        None => ContainerSource::Session,
+    }
 }
 
 /// Optional context supplied by the TUI; CLI / API leave this `None`.
@@ -119,10 +149,14 @@ pub trait StatusCommandFrontend: UserMessageSink + Send + Sync {
                     .tab_number
                     .map(|t| format!(" [tab {t}]"))
                     .unwrap_or_default();
+                let source_col = c
+                    .source_label()
+                    .map(|label| format!(" [{label}]"))
+                    .unwrap_or_default();
                 self.write_message(UserMessage {
                     level: MessageLevel::Info,
                     text: format!(
-                        "  {indicator} {name}  {cpu}  {mem}  {img}{tab_col}",
+                        "  {indicator} {name}  {cpu}  {mem}  {img}{tab_col}{source_col}",
                         name = c.name,
                         img = c.image,
                     ),
@@ -145,6 +179,17 @@ pub struct StatusCommand {
 impl StatusCommand {
     pub fn new(flags: StatusCommandFlags, engines: Engines) -> Self {
         Self { flags, engines }
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10). `status`
+    /// reports on the runtime rather than the repo, so it holds no session.
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        Ok(Self::new(
+            StatusCommandFlags {
+                watch: ctx.flags.bool("watch"),
+            },
+            ctx.engines.clone(),
+        ))
     }
 
     pub fn flags(&self) -> &StatusCommandFlags {
@@ -188,7 +233,8 @@ impl Command for StatusCommand {
                         name: h.name.clone(),
                         image: h.image_tag.clone(),
                         started_at: h.started_at.to_rfc3339(),
-                        kind: classify_container(&h.name),
+                        kind: ContainerKind::Agent,
+                        source: classify_source(&h.name),
                         tab_number: None,
                         stuck: false,
                         command_label: None,
@@ -285,6 +331,7 @@ mod tests {
             tab_number: None,
             stuck: false,
             kind: ContainerKind::Agent,
+            source: ContainerSource::Session,
             command_label: None,
             cpu_percent: None,
             memory_mb: None,
@@ -314,6 +361,7 @@ mod tests {
             image: "img".into(),
             started_at: "2025-01-01T00:00:00Z".into(),
             kind: ContainerKind::Agent,
+            source: ContainerSource::Session,
             tab_number: None,
             stuck: false,
             command_label: None,
@@ -339,6 +387,7 @@ mod tests {
             image: "img".into(),
             started_at: "2025-01-01T00:00:00Z".into(),
             kind: ContainerKind::Agent,
+            source: ContainerSource::Session,
             tab_number: None,
             stuck: false,
             command_label: None,
@@ -360,7 +409,35 @@ mod tests {
 
     #[test]
     fn classify_agent_containers() {
-        assert_eq!(classify_container("awman-123-456"), ContainerKind::Agent);
-        assert_eq!(classify_container("awman-abc"), ContainerKind::Agent);
+        assert_eq!(classify_source("awman-123-456"), ContainerSource::Session);
+        assert_eq!(classify_source("awman-abc"), ContainerSource::Session);
+    }
+
+    #[test]
+    fn classify_source_marks_squad_containers() {
+        assert_eq!(
+            classify_source("awman-squad-issue-triage-12ab34cd"),
+            ContainerSource::Squad("issue-triage".to_string())
+        );
+    }
+
+    #[test]
+    fn source_label_is_none_for_session_and_marked_for_squad() {
+        let mut row = StatusContainerRow {
+            id: "abc".into(),
+            name: "awman-x".into(),
+            image: "img".into(),
+            started_at: "2025-01-01T00:00:00Z".into(),
+            kind: ContainerKind::Agent,
+            source: ContainerSource::Session,
+            tab_number: None,
+            stuck: false,
+            command_label: None,
+            cpu_percent: None,
+            memory_mb: None,
+        };
+        assert_eq!(row.source_label(), None);
+        row.source = ContainerSource::Squad("issue-triage".into());
+        assert_eq!(row.source_label().as_deref(), Some("squad:issue-triage"));
     }
 }

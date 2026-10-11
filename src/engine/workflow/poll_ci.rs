@@ -26,8 +26,10 @@ pub fn fetch_ci_status(git_root: &Path) -> Result<CiStatus, EngineError> {
         return fetch_via_gh(&branch, &head_sha, git_root);
     }
 
-    let token = match std::env::var("GITHUB_TOKEN") {
-        Ok(t) if !t.is_empty() => t,
+    // Host-supplied, so it must come through the daemon overlay when squad is
+    // the caller: the daemon does not inherit the shell that created the task.
+    let token = match crate::data::config::env::host_var(crate::data::config::env::GITHUB_TOKEN) {
+        Some(t) if !t.is_empty() => t,
         _ => {
             return Err(EngineError::Other(
                 "poll_ci: neither `gh` CLI (authenticated) nor GITHUB_TOKEN env var is available; \
@@ -743,6 +745,11 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn real_git_run_poll_ci_loop_exhausts_max_retries_returns_error() {
+        const EXACT_TEST: &str = "engine::workflow::poll_ci::tests::real_git_run_poll_ci_loop_exhausts_max_retries_returns_error";
+        if !enter_path_fixture_child(EXACT_TEST) {
+            return;
+        }
+
         if !std::process::Command::new("git")
             .arg("--version")
             .stdout(std::process::Stdio::null())
@@ -794,6 +801,7 @@ mod tests {
             3,
             "must emit one attempt message per retry: {messages:?}"
         );
+        complete_path_fixture_child(EXACT_TEST);
     }
 
     /// When CI succeeds on the first poll, `run_poll_ci_loop` returns `Ok` and
@@ -801,6 +809,12 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn real_git_run_poll_ci_loop_succeeds_on_first_poll() {
+        const EXACT_TEST: &str =
+            "engine::workflow::poll_ci::tests::real_git_run_poll_ci_loop_succeeds_on_first_poll";
+        if !enter_path_fixture_child(EXACT_TEST) {
+            return;
+        }
+
         if !std::process::Command::new("git")
             .arg("--version")
             .stdout(std::process::Stdio::null())
@@ -845,6 +859,7 @@ mod tests {
             messages.iter().any(|(_, m)| m.contains("CI passed")),
             "must emit 'CI passed' message: {messages:?}"
         );
+        complete_path_fixture_child(EXACT_TEST);
     }
 
     /// When CI has failed, `run_poll_ci_loop` returns `Err` and emits a
@@ -852,6 +867,12 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn real_git_run_poll_ci_loop_fails_when_ci_failed() {
+        const EXACT_TEST: &str =
+            "engine::workflow::poll_ci::tests::real_git_run_poll_ci_loop_fails_when_ci_failed";
+        if !enter_path_fixture_child(EXACT_TEST) {
+            return;
+        }
+
         if !std::process::Command::new("git")
             .arg("--version")
             .stdout(std::process::Stdio::null())
@@ -899,6 +920,7 @@ mod tests {
             warnings.iter().any(|w| w.contains("unit-tests")),
             "warning must contain run name 'unit-tests': {warnings:?}"
         );
+        complete_path_fixture_child(EXACT_TEST);
     }
 
     /// When gh is unavailable and GITHUB_TOKEN is absent, `fetch_ci_status`
@@ -957,6 +979,88 @@ mod tests {
     }
 
     // ── Helpers for real-git tests ────────────────────────────────────────────
+
+    #[cfg(unix)]
+    const PATH_FIXTURE_CHILD: &str = "AWMAN_POLL_CI_PATH_FIXTURE_CHILD";
+    #[cfg(unix)]
+    const PATH_FIXTURE_ENTRY: &str = "AWMAN_POLL_CI_PATH_FIXTURE_ENTRY";
+    #[cfg(unix)]
+    const PATH_FIXTURE_COMPLETION: &str = "AWMAN_POLL_CI_PATH_FIXTURE_COMPLETION";
+
+    /// Run one PATH-mutating fixture as the only selected test in a fresh copy
+    /// of this unit-test process. Environment changes in that child cannot race
+    /// unrelated modules that temporarily replace the parent process's PATH.
+    /// The exact test name in the guard prevents recursive child spawning.
+    #[cfg(unix)]
+    fn enter_path_fixture_child(exact_test: &str) -> bool {
+        if std::env::var(PATH_FIXTURE_CHILD).ok().as_deref() == Some(exact_test) {
+            let entry =
+                std::env::var_os(PATH_FIXTURE_ENTRY).expect("isolated poll_ci fixture entry path");
+            std::fs::write(entry, exact_test).expect("record isolated poll_ci fixture entry");
+            return true;
+        }
+
+        let proof_dir = tempfile::tempdir().expect("isolated poll_ci proof directory");
+        let entry = proof_dir.path().join("entered");
+        let completion = proof_dir.path().join("completed");
+        let mut child = std::process::Command::new(
+            std::env::current_exe().expect("current poll_ci unit-test binary"),
+        )
+        .args(["--exact", exact_test, "--nocapture"])
+        .env(PATH_FIXTURE_CHILD, exact_test)
+        .env(PATH_FIXTURE_ENTRY, &entry)
+        .env(PATH_FIXTURE_COMPLETION, &completion)
+        .spawn()
+        .expect("spawn isolated poll_ci PATH fixture");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match child
+                .try_wait()
+                .expect("poll isolated poll_ci PATH fixture")
+            {
+                Some(status) => {
+                    assert!(
+                        status.success(),
+                        "isolated poll_ci fixture failed: {exact_test}"
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(&entry)
+                            .expect("isolated poll_ci fixture entry proof"),
+                        exact_test,
+                        "exact poll_ci fixture test did not run"
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(&completion).expect(
+                            "isolated poll_ci fixture did not complete assertions; required git dependency may be unavailable",
+                        ),
+                        exact_test,
+                        "isolated poll_ci fixture completion did not match the selected test"
+                    );
+                    return false;
+                }
+                None if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("isolated poll_ci fixture timed out: {exact_test}");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn complete_path_fixture_child(exact_test: &str) {
+        assert_eq!(
+            std::env::var(PATH_FIXTURE_CHILD).ok().as_deref(),
+            Some(exact_test),
+            "completion may only be recorded by the selected child"
+        );
+        let completion = std::env::var_os(PATH_FIXTURE_COMPLETION)
+            .expect("isolated poll_ci fixture completion path");
+        std::fs::write(completion, exact_test).expect("record isolated poll_ci fixture completion");
+    }
 
     /// Serialises tests that mutate the process-wide PATH.
     static GH_SCRIPT_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());

@@ -38,6 +38,12 @@ pub enum CommandError {
         argument: String,
     },
 
+    #[error("unexpected argument '{argument}' for command {command:?}")]
+    UnexpectedArgument {
+        command: Vec<String>,
+        argument: String,
+    },
+
     #[error("flags '{a}' and '{b}' are mutually exclusive on {command:?}")]
     MutuallyExclusive {
         command: Vec<String>,
@@ -105,8 +111,58 @@ pub enum CommandError {
     #[error("API server is not running")]
     ApiServerNotRunning,
 
-    #[error("no API key configured; run `awman api start --refresh-key` first, or pass `--dangerously-skip-auth`")]
+    #[error(
+        "no API key configured; run `awman api start --refresh-key` first, or pass `--dangerously-skip-auth`"
+    )]
     ApiServerAuthMissing,
+
+    // ── Squad ─────────────────────────────────────────────────────────────
+    /// The squad daemon is reachable but this process holds no bearer key for
+    /// it. Reported *before* the request rather than after it, because the
+    /// request's own answer is a bare `HTTP 401: API key required`, which
+    /// names neither the variable to set nor the fact that the key can no
+    /// longer be read back — it was shown once and is stored only as a hash.
+    ///
+    /// Typed (WI 0113 F-04) so the CLI and TUI stop authoring this text
+    /// themselves; the wording is byte-identical to the CLI's former
+    /// `missing_squad_key_error`, and tests assert it.
+    #[error(
+        "squad requires a bearer key and none is set in this shell.\n\n\
+         The key is shown only once, when it is minted, and only its hash is \
+         stored — so it cannot be read back. Set {} if you saved it, or mint a \
+         new one with:\n    awman squad start --refresh-key\n\
+         which invalidates the previous key, so any shell still exporting it \
+         must be updated too.",
+        crate::data::config::env::AWMAN_SQUAD_KEY
+    )]
+    SquadKeyMissing,
+    // ── Session creation (multi-session frontends: API, future desktop, …) ──
+    // Typed so that a frontend can map each to the right transport status
+    // (e.g. HTTP 400 vs 403) without inspecting the message string. Display
+    // text is kept byte-identical to the previous inline API responses.
+    #[error("session_type must be 'local' or 'remote'; got '{got}'")]
+    SessionInvalidType { got: String },
+
+    #[error("workdir is required when session_type is 'local'")]
+    SessionWorkdirRequired,
+
+    #[error("Cannot resolve path: {path}")]
+    SessionWorkdirUnresolvable { path: String },
+
+    #[error("Workdir '{requested}' is not in the allowlist. Allowed: {allowed:?}")]
+    SessionWorkdirNotAllowed {
+        requested: String,
+        allowed: Vec<String>,
+    },
+
+    #[error("repo_url is required when session_type is 'remote'")]
+    SessionRepoUrlRequired,
+
+    #[error("repo_url must be non-empty")]
+    SessionRepoUrlEmpty,
+
+    #[error("repo_url must use http(s), ssh, or git scheme")]
+    SessionRepoUrlInvalidScheme { url: String },
 
     // ── Remote ────────────────────────────────────────────────────────────
     #[error("no remote session id; pass --session <id> or run `awman remote session start`")]
@@ -167,6 +223,13 @@ impl CommandError {
         CommandError::UnknownFlag {
             command: command.iter().map(|s| s.to_string()).collect(),
             flag: flag.into(),
+        }
+    }
+
+    pub fn unexpected_argument(command: &[&str], argument: impl Into<String>) -> Self {
+        CommandError::UnexpectedArgument {
+            command: command.iter().map(|s| s.to_string()).collect(),
+            argument: argument.into(),
         }
     }
 

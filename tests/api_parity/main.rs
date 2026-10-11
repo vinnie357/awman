@@ -13,8 +13,11 @@
 mod helpers;
 
 mod auth_modes;
+mod http_core;
 mod live_server;
 mod rename_0077;
 mod routes;
 mod wi_0078;
 mod wi_0079;
+mod wi_0097;
+mod wi_0097_architecture;

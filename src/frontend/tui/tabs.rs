@@ -9,10 +9,25 @@ use ratatui::layout::Rect;
 
 use crate::command::dispatch::CommandOutcome;
 use crate::command::error::CommandError;
-use crate::data::session::Session;
+use crate::data::session::{Session, SessionId};
+use crate::engine::acp::{PermissionRequest, SessionUpdate};
 use crate::engine::agent_runtime::execution::{AgentStats, StuckEvent};
+use crate::engine::git::{GitDiffSummary, GitEngine};
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
+use crate::frontend::tui::git_sidebar::{start_git_diff_poll_task, GitSidebarState};
 use crate::frontend::tui::user_message::SharedStatusLog;
+
+mod container_slots;
+mod git_poll;
+mod labels;
+mod overlay_lifecycle;
+pub mod squad_state;
+#[cfg(test)]
+mod tests;
+
+use squad_state::SquadTabState;
+
+pub type SharedGitDiffSummary = Arc<Mutex<Option<GitDiffSummary>>>;
 
 /// Per-tab execution lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,11 +56,51 @@ impl ContainerWindowState {
     }
 }
 
+/// Workflow Overview display mode.
+///
+/// The overview defaults to `Minimized`: exactly one 3-row box per topological
+/// stage, so it never costs the execution window more than 3 rows. A stage
+/// with a single step draws that step's normal box; a parallel stage draws a
+/// `N steps…` summary box in the stage's aggregate status colour.
+///
+/// `Maximized` draws every step of every stage as its own box — full name,
+/// agent/model label, status colour, nothing rolled up. It grows into the
+/// space the frame can spare between the tab bar and the command box, ahead of
+/// the execution window and the container status bars — but it never displaces
+/// a maximized container PTY, which keeps its own share of the body.
+///
+/// Toggled with `Ctrl-O` ("overview"), independently of the container PTY's
+/// own `Ctrl-M` min/max ([`ContainerWindowState`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkflowOverviewState {
+    #[default]
+    Minimized,
+    Maximized,
+}
+
+impl WorkflowOverviewState {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Minimized => Self::Maximized,
+            Self::Maximized => Self::Minimized,
+        }
+    }
+
+    pub fn is_maximized(self) -> bool {
+        matches!(self, Self::Maximized)
+    }
+}
+
 /// Current workflow view state (visible when a workflow is running).
 #[derive(Debug, Clone, Default)]
 pub struct WorkflowViewState {
     pub steps: Vec<WorkflowStepView>,
     pub current_step: Option<String>,
+    /// Effective `maxConcurrentAgents` for the running workflow (WI-0096 §11),
+    /// set by the frontend when the engine reports a parallel group start.
+    /// `None` means unlimited — the overview caps parallel rows at the legacy 3
+    /// and renders no "queued" markers, so behavior is unchanged.
+    pub max_concurrent: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,10 +111,25 @@ pub struct WorkflowStepView {
     pub agent: Option<String>,
     /// Optional resolved model.
     pub model: Option<String>,
-    /// Steps this one waits on. Drives the column-grouping in the strip
+    /// Steps this one waits on. Drives the column-grouping in the overview
     /// renderer (steps with the same sorted `depends_on` set sit in the
     /// same topological column).
     pub depends_on: Vec<String>,
+    /// Which phase this step belongs to. `Setup`/`Teardown` steps get their
+    /// own dedicated first/last column in the overview rather than being
+    /// grouped by `depends_on` topology alongside `Agent` steps.
+    pub kind: WorkflowStepKind,
+}
+
+/// The phase a [`WorkflowStepView`] belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowStepKind {
+    /// A `setup:` step, run once before the main workflow steps.
+    Setup,
+    /// An ordinary workflow step, grouped into columns by `depends_on`.
+    Agent,
+    /// A `teardown:` step, run once after the main workflow steps.
+    Teardown,
 }
 
 /// Cross-thread shared workflow view state.
@@ -98,6 +168,12 @@ pub type SharedPtyResetFlag = Arc<AtomicBool>;
 /// loop reads this to populate `ContainerInfo.container_name` for stats
 /// polling.
 pub type SharedContainerName = Arc<Mutex<Option<String>>>;
+
+/// Shared container exit code. Set by the workflow frontend when the engine
+/// reports `report_container_exited` — the step's container has actually
+/// terminated (killed by awman or the agent process exited). The TUI event
+/// loop takes it and closes the container window, leaving the summary bar.
+pub type SharedContainerExitCode = Arc<Mutex<Option<i32>>>;
 
 /// Shared active-worktree path. Set by the worktree-lifecycle frontend on
 /// `report_worktree_created` and cleared on the post-workflow report
@@ -184,17 +260,255 @@ pub struct LastContainerSummary {
     pub exit_code: i32,
 }
 
+/// Upper bound on the rendered ACP update history kept per slot. Once full,
+/// the oldest entry is dropped as new ones arrive — a plain ring buffer.
+/// There is no raw terminal scrollback to fall back on for an ACP window, so
+/// this cap is the only backstop against unbounded growth.
+pub const ACP_HISTORY_LIMIT: usize = 2000;
+
+/// Rendered state for an ACP (Agent Client Protocol) agent window.
+///
+/// Unlike a stdio slot there is no raw terminal byte stream and no vt100
+/// grid: the agent speaks structured [`SessionUpdate`] frames, which are kept
+/// here as a bounded history and drawn as a scrollable list. A pending
+/// permission request is parked here while its modal is open.
+///
+/// The state is shared (`Arc<Mutex<…>>`, see [`SharedAcpState`]) between the
+/// TUI render thread, which reads the history to draw the window, and the ACP
+/// frontend running on the engine task, which appends updates in
+/// `render_update`. This mirrors the other engine→TUI shared handles
+/// (`SharedStatusLog`, `SharedYoloState`): the render loop repaints every
+/// tick, so an append is picked up on the next frame with no explicit redraw
+/// signal.
+#[derive(Debug, Default)]
+pub struct AcpSlotState {
+    /// Rendered update history, oldest first. Bounded to [`ACP_HISTORY_LIMIT`]
+    /// entries (a ring buffer).
+    pub history: std::collections::VecDeque<SessionUpdate>,
+    /// The permission request currently awaiting a user decision, if any. Set
+    /// when the modal opens and cleared when it resolves.
+    pub pending_permission: Option<PermissionRequest>,
+    /// Lines-from-bottom scroll offset into the rendered history. `0` follows
+    /// the latest updates; increasing it scrolls toward older output. This is
+    /// the ACP window's own simple list scroll — it never touches the
+    /// vt100 scrollback path stdio slots use.
+    pub scroll_offset: usize,
+}
+
+impl AcpSlotState {
+    /// Append an update, enforcing the [`ACP_HISTORY_LIMIT`] ring-buffer cap.
+    pub fn push_update(&mut self, update: SessionUpdate) {
+        self.history.push_back(update);
+        while self.history.len() > ACP_HISTORY_LIMIT {
+            self.history.pop_front();
+        }
+    }
+}
+
+/// Cross-thread handle to an ACP window's [`AcpSlotState`]. Held by both the
+/// [`ContainerSlot`] (TUI thread) and the ACP frontend (engine task).
+pub type SharedAcpState = Arc<Mutex<AcpSlotState>>;
+
+/// Which kind of agent window a [`ContainerSlot`] hosts.
+///
+/// A **stdio** slot bridges a real PTY/piped byte stream into the vt100 grid,
+/// using the `vt100_parser`, `region_scroll`, terminal-mode flags, and I/O
+/// channels on [`ContainerSlot`]. An **ACP** slot has no raw terminal stream:
+/// its structured updates live in the shared [`AcpSlotState`] instead, and the
+/// vt100 fields on the slot stay inert.
+///
+/// Keeping both behind one `ContainerSlot` type is what lets a parallel
+/// workflow group mix stdio and ACP windows in a single `container_slots`
+/// vec, so `focused_slot()` and the minimized-bar iteration stay uniform over
+/// one slot type.
+#[derive(Debug, Clone)]
+pub enum AgentWindowKind {
+    Stdio,
+    Acp(SharedAcpState),
+}
+
+/// One running container. This is THE container representation — a plain
+/// containerized command (`chat`, `exec prompt`) is simply a tab with one
+/// slot, and a parallel workflow group is a tab with N of them (WI-0096).
+///
+/// Each slot owns its own PTY parser, terminal-mode flags, stats, and I/O
+/// channels. The slot at `Tab::focused_slot_idx` renders maximized; the
+/// others render as stacked minimized status bars. A slot's [`AgentWindowKind`]
+/// selects whether it is driven by that stdio/PTY machinery or by a structured
+/// ACP update stream (in which case the vt100 fields stay inert).
+pub struct ContainerSlot {
+    /// Whether this slot is a stdio (PTY/vt100) window or an ACP window.
+    /// Stdio is the default; ACP slots carry their shared render state here.
+    pub kind: AgentWindowKind,
+    /// Workflow step this container runs, or empty for non-workflow
+    /// commands and sequential workflow steps (whose step name comes from
+    /// the workflow view state instead).
+    pub step_name: String,
+    pub vt100_parser: vt100::Parser,
+    pub region_scroll: crate::frontend::tui::region_scroll::RegionScrollEmulator,
+    pub container_info: Option<ContainerInfo>,
+    pub container_stdout_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+    pub container_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    pub container_resize_tx: Option<tokio::sync::mpsc::UnboundedSender<(u16, u16)>>,
+    /// Whether the agent has requested the alternate screen buffer. Tracked
+    /// here (not via the vt100 parser) because `drain_container_output`
+    /// strips alternate-screen sequences before the parser sees them.
+    pub agent_alt_screen: bool,
+    /// Whether the agent has enabled "alternate scroll" mode (DECSET 1007),
+    /// tracked from the raw PTY output for the same reason.
+    pub agent_alternate_scroll: bool,
+    pub stuck: bool,
+    pub yolo_mode: bool,
+    pub yolo_state: SharedYoloState,
+    pub yolo_cancel_flag: SharedYoloCancelFlag,
+    pub stuck_rx: Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
+}
+
+pub struct ContainerSlotIo {
+    pub stdout_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    pub stdin_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    pub resize_tx: tokio::sync::mpsc::UnboundedSender<(u16, u16)>,
+}
+
+impl ContainerSlot {
+    /// Create a fresh slot for a newly-launched container. The PTY parser
+    /// starts at 80x24 and is sized to the real overlay dimensions as soon
+    /// as they are known; live I/O channels are attached by the caller.
+    pub fn new(step_name: String, agent_display_name: String, scrollback: usize) -> Self {
+        Self {
+            kind: AgentWindowKind::Stdio,
+            step_name,
+            vt100_parser: vt100::Parser::new(24, 80, scrollback),
+            region_scroll: crate::frontend::tui::region_scroll::RegionScrollEmulator::new(),
+            container_info: Some(ContainerInfo {
+                agent_display_name,
+                container_name: String::new(),
+                start_time: Instant::now(),
+                latest_stats: None,
+                stats_history: Vec::new(),
+                sandboxed: false,
+            }),
+            container_stdout_rx: None,
+            container_stdin_tx: None,
+            container_resize_tx: None,
+            agent_alt_screen: false,
+            agent_alternate_scroll: false,
+            stuck: false,
+            yolo_mode: false,
+            yolo_state: Arc::new(Mutex::new(None)),
+            yolo_cancel_flag: Arc::new(AtomicBool::new(false)),
+            stuck_rx: None,
+        }
+    }
+
+    /// Create a fresh ACP window slot. The vt100 fields exist but stay inert
+    /// (no PTY stream feeds them); the window renders from `state` instead.
+    /// `state` is the same handle the ACP frontend appends updates to, so the
+    /// caller shares one `Arc` between the slot and the frontend.
+    pub fn new_acp(step_name: String, agent_display_name: String, state: SharedAcpState) -> Self {
+        let mut slot = Self::new(step_name, agent_display_name, 0);
+        slot.kind = AgentWindowKind::Acp(state);
+        slot
+    }
+
+    /// Whether this slot hosts an ACP window (rather than a stdio/PTY one).
+    pub fn is_acp(&self) -> bool {
+        matches!(self.kind, AgentWindowKind::Acp(_))
+    }
+
+    /// The shared ACP render state, when this is an ACP slot.
+    pub fn acp_state(&self) -> Option<&SharedAcpState> {
+        match &self.kind {
+            AgentWindowKind::Acp(state) => Some(state),
+            AgentWindowKind::Stdio => None,
+        }
+    }
+
+    /// Agent display name for the minimized bar, falling back to "agent".
+    pub fn agent_name(&self) -> &str {
+        self.container_info
+            .as_ref()
+            .map(|i| i.agent_display_name.as_str())
+            .unwrap_or("agent")
+    }
+
+    /// Elapsed run time for the minimized bar.
+    pub fn elapsed_secs(&self) -> u64 {
+        self.container_info
+            .as_ref()
+            .map(|i| i.start_time.elapsed().as_secs())
+            .unwrap_or(0)
+    }
+}
+
+/// Lifecycle event published by the workflow frontend (engine thread) and
+/// drained by the TUI event loop to maintain `Tab::container_slots`
+/// (WI-0096 §12). Kept in a shared queue rather than mutating `Tab` directly
+/// because the frontend runs on the engine's tokio task while `Tab` lives on
+/// the TUI thread.
+pub enum ContainerSlotEvent {
+    /// A parallel group is starting: the sequential "backbone" slot (the
+    /// command-level container plumbing that sequential steps reuse) goes
+    /// dormant while the group's per-step slots take over the display.
+    GroupStarted,
+    /// A container in the group started running (initial launch or dequeued).
+    Launched {
+        step_name: String,
+        agent: String,
+        model: Option<String>,
+        io: Option<ContainerSlotIo>,
+    },
+    /// The engine learned the step's actual container name (published right
+    /// after launch). Drives per-slot stats polling and the stats title.
+    ContainerName {
+        step_name: String,
+        container_name: String,
+    },
+    /// A container exited — evict its slot with no grey summary bar.
+    Exited { step_name: String },
+    /// A container's stuck timer fired (yolo off).
+    Stuck { step_name: String },
+    /// A stuck container recovered.
+    Unstuck { step_name: String },
+    /// A container's yolo countdown started. `cancel_flag` is the same
+    /// `Arc` the engine-side frontend checks each tick — stashed on the slot
+    /// so the TUI event loop can request cancellation (Esc on the per-slot
+    /// countdown modal) without a lookup back into the engine thread.
+    YoloStarted {
+        step_name: String,
+        cancel_flag: SharedYoloCancelFlag,
+    },
+    /// A per-second countdown update for a slot's yolo timer, mirroring the
+    /// sequential path's `yolo_countdown_tick`. Drives both the minimized-bar
+    /// countdown text and the per-slot modal shown when the slot is focused.
+    YoloTick {
+        step_name: String,
+        remaining_secs: u64,
+    },
+    /// A container's yolo countdown ended (cancelled, expired, or advanced).
+    YoloFinished { step_name: String },
+    /// The whole group drained; clear any remaining group slots and restore
+    /// the dormant sequential backbone.
+    GroupFinished,
+}
+
+/// Shared queue of [`ContainerSlotEvent`]s. Mirrors the other `SharedXxx`
+/// slots: the workflow frontend pushes, the event loop drains.
+pub type SharedContainerSlotEvents = Arc<Mutex<std::collections::VecDeque<ContainerSlotEvent>>>;
+
 /// Tab state — one per open tab.
 pub struct Tab {
+    /// Identity of the manager-owned session backing this tab. The session
+    /// snapshot below remains the pre-F-22 view data; WI 0114 moves that view
+    /// state out of Tab without changing ownership again.
+    pub session_id: SessionId,
     pub session: Session,
+    pub(crate) git_engine: Arc<GitEngine>,
     pub execution_phase: ExecutionPhase,
-    pub vt100_parser: vt100::Parser,
     pub container_window_state: ContainerWindowState,
-    /// How many lines from the bottom to skip in the vt100 scrollback when
-    /// the container is Maximized. 0 = follow live output.
+    /// How many lines from the bottom to skip in the focused slot's vt100
+    /// scrollback when the container is Maximized. 0 = follow live output.
     pub container_scroll_offset: usize,
-    /// Live container metadata, populated while a containerized command runs.
-    pub container_info: Option<ContainerInfo>,
     /// Summary of the last container session, shown in a dashed-border bar
     /// below the exec window after the container exits.
     pub last_container_summary: Option<LastContainerSummary>,
@@ -222,7 +536,7 @@ pub struct Tab {
     pub exec_window_grid: Vec<Vec<String>>,
     /// Shared workflow view state. The engine's `WorkflowFrontend` impl
     /// writes here on `report_workflow_progress` / `report_step_status`;
-    /// the renderer reads from here when drawing the workflow strip.
+    /// the renderer reads from here when drawing the Workflow Overview.
     pub workflow_state: SharedWorkflowViewState,
     /// Shared yolo countdown state. Updated by `yolo_countdown_tick` on the
     /// engine side; rendered as a non-modal overlay (avoids the dialog-spam
@@ -235,27 +549,22 @@ pub struct Tab {
     pub status_log_collapsed: bool,
     pub status_dashboard: SharedStatusDashboard,
     pub scroll_offset: usize,
-    pub workflow_strip_scroll_offset: usize,
-    pub last_strip_rect: Option<Rect>,
+    pub workflow_overview_scroll_offset: usize,
+    /// Whether the Workflow Overview shows one box per stage (the default) or
+    /// every parallel step of every stage. Toggled with `Ctrl-O`, independently
+    /// of the container PTY's `Ctrl-M` min/max.
+    pub workflow_overview_state: WorkflowOverviewState,
+    pub last_overview_rect: Option<Rect>,
     pub mouse_selection: Option<TextSelection>,
-    /// Whether the agent has requested the alternate screen buffer. Tracked
-    /// here (not via the vt100 parser) because `drain_container_output`
-    /// strips alternate-screen sequences before the parser sees them, so
-    /// `screen().alternate_screen()` always reports `false`.
-    pub agent_alt_screen: bool,
-    /// Whether the agent has enabled "alternate scroll" mode (DECSET 1007).
-    /// Agents like codex never enable real mouse tracking; they expect the
-    /// terminal to translate wheel events into arrow keys while the
-    /// alternate screen is active. The vt100 parser ignores mode 1007, so
-    /// it is tracked here from the raw PTY output.
-    pub agent_alternate_scroll: bool,
-    /// Emulates scrollback for top-anchored scroll regions (codex's inline
-    /// history insertion) that the vt100 parser would otherwise discard.
-    /// All container output is funneled through it on its way to
-    /// `vt100_parser`; reset alongside the parser.
-    pub region_scroll: crate::frontend::tui::region_scroll::RegionScrollEmulator,
     pub workflow_agent_fallbacks: HashMap<String, String>,
     pub is_remote: bool,
+    /// Fixed tab kind, following the `is_remote` precedent. A squad tab is not
+    /// bound to a project directory and renders squad content in place of the
+    /// execution window. Never toggled after construction.
+    pub is_squad: bool,
+    /// Squad sub-view state (selection, polled tasks, daemon reachability).
+    /// `Some` exactly when `is_squad`.
+    pub squad: Option<SquadTabState>,
     pub output_lines: Vec<String>,
     pub stuck: bool,
     pub yolo_mode: bool,
@@ -263,13 +572,32 @@ pub struct Tab {
     /// Drained non-blockingly in `tick_all_tabs` for tab coloring.
     pub stuck_rx: Option<tokio::sync::broadcast::Receiver<StuckEvent>>,
 
+    // ── Container slots ──────────────────────────────────────────────────
+    /// The tab's running containers. A plain containerized command is one
+    /// slot; a parallel workflow group is N of them. Empty while nothing
+    /// containerized is running. The slot at `focused_slot_idx` renders
+    /// maximized; the others render as stacked minimized status bars.
+    pub container_slots: Vec<ContainerSlot>,
+    /// Index into `container_slots` of the Maximized (focused) slot. Cycled
+    /// by Ctrl-S. Always `0` with a single slot.
+    pub focused_slot_idx: usize,
+    /// The sequential "backbone" slot(s), stashed while a parallel workflow
+    /// group runs. Sequential steps reuse the command-level stdout channel,
+    /// so the slot holding its receiver must stay alive across the group
+    /// and is restored when the group finishes. Non-empty exactly while a
+    /// parallel group is active.
+    pub dormant_slots: Vec<ContainerSlot>,
+    /// Shared queue of slot lifecycle events published by the workflow
+    /// frontend; drained each tick to maintain `container_slots`.
+    pub container_slot_events: SharedContainerSlotEvents,
+    /// Set after a mid-workflow container exit closes the window: PTY bytes
+    /// that were still in flight from the dead container must not re-open it
+    /// via `drain_container_output`'s auto-open branch. Cleared when the next
+    /// container launches (new command, step transition, or a fresh
+    /// `Running { container_name }` report).
+    pub suppress_container_auto_open: bool,
+
     // ── Async command plumbing ───────────────────────────────────────────
-    /// Event loop drains container stdout/stderr into the vt100 parser.
-    pub container_stdout_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
-    /// Event loop forwards keystrokes to the container stdin.
-    pub container_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
-    /// Event loop forwards terminal resizes to the container's PTY master.
-    pub container_resize_tx: Option<tokio::sync::mpsc::UnboundedSender<(u16, u16)>>,
     /// Receives the command outcome once the spawned task finishes.
     pub command_result_rx: Option<std::sync::mpsc::Receiver<Result<CommandOutcome, CommandError>>>,
     /// Event loop polls for dialog requests from the command thread.
@@ -282,6 +610,9 @@ pub struct Tab {
     /// Shared container name: set by the container frontend when the engine
     /// reports the running container's name.
     pub container_name_shared: SharedContainerName,
+    /// Shared container exit code: set by the workflow frontend when the
+    /// engine reports a mid-workflow container has actually terminated.
+    pub container_exit_shared: SharedContainerExitCode,
     /// Shared stdin sender slot for workflow step transitions.
     pub stdin_tx_shared: SharedStdinTx,
     /// Shared resize sender slot for workflow step transitions.
@@ -299,18 +630,72 @@ pub struct Tab {
     /// on every tick; `TuiCommandFrontend` reads from it on each watch
     /// iteration so the status table always reflects current tab state.
     pub tui_context_shared: SharedTuiContext,
+
+    // ── Git sidebar ──────────────────────────────────────────────────────
+    /// Whether the git sidebar is open. Toggled by Ctrl-G.
+    pub git_sidebar_state: GitSidebarState,
+    /// Shared diff summary written by the background poll task and read by the
+    /// renderer for the sidebar and the status-bar `+X -Y` summary.
+    pub git_diff_summary: SharedGitDiffSummary,
+    /// Handle to the background poll task, aborted on `Drop`.
+    git_poll_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Cancellation token for the current poll task; triggered before a
+    /// restart (worktree change) and on `Drop`.
+    git_poll_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// The directory the poll task is currently watching. Compared against the
+    /// desired root each tick so the task restarts when the worktree changes.
+    git_poll_root: Option<std::path::PathBuf>,
+}
+
+impl Drop for Tab {
+    fn drop(&mut self) {
+        // Stop the background git poll task so it doesn't outlive the tab.
+        if let Some(cancel) = self.git_poll_cancel.take() {
+            cancel.cancel();
+        }
+        if let Some(handle) = self.git_poll_handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl Tab {
     pub fn new(session: Session) -> Self {
-        let scrollback = session.effective_config().scrollback_lines();
+        Self::new_with_git_engine(session, Arc::new(GitEngine::new()))
+    }
+
+    pub fn new_with_git_engine(session: Session, git_engine: Arc<GitEngine>) -> Self {
+        let git_root = session.git_root().to_path_buf();
+        let mut tab = Self::new_inner(session, git_engine);
+        // Start polling against the session git root. Once a worktree is
+        // created, `refresh_git_poll` (called each tick) restarts the task
+        // pointed at the worktree path.
+        tab.start_git_poll(git_root);
+        tab
+    }
+
+    /// Construct the singleton squad tab. Unlike [`Tab::new`] this starts **no**
+    /// git poll: the synthetic session is rooted at the squad storage root,
+    /// which has no meaningful diff. The caller must not auto-spawn a startup
+    /// command into this tab.
+    pub fn new_squad(session: Session) -> Self {
+        let mut tab = Self::new_inner(session, Arc::new(GitEngine::new()));
+        tab.is_squad = true;
+        tab.squad = Some(SquadTabState::new());
+        tab
+    }
+
+    /// Shared field initialisation for [`Tab::new`] and [`Tab::new_squad`].
+    /// Starts **no** poll and spawns nothing; the caller decides whether a git
+    /// poll runs (normal tab) or not (squad tab).
+    fn new_inner(session: Session, git_engine: Arc<GitEngine>) -> Self {
         Self {
+            session_id: session.id(),
             session,
+            git_engine,
             execution_phase: ExecutionPhase::Idle,
-            vt100_parser: vt100::Parser::new(24, 80, scrollback),
             container_window_state: ContainerWindowState::Hidden,
             container_scroll_offset: 0,
-            container_info: None,
             last_container_summary: None,
             container_inner_area: None,
             container_rendered: false,
@@ -323,26 +708,29 @@ impl Tab {
             status_log_collapsed: false,
             status_dashboard: Arc::new(Mutex::new(None)),
             scroll_offset: 0,
-            workflow_strip_scroll_offset: 0,
-            last_strip_rect: None,
+            workflow_overview_scroll_offset: 0,
+            workflow_overview_state: WorkflowOverviewState::Minimized,
+            last_overview_rect: None,
             mouse_selection: None,
-            agent_alt_screen: false,
-            agent_alternate_scroll: false,
-            region_scroll: crate::frontend::tui::region_scroll::RegionScrollEmulator::new(),
             workflow_agent_fallbacks: HashMap::new(),
             is_remote: false,
+            is_squad: false,
+            squad: None,
             output_lines: Vec::new(),
             stuck: false,
             yolo_mode: false,
             stuck_rx: None,
-            container_stdout_rx: None,
-            container_stdin_tx: None,
-            container_resize_tx: None,
+            container_slots: Vec::new(),
+            focused_slot_idx: 0,
+            dormant_slots: Vec::new(),
+            container_slot_events: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            suppress_container_auto_open: false,
             command_result_rx: None,
             dialog_request_rx: None,
             dialog_response_tx: None,
             pty_reset_flag: Arc::new(AtomicBool::new(false)),
             container_name_shared: Arc::new(Mutex::new(None)),
+            container_exit_shared: Arc::new(Mutex::new(None)),
             stdin_tx_shared: Arc::new(Mutex::new(None)),
             resize_tx_shared: Arc::new(Mutex::new(None)),
             engine_tx_shared: Arc::new(Mutex::new(None)),
@@ -351,404 +739,11 @@ impl Tab {
             tui_context_shared: Arc::new(Mutex::new(
                 crate::command::commands::status::StatusCommandTuiContext::default(),
             )),
-        }
-    }
-
-    /// Drain pending stuck events from the broadcast channel and update
-    /// the `stuck` flag for tab coloring.
-    pub fn drain_stuck_events(&mut self) {
-        // Pick up a new stuck sender from the engine if available.
-        if let Ok(mut guard) = self.stuck_sender_shared.lock() {
-            if let Some(sender) = guard.take() {
-                self.stuck_rx = Some(sender.subscribe());
-            }
-        }
-        if let Some(ref mut rx) = self.stuck_rx {
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    StuckEvent::Stuck => self.stuck = true,
-                    StuckEvent::Unstuck => self.stuck = false,
-                    // Bridge already killed the container; clear the stuck
-                    // flag because the step is failing rather than blocked.
-                    StuckEvent::StartupGraceExpired => self.stuck = false,
-                }
-            }
-        }
-    }
-
-    /// Activate the container overlay for a fresh PTY container session.
-    ///
-    /// Resizes the vt100 parser to the container's inner area, resets
-    /// scrollback, and records `ContainerInfo` so the title bar can show the
-    /// agent name and live stats.
-    pub fn start_container(
-        &mut self,
-        agent_display_name: String,
-        container_name: String,
-        cols: u16,
-        rows: u16,
-    ) {
-        self.container_window_state = ContainerWindowState::Maximized;
-        self.container_scroll_offset = 0;
-        self.container_rendered = false;
-        self.vt100_parser = vt100::Parser::new(
-            rows,
-            cols,
-            self.session.effective_config().scrollback_lines(),
-        );
-        self.last_container_summary = None;
-        self.mouse_selection = None;
-        self.agent_alt_screen = false;
-        self.agent_alternate_scroll = false;
-        self.region_scroll.reset();
-        self.container_info = Some(ContainerInfo {
-            agent_display_name,
-            container_name,
-            start_time: Instant::now(),
-            latest_stats: None,
-            stats_history: Vec::new(),
-            sandboxed: false,
-        });
-    }
-
-    /// Project name for display in the tab bar. Truncated to 14 chars + `…`
-    /// when the cwd's basename is longer.
-    pub fn project_name(&self) -> String {
-        let name = self
-            .session
-            .working_dir()
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?")
-            .to_string();
-        truncate_with_ellipsis(&name, 14)
-    }
-
-    /// Yolo countdown label for background tabs: alternates emoji + countdown.
-    /// Returns `None` when no yolo countdown is active.
-    pub fn background_yolo_label(&self, tab_width: u16) -> Option<String> {
-        let state = self.yolo_state.lock().ok()?.as_ref()?.clone();
-        let label = if state.remaining_secs % 2 == 0 {
-            format!("\u{26a0}\u{fe0f}  yolo in {}", state.remaining_secs)
-        } else {
-            format!("\u{1f918} yolo in {}", state.remaining_secs)
-        };
-        let max_chars = tab_width.saturating_sub(4) as usize;
-        let truncated = if label.chars().count() > max_chars && max_chars > 1 {
-            let t: String = label.chars().take(max_chars - 1).collect();
-            format!("{}\u{2026}", t)
-        } else {
-            label
-        };
-        Some(truncated)
-    }
-
-    /// Subcommand label rendered inside the tab cell (NOT in the title).
-    /// Empty while Idle. Prepended with `⚠️ ` while stuck. Truncated to fit
-    /// `tab_width - 4` chars (2 borders + 2 padding spaces).
-    /// For background tabs with an active yolo countdown, shows the countdown
-    /// label instead.
-    pub fn tab_subcommand_label(&self, tab_width: u16, is_active: bool) -> String {
-        if !is_active {
-            if let Some(label) = self.background_yolo_label(tab_width) {
-                return label;
-            }
-        }
-        let cmd = match &self.execution_phase {
-            ExecutionPhase::Idle => return String::new(),
-            ExecutionPhase::Running { command }
-            | ExecutionPhase::Done { command, .. }
-            | ExecutionPhase::Error { command, .. } => command.as_str(),
-        };
-
-        // When a workflow is active, append step info: "exec workflow: step (N/M)"
-        let workflow_suffix = self.workflow_step_suffix();
-        let display = if workflow_suffix.is_empty() {
-            cmd.to_string()
-        } else {
-            format!("{}: {}", cmd, workflow_suffix)
-        };
-
-        let prefix = if self.stuck { "\u{26a0}\u{fe0f} " } else { "" };
-        let prefix_chars = prefix.chars().count();
-        let max_chars = (tab_width as usize).saturating_sub(4);
-        let cmd_max = max_chars.saturating_sub(prefix_chars);
-        let cmd_str = if display.chars().count() > cmd_max && cmd_max > 1 {
-            let truncated: String = display.chars().take(cmd_max - 1).collect();
-            format!("{}\u{2026}", truncated)
-        } else {
-            display
-        };
-        format!("{}{}", prefix, cmd_str)
-    }
-
-    /// Build a workflow step suffix like "implement (2/5)" for the tab label.
-    /// Returns empty string when no workflow is active or has no steps.
-    fn workflow_step_suffix(&self) -> String {
-        let guard = match self.workflow_state.lock() {
-            Ok(g) => g,
-            Err(_) => return String::new(),
-        };
-        let view = match guard.as_ref() {
-            Some(v) if !v.steps.is_empty() => v,
-            _ => return String::new(),
-        };
-        let total = view.steps.len();
-        let done_count = view.steps.iter().filter(|s| s.status == "done").count();
-        let current_name = view.current_step.as_deref().unwrap_or_else(|| {
-            view.steps
-                .iter()
-                .find(|s| s.status == "running")
-                .map(|s| s.name.as_str())
-                .unwrap_or("")
-        });
-        if current_name.is_empty() {
-            // Workflow finished or not yet started
-            let completed = done_count == total;
-            if completed {
-                return format!("done ({}/{})", total, total);
-            }
-            return String::new();
-        }
-        let step_index = view
-            .steps
-            .iter()
-            .position(|s| s.name == current_name)
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        format!("{} ({}/{})", current_name, step_index, total)
-    }
-
-    /// Drain pending container output into the vt100 parser.
-    ///
-    /// Auto-opens the container overlay to Maximized the first time bytes
-    /// arrive so the user sees the PTY output immediately without having to
-    /// manually cycle with Ctrl+M. Also ensures the parser is sized to match
-    /// the current terminal dimensions (prevents the PTY rendering at 80x24
-    /// until the first resize event).
-    ///
-    /// Between workflow steps the engine sets `pty_reset_flag`, which causes
-    /// this method to reinitialize the vt100 parser (clearing the old step's
-    /// terminal content) before processing the new step's output.
-    pub fn drain_container_output(&mut self) {
-        if let Some(ref mut rx) = self.container_stdout_rx {
-            // Check if the engine signalled a PTY reset (workflow step transition).
-            if self.pty_reset_flag.swap(false, Ordering::Relaxed) {
-                let (rows, cols) = self.vt100_parser.screen().size();
-                self.vt100_parser = vt100::Parser::new(
-                    rows,
-                    cols,
-                    self.session.effective_config().scrollback_lines(),
-                );
-                self.container_scroll_offset = 0;
-                self.container_rendered = false;
-                self.mouse_selection = None;
-                self.agent_alt_screen = false;
-                self.agent_alternate_scroll = false;
-                self.region_scroll.reset();
-            }
-
-            let mut received_any = false;
-            while let Ok(bytes) = rx.try_recv() {
-                let filtered = strip_alternate_screen_sequences(&bytes);
-                if let Some(on) = filtered.alt_screen {
-                    self.agent_alt_screen = on;
-                }
-                if let Some(on) = filtered.alternate_scroll {
-                    self.agent_alternate_scroll = on;
-                }
-                self.region_scroll
-                    .process(&mut self.vt100_parser, &filtered.bytes);
-                received_any = true;
-            }
-            if received_any && self.container_window_state == ContainerWindowState::Hidden {
-                if let Ok((cols, rows)) = crossterm::terminal::size() {
-                    let (inner_cols, inner_rows) =
-                        crate::frontend::tui::compute_container_inner_size(cols, rows);
-                    self.vt100_parser
-                        .screen_mut()
-                        .set_size(inner_rows, inner_cols);
-                    if let Some(ref tx) = self.container_resize_tx {
-                        let _ = tx.send((inner_cols, inner_rows));
-                    }
-                }
-                self.container_window_state = ContainerWindowState::Maximized;
-            }
-        }
-    }
-
-    /// Push the container's terminal contents to the status log when the
-    /// overlay never got a frame on screen (the agent exited within one
-    /// event-loop tick of producing its first output). Without this, a
-    /// fast-failing launch's error output is parsed into the vt100 grid and
-    /// then discarded before the user ever sees it.
-    fn surface_unseen_container_output(&mut self) {
-        if self.container_rendered {
-            return;
-        }
-        let contents = self.vt100_parser.screen().contents();
-        let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
-        if lines.is_empty() {
-            return;
-        }
-        if let Ok(mut log) = self.status_log.lock() {
-            log.push(crate::frontend::tui::user_message::StatusLogEntry {
-                level: crate::data::message::MessageLevel::Warning,
-                text: "Agent exited before its output could be displayed; captured output:"
-                    .to_string(),
-            });
-            for line in lines {
-                log.push(crate::frontend::tui::user_message::StatusLogEntry {
-                    level: crate::data::message::MessageLevel::Info,
-                    text: format!("  {line}"),
-                });
-            }
-        }
-    }
-
-    /// Tear down the container overlay state. Called when a containerized
-    /// command finishes (exit, error, or task drop). Captures
-    /// `LastContainerSummary` from `container_info` (if any) so the post-exit
-    /// summary bar can show averaged stats and the exit code.
-    fn close_container_overlay(&mut self, exit_code: i32) {
-        self.surface_unseen_container_output();
-        if self.container_window_state != ContainerWindowState::Hidden {
-            if let Some(info) = self.container_info.take() {
-                let elapsed = info.start_time.elapsed().as_secs();
-                let (avg_cpu, avg_memory) = if info.stats_history.is_empty() {
-                    ("n/a".to_string(), "n/a".to_string())
-                } else {
-                    let count = info.stats_history.len() as f64;
-                    let cpu_avg: f64 =
-                        info.stats_history.iter().map(|(c, _)| c).sum::<f64>() / count;
-                    let mem_avg: f64 =
-                        info.stats_history.iter().map(|(_, m)| m).sum::<f64>() / count;
-                    (format!("{:.1}%", cpu_avg), format!("{:.0}MiB", mem_avg))
-                };
-                self.last_container_summary = Some(LastContainerSummary {
-                    agent_display_name: info.agent_display_name,
-                    container_name: info.container_name,
-                    avg_cpu,
-                    avg_memory,
-                    total_time: format_duration(elapsed),
-                    exit_code,
-                });
-            }
-        }
-        self.container_window_state = ContainerWindowState::Hidden;
-        self.container_inner_area = None;
-        self.mouse_selection = None;
-        self.container_scroll_offset = 0;
-        self.agent_alt_screen = false;
-        self.agent_alternate_scroll = false;
-        self.region_scroll.reset();
-        self.stuck = false;
-        self.stuck_rx = None;
-    }
-
-    /// Check if the command task has completed; update execution phase.
-    ///
-    /// Closes the container overlay on completion so the user regains full
-    /// keyboard control without having to manually cycle Ctrl+M.
-    pub fn poll_command_completion(&mut self) {
-        if let Some(ref rx) = self.command_result_rx {
-            match rx.try_recv() {
-                Ok(Ok(outcome)) => {
-                    let cmd_name = match &self.execution_phase {
-                        ExecutionPhase::Running { command } => command.clone(),
-                        _ => String::new(),
-                    };
-                    // Agent-session commands carry the agent's real exit code;
-                    // reflect it instead of unconditionally reporting success.
-                    let exit_code = match &outcome {
-                        CommandOutcome::Chat(o) => o.exit_code.unwrap_or(0),
-                        CommandOutcome::ExecPrompt(o) => o.exit_code.unwrap_or(0),
-                        _ => 0,
-                    };
-                    if let Ok(mut log) = self.status_log.lock() {
-                        if exit_code == 0 {
-                            log.push(crate::frontend::tui::user_message::StatusLogEntry {
-                                level: crate::data::message::MessageLevel::Success,
-                                text: format!("Command '{}' completed successfully.", cmd_name),
-                            });
-                        } else {
-                            log.push(crate::frontend::tui::user_message::StatusLogEntry {
-                                level: crate::data::message::MessageLevel::Error,
-                                text: format!(
-                                    "Command '{}' finished: agent exited with code {}.",
-                                    cmd_name, exit_code
-                                ),
-                            });
-                        }
-                    }
-                    self.execution_phase = ExecutionPhase::Done {
-                        command: cmd_name,
-                        exit_code,
-                    };
-                    self.close_container_overlay(exit_code);
-                    self.command_result_rx = None;
-                    self.container_stdout_rx = None;
-                    self.container_stdin_tx = None;
-                    self.container_resize_tx = None;
-                }
-                Ok(Err(err)) => {
-                    let cmd_name = match &self.execution_phase {
-                        ExecutionPhase::Running { command } => command.clone(),
-                        _ => String::new(),
-                    };
-                    let err_msg = format!("{err}");
-                    if let Ok(mut log) = self.status_log.lock() {
-                        log.push(crate::frontend::tui::user_message::StatusLogEntry {
-                            level: crate::data::message::MessageLevel::Error,
-                            text: format!("Command '{}' failed: {}", cmd_name, err_msg),
-                        });
-                    }
-                    self.execution_phase = ExecutionPhase::Error {
-                        command: cmd_name,
-                        message: err_msg,
-                    };
-                    self.close_container_overlay(-1);
-                    self.command_result_rx = None;
-                    self.container_stdout_rx = None;
-                    self.container_stdin_tx = None;
-                    self.container_resize_tx = None;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Still running — nothing to do.
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // Command task dropped without sending a result.
-                    let cmd_name = match &self.execution_phase {
-                        ExecutionPhase::Running { command } => command.clone(),
-                        _ => String::new(),
-                    };
-                    let err_msg = "command task dropped unexpectedly".to_string();
-                    if let Ok(mut log) = self.status_log.lock() {
-                        log.push(crate::frontend::tui::user_message::StatusLogEntry {
-                            level: crate::data::message::MessageLevel::Error,
-                            text: format!("Command '{}' failed: {}", cmd_name, err_msg),
-                        });
-                    }
-                    self.execution_phase = ExecutionPhase::Error {
-                        command: cmd_name,
-                        message: err_msg,
-                    };
-                    self.close_container_overlay(-1);
-                    self.command_result_rx = None;
-                    self.container_stdout_rx = None;
-                    self.container_stdin_tx = None;
-                    self.container_resize_tx = None;
-                }
-            }
-        }
-    }
-
-    pub fn subcommand_label(&self) -> &str {
-        match &self.execution_phase {
-            ExecutionPhase::Idle => "",
-            ExecutionPhase::Running { command } => command.as_str(),
-            ExecutionPhase::Done { command, .. } => command.as_str(),
-            ExecutionPhase::Error { command, .. } => command.as_str(),
+            git_sidebar_state: GitSidebarState::Closed,
+            git_diff_summary: Arc::new(Mutex::new(None)),
+            git_poll_handle: None,
+            git_poll_cancel: None,
+            git_poll_root: None,
         }
     }
 }
@@ -795,6 +790,11 @@ pub fn tab_color(tab: &Tab) -> ratatui::style::Color {
     if tab.stuck {
         return Color::Yellow;
     }
+    // Fixed tab kinds. Both win over execution-phase colouring and both yield
+    // to the stuck / yolo indicators above, which are transient run signals.
+    if tab.is_squad {
+        return Color::Cyan;
+    }
     if tab.is_remote {
         return Color::Magenta;
     }
@@ -802,7 +802,15 @@ pub fn tab_color(tab: &Tab) -> ratatui::style::Color {
         ExecutionPhase::Error { .. } => Color::Red,
         ExecutionPhase::Running { .. } => {
             if tab.container_window_state != ContainerWindowState::Hidden {
-                Color::Green
+                // The container-visible "running" color is the agent-window
+                // identity color: purple when the focused slot is an ACP
+                // window, green for a stdio one. The Blue/Red/DarkGray phase
+                // states below and above are unchanged.
+                if tab.focused_slot().is_some_and(|s| s.is_acp()) {
+                    crate::frontend::tui::acp_view::ACP_BORDER_COLOR
+                } else {
+                    Color::Green
+                }
             } else {
                 Color::Blue
             }
@@ -812,7 +820,16 @@ pub fn tab_color(tab: &Tab) -> ratatui::style::Color {
 }
 
 /// Execution window border color based on phase and focus.
-pub fn window_border_color(phase: &ExecutionPhase, focused: bool) -> ratatui::style::Color {
+///
+/// `acp` is `true` when the focused agent slot is an ACP window: the only
+/// green state (focused + Done) then becomes the ACP identity color, matching
+/// [`tab_color`]. The Blue/Gray/Red/DarkGray phase states are unchanged — the
+/// stdio window's appearance is identical (callers pass `acp = false`).
+pub fn window_border_color(
+    phase: &ExecutionPhase,
+    focused: bool,
+    acp: bool,
+) -> ratatui::style::Color {
     use ratatui::style::Color;
     match phase {
         ExecutionPhase::Error { .. } => Color::Red,
@@ -825,7 +842,11 @@ pub fn window_border_color(phase: &ExecutionPhase, focused: bool) -> ratatui::st
         }
         ExecutionPhase::Done { .. } => {
             if focused {
-                Color::Green
+                if acp {
+                    crate::frontend::tui::acp_view::ACP_BORDER_COLOR
+                } else {
+                    Color::Green
+                }
             } else {
                 Color::Gray
             }
@@ -955,660 +976,5 @@ fn strip_alternate_screen_sequences(input: &[u8]) -> StrippedOutput {
         bytes: out,
         alt_screen,
         alternate_scroll,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
-
-    fn make_test_session() -> Session {
-        let tmp = tempfile::tempdir().unwrap();
-        let resolver = StaticGitRootResolver::new(tmp.path());
-        Session::open(
-            tmp.path().to_path_buf(),
-            &resolver,
-            SessionOpenOptions::default(),
-        )
-        .unwrap()
-    }
-
-    fn make_tab() -> Tab {
-        Tab::new(make_test_session())
-    }
-
-    #[test]
-    fn container_window_cycles() {
-        assert_eq!(
-            ContainerWindowState::Hidden.cycle(),
-            ContainerWindowState::Maximized
-        );
-        assert_eq!(
-            ContainerWindowState::Minimized.cycle(),
-            ContainerWindowState::Maximized
-        );
-        assert_eq!(
-            ContainerWindowState::Maximized.cycle(),
-            ContainerWindowState::Minimized
-        );
-    }
-
-    /// Reproduces TUI-3: vt100 0.15.2's `Grid::visible_rows()` panicked in
-    /// debug builds when `scrollback_offset > rows_len` (an unchecked
-    /// `rows_len - scrollback_offset` subtraction). vt100-ctt 0.17 fixes
-    /// the panic with `saturating_sub`, so we can scroll the full
-    /// configured scrollback depth (5000 lines by default) without
-    /// hitting an arithmetic overflow.
-    #[test]
-    fn deep_scroll_past_screen_rows_does_not_panic() {
-        let mut tab = make_tab();
-        tab.start_container("agent".into(), "container".into(), 80, 24);
-        // Feed enough lines that the vt100 scrollback grows well past the
-        // screen height. Each "line\n" becomes one row of scrollback.
-        for i in 0..500 {
-            let s = format!("line {i}\r\n");
-            tab.vt100_parser.process(s.as_bytes());
-        }
-        // Probe depth.
-        let depth = {
-            let screen = tab.vt100_parser.screen_mut();
-            screen.set_scrollback(usize::MAX);
-            let d = screen.scrollback();
-            screen.set_scrollback(0);
-            d
-        };
-        assert!(
-            depth > 24,
-            "test setup: scrollback depth must exceed screen height; got {depth}"
-        );
-        // Set offset to a value much larger than screen_rows. Pre-fix
-        // (vt100 0.15.2) this would panic in debug; vt100-ctt 0.17 must
-        // handle it safely.
-        let screen = tab.vt100_parser.screen_mut();
-        screen.set_scrollback(depth);
-        let eff = screen.scrollback();
-        assert_eq!(
-            eff, depth,
-            "set_scrollback must clamp to depth, not screen_rows"
-        );
-        // Reading cells at this offset must not panic.
-        let _ = screen.cell(0, 0);
-        let _ = screen.cell(23, 79);
-        screen.set_scrollback(0);
-    }
-
-    // ── truncate_with_ellipsis ─────────────────────────────────────────────────
-
-    #[test]
-    fn truncate_with_ellipsis_no_change_when_short() {
-        assert_eq!(truncate_with_ellipsis("hello", 14), "hello");
-    }
-
-    #[test]
-    fn truncate_with_ellipsis_at_limit() {
-        // Exactly 14 chars: no ellipsis.
-        assert_eq!(
-            truncate_with_ellipsis("aaaaaaaaaaaaaa", 14),
-            "aaaaaaaaaaaaaa"
-        );
-    }
-
-    #[test]
-    fn truncate_with_ellipsis_when_too_long() {
-        let s = "aaaaaaaaaaaaaaaaaa"; // 18 chars
-        let result = truncate_with_ellipsis(s, 14);
-        assert!(result.ends_with('\u{2026}'));
-        assert_eq!(result.chars().count(), 14);
-    }
-
-    // ── tab_subcommand_label ───────────────────────────────────────────────────
-
-    #[test]
-    fn tab_subcommand_label_idle_is_empty() {
-        let tab = make_tab();
-        assert_eq!(tab.tab_subcommand_label(20, true), "");
-    }
-
-    #[test]
-    fn tab_subcommand_label_running_returns_command() {
-        let mut tab = make_tab();
-        tab.execution_phase = ExecutionPhase::Running {
-            command: "chat".into(),
-        };
-        assert_eq!(tab.tab_subcommand_label(20, true), "chat");
-    }
-
-    #[test]
-    fn tab_subcommand_label_truncates_to_fit_cell() {
-        let mut tab = make_tab();
-        tab.execution_phase = ExecutionPhase::Running {
-            command: "very-long-subcommand-name".into(),
-        };
-        // tab_width=10 → max_chars=6; truncated to 5 chars + …
-        let label = tab.tab_subcommand_label(10, true);
-        assert!(label.ends_with('\u{2026}'));
-        assert!(label.chars().count() <= 6);
-    }
-
-    // ── compute_tab_bar_width ──────────────────────────────────────────────────
-
-    #[test]
-    fn tab_bar_width_single_tab_uses_min_when_content_small() {
-        // 1 tab, content 5 → natural = max(7, 20) = 20, fits in 200.
-        assert_eq!(compute_tab_bar_width(1, 200, 5), 20);
-    }
-
-    #[test]
-    fn tab_bar_width_single_tab_uses_natural_when_fits() {
-        // 1 tab, content 80 → natural = 82, fits in 100.
-        assert_eq!(compute_tab_bar_width(1, 100, 80), 82);
-    }
-
-    #[test]
-    fn tab_bar_width_two_tabs_shrinks_when_overflow() {
-        // 2 tabs, content 90 → natural = 92, total = 184 > 100. Shrink: 100/2 = 50.
-        assert_eq!(compute_tab_bar_width(2, 100, 90), 50);
-    }
-
-    #[test]
-    fn tab_bar_width_three_tabs_shrinks_when_overflow() {
-        // 3 tabs, content 90 → natural = 92, total = 276 > 100. Shrink: 100/3 = 33.
-        assert_eq!(compute_tab_bar_width(3, 100, 90), 33);
-    }
-
-    #[test]
-    fn tab_bar_width_four_tabs_uses_min_when_content_small() {
-        // 4 tabs, content 10 → natural = max(12, 20) = 20, total = 80 ≤ 100.
-        assert_eq!(compute_tab_bar_width(4, 100, 10), 20);
-    }
-
-    #[test]
-    fn tab_bar_width_zero_tabs() {
-        assert_eq!(compute_tab_bar_width(0, 100, 5), 0);
-    }
-
-    // ── phase_label ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn phase_label_idle() {
-        assert_eq!(phase_label(&ExecutionPhase::Idle), " awman ");
-    }
-
-    #[test]
-    fn phase_label_running() {
-        let label = phase_label(&ExecutionPhase::Running {
-            command: "chat".into(),
-        });
-        assert!(label.contains("running"));
-        assert!(label.contains("chat"));
-    }
-
-    #[test]
-    fn phase_label_done_exit_zero_shows_checkmark() {
-        let label = phase_label(&ExecutionPhase::Done {
-            command: "chat".into(),
-            exit_code: 0,
-        });
-        assert!(label.contains('✓'), "exit-0 done must use checkmark");
-        assert!(label.contains("done"));
-        assert!(label.contains("chat"));
-    }
-
-    #[test]
-    fn phase_label_done_nonzero_exit_shows_cross_and_code() {
-        let label = phase_label(&ExecutionPhase::Done {
-            command: "chat".into(),
-            exit_code: 1,
-        });
-        assert!(label.contains('✗'), "non-zero exit must use cross");
-        assert!(label.contains("exit 1"));
-        assert!(label.contains("chat"));
-    }
-
-    #[test]
-    fn phase_label_error_shows_cross_and_command() {
-        let label = phase_label(&ExecutionPhase::Error {
-            command: "ready".into(),
-            message: "something broke".into(),
-        });
-        assert!(label.contains('✗'));
-        assert!(label.contains("error"));
-        assert!(label.contains("ready"));
-    }
-
-    // ── window_border_color matrix ────────────────────────────────────────────
-
-    #[test]
-    fn window_border_color_error_always_red() {
-        use ratatui::style::Color;
-        let phase = ExecutionPhase::Error {
-            command: "x".into(),
-            message: "y".into(),
-        };
-        assert_eq!(window_border_color(&phase, true), Color::Red);
-        assert_eq!(window_border_color(&phase, false), Color::Red);
-    }
-
-    #[test]
-    fn window_border_color_running_focused_is_blue() {
-        use ratatui::style::Color;
-        let phase = ExecutionPhase::Running {
-            command: "x".into(),
-        };
-        assert_eq!(window_border_color(&phase, true), Color::Blue);
-    }
-
-    #[test]
-    fn window_border_color_running_unfocused_is_gray() {
-        use ratatui::style::Color;
-        let phase = ExecutionPhase::Running {
-            command: "x".into(),
-        };
-        assert_eq!(window_border_color(&phase, false), Color::Gray);
-    }
-
-    #[test]
-    fn window_border_color_done_focused_is_green() {
-        use ratatui::style::Color;
-        let phase = ExecutionPhase::Done {
-            command: "x".into(),
-            exit_code: 0,
-        };
-        assert_eq!(window_border_color(&phase, true), Color::Green);
-    }
-
-    #[test]
-    fn window_border_color_done_unfocused_is_gray() {
-        use ratatui::style::Color;
-        let phase = ExecutionPhase::Done {
-            command: "x".into(),
-            exit_code: 0,
-        };
-        assert_eq!(window_border_color(&phase, false), Color::Gray);
-    }
-
-    #[test]
-    fn window_border_color_idle_is_dark_gray_regardless_of_focus() {
-        use ratatui::style::Color;
-        assert_eq!(
-            window_border_color(&ExecutionPhase::Idle, true),
-            Color::DarkGray
-        );
-        assert_eq!(
-            window_border_color(&ExecutionPhase::Idle, false),
-            Color::DarkGray
-        );
-    }
-
-    // ── tab_color ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn tab_color_stuck_is_yellow() {
-        use ratatui::style::Color;
-        let mut tab = make_tab();
-        tab.stuck = true;
-        assert_eq!(tab_color(&tab), Color::Yellow);
-    }
-
-    #[test]
-    fn tab_color_remote_is_magenta() {
-        use ratatui::style::Color;
-        let mut tab = make_tab();
-        tab.is_remote = true;
-        assert_eq!(tab_color(&tab), Color::Magenta);
-    }
-
-    #[test]
-    fn tab_color_stuck_takes_priority_over_remote() {
-        use ratatui::style::Color;
-        let mut tab = make_tab();
-        tab.stuck = true;
-        tab.is_remote = true;
-        assert_eq!(tab_color(&tab), Color::Yellow);
-    }
-
-    #[test]
-    fn tab_color_error_is_red() {
-        use ratatui::style::Color;
-        let mut tab = make_tab();
-        tab.execution_phase = ExecutionPhase::Error {
-            command: "chat".into(),
-            message: "oops".into(),
-        };
-        assert_eq!(tab_color(&tab), Color::Red);
-    }
-
-    #[test]
-    fn tab_color_running_with_pty_container_visible_is_green() {
-        use ratatui::style::Color;
-        let mut tab = make_tab();
-        tab.execution_phase = ExecutionPhase::Running {
-            command: "chat".into(),
-        };
-        tab.container_window_state = ContainerWindowState::Minimized;
-        assert_eq!(tab_color(&tab), Color::Green);
-    }
-
-    #[test]
-    fn tab_color_running_maximized_container_is_green() {
-        use ratatui::style::Color;
-        let mut tab = make_tab();
-        tab.execution_phase = ExecutionPhase::Running {
-            command: "chat".into(),
-        };
-        tab.container_window_state = ContainerWindowState::Maximized;
-        assert_eq!(tab_color(&tab), Color::Green);
-    }
-
-    #[test]
-    fn tab_color_running_no_container_is_blue() {
-        use ratatui::style::Color;
-        let mut tab = make_tab();
-        tab.execution_phase = ExecutionPhase::Running {
-            command: "chat".into(),
-        };
-        tab.container_window_state = ContainerWindowState::Hidden;
-        assert_eq!(tab_color(&tab), Color::Blue);
-    }
-
-    #[test]
-    fn tab_color_idle_is_dark_gray() {
-        use ratatui::style::Color;
-        let tab = make_tab();
-        assert_eq!(tab_color(&tab), Color::DarkGray);
-    }
-
-    #[test]
-    fn tab_color_done_is_dark_gray() {
-        use ratatui::style::Color;
-        let mut tab = make_tab();
-        tab.execution_phase = ExecutionPhase::Done {
-            command: "chat".into(),
-            exit_code: 0,
-        };
-        assert_eq!(tab_color(&tab), Color::DarkGray);
-    }
-
-    // ── strip_alternate_screen_sequences ─────────────────────────────
-
-    #[test]
-    fn strip_alt_screen_removes_1049h() {
-        let input = b"hello\x1b[?1049hworld";
-        let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out.bytes, b"helloworld");
-        assert_eq!(out.alt_screen, Some(true));
-    }
-
-    #[test]
-    fn strip_alt_screen_removes_1049l() {
-        let input = b"\x1b[?1049lafter";
-        let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out.bytes, b"after");
-        assert_eq!(out.alt_screen, Some(false));
-    }
-
-    #[test]
-    fn strip_alt_screen_removes_47h_and_47l() {
-        let input = b"a\x1b[?47hb\x1b[?47lc";
-        let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out.bytes, b"abc");
-        // Last toggle in the chunk wins.
-        assert_eq!(out.alt_screen, Some(false));
-    }
-
-    #[test]
-    fn strip_alt_screen_removes_1047h() {
-        let input = b"\x1b[?1047hx";
-        let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out.bytes, b"x");
-        assert_eq!(out.alt_screen, Some(true));
-    }
-
-    #[test]
-    fn strip_alt_screen_preserves_other_escapes() {
-        let input = b"\x1b[31mred\x1b[0m";
-        let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out.bytes, input.to_vec());
-        assert_eq!(out.alt_screen, None);
-        assert_eq!(out.alternate_scroll, None);
-    }
-
-    #[test]
-    fn strip_alt_screen_passthrough_no_sequences() {
-        let input = b"plain text without escapes";
-        let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out.bytes, input.to_vec());
-        assert_eq!(out.alt_screen, None);
-        assert_eq!(out.alternate_scroll, None);
-    }
-
-    #[test]
-    fn strip_alt_screen_empty_input() {
-        let out = strip_alternate_screen_sequences(b"");
-        assert!(out.bytes.is_empty());
-        assert_eq!(out.alt_screen, None);
-        assert_eq!(out.alternate_scroll, None);
-    }
-
-    #[test]
-    fn strip_alt_screen_consecutive_sequences() {
-        let input = b"\x1b[?1049h\x1b[?1049l";
-        let out = strip_alternate_screen_sequences(input);
-        assert!(out.bytes.is_empty());
-        assert_eq!(out.alt_screen, Some(false));
-    }
-
-    #[test]
-    fn strip_observes_alternate_scroll_enable_without_stripping() {
-        // codex's alt-screen entry: CSI ?1049h then CSI ?1007h. The 1049
-        // must be stripped, the 1007 observed but left in the stream.
-        let input = b"\x1b[?1049h\x1b[?1007h";
-        let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out.bytes, b"\x1b[?1007h");
-        assert_eq!(out.alt_screen, Some(true));
-        assert_eq!(out.alternate_scroll, Some(true));
-    }
-
-    #[test]
-    fn strip_observes_alternate_scroll_disable() {
-        // codex's alt-screen exit: CSI ?1007l then CSI ?1049l.
-        let input = b"\x1b[?1007l\x1b[?1049l";
-        let out = strip_alternate_screen_sequences(input);
-        assert_eq!(out.bytes, b"\x1b[?1007l");
-        assert_eq!(out.alt_screen, Some(false));
-        assert_eq!(out.alternate_scroll, Some(false));
-    }
-
-    #[test]
-    fn drain_container_output_tracks_alt_screen_and_alternate_scroll() {
-        let mut tab = make_tab();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        tab.container_stdout_rx = Some(rx);
-
-        tx.send(b"\x1b[?1049h\x1b[?1007h".to_vec()).unwrap();
-        tab.drain_container_output();
-        assert!(tab.agent_alt_screen, "1049h must set agent_alt_screen");
-        assert!(
-            tab.agent_alternate_scroll,
-            "1007h must set agent_alternate_scroll"
-        );
-
-        tx.send(b"\x1b[?1007l\x1b[?1049l".to_vec()).unwrap();
-        tab.drain_container_output();
-        assert!(!tab.agent_alt_screen, "1049l must clear agent_alt_screen");
-        assert!(
-            !tab.agent_alternate_scroll,
-            "1007l must clear agent_alternate_scroll"
-        );
-    }
-
-    #[test]
-    fn codex_inline_history_insertion_lands_in_scrollback() {
-        // Reproduces codex's inline-viewport history insertion
-        // (codex-rs/tui/src/insert_history.rs): a scroll region anchored at
-        // the top of the screen ending above the inline viewport, the cursor
-        // parked on the region's bottom row, and one "\r\n" + line per
-        // history entry. Each newline scrolls the region; the rows pushed
-        // off the top of the screen must accumulate in vt100 scrollback so
-        // mouse-wheel scrollback has something to show. Relies on the
-        // RegionScrollEmulator in the drain pipeline (vt100 alone discards
-        // these rows).
-        let mut tab = make_tab(); // 24x80 parser
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        tab.container_stdout_rx = Some(rx);
-        // Steady-state: the overlay is already open and the parser sized
-        // (start_container). Skips drain's auto-open branch, which would
-        // resize the parser to the host terminal mid-test.
-        tab.container_window_state = ContainerWindowState::Maximized;
-
-        // Viewport occupies the bottom 6 rows (0-based top = row 18), so the
-        // scroll region is 1-based rows 1..18.
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"\x1b[1;18r"); // DECSTBM, top-anchored
-        bytes.extend_from_slice(b"\x1b[18;1H"); // cursor to region bottom
-        for i in 0..30 {
-            bytes.extend_from_slice(format!("\r\nhistory line {i}").as_bytes());
-        }
-        bytes.extend_from_slice(b"\x1b[r"); // reset region
-        tx.send(bytes).unwrap();
-        tab.drain_container_output();
-
-        let screen = tab.vt100_parser.screen_mut();
-        screen.set_scrollback(usize::MAX);
-        let depth = screen.scrollback();
-        assert!(
-            depth >= 12,
-            "30 lines through an 18-row region must overflow into scrollback \
-             (got depth {depth})"
-        );
-        let scrolled_back = screen.contents();
-        screen.set_scrollback(0);
-        assert!(
-            scrolled_back.contains("history line 0"),
-            "earliest history line must be reachable in scrollback"
-        );
-    }
-
-    // ── Agent exit-code reporting and fast-exit output capture ──────────
-
-    fn finish_with_chat_outcome(tab: &mut Tab, exit_code: Option<i32>) {
-        let (result_tx, result_rx) =
-            std::sync::mpsc::channel::<Result<CommandOutcome, CommandError>>();
-        tab.command_result_rx = Some(result_rx);
-        tab.execution_phase = ExecutionPhase::Running {
-            command: "chat".into(),
-        };
-        result_tx
-            .send(Ok(CommandOutcome::Chat(
-                crate::command::commands::chat::ChatOutcome {
-                    agent: Some("claude".into()),
-                    exit_code,
-                },
-            )))
-            .unwrap();
-        tab.poll_command_completion();
-    }
-
-    fn log_texts(tab: &Tab) -> Vec<(crate::data::message::MessageLevel, String)> {
-        tab.status_log
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|e| (e.level, e.text.clone()))
-            .collect()
-    }
-
-    #[test]
-    fn poll_completion_reports_nonzero_agent_exit_code() {
-        let mut tab = make_tab();
-        finish_with_chat_outcome(&mut tab, Some(2));
-
-        assert!(
-            matches!(
-                tab.execution_phase,
-                ExecutionPhase::Done { exit_code: 2, .. }
-            ),
-            "Done phase must carry the agent's exit code: {:?}",
-            tab.execution_phase
-        );
-        let logs = log_texts(&tab);
-        assert!(
-            logs.iter().any(|(level, text)| {
-                *level == crate::data::message::MessageLevel::Error
-                    && text.contains("agent exited with code 2")
-            }),
-            "non-zero agent exit must be reported as an Error, got: {logs:?}"
-        );
-        assert!(
-            !logs
-                .iter()
-                .any(|(_, text)| text.contains("completed successfully")),
-            "non-zero agent exit must not be reported as success: {logs:?}"
-        );
-    }
-
-    #[test]
-    fn poll_completion_zero_exit_reports_success() {
-        let mut tab = make_tab();
-        finish_with_chat_outcome(&mut tab, Some(0));
-
-        let logs = log_texts(&tab);
-        assert!(
-            logs.iter().any(|(level, text)| {
-                *level == crate::data::message::MessageLevel::Success
-                    && text.contains("completed successfully")
-            }),
-            "clean agent exit keeps the success message: {logs:?}"
-        );
-    }
-
-    #[test]
-    fn unrendered_container_output_is_surfaced_to_status_log() {
-        let mut tab = make_tab();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        tab.container_stdout_rx = Some(rx);
-
-        // The agent prints an error and dies before the renderer draws a
-        // single frame — drain opens the overlay, poll closes it in the same
-        // tick, container_rendered stays false.
-        tx.send(b"ERROR: unknown flag: --workspace-dir\r\n".to_vec())
-            .unwrap();
-        tab.drain_container_output();
-        assert!(!tab.container_rendered);
-        finish_with_chat_outcome(&mut tab, Some(1));
-
-        let logs = log_texts(&tab);
-        assert!(
-            logs.iter()
-                .any(|(_, text)| text.contains("before its output could be displayed")),
-            "must announce the captured-output replay: {logs:?}"
-        );
-        assert!(
-            logs.iter()
-                .any(|(_, text)| text.contains("ERROR: unknown flag: --workspace-dir")),
-            "the agent's dying words must land in the status log: {logs:?}"
-        );
-    }
-
-    #[test]
-    fn rendered_container_output_is_not_duplicated_into_status_log() {
-        let mut tab = make_tab();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-        tab.container_stdout_rx = Some(rx);
-
-        tx.send(b"normal session output\r\n".to_vec()).unwrap();
-        tab.drain_container_output();
-        // The renderer drew the overlay at least once.
-        tab.container_rendered = true;
-        finish_with_chat_outcome(&mut tab, Some(0));
-
-        let logs = log_texts(&tab);
-        assert!(
-            !logs
-                .iter()
-                .any(|(_, text)| text.contains("normal session output")),
-            "output the user already saw must not be replayed: {logs:?}"
-        );
     }
 }

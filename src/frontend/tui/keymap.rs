@@ -12,8 +12,13 @@ pub enum Action {
     NextTab,
     CloseTabOrQuit,
     CycleContainerWindow,
+    /// Ctrl-O ("overview"): toggle the Workflow Overview between its minimized
+    /// one-box-per-stage view and its maximized every-step view. Independent of
+    /// `CycleContainerWindow` (Ctrl-M) — neither min/max affects the other.
+    ToggleWorkflowOverview,
     OpenConfigShow,
     WorkflowControl,
+    ToggleGitSidebar,
 
     // ── Command box ─────────────────────────────────────────────────────
     SubmitCommand,
@@ -31,9 +36,42 @@ pub enum Action {
     ScrollToBottom,
     CopySelection,
     ToggleStatusLog,
+    /// Ctrl-\ — leave the container view without signalling any container
+    /// (WI 0110). Ends a squad attach session, or minimizes an ordinary
+    /// command's maximized container. Never kills or interrupts an agent.
+    DetachContainers,
 
     // ── Dialog ──────────────────────────────────────────────────────────
     DismissDialog,
+    /// Ctrl+N in the config dialog: start the add-model-mapping flow.
+    NewMapEntry,
+
+    // ── squad list (WI 0102) ─────────────────────────────────────────────
+    /// Enter — open the task detail modal for the selected row.
+    SquadShowDetail,
+    /// h — open the run-history modal for the selected row.
+    SquadShowHistory,
+    /// a — attach to the selected task's running container(s).
+    SquadAttach,
+    /// n — create a task (drives the Layer-2 interview dialog chain).
+    SquadNew,
+    /// e — edit the selected task (WI 0110), through the same interview
+    /// dialog chain, prefilled with the task as it stands.
+    SquadEdit,
+    /// p — pause the selected task.
+    SquadPause,
+    /// r — resume the selected task.
+    SquadResume,
+    /// t — evaluate the selected task now, ignoring its schedule.
+    SquadTrigger,
+    /// c — cancel the selected task's in-progress run.
+    SquadCancel,
+    /// d — remove the selected task (opens a confirmation first).
+    SquadDelete,
+    /// Left — move the card grid selection one column left.
+    SquadMoveLeft,
+    /// Right — move the card grid selection one column right.
+    SquadMoveRight,
 
     // ── Text input ──────────────────────────────────────────────────────
     Char(char),
@@ -62,6 +100,10 @@ pub enum FocusContext {
     ExecutionWindow,
     Dialog,
     ContainerMaximized,
+    /// The squad tab's task list has focus (WI 0102). Only reachable when
+    /// the active tab is the squad tab, focus is on the body, and no attach
+    /// session owns the tab's container slots.
+    SquadList,
 }
 
 /// Map a key event + focus context to an [`Action`].
@@ -79,9 +121,31 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
             KeyCode::Char('a') if ctx != FocusContext::Dialog => return Action::PreviousTab,
             KeyCode::Char('d') if ctx != FocusContext::Dialog => return Action::NextTab,
             KeyCode::Char('m') if ctx != FocusContext::Dialog => {
-                return Action::CycleContainerWindow
+                return Action::CycleContainerWindow;
+            }
+            // Ctrl-O (SI, 0x0f) is intercepted in every context — including
+            // ContainerMaximized, before the ForwardToPty path below — so the
+            // workflow overview is always one keystroke away.
+            KeyCode::Char('o') if ctx != FocusContext::Dialog => {
+                return Action::ToggleWorkflowOverview;
             }
             KeyCode::Char('w') => return Action::WorkflowControl,
+            // Ctrl-G (BEL, 0x07) is rarely used by terminal programs, so we
+            // intercept it here — before the ContainerMaximized ForwardToPty
+            // path below — in every focus context so it never reaches the PTY.
+            KeyCode::Char('g') => return Action::ToggleGitSidebar,
+            // Ctrl-\ (FS, 0x1c) detaches from whatever container view is on
+            // screen, leaving every container running (WI 0110). It is
+            // intercepted in every context — like Ctrl-O and Ctrl-G — so it
+            // never reaches the PTY: the whole point is a way out that does
+            // *not* signal the agent the way Ctrl-C does.
+            //
+            // A terminal without the kitty keyboard protocol enhancement
+            // reports the raw FS byte, and crossterm's legacy decoder maps
+            // 0x1C..=0x1F to Ctrl+'4'..'7' (not the literal key), so Ctrl-\
+            // arrives here as Ctrl+'4'. Match both encodings, or Ctrl-\ only
+            // works on the minority of terminals that support kitty.
+            KeyCode::Char('\\') | KeyCode::Char('4') => return Action::DetachContainers,
             _ => {}
         }
     }
@@ -110,6 +174,38 @@ pub fn map_key(key: KeyEvent, ctx: FocusContext) -> Action {
                 Action::ForwardToPty(key)
             }
         }
+        FocusContext::SquadList => map_squad_list_key(key, ctrl),
+    }
+}
+
+/// Key bindings for the squad task list (WI 0102). Reached only through
+/// `FocusContext::SquadList`; the global `ctrl` block in `map_key` runs first,
+/// so `Ctrl-T`/`Ctrl-A`/`Ctrl-D`/`Ctrl-M`/`Ctrl-O`/`Ctrl-W`/`Ctrl-G`/`Ctrl-C`/
+/// `Ctrl-,` keep their global meaning here.
+fn map_squad_list_key(key: KeyEvent, ctrl: bool) -> Action {
+    match key.code {
+        // WI 0112: the command box is permanently inactive on the squad tab,
+        // so there is nothing for Esc to hand focus to. It is deliberately
+        // unmapped rather than `FocusCommandBox`.
+        KeyCode::Esc => Action::None,
+        KeyCode::Up => Action::ScrollUp,
+        KeyCode::Down => Action::ScrollDown,
+        KeyCode::Left if !ctrl => Action::SquadMoveLeft,
+        KeyCode::Right if !ctrl => Action::SquadMoveRight,
+        KeyCode::PageUp => Action::ScrollPageUp,
+        KeyCode::PageDown => Action::ScrollPageDown,
+        KeyCode::Enter => Action::SquadShowDetail,
+        KeyCode::Char('a') if !ctrl => Action::SquadAttach,
+        KeyCode::Char('n') if !ctrl => Action::SquadNew,
+        KeyCode::Char('e') if !ctrl => Action::SquadEdit,
+        KeyCode::Char('h') if !ctrl => Action::SquadShowHistory,
+        KeyCode::Char('p') if !ctrl => Action::SquadPause,
+        KeyCode::Char('r') if !ctrl => Action::SquadResume,
+        KeyCode::Char('t') if !ctrl => Action::SquadTrigger,
+        KeyCode::Char('c') if !ctrl => Action::SquadCancel,
+        KeyCode::Char('d') if !ctrl => Action::SquadDelete,
+        KeyCode::Char('y') if ctrl => Action::CopySelection,
+        _ => Action::None,
     }
 }
 
@@ -153,12 +249,15 @@ fn map_execution_window_key(key: KeyEvent, ctrl: bool) -> Action {
     }
 }
 
-fn map_dialog_key(key: KeyEvent, _ctrl: bool) -> Action {
+fn map_dialog_key(key: KeyEvent, ctrl: bool) -> Action {
     if key.code == KeyCode::Esc {
         return Action::DismissDialog;
     }
     match key.code {
-        KeyCode::Char(c) => Action::Char(c),
+        KeyCode::Char('n') if ctrl => Action::NewMapEntry,
+        // Other Ctrl chords must not fall through as literal characters
+        // (e.g. Ctrl+X inserting 'x' into an inline editor).
+        KeyCode::Char(c) if !ctrl => Action::Char(c),
         KeyCode::Enter => Action::SubmitCommand,
         KeyCode::Backspace => Action::Backspace,
         KeyCode::Delete => Action::Delete,
@@ -166,6 +265,8 @@ fn map_dialog_key(key: KeyEvent, _ctrl: bool) -> Action {
         KeyCode::End => Action::CursorEnd,
         KeyCode::Up => Action::ScrollUp,
         KeyCode::Down => Action::ScrollDown,
+        KeyCode::PageUp => Action::ScrollPageUp,
+        KeyCode::PageDown => Action::ScrollPageDown,
         KeyCode::Left => Action::CursorLeft,
         KeyCode::Right => Action::CursorRight,
         _ => Action::None,
@@ -176,6 +277,21 @@ fn map_dialog_key(key: KeyEvent, _ctrl: bool) -> Action {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    /// WI 0112 Part 4: the squad grid has no command box to hand focus to.
+    #[test]
+    fn esc_on_the_squad_list_is_unmapped() {
+        let action = map_key(
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            },
+            FocusContext::SquadList,
+        );
+        assert_eq!(action, Action::None);
+    }
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent {
@@ -245,6 +361,47 @@ mod tests {
         let k = key(KeyCode::Char('c'), KeyModifiers::CONTROL);
         let action = map_key(k, FocusContext::ContainerMaximized);
         assert_eq!(action, Action::ForwardToPty(k));
+    }
+
+    // ── Ctrl-G / git sidebar ───────────────────────────────────────────────
+
+    #[test]
+    fn ctrl_g_toggles_git_sidebar_in_all_contexts() {
+        // Covers the Idle / Running / CommandBox scenarios from the work item:
+        // the sidebar toggle is a global shortcut in every focus context.
+        for ctx in [
+            FocusContext::CommandBox,
+            FocusContext::ExecutionWindow,
+            FocusContext::Dialog,
+            FocusContext::ContainerMaximized,
+        ] {
+            let action = map_key(key(KeyCode::Char('g'), KeyModifiers::CONTROL), ctx);
+            assert_eq!(
+                action,
+                Action::ToggleGitSidebar,
+                "Ctrl-G must toggle the git sidebar in {ctx:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_g_in_maximized_container_is_not_forwarded_to_pty() {
+        // Ctrl-G (BEL) must be intercepted before the ContainerMaximized
+        // ForwardToPty fallthrough so it never reaches the running process.
+        let k = key(KeyCode::Char('g'), KeyModifiers::CONTROL);
+        let action = map_key(k, FocusContext::ContainerMaximized);
+        assert_eq!(action, Action::ToggleGitSidebar);
+        assert_ne!(action, Action::ForwardToPty(k));
+    }
+
+    #[test]
+    fn plain_g_is_not_a_sidebar_toggle() {
+        // Without Ctrl, `g` is ordinary input (a char in the command box).
+        let action = map_key(
+            key(KeyCode::Char('g'), KeyModifiers::NONE),
+            FocusContext::CommandBox,
+        );
+        assert_ne!(action, Action::ToggleGitSidebar);
     }
 
     #[test]
@@ -323,6 +480,55 @@ mod tests {
             Action::PreviousTab,
             "Ctrl-A must not switch tabs while a dialog is open"
         );
+    }
+
+    // ── Ctrl-O / Workflow Overview ───────────────────────────────────
+
+    #[test]
+    fn ctrl_o_toggles_workflow_overview_in_all_non_dialog_contexts() {
+        for ctx in [
+            FocusContext::CommandBox,
+            FocusContext::ExecutionWindow,
+            FocusContext::ContainerMaximized,
+            FocusContext::SquadList,
+        ] {
+            let action = map_key(key(KeyCode::Char('o'), KeyModifiers::CONTROL), ctx);
+            assert_eq!(
+                action,
+                Action::ToggleWorkflowOverview,
+                "Ctrl-O must toggle the Workflow Overview in {ctx:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_o_in_maximized_container_is_not_forwarded_to_pty() {
+        let k = key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        let action = map_key(k, FocusContext::ContainerMaximized);
+        assert_eq!(action, Action::ToggleWorkflowOverview);
+        assert_ne!(action, Action::ForwardToPty(k));
+    }
+
+    #[test]
+    fn ctrl_o_suppressed_in_dialog() {
+        let action = map_key(
+            key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            FocusContext::Dialog,
+        );
+        assert_ne!(
+            action,
+            Action::ToggleWorkflowOverview,
+            "Ctrl-O must not toggle the Workflow Overview while a dialog is open"
+        );
+    }
+
+    #[test]
+    fn bare_o_in_command_box_still_types_a_character() {
+        let action = map_key(
+            key(KeyCode::Char('o'), KeyModifiers::NONE),
+            FocusContext::CommandBox,
+        );
+        assert_eq!(action, Action::Char('o'));
     }
 
     #[test]
@@ -540,6 +746,39 @@ mod tests {
     fn up_in_dialog_maps_to_scroll_up() {
         let action = map_key(key(KeyCode::Up, KeyModifiers::NONE), FocusContext::Dialog);
         assert_eq!(action, Action::ScrollUp);
+    }
+
+    #[test]
+    fn ctrl_n_in_dialog_maps_to_new_map_entry() {
+        let action = map_key(
+            key(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            FocusContext::Dialog,
+        );
+        assert_eq!(action, Action::NewMapEntry);
+    }
+
+    #[test]
+    fn page_keys_in_dialog_map_to_page_scroll() {
+        let action = map_key(
+            key(KeyCode::PageUp, KeyModifiers::NONE),
+            FocusContext::Dialog,
+        );
+        assert_eq!(action, Action::ScrollPageUp);
+        let action = map_key(
+            key(KeyCode::PageDown, KeyModifiers::NONE),
+            FocusContext::Dialog,
+        );
+        assert_eq!(action, Action::ScrollPageDown);
+    }
+
+    #[test]
+    fn ctrl_chords_in_dialog_do_not_insert_literal_chars() {
+        // A Ctrl chord must never leak its letter into an inline editor.
+        let action = map_key(
+            key(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            FocusContext::Dialog,
+        );
+        assert_ne!(action, Action::Char('x'));
     }
 
     // ── ContainerMaximized context ────────────────────────────────────────────

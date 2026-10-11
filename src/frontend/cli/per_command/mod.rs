@@ -13,14 +13,19 @@
 pub(crate) mod helpers;
 pub(crate) mod render;
 
+pub(crate) mod squad;
+pub(crate) mod squad_attach;
+
 mod api_server;
 mod chat;
+mod clean;
 mod exec_prompt;
 mod exec_workflow;
 mod init;
 mod ready;
 
 // Engine-level frontend trait impls used by multiple commands.
+mod acp_frontend;
 mod agent_auth;
 mod agent_setup;
 mod container_frontend_marker;
