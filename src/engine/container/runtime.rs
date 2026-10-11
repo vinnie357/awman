@@ -22,8 +22,21 @@ use crate::engine::container::apple::AppleBackend;
 use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::background::BackgroundContainer;
 use crate::engine::container::docker::DockerBackend;
+use crate::engine::container::gated_launch::{LaunchRetentionInitError, LaunchRetentionRegistry};
 use crate::engine::container::options::{OverlaySpec, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
+
+/// A container image row returned by image-listing queries. Used by
+/// `awman clean` to enumerate dangling awman images eligible for removal.
+#[derive(Debug, Clone)]
+pub struct ContainerImageInfo {
+    /// Image ID (short or full).
+    pub id: String,
+    /// `repository:tag` label, or `<none>:<none>` for untagged images.
+    pub repo_tag: String,
+    /// Human-readable size string reported by the runtime (e.g. "1.2GB").
+    pub size: String,
+}
 
 /// Capabilities shared by container-class backends (Docker, Apple
 /// Containers): image-based, ephemeral, arbitrary mounts/env, label-based
@@ -42,13 +55,107 @@ static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
 
 pub struct ContainerRuntime {
     backend: Arc<dyn ContainerBackend>,
+    launch_retention: Result<Arc<LaunchRetentionRegistry>, LaunchRetentionInitError>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GateImageConfig {
+    user: String,
+    env: Vec<String>,
+    entrypoint: Vec<String>,
+    trusted: bool,
+}
+
+fn parse_gate_image_config(runtime: &str, raw: &[u8]) -> Result<GateImageConfig, EngineError> {
+    let value: serde_json::Value = serde_json::from_slice(raw).map_err(|error| {
+        EngineError::Container(format!("parse startup-gate image inspection: {error}"))
+    })?;
+    let config = if runtime == "apple-containers" {
+        value
+            .get(0)
+            .and_then(|v| v.get("variants"))
+            .and_then(|v| v.as_array())
+            .and_then(|v| v.first())
+            .and_then(|v| v.get("config"))
+            .and_then(|v| v.get("config"))
+    } else {
+        Some(&value)
+    }
+    .ok_or_else(|| EngineError::Container("startup-gate image has no inspectable config".into()))?;
+    let user = config
+        .get("User")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let env = match config.get("Env") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| {
+                EngineError::Config("startup-gated image has malformed environment".into())
+            })?
+            .iter()
+            .map(|v| {
+                v.as_str().map(str::to_string).ok_or_else(|| {
+                    EngineError::Config("startup-gated image has malformed environment".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let entrypoint = match config.get("Entrypoint") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| {
+                EngineError::Config("startup-gated image has malformed entrypoint".into())
+            })?
+            .iter()
+            .map(|v| {
+                v.as_str().map(str::to_string).ok_or_else(|| {
+                    EngineError::Config("startup-gated image has malformed entrypoint".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let trusted = config
+        .get("Labels")
+        .and_then(|v| v.as_object())
+        .and_then(|labels| labels.get("dev.awman.startup-gate"))
+        .and_then(|v| v.as_str())
+        == Some("1");
+    if !entrypoint.is_empty() {
+        return Err(EngineError::Config(
+            "startup-gated images may not define an entrypoint".into(),
+        ));
+    }
+    if env
+        .iter()
+        .filter_map(|entry| entry.split_once('=').map(|(key, _)| key))
+        .any(|key| {
+            key == "PYTHONHOME"
+                || key == "PYTHONPATH"
+                || key.starts_with("LD_")
+                || key.starts_with("DYLD_")
+        })
+    {
+        return Err(EngineError::Config(
+            "startup-gated images may not define Python or dynamic-loader environment".into(),
+        ));
+    }
+    Ok(GateImageConfig {
+        user,
+        env,
+        entrypoint,
+        trusted,
+    })
 }
 
 impl ContainerRuntime {
     /// Construct with the Docker backend.
     pub fn docker() -> Self {
         Self {
-            backend: Arc::new(DockerBackend::new()),
+            backend: Arc::new(DockerBackend),
+            launch_retention: LaunchRetentionRegistry::try_new(),
         }
     }
 
@@ -57,7 +164,8 @@ impl ContainerRuntime {
     /// non-mac host yields a runtime whose probes simply fail.
     pub fn apple() -> Self {
         Self {
-            backend: Arc::new(AppleBackend::new()),
+            backend: Arc::new(AppleBackend),
+            launch_retention: LaunchRetentionRegistry::try_new(),
         }
     }
 
@@ -80,12 +188,75 @@ impl ContainerRuntime {
         &CONTAINER_CAPABILITIES
     }
 
+    pub(crate) fn launch_retention(
+        &self,
+    ) -> Result<Arc<LaunchRetentionRegistry>, LaunchRetentionInitError> {
+        self.launch_retention.clone()
+    }
+
     /// Build a fully-configured `AgentInstance` from pre-resolved options.
     pub fn build(
         &self,
-        options: ResolvedContainerOptions,
+        mut options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
-        self.backend.build(options)
+        let orchestrated = options
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some());
+        let launch_retention = match self.launch_retention() {
+            Ok(registry) => Some(registry),
+            Err(_) if orchestrated => {
+                return Err(EngineError::Config(
+                    "orchestrated launch retention is unavailable".into(),
+                ));
+            }
+            Err(_) => None,
+        };
+        if options.startup_gate.is_some() {
+            if !options.startup_gate_trusted_template {
+                return Err(EngineError::Config(
+                    "startup gate requires an awman-supported generated agent image".into(),
+                ));
+            }
+            let image = options
+                .image
+                .as_ref()
+                .ok_or_else(|| EngineError::MissingRequiredOption("startup gate image".into()))?;
+            let inspected = self.inspect_gate_image(image.as_str())?;
+            debug_assert!(inspected.entrypoint.is_empty());
+            debug_assert!(inspected.env.iter().all(|entry| !entry.is_empty()));
+            if !inspected.trusted {
+                return Err(EngineError::Config("startup-gated image was not built from an awman startup-gate template; rebuild the project and agent images with `awman ready --no-cache`".into()));
+            }
+            options.startup_gate_runtime_user =
+                (!inspected.user.is_empty() && inspected.user != "0" && inspected.user != "root")
+                    .then_some(inspected.user);
+        }
+        self.backend
+            .build_with_launch_retention(options, launch_retention)
+    }
+
+    fn inspect_gate_image(&self, image: &str) -> Result<GateImageConfig, EngineError> {
+        use std::process::{Command, Stdio};
+        let output = match self.backend.name() {
+            "apple-containers" => Command::new("container")
+                .args(["image", "inspect", image])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+            _ => Command::new("docker")
+                .args(["image", "inspect", "--format", "{{json .Config}}", image])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        }
+        .map_err(|error| EngineError::Container(format!("inspect startup-gate image: {error}")))?;
+        if !output.status.success() {
+            return Err(EngineError::Container(
+                "could not inspect startup-gate image".into(),
+            ));
+        }
+        parse_gate_image_config(self.backend.name(), &output.stdout)
     }
 
     pub fn list_running(&self, session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
@@ -214,6 +385,31 @@ impl ContainerRuntime {
         self.backend.stop(handle)
     }
 
+    /// List stopped (exited/dead) awman containers eligible for cleanup.
+    /// Running and paused containers are never returned. Used by `awman clean`.
+    pub fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
+        self.backend.list_stopped()
+    }
+
+    /// List dangling awman images (superseded by a newer build of the same
+    /// tag). Used by `awman clean`.
+    pub fn list_dangling_images(&self) -> Result<Vec<ContainerImageInfo>, EngineError> {
+        self.backend.list_dangling_images()
+    }
+
+    /// Remove a container by id/name. Returns an error when the runtime refuses
+    /// (e.g. the container transitioned back to running between discovery and
+    /// deletion). Used by `awman clean` for per-item failure handling.
+    pub fn remove_container(&self, id: &str) -> Result<(), EngineError> {
+        run_removal(self.cli_binary(), "rm", id)
+    }
+
+    /// Remove an image by id. Returns an error when the runtime refuses (e.g.
+    /// the image is still referenced by a container). Used by `awman clean`.
+    pub fn remove_image(&self, id: &str) -> Result<(), EngineError> {
+        run_removal(self.cli_binary(), "rmi", id)
+    }
+
     /// Build CLI arguments for `docker exec -it` (or equivalent) into a running
     /// container. Returns args suitable for `Command::new(cli_binary).args(...)`.
     pub fn exec_args(
@@ -225,6 +421,21 @@ impl ContainerRuntime {
     ) -> Vec<String> {
         self.backend
             .exec_args(container_id, working_dir, entrypoint, env_vars)
+    }
+
+    /// Attach to an already-running container this process did not start.
+    /// Delegates to the backend; the returned instance runs `<cli> exec`
+    /// through the existing `run_with_frontend` path.
+    pub fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.backend.attach(handle)
+    }
+
+    /// List running awman containers whose name starts with `prefix`.
+    pub fn list_running_with_name_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<AgentHandle>, EngineError> {
+        self.backend.list_running_with_name_prefix(prefix)
     }
 
     /// The CLI binary name for this runtime (`"docker"` or `"container"`).
@@ -334,9 +545,44 @@ impl AgentRuntimeEngine for ContainerRuntime {
         ContainerRuntime::exec_args(self, agent_id, working_dir, entrypoint, env_vars)
     }
 
+    fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
+        ContainerRuntime::attach(self, handle)
+    }
+
+    fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError> {
+        ContainerRuntime::list_running_with_name_prefix(self, prefix)
+    }
+
     fn cli_binary(&self) -> &'static str {
         ContainerRuntime::cli_binary(self)
     }
+}
+
+/// Shell out to the runtime CLI to remove a container (`rm`) or image (`rmi`).
+/// Returns an error on a non-zero exit so callers can count per-item failures.
+fn run_removal(cli_bin: &str, subcommand: &str, target: &str) -> Result<(), EngineError> {
+    use std::process::{Command, Stdio};
+    let output = Command::new(cli_bin)
+        .args([subcommand, target])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                EngineError::ContainerRuntimeUnavailable {
+                    binary: cli_bin.to_string(),
+                }
+            } else {
+                EngineError::Container(format!("{cli_bin} {subcommand} {target}: {e}"))
+            }
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(EngineError::Container(format!(
+            "{cli_bin} {subcommand} {target} failed: {stderr}"
+        )));
+    }
+    Ok(())
 }
 
 /// Wait for a child process with a timeout. Kills the process and returns
@@ -368,6 +614,135 @@ mod tests {
     use super::*;
     use crate::engine::agent_runtime::ResolvedAgentOptions;
     use crate::engine::sandbox::options::ResolvedSandboxOptions;
+
+    fn docker_gate_config(env: serde_json::Value, entrypoint: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "User": "1000:1000",
+            "Env": env,
+            "Entrypoint": entrypoint,
+            "Labels": {"dev.awman.startup-gate": "1"}
+        }))
+        .expect("Docker inspect fixture")
+    }
+
+    fn apple_gate_config(env: serde_json::Value, entrypoint: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!([{
+            "variants": [{
+                "config": {
+                    "config": {
+                        "User": "1000:1000",
+                        "Env": env,
+                        "Entrypoint": entrypoint,
+                        "Labels": {"dev.awman.startup-gate": "1"}
+                    }
+                }
+            }]
+        }]))
+        .expect("Apple Containers inspect fixture")
+    }
+
+    #[test]
+    fn gate_image_parser_accepts_real_docker_and_apple_config_shapes() {
+        for (runtime, raw) in [
+            (
+                "docker",
+                docker_gate_config(
+                    serde_json::json!(["PATH=/usr/bin"]),
+                    serde_json::Value::Null,
+                ),
+            ),
+            (
+                "apple-containers",
+                apple_gate_config(serde_json::json!(["PATH=/usr/bin"]), serde_json::json!([])),
+            ),
+        ] {
+            let parsed =
+                parse_gate_image_config(runtime, &raw).expect("supported startup-gate image");
+            assert_eq!(
+                parsed,
+                GateImageConfig {
+                    user: "1000:1000".into(),
+                    env: vec!["PATH=/usr/bin".into()],
+                    entrypoint: Vec::new(),
+                    trusted: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_gate_label_does_not_allow_image_loader_environment() {
+        for key in [
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+        ] {
+            for (runtime, raw) in [
+                (
+                    "docker",
+                    docker_gate_config(
+                        serde_json::json!([format!("{key}=/untrusted")]),
+                        serde_json::Value::Null,
+                    ),
+                ),
+                (
+                    "apple-containers",
+                    apple_gate_config(
+                        serde_json::json!([format!("{key}=/untrusted")]),
+                        serde_json::json!([]),
+                    ),
+                ),
+            ] {
+                assert!(
+                    parse_gate_image_config(runtime, &raw).is_err(),
+                    "{runtime} must reject image variable {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trusted_gate_label_does_not_allow_an_image_entrypoint() {
+        for (runtime, raw) in [
+            (
+                "docker",
+                docker_gate_config(
+                    serde_json::json!(["PATH=/usr/bin"]),
+                    serde_json::json!(["/bin/sh", "-c"]),
+                ),
+            ),
+            (
+                "apple-containers",
+                apple_gate_config(
+                    serde_json::json!(["PATH=/usr/bin"]),
+                    serde_json::json!(["python3", "-c"]),
+                ),
+            ),
+        ] {
+            assert!(
+                parse_gate_image_config(runtime, &raw).is_err(),
+                "{runtime} image entrypoint could run before the fixed bootstrap"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_image_parser_rejects_malformed_security_fields() {
+        let non_string_env = docker_gate_config(
+            serde_json::json!(["PATH=/usr/bin", 7]),
+            serde_json::Value::Null,
+        );
+        assert!(parse_gate_image_config("docker", &non_string_env).is_err());
+
+        let scalar_entrypoint = apple_gate_config(
+            serde_json::json!(["PATH=/usr/bin"]),
+            serde_json::json!("/bin/sh"),
+        );
+        assert!(parse_gate_image_config("apple-containers", &scalar_entrypoint).is_err());
+    }
 
     #[test]
     fn build_requires_image_option() {

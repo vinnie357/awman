@@ -15,9 +15,17 @@ By default, an agent environment:
 
 This means a misbehaving agent can't access your SSH keys, can't run arbitrary containers on your behalf, and can't touch files outside the project. The worst case is that it makes bad edits inside the repo — which git can undo.
 
-**Docker / Apple Containers:** agents run in a Linux container or lightweight VM respectively. The container is removed (`--rm`) when the session ends. Credentials are injected as environment variables.
+**Docker / Apple Containers:** agents run in a Linux container or lightweight VM respectively. The container is removed (`--rm`) when the session ends. Most agents receive credentials as environment variables. Claude Code is the exception: it receives a live-updated credential file (access token, expiry, and scopes only — never the refresh token) written into its staged settings directory and kept fresh for as long as the session runs. See [Live credential refresh](#live-credential-refresh) below.
 
-**Docker Sandboxes (`docker-sbx-experimental`):** agents run in a dedicated microVM with its own kernel, private Docker daemon, and private filesystem. Host escape requires a hypervisor exploit rather than a container escape. Sandboxes persist between sessions (state survives `sbx stop`); awman runs `sbx rm` only on explicit teardown. Credentials are registered at agent launch with sandbox-scoped `sbx secret set` calls (never global), so removing a sandbox removes its secrets with it. See [Runtimes](12-runtimes.md#docker-sandboxes-experimental) for setup and limitations.
+**Docker Sandboxes (`docker-sbx-experimental`):** agents run in a dedicated microVM with its own kernel, private Docker daemon, and private filesystem. Host escape requires a hypervisor exploit rather than a container escape. Sandboxes persist between sessions (state survives `sbx stop`); awman runs `sbx rm` only on explicit teardown. Credentials are registered at agent launch with sandbox-scoped `sbx secret set` calls (never global), so removing a sandbox removes its secrets with it. sbx is unaffected by the live credential-file refresh described below — it continues to authenticate Claude only through `ANTHROPIC_API_KEY` or an in-sandbox login. See [Runtimes](11-runtimes.md#docker-sandboxes-experimental) for setup and limitations.
+
+### Live credential refresh
+
+Claude Code's OAuth refresh token — the credential that could mint new access tokens indefinitely — never leaves your host and is never given to a container. Instead, for each session awman writes a sanitized, awman-authored `.credentials.json` (access token, expiry, and scopes only, mode `0600`) into the staged `~/.claude` directory that's bind-mounted into the container; the host's own `~/.claude/.credentials.json` is excluded from that mount entirely.
+
+While a Claude session is running, awman's credential-refresh monitor watches the access token's expiry. Shortly before it would expire, the monitor triggers a host-side refresh: it invokes the same sanctioned, hardcoded ready-check ping that `awman ready` uses to verify your local agent is authenticated (fixed prompt, no user input, no repository content, no working directory) — this causes your host's Claude Code installation to rotate its own Keychain entry. The monitor then atomically replaces the staged credential file for every live session with the new token, so a long-running container observes it on its next request without a restart.
+
+If the host can't refresh (asleep, logged out, offline), awman keeps the last-known-good token in place, warns loudly, and retries with backoff; it never leaves a container with no credential at all. This behavior is on by default and can be tuned or disabled — see [Control credential refresh](07-configuration.md#control-credential-refresh-authrefresh).
 
 ### Transparency
 
@@ -25,7 +33,7 @@ Every time awman runs a container or sandbox command, the full CLI invocation is
 
 ```
 $ docker run --rm -it -v /home/user/myproject:/workspace -w /workspace \
-    -e CLAUDE_CODE_OAUTH_TOKEN=*** awman-myproject:latest claude "..."
+    -v /tmp/awman-claude-dir-a1b2c3/.claude:/root/.claude -e GEMINI_API_KEY=*** awman-myproject:latest claude "..."
 ```
 
 For Docker Sandboxes, every `sbx` invocation is announced the same way:
@@ -36,7 +44,7 @@ Running: sbx secret set awman-ab12-claude anthropic (value piped via stdin)
 Running: sbx run awman-ab12-claude
 ```
 
-Credential values are masked, but everything else is visible. You can always see exactly what awman is doing.
+Credential values never appear in a printed command. Env-delivered agent credentials show as a bare `-e VAR_NAME` — the value is passed straight from awman's own environment to the container CLI's process, never through argv. Claude Code's OAuth credential is instead delivered as a file (see [Live credential refresh](#live-credential-refresh)), so the printed command shows only the staged directory's mount path, never a token. Env vars you configure yourself (`env()` overlays, `envPassthrough`) still show as `VAR_NAME=***`. Everything else is visible in full. You can always see exactly what awman is doing.
 
 ---
 
@@ -53,7 +61,7 @@ awman exec workflow path/to/workflow.toml --worktree
 - The agent can make sweeping changes without your working branch becoming unstable mid-implementation
 - You can review the full diff as a coherent unit before it touches your main tree
 - If the output isn't useful, discard it with a single keypress — no `git reset` needed
-- Works with `--workflow`: all steps in the workflow share the same isolated worktree
+- Works with `exec workflow`: all steps in the workflow share the same isolated worktree
 
 ### How it works
 
@@ -62,38 +70,35 @@ awman exec workflow path/to/workflow.toml --worktree
 3. The agent container mounts the worktree instead of your repo root
 4. After the agent exits, you choose what to do with the branch
 
-### Post-run options (command mode)
+### Post-run options
 
-When a worktree run completes (or is aborted), the worktree is preserved on disk:
-
-```
-Worktree branch `awman/work-item-0030` is ready. Merge into current branch? [y/n/s]
-```
+When a worktree run completes (or is aborted), the worktree is preserved on disk and awman asks what to do with it:
 
 | Key | Action |
 |-----|--------|
-| `y` | Merge into current branch (`git merge --no-ff`), remove worktree and branch |
-| `n` | Discard — remove worktree and delete branch |
-| `s` | Keep worktree and branch for manual review; prints the path |
+| `m` | Merge into the current branch (opens the merge-mode prompt below) |
+| `d` | Discard — remove worktree and delete branch |
+| `k` | Keep worktree and branch for manual review; prints the path |
 
 If you abort the workflow (Ctrl+C or the **Abort** action in the workflow control board), awman shows the same merge/discard dialog. The worktree is never automatically deleted on abort — your completed steps' changes are preserved and ready for review.
 
-### Post-run dialog (TUI mode)
+### Merge modes
 
-```
-╭─── Worktree: Merge or Discard? ───────────────────────╮
-│                                                        │
-│  Branch 'awman/work-item-0030' completed.               │
-│  (or was aborted — changes preserved on disk)         │
-│                                                        │
-│  [m/y] Merge into current branch                       │
-│  [d]   Discard (delete branch + worktree)              │
-│  [s/Esc] Keep worktree branch as-is                    │
-│                                                        │
-╰────────────────────────────────────────────────────────╯
-```
+Choosing **Merge** asks how the branch should be integrated:
 
-The same dialog appears whether the workflow completed successfully or was aborted. Your partially completed work is preserved, allowing you to review, manually continue, or discard as you choose.
+| Key | Mode | Effect |
+|-----|------|--------|
+| `m` | Merge (no squash) | Plain `git merge` — the branch's individual commits are preserved (fast-forwards when possible) |
+| `s` | Squash | `git merge --squash` followed by a single commit `Implement <branch>` |
+| `l` | Leave branch alone | No merge; the worktree and branch are kept as-is |
+
+Whichever mode you pick — including *Leave branch alone* — awman then checks for uncommitted files in the worktree and offers to commit them, so nothing on the branch is left dangling. After a successful merge (squash or not), awman offers to clean up the worktree and delete the branch.
+
+The same dialogs appear whether the workflow completed successfully or was aborted, and in both CLI and TUI mode. Your partially completed work is preserved, allowing you to review, manually continue, or discard as you choose.
+
+### Setup steps in worktree runs
+
+If the workflow defines a `checkout_create_branch` setup step, it is **skipped with a warning** when running in a worktree — the run is already isolated on its own branch, so creating another branch inside the worktree is redundant. This is not an error; the remaining setup steps run normally.
 
 ### Interrupted runs
 
@@ -126,7 +131,7 @@ When Git commit signing is enabled, awman **suspends the TUI** around each `git 
 | Detached HEAD | Warning printed; worktree created from current commit; continues |
 | Branch exists, no worktree dir | Worktree created using the existing branch |
 | Merge conflict | Error with manual resolution instructions; worktree kept |
-| Combined with `--workflow` | All workflow-step containers share the same worktree |
+| Combined with `exec workflow` | All workflow-step containers share the same worktree |
 | Combined with `--overlay ssh()` | Both flags apply independently |
 
 ### Examples
@@ -140,129 +145,21 @@ awman exec workflow path/to/workflow.toml --worktree --overlay "ssh()"          
 
 ## Overlay mounts
 
-The `--overlay` flag mounts additional host resources into the agent container beyond the default Git repository mount. Supported overlay types:
+Overlays extend the base isolation model: they are the *only* supported way to give a container anything beyond the project mount. There are five kinds — `dir()`, `env()`, `skill()`, `ssh()`, and `context()` — and they can come from global config, per-repo config, `AWMAN_OVERLAYS`, `--overlay` flags, or an individual workflow step. [Overlays](08-overlays.md) is the full reference for the syntax, the five sources, and the merge and conflict rules; this section covers only what they mean for security.
 
-- `skill()` — mount your global awman skills directory (`~/.awman/skills/`) as slash commands
-- `dir(host_path:container_path[:ro|rw])` — mount a host directory
+**What an overlay can and cannot reach.** With overlays in play, the agent can access your Git repo **plus exactly the listed overlay directories, variables, and skills** — nothing more. There is no wildcard that exposes the host filesystem, and no overlay type that grants a shell on the host.
 
-This lets you give an agent access to a personal skills library, a reference dataset, a shared prompts directory, or any other host resource without permanently modifying any config file.
+**Read-only by default.** `dir()` mounts default to `:ro` when no permission is given. Only use `:rw` when the agent genuinely has to write there, and only with agent images you trust. Skills overlays are **always** mounted read-only regardless of source, so an agent can never modify a skill file.
 
-### Directory overlay format
-
-```
-dir(host_path:container_path[:ro|rw])
-```
-
-| Field | Description |
-|-------|-------------|
-| `host_path` | Absolute path on the host. Leading `~` is expanded to your home directory. |
-| `container_path` | Absolute path inside the container where the directory will appear. |
-| `ro` / `rw` | Mount permission. Defaults to `ro` when omitted. |
-
-### Skills overlay
-
-```
-skill()
-```
-
-Mounts `~/.awman/skills/` read-only into the agent's native skills directory (determined by agent type). No arguments allowed.
-
-### Basic examples
-
-```sh
-# Mount your personal skills library
-awman exec workflow path/to/workflow.toml --overlay "skill()"
-
-# Mount a reference dataset read-only
-awman exec workflow path/to/workflow.toml --overlay "dir(/data/reference:/mnt/reference:ro)"
-
-# Mount a shared prompts directory read-write
-awman chat --overlay "dir(~/prompts:/mnt/prompts:rw)"
-
-# Skills + directories (repeated flag or comma-separated — both are equivalent)
-awman exec workflow path/to/workflow.toml --overlay "skill()" --overlay "dir(/data/ref:/mnt/ref:ro)" --overlay "dir(~/snippets:/mnt/snippets)"
-awman exec workflow path/to/workflow.toml --overlay "skill(),dir(/data/ref:/mnt/ref:ro),dir(~/snippets:/mnt/snippets)"
-```
-
-Available on all agent-launching commands: `chat`, `exec prompt`, and `exec workflow`.
-
-### `AWMAN_OVERLAYS` environment variable
-
-Set `AWMAN_OVERLAYS` in your shell profile to apply overlays automatically to every agent session regardless of which repo you're working in. It uses the same format as `--overlay` — a comma-separated list of typed overlay expressions:
-
-```sh
-export AWMAN_OVERLAYS="skill(),dir(~/personal-prompts:/mnt/prompts),dir(/data/shared-fixtures:/mnt/fixtures:ro)"
-```
-
-### Config-based overlays
-
-Overlays can be declared in config files so they are applied automatically without requiring any flags each time. The `overlays` field is a flat array of overlay expression strings — the same syntax as `--overlay`:
-
-**Per-repo config** (`.awman/config.json`):
-```json
-{
-  "overlays": [
-    "skill(*)",
-    "dir(/data/fixtures:/mnt/fixtures:ro)",
-    "dir(~/shared-prompts:/mnt/prompts)"
-  ]
-}
-```
-
-**Global config** (`~/.awman/config.json`):
-```json
-{
-  "overlays": [
-    "skill(*)",
-    "dir(~/personal-prompts:/mnt/prompts:ro)"
-  ]
-}
-```
-
-### Priority and conflict resolution
-
-Overlays are **additive**: all four sources contribute entries, then conflicts are resolved.
-
-**Priority order**, from lowest to highest:
-
-1. Global config (`~/.awman/config.json`)
-2. Per-repo config (`.awman/config.json`)
-3. `AWMAN_OVERLAYS` environment variable
-4. `--overlay` CLI flags (highest priority)
-
-Overlay sources are merged — entries from all four sources appear in the final mount list unless they conflict. When two sources specify the same container path, the higher-priority source wins.
-
-**Skills overlays are always read-only** and cannot be modified by the agent.
-
-### Missing host paths
-
-If a configured host path does not exist when the container launches, awman logs a warning and skips that overlay — it does not abort the session. This matches the behaviour of other optional mounts (SSH keys, Docker socket).
+**Missing paths never fail open.** If a configured host path does not exist at launch, awman logs a warning and skips that overlay rather than aborting the session or substituting something else:
 
 ```
 WARN overlay host path '/data/reference' does not exist; skipping
 ```
 
-### Security note
+**Everything is printed.** Like `ssh()` and `--allow-docker`, every overlay mount appears in the runtime command awman prints before it executes, so you can always see exactly what a container was given. Values of `env()` overlays are masked as `***`.
 
-Overlay mounts extend the base isolation model: the agent still cannot access anything outside your Git repo **plus the explicitly listed overlay directories and skills**. Directory `:ro` mounts prevent the agent from modifying the overlaid directory. Only use `:rw` when the task genuinely requires the agent to write to that directory, and only with agent images you trust.
-
-Skills overlays are always mounted read-only, whether skills are provided by global config, per-repo config, environment variable, or CLI flag. The agent cannot modify any skill files.
-
-Like `--overlay ssh()` and `--allow-docker`, all overlay mounts are printed in the Docker command before execution so you can see exactly what is mounted.
-
-### TUI usage
-
-In the TUI command box, use comma-separated syntax when specifying multiple overlays — the TUI flag parser stores one value per flag, so repeating `--overlay` keeps only the last value:
-
-```
-# Correct: comma-separated in one value
-exec workflow path/to/workflow.toml --overlay "skill(),dir(/data/ref:/mnt/ref:ro),dir(~/prompts:/mnt/prompts)"
-
-# Incorrect in TUI (second value silently overwrites first):
-exec workflow path/to/workflow.toml --overlay "skill()" --overlay "dir(/data/ref:/mnt/ref:ro)"
-```
-
-On the CLI, both repeated flags and comma-separated syntax are equivalent.
+Two overlay types have host-access implications significant enough to document on their own: [SSH key access](#ssh-key-access) below, and [context overlays](08-overlays.md#context-overlays-in-depth), which mount a writable directory shared across sessions.
 
 ---
 
@@ -358,12 +255,22 @@ $ docker build -t awman-myapp:latest -f Dockerfile.dev /path/to/repo
 $ docker run --rm -it \
     -v /path/to/repo:/workspace \
     -w /workspace \
-    -e CLAUDE_CODE_OAUTH_TOKEN=*** \
+    -v /tmp/awman-claude-dir-a1b2c3/.claude:/root/.claude \
     awman-myapp:latest claude "Implement work item 0001..."
 ```
 
-With the Apple Containers runtime, the same commands are shown with `container` instead of `docker`. With the Docker Sandboxes runtime, every `sbx` invocation is announced — `sbx run`, `sbx exec`, `sbx stop`, `sbx rm`, `sbx secret set`, `sbx kit validate` — with sensitive values masked. Credential values are always masked across all runtimes.
+With the Apple Containers runtime, the same commands are shown with `container` instead of `docker`. With the Docker Sandboxes runtime, every `sbx` invocation is announced — `sbx run`, `sbx exec`, `sbx stop`, `sbx rm`, `sbx secret set`, `sbx kit validate` — without sensitive values. Credential values are never printed: env-delivered agent credentials render as a bare `-e VAR_NAME`, Claude's file-delivered OAuth credential shows only as the staged directory's ordinary mount path, and user-configured environment overlays render as `VAR_NAME=***`.
 
 ---
 
 [← Agent Sessions](03-agent-sessions.md) · [Next: Workflows →](05-workflows.md)
+# Startup-gate trust boundary
+
+The optional startup gate verifies prepared workspace mounts inside the same
+container that will run the agent. It uses an awman-authored bootstrap mounted
+under `/.awman/startup-gate` and the fixed interpreter
+`/usr/bin/python3 -I -S`. Gated launches reject protected-path overlays,
+dynamic-loader environment variables, symlinks, hard links, special files,
+unexpected nested mounts, and mismatched access modes before releasing the
+agent. The proof covers the complete guest tree at gate time; a writable tree
+may change after release.

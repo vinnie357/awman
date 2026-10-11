@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::command::commands::Command;
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage};
 use crate::data::session::AgentName;
@@ -70,6 +70,19 @@ impl InitCommand {
         }
     }
 
+    /// Construct from the catalogue-resolved input (WI 0113 F-10). `--agent`
+    /// carries `FlagDefault::Str("claude")`, so no default is restated here.
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        Ok(Self::new(
+            InitCommandFlags {
+                agent: ctx.flags.require_str("agent")?,
+                aspec: ctx.flags.bool("aspec"),
+            },
+            ctx.engines.clone(),
+            ctx.session.clone(),
+        ))
+    }
+
     pub fn flags(&self) -> &InitCommandFlags {
         &self.flags
     }
@@ -111,7 +124,7 @@ impl Command for InitCommand {
         };
         frontend.write_message(UserMessage {
             level: MessageLevel::Info,
-            text: format!("init: configuring agent '{}'", &self.flags.agent),
+            text: format!("init: configuring agent '{}'", self.flags.agent),
         });
         let mut engine = InitEngine::new(
             std::sync::Arc::new(session),

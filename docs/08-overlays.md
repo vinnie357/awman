@@ -83,6 +83,18 @@ env(GITHUB_TOKEN), env(ANTHROPIC_API_KEY)
 
 If the named variable is not set on your host, it is silently absent from the container environment — this is not an error. This lets you list optional variables that may only be set in some contexts (CI vs. local development).
 
+For a squad task, "your host" means something different: the value is
+resolved by the **squad daemon**, not by whatever shell ran `awman squad add`
+or `awman squad edit`. The daemon is a long-lived background process, so it
+needs its own copy of any `env(VAR)` name a task declares, kept in sync as
+your shells come and go. See [Squad: Task environment
+values](12-squad.md#task-environment-values) for how a value reaches the
+daemon, what it means when the daemon doesn't have one yet, and how to check
+or fix that with `awman squad env`. A squad task's leader agent is shown in its
+prompt which of the task's `env()` names the daemon actually holds a value for
+— see [Squad: What the leader agent is told about
+them](12-squad.md#what-the-leader-agent-is-told-about-them).
+
 **Example use case:**
 ```toml
 [[teardown]]
@@ -92,14 +104,14 @@ overlays = ["env(GITHUB_TOKEN)"]
 
 ### `skill(*)`
 
-Mounts all global awman skills into the agent container.
+Mounts all hand-authored global awman skills into the agent container. Pulled libraries are not implicitly included by this wildcard; choose them explicitly with `skill(LIBRARY)` or `skill(LIBRARY/SKILL)`.
 
 **Syntax:**
 ```
 skill(*)
 ```
 
-This makes every skill in `~/.awman/skills/` available as a slash command inside the container.
+This makes every hand-authored skill in `~/.awman/skills/` available as a slash command inside the container. Pulled libraries live below `.library/` and are opt-in.
 
 ### `skill(name)`
 
@@ -110,7 +122,7 @@ Mounts a single named skill into the agent container.
 skill(NAME)
 ```
 
-- `NAME` — the directory name of the skill in `~/.awman/skills/` (e.g., `lint`, `review`).
+- `NAME` — a hand-authored skill name, a pulled library name, or a pulled library and skill separated by `/`.
 - Multiple named skills are expressed as multiple `skill()` calls — not comma-separated inside one call.
 
 **Examples:**
@@ -118,6 +130,8 @@ skill(NAME)
 skill(lint)
 skill(review)
 skill(fetch)
+skill(superpowers)
+skill(superpowers/brainstorming)
 ```
 
 Multiple skills:
@@ -125,7 +139,9 @@ Multiple skills:
 skill(lint), skill(review)
 ```
 
-If a named skill does not exist in `~/.awman/skills/`, awman exits with an error before launching the container. This catches typos early rather than silently failing inside the container.
+`skill(superpowers)` mounts the whole pulled library. `skill(superpowers/brainstorming)` mounts only the `brainstorming` skill from that library. A hand-authored skill takes precedence when it has the same name as a pulled library, so `~/.awman/skills/superpowers/` wins over `~/.awman/skills/.library/superpowers/`.
+
+Pulled libraries and their skills are read from `~/.awman/skills/.library/<library>/`, using the subdirectory selected when the library was pulled. A named skill that cannot be found is reported before the container launches. Names can contain at most one `/`; `skill(a/b/c)` is rejected with `skill(name) supports at most one '/' (library/skill); got 'a/b/c'`. Each part of the name must be a plain directory name: empty, `.` and `..` parts (as in `skill(superpowers/..)`) are rejected with `skill(name) segments must not be empty, '.' or '..'`.
 
 ### `context(scope[:permission])`
 
@@ -199,9 +215,11 @@ When different sources specify **different host paths** mapping to the **same co
 ### Skills overlays
 
 Skills use **union/additive** semantics:
-- If *any* source specifies `skill(*)`, all skills are mounted.
+- If *any* source specifies `skill(*)`, all hand-authored global skills are mounted; pulled libraries still require an explicit library or library/skill reference.
 - Named skills from all sources are accumulated. If global config specifies `skill(foo)` and a per-step overlay specifies `skill(bar)`, both `foo` and `bar` are mounted.
 - When `skill(*)` is active from any source, the accumulated named skills list is ignored (all skills are already mounted).
+
+If a session needs a pulled library, use its explicit `skill(library)` or `skill(library/skill)` reference instead of relying on `skill(*)`.
 
 ### Environment variable overlays
 
@@ -288,6 +306,13 @@ awman chat --overlay "ssh(),env(GITHUB_TOKEN),skill(lint)"
 ```
 
 This source has the highest priority among global/repo/env/flag sources, but per-step overlays in workflows override it.
+
+`awman squad add` also accepts repeatable `--overlay` flags, and the squad
+interview offers the same overlay step. These task overlays are saved with
+the task and applied to its evaluation and workflow containers, together with
+the other overlay sources. See [Squad: Giving your squad a task](12-squad.md#giving-your-squad-a-task)
+for the task-creation flow; this page remains the authoritative reference for
+overlay syntax and merge behavior.
 
 ---
 
@@ -528,6 +553,14 @@ The three scopes:
 | **repo** | `~/.awman/context/repo/{owner}/{repo}/` | Project-specific architecture notes, gotchas, accumulated team knowledge | All agents working on this repo |
 | **workflow** | `~/.awman/context/workflow/` (per workflow invocation) | Shared state and coordination between steps in a multi-agent workflow | All steps in the same workflow run |
 
+The squad daemon keeps each task's durable context in
+`~/.awman/squad/tasks/{name}/workspace/`. It is a task-scoped location in
+addition to the ordinary global, repo, and workflow contexts. A task's
+workspace is long-lived: it is created once and reused for every evaluation
+of that task, including when the task's primary workspace is a custom folder.
+It is never recreated for each run. See [Squad: Task workspaces](12-squad.md#task-workspaces)
+for how this location is selected and preserved.
+
 ### When to use each scope
 
 **Global context** (`context(global)`) — standing guidance that applies everywhere: personal coding style, common gotchas you've learned to avoid, architectural patterns you always want followed, links to frequently-referenced docs. Example: a `~/.awman/context/global/coding-style.md` that says "Always use async/await, never callbacks." Every agent you run, in any project, reads it.
@@ -707,18 +740,30 @@ The command does not proceed — you must fix the syntax before launching.
 If a configured host path does not exist when you launch the session:
 
 ```
-warning: overlay host path '/nonexistent/data' does not exist; skipping
+error: overlay host path '/nonexistent/data' does not exist
 ```
 
-The warning is logged, but the session proceeds without that overlay. This is intentional — you may list optional paths that only exist in some contexts (CI vs. local, different machines, etc.).
+The launch fails rather than asking Docker to create an empty bind-mount source.
+If a directory is optional across environments (for example, CI versus a local
+machine), add the overlay only in the environments where that path exists.
 
 ### Missing named skills
 
-If you request a skill that doesn't exist in `~/.awman/skills/`:
+If a named skill is neither a hand-authored skill nor a pulled library:
 
 ```
-error: skill 'nonexistent' not found in ~/.awman/skills/
+error: named skill 'nonexistent' not found in ~/.awman/skills or ~/.awman/skills/.library
 ```
+
+For a library skill, the error identifies both the library and the missing skill, for example:
+
+```
+error: skill 'brainstorming' not found in library 'superpowers' (looked for a SKILL.md in ~/.awman/skills/.library/superpowers/skills/brainstorming)
+```
+
+A skill is a directory containing a `SKILL.md`. A directory inside a library
+that has no `SKILL.md` is reported the same way — it is not mountable as a
+skill.
 
 The command exits immediately. This catches typos before the container launches, preventing silent failures.
 
@@ -811,7 +856,8 @@ If you see this warning for a path that should exist, check:
 ### Skills not available in container
 
 - Is `skill(*)` or `skill(skillname)` configured?
-- Do the skills exist in `~/.awman/skills/`?
+- For a hand-authored skill, does it exist in `~/.awman/skills/<name>/`?
+- For a pulled library, does it exist in `~/.awman/skills/.library/<library>/` and is the requested library or library/skill name correct?
 - Check the full Docker command printed before the session — it should include `-v` mounts for each skill.
 
 ### Git operations failing with "Permission denied"
@@ -846,4 +892,12 @@ If you see this warning for a path that should exist, check:
 
 ---
 
-[← Configuration](07-configuration.md) · [Next: API Mode →](09-api-mode.md)
+[← Configuration](07-configuration.md) · [Next: API & Remote Mode →](09-api-and-remote-mode.md)
+# Startup-gated bindings
+
+Startup-gate bindings are declared by the orchestrator's `request.json`, not by
+the ordinary overlay flag. Their guest paths are limited to `/workspace`,
+`/review`, `/work`, `/data`, `/mnt`, and `/output` or descendants. Binding paths
+must not overlap. During a gated launch ordinary overlays may not overlap
+`/bin`, `/sbin`, `/usr`, `/lib`, `/lib64`, `/etc`, `/proc`, `/sys`, `/dev`, or
+`/.awman/startup-gate`.

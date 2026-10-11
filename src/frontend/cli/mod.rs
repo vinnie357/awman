@@ -16,17 +16,20 @@ use std::sync::Arc;
 use clap::ArgMatches;
 use tokio::sync::RwLock;
 
-use crate::command::dispatch::{Dispatch, Engines};
+use crate::command::commands::Command;
+use crate::command::dispatch::{BuiltCommand, Dispatch, Engines};
 use crate::command::error::CommandError;
 use crate::command::CommandOutcome;
 use crate::data::session::Session;
 
 mod command_frontend;
 mod output;
+mod parallel;
 pub(crate) mod per_command;
 mod user_message;
 
 pub use command_frontend::{command_path_from_matches, CliFrontend};
+pub use parallel::CliParallelFrontend;
 
 /// Bundle of state that `main.rs` constructs once at startup and hands to
 /// either [`run`] (CLI path) or [`crate::frontend::tui::run`] (TUI path).
@@ -59,12 +62,51 @@ pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
         return ExitCode::from(2);
     }
     let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+    if path_strs == ["exec", "workflow"] {
+        let build_frontend = CliFrontend::new(matches.clone());
+        let json = build_frontend.is_json_mode();
+        let dispatch = Dispatch::new(build_frontend, ctx.session.clone(), ctx.engines.clone());
+        return match dispatch.build_command(&path_strs) {
+            Ok(BuiltCommand::ExecWorkflow(cmd)) => {
+                let frontend = CliParallelFrontend::new(CliFrontend::new(matches));
+                match cmd.run_with_frontend(Box::new(frontend)).await {
+                    Ok(outcome) => render_outcome(&CommandOutcome::ExecWorkflow(outcome), json),
+                    Err(err) => render_error(&err),
+                }
+            }
+            Ok(_) => render_error(&CommandError::unknown_command(&path_strs)),
+            Err(err) => render_error(&err),
+        };
+    }
+
+    // The runtime-tier guard and the squad gateway are catalogue-driven and
+    // resolved by `Dispatch::run_command` (WI 0113 F-04). The CLI names no
+    // squad subcommand of its own.
     let frontend = CliFrontend::new(matches);
+    let json = frontend.is_json_mode();
     let dispatch = Dispatch::new(frontend, ctx.session, ctx.engines);
     match dispatch.run_command(&path_strs).await {
-        Ok(outcome) => render_outcome(&outcome),
-        Err(err) => render_error(&err),
+        Ok(outcome) => render_outcome(&outcome, json),
+        Err(err) => render_error_for_mode(&err, json),
     }
+}
+
+fn render_error_for_mode(error: &CommandError, json: bool) -> ExitCode {
+    if json {
+        println!("{}", serde_json::json!({ "error": format_error(error) }));
+        ExitCode::from(error_exit_code(error))
+    } else {
+        render_error(error)
+    }
+}
+
+/// True exactly for the TTY form of bare `awman squad`, which main.rs opens in
+/// the TUI. JSON implies non-interactive and therefore never takes this path.
+pub fn is_bare_squad_tui_invocation(matches: &ArgMatches) -> bool {
+    command_path_from_matches(matches) == ["squad"]
+        && output::stdin_is_tty()
+        && !per_command::squad::squad_flag(matches, "non-interactive")
+        && !per_command::squad::squad_flag(matches, "json")
 }
 
 /// Format a successful [`CommandOutcome`] to user-facing stdout text.
@@ -75,8 +117,8 @@ pub async fn run(matches: ArgMatches, ctx: RuntimeContext) -> ExitCode {
 /// for every non-Empty variant, which surfaced raw JSON as the primary
 /// user output for `chat`, `status`, `config`, etc. Per-variant rendering
 /// now lives in [`per_command::render`].
-pub(crate) fn format_outcome(outcome: &CommandOutcome) -> Option<String> {
-    per_command::render::render(outcome)
+pub(crate) fn format_outcome(outcome: &CommandOutcome, json: bool) -> Option<String> {
+    per_command::render::render(outcome, json)
 }
 
 /// Format a [`CommandError`] to the user-visible stderr string.
@@ -109,6 +151,13 @@ pub(crate) fn format_error(err: &CommandError) -> String {
         CommandError::MissingRequiredArgument { command, argument } => {
             format!(
                 "missing required argument {argument} for command `{}`",
+                command.join(" ")
+            )
+        }
+        CommandError::UnexpectedArgument { command, argument } => {
+            format!(
+                "unexpected argument '{argument}' for command `{}`\n  try `awman {} --help`",
+                command.join(" "),
                 command.join(" ")
             )
         }
@@ -255,6 +304,10 @@ pub(crate) fn format_error(err: &CommandError) -> String {
             crate::engine::error::EngineError::Io { path, source } => {
                 format!("io error at {}: {source}", path.display())
             }
+            crate::engine::error::EngineError::SquadRuntimeUnsupported { .. }
+            | crate::engine::error::EngineError::SquadDaemonStartup(_)
+            | crate::engine::error::EngineError::SquadDaemonConflict(_)
+            | crate::engine::error::EngineError::SquadDaemonUnreachable(_) => format!("{e}"),
             crate::engine::error::EngineError::Git(msg) => {
                 format!("git operation failed: {msg}")
             }
@@ -282,23 +335,55 @@ pub(crate) fn format_error(err: &CommandError) -> String {
             crate::engine::error::EngineError::NotImplemented(msg) => {
                 format!("not implemented: {msg}")
             }
+            // ACP (WI 0104). Minimal build-plumbing arms so the exhaustive match
+            // compiles after the foundation step added these variants; the
+            // cli-frontend step owns the final user-facing wording.
+            crate::engine::error::EngineError::AcpUnsupported { agent } => {
+                format!("agent '{agent}' does not support ACP (Agent Client Protocol) launch mode")
+            }
+            crate::engine::error::EngineError::Acp(msg) => {
+                format!("ACP protocol error: {msg}")
+            }
             crate::engine::error::EngineError::Other(msg) => msg.to_string(),
         },
         CommandError::Data(e) => format!("{e}"),
         CommandError::NotAvailableForFrontend { command, frontend } => {
             format!("command `{command}` is not available via the {frontend} frontend")
         }
+        // The squad missing-key answer authors its own full text, including
+        // the variable to set and the command to mint a new key.
+        CommandError::SquadKeyMissing => err.to_string(),
+        // Session-creation validation errors (surfaced by multi-session
+        // frontends); their Display text is already user-appropriate.
+        CommandError::SessionInvalidType { .. }
+        | CommandError::SessionWorkdirRequired
+        | CommandError::SessionWorkdirUnresolvable { .. }
+        | CommandError::SessionWorkdirNotAllowed { .. }
+        | CommandError::SessionRepoUrlRequired
+        | CommandError::SessionRepoUrlEmpty
+        | CommandError::SessionRepoUrlInvalidScheme { .. } => err.to_string(),
     };
     format!("awman: {body}")
 }
 
 /// Render a successful [`CommandOutcome`] to stdout and return the
 /// process exit code.
-fn render_outcome(outcome: &CommandOutcome) -> ExitCode {
-    if let Some(s) = format_outcome(outcome) {
+fn render_outcome(outcome: &CommandOutcome, json: bool) -> ExitCode {
+    if let Some(s) = format_outcome(outcome, json) {
         println!("{s}");
     }
-    ExitCode::from(0)
+    ExitCode::from(outcome_exit_code(outcome))
+}
+
+/// Pure mapping from a successful [`CommandOutcome`] to a process exit code.
+///
+/// Some commands deliberately complete without short-circuiting on per-item
+/// failures and report those failures inside the outcome instead — today,
+/// `new skill --pull-all`, which must still refresh every reachable library
+/// when one upstream is gone. Their aggregate status has to reach scripts and
+/// CI as a non-zero exit code even though the command itself returned `Ok`.
+fn outcome_exit_code(outcome: &CommandOutcome) -> u8 {
+    u8::try_from(outcome.exit_code()).unwrap_or(1)
 }
 
 /// Render a [`CommandError`] to stderr and return the corresponding
@@ -326,13 +411,22 @@ pub(crate) fn error_exit_code(err: &CommandError) -> u8 {
         | CommandError::UnknownFlag { .. }
         | CommandError::MissingRequiredFlag { .. }
         | CommandError::MissingRequiredArgument { .. }
+        | CommandError::UnexpectedArgument { .. }
         | CommandError::MutuallyExclusive { .. }
         | CommandError::InvalidFlagValue { .. }
         | CommandError::InvalidArgumentValue { .. }
         | CommandError::CommandBoxParse(_)
         | CommandError::InvalidOverlaySpec { .. }
         | CommandError::UnknownConfigField { .. }
-        | CommandError::InteractiveInputUnavailable { .. } => 2,
+        | CommandError::InteractiveInputUnavailable { .. }
+        // Session-creation validation failures are invalid-usage class.
+        | CommandError::SessionInvalidType { .. }
+        | CommandError::SessionWorkdirRequired
+        | CommandError::SessionWorkdirUnresolvable { .. }
+        | CommandError::SessionWorkdirNotAllowed { .. }
+        | CommandError::SessionRepoUrlRequired
+        | CommandError::SessionRepoUrlEmpty
+        | CommandError::SessionRepoUrlInvalidScheme { .. } => 2,
 
         // Exit 4 — missing referenced resource
         CommandError::WorkItemNotFound { .. }
@@ -364,6 +458,7 @@ pub(crate) fn error_exit_code(err: &CommandError) -> u8 {
         | CommandError::RemoteSessionKillFailed { .. } => 1,
         CommandError::NotImplemented(_) => 1,
         CommandError::NotAvailableForFrontend { .. } => 1,
+        CommandError::SquadKeyMissing => 1,
         CommandError::Other(_) => 1,
     }
 }
@@ -469,14 +564,14 @@ mod tests {
     #[test]
     fn render_outcome_empty_is_success() {
         let outcome = crate::command::CommandOutcome::Empty;
-        let _code = render_outcome(&outcome);
+        let _code = render_outcome(&outcome, false);
     }
 
     // ─── format_outcome — snapshot-style per-variant assertions ──────────────
 
     #[test]
     fn format_outcome_empty_returns_none() {
-        assert!(format_outcome(&crate::command::CommandOutcome::Empty).is_none());
+        assert!(format_outcome(&crate::command::CommandOutcome::Empty, false).is_none());
     }
 
     #[test]
@@ -488,7 +583,7 @@ mod tests {
             watched: false,
             tip: "test tip".into(),
         });
-        let s = format_outcome(&outcome).expect("status must render text");
+        let s = format_outcome(&outcome, false).expect("status must render text");
         assert!(s.contains("AWMAN STATUS DASHBOARD"));
         assert!(!s.contains('{'), "status must not be rendered as JSON");
     }
@@ -501,7 +596,7 @@ mod tests {
             agent: Some("claude".into()),
             exit_code: Some(0),
         });
-        assert!(format_outcome(&outcome).is_none());
+        assert!(format_outcome(&outcome, false).is_none());
     }
 
     // ─── format_error — per-variant rendering assertions ─────────────────────
@@ -558,25 +653,20 @@ mod tests {
     }
 
     // ─── TTY detection ────────────────────────────────────────────────────────
-    // These tests exercise the output.rs TTY-detection functions to confirm
-    // they don't panic and return consistent bool values. In CI, both stdin
-    // and stderr are non-TTY, so both return false. The behavior is documented
-    // rather than asserted to avoid fragility when running locally.
+    // These tests exercise the output.rs TTY-detection function to confirm
+    // it doesn't panic and returns a consistent bool value. In CI, stdin is
+    // non-TTY, so it returns false. The behavior is documented rather than
+    // asserted to avoid fragility when running locally.
 
     #[test]
     fn tty_detection_does_not_panic() {
-        let _stderr = crate::frontend::cli::output::stderr_is_tty();
         let _stdin = crate::frontend::cli::output::stdin_is_tty();
-        // No assertion — just verifying the calls don't panic.
+        // No assertion — just verifying the call doesn't panic.
     }
 
     #[test]
-    fn stderr_and_stdin_tty_return_consistent_bools() {
+    fn stdin_tty_returns_consistent_bools() {
         // Calling twice must return the same value (no side effects, no flicker).
-        let a = crate::frontend::cli::output::stderr_is_tty();
-        let b = crate::frontend::cli::output::stderr_is_tty();
-        assert_eq!(a, b, "stderr_is_tty must be idempotent");
-
         let c = crate::frontend::cli::output::stdin_is_tty();
         let d = crate::frontend::cli::output::stdin_is_tty();
         assert_eq!(c, d, "stdin_is_tty must be idempotent");

@@ -64,7 +64,7 @@ impl AuthPathResolver {
                 config_file: None,
                 settings_dir: Some(self.home.join(".gemini")),
             },
-            "antigravity" => AgentAuthPaths {
+            "agy" | "antigravity" => AgentAuthPaths {
                 agent: agent.to_string(),
                 config_file: None,
                 settings_dir: Some(self.home.join(".gemini")),
@@ -163,6 +163,23 @@ mod tests {
             paths.config_file, None,
             "antigravity must have no config_file"
         );
+    }
+
+    #[test]
+    fn resolve_agy_and_legacy_alias_select_the_same_auth_paths() {
+        let r = resolver();
+        let canonical = r.resolve("agy");
+        let legacy = r.resolve("antigravity");
+
+        assert_eq!(canonical.config_file, legacy.config_file);
+        assert_eq!(canonical.settings_dir, legacy.settings_dir);
+        assert_eq!(canonical.config_file, None);
+        assert_eq!(
+            canonical.settings_dir,
+            Some(Path::new("/home/testuser/.gemini").to_path_buf())
+        );
+        assert_eq!(canonical.agent, "agy");
+        assert_eq!(legacy.agent, "antigravity");
     }
 
     #[test]

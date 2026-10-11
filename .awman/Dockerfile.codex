@@ -25,19 +25,35 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 ENTRYPOINT []
 CMD ["/bin/bash"]
 
+# ── Runtime prerequisites ─────────────────────────────────────────────────────
+# Codex sandboxes command execution on Linux with bubblewrap and treats it as a
+# hard prerequisite; without the `bwrap` binary on PATH, sandboxed exec fails.
+# The base image does not ship it, so install it here (as root, before dropping
+# to the runtime user) and prune apt lists to keep the layer small.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bubblewrap \
+    && rm -rf /var/lib/apt/lists/*
+
 # ── Install agent binary ──────────────────────────────────────────────────────
-# Codex CLI ships prebuilt musl binaries on GitHub releases. Use `uname -m`
-# instead of `dpkg --print-architecture` so this works on non-Debian bases too.
-RUN case "$(uname -m)" in \
-        x86_64|amd64)  CODEX_ARCH=x86_64-unknown-linux-musl ;; \
-        aarch64|arm64) CODEX_ARCH=aarch64-unknown-linux-musl ;; \
-        *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;; \
-    esac \
-    && curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 120 \
-        "https://github.com/openai/codex/releases/latest/download/codex-${CODEX_ARCH}.tar.gz" \
-        | tar xz -C /tmp "codex-${CODEX_ARCH}" \
-    && install -m 0755 "/tmp/codex-${CODEX_ARCH}" /usr/local/bin/codex \
-    && rm -f "/tmp/codex-${CODEX_ARCH}"
+# Codex CLI is installed via OpenAI's official installer, which fetches the
+# correct prebuilt binary for the current architecture. The installer drops the
+# binary under the invoking user's ~/.local/bin; copy it into /usr/local/bin so
+# it is on PATH for every user (including the runtime `awman` user below).
+#
+# The installer also unpacks a `codex-code-mode-host` helper (required for
+# Codex's Code Mode tool execution) into its release directory, but upstream's
+# install.sh only symlinks it into ~/.local/bin on macOS — on Linux it stays
+# un-linked, so Code Mode fails closed with "host executable was not found"
+# even though the binary was downloaded. Install it from the release
+# directory explicitly so Code Mode works from this Linux-based image too.
+RUN curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 120 \
+        https://chatgpt.com/codex/install.sh | sh \
+    && codex_bin="$(command -v codex || true)" \
+    && [ -n "$codex_bin" ] || codex_bin="$HOME/.local/bin/codex" \
+    && install -m 0755 "$codex_bin" /usr/local/bin/codex \
+    && install -m 0755 \
+        "$HOME/.codex/packages/standalone/current/bin/codex-code-mode-host" \
+        /usr/local/bin/codex-code-mode-host
 
 # ── awman user + workspace (idempotent against a base that already created it) ─
 # Outer braces keep the && chain associated with the user-creation block,
@@ -56,4 +72,6 @@ WORKDIR /workspace
 
 # ── Smoke test: run as the runtime user so we verify the binary is on PATH and
 # executable from the actual entrypoint context, not just for root. ───────────
-RUN test -x "$(command -v codex)"
+RUN test -x "$(command -v codex)" \
+    && test -x "$(command -v bwrap)" \
+    && test -x "$(command -v codex-code-mode-host)"

@@ -1,7 +1,7 @@
 //! `UserMessage` and `UserMessageSink` — Layer 0.
 //!
 //! Plain message types and sink traits with no dependencies, importable by
-//! every layer (notably `data::issue`, which reports GitHub fetch progress).
+//! every layer (notably `engine::issue`, which reports GitHub fetch progress).
 //! All engines write status messages to the user through a `UserMessageSink`.
 //! Layer 3 implements one sink per concrete frontend type. The CLI sink queues
 //! while a PTY-bound container owns the terminal and replays after the
@@ -113,6 +113,35 @@ impl UserMessageSink for RecordingMessageSink {
     fn replay_queued(&mut self) {
         self.replayed.append(&mut self.queue);
     }
+}
+
+/// A sink that writes messages straight to stderr, prefixed like the rest of
+/// awman's stderr output. Used where a message must stay visible but no
+/// frontend is available to hold it — notably the ACP client's reader task,
+/// which surfaces protocol warnings and agent stderr from a detached tokio task
+/// (a `RecordingMessageSink` there would buffer into a `Vec` nobody ever reads,
+/// silently swallowing every "ignoring malformed line" / "ACP agent stderr"
+/// warning in production).
+#[derive(Debug, Default)]
+pub struct StderrMessageSink;
+
+impl StderrMessageSink {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl UserMessageSink for StderrMessageSink {
+    fn write_message(&mut self, msg: UserMessage) {
+        let prefix = match msg.level {
+            MessageLevel::Warning => "awman warning: ",
+            MessageLevel::Error => "awman error: ",
+            MessageLevel::Info | MessageLevel::Success => "awman: ",
+        };
+        eprintln!("{prefix}{}", msg.text);
+    }
+
+    fn replay_queued(&mut self) {}
 }
 
 #[cfg(test)]

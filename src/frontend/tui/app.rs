@@ -5,12 +5,12 @@
 
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
-
+use crate::command::commands::squad::supervisor::SquadGatewayResolver;
 use crate::command::dispatch::catalogue::CommandCatalogue;
 use crate::command::dispatch::parsed_input::ParsedCommandBoxInput;
 use crate::command::dispatch::{CommandOutcome, Dispatch, Engines};
 use crate::command::error::CommandError;
+use crate::data::config::env::Env;
 use crate::data::session::Session;
 use crate::data::session_manager::SessionManager;
 use crate::frontend::tui::command_frontend::TuiCommandFrontend;
@@ -50,6 +50,33 @@ pub struct StatusBar {
     pub text: String,
 }
 
+/// The outcome of the pre-event-loop squad tab build (`awman squad`).
+///
+/// `KeyMissing` is not an error — the daemon is up and healthy — but no tab is
+/// assembled for it, because a tab whose every poll is refused with 401 shows
+/// nothing but that. The caller raises [`Dialog::SquadKeyMissing`] instead, and
+/// accepting it builds the tab through the ordinary
+/// [`App::poll_squad_startup`] path once a usable key exists.
+pub enum SquadTabStart {
+    Ready(Box<SquadTabBuild>),
+    KeyMissing,
+}
+
+/// A live squad gateway plus what this process can authenticate to it with,
+/// as Layer 2 reports it.
+pub use crate::command::commands::squad::supervisor::{
+    SquadKeySetup, SquadStartError, SquadStartup,
+};
+
+/// Everything [`App::build_squad_tab`] produces. `key_setup` is `Some` only on
+/// the run that minted the squad bearer key, and carries the shell snippet the
+/// caller must show before it is lost — the plaintext key exists nowhere else.
+pub struct SquadTabBuild {
+    pub tab: Tab,
+    pub gateway: Arc<dyn crate::command::commands::squad::gateway::TaskGateway>,
+    pub key_setup: Option<SquadKeySetup>,
+}
+
 /// Central TUI state. Contains NO business logic — only UI state.
 pub struct App {
     pub tabs: Vec<Tab>,
@@ -58,7 +85,7 @@ pub struct App {
     pub focus: Focus,
     pub catalogue: &'static CommandCatalogue,
     pub engines: Engines,
-    pub session_manager: Arc<RwLock<SessionManager>>,
+    pub session_manager: Arc<SessionManager>,
     pub command_input: TextEdit,
     pub suggestion_row: Vec<String>,
     pub input_error: Option<String>,
@@ -67,26 +94,71 @@ pub struct App {
     pub needs_redraw: bool,
     pub command_dialog_active: bool,
     pub runtime_handle: tokio::runtime::Handle,
-    /// Receiver for asynchronous container stats results.
+    /// Gateway for the singleton squad tab, obtained from
+    /// `SquadGatewayResolver::ensure_running()` when the tab is opened. Injected into
+    /// `Dispatch` for `squad` in-tab actions so they reach the daemon. `None`
+    /// until the squad tab exists.
+    pub squad_gateway: Option<Arc<dyn crate::command::commands::squad::gateway::TaskGateway>>,
+    /// A squad daemon start that is running on the tokio runtime, waiting for
+    /// the daemon to publish its endpoint. `Some` only between the user
+    /// accepting the daemon-start confirmation and
+    /// [`App::poll_squad_startup`] draining the result, which is also what
+    /// keeps a second `y` from spawning a second daemon.
+    #[allow(clippy::type_complexity)]
+    pub squad_startup_rx: Option<std::sync::mpsc::Receiver<Result<SquadStartup, SquadStartError>>>,
+    /// Receiver for asynchronous container stats results. The middle element
+    /// is the step name of the slot the sample was polled for (empty for the
+    /// single/backbone slot of a plain containerized command).
+    #[allow(clippy::type_complexity)]
     pub stats_rx: Option<
-        std::sync::mpsc::Receiver<(usize, crate::engine::agent_runtime::execution::AgentStats)>,
+        std::sync::mpsc::Receiver<(
+            usize,
+            String,
+            crate::engine::agent_runtime::execution::AgentStats,
+        )>,
     >,
     /// Sender cloned per stats query — kept alive so the channel stays open.
-    pub stats_tx:
-        std::sync::mpsc::Sender<(usize, crate::engine::agent_runtime::execution::AgentStats)>,
+    #[allow(clippy::type_complexity)]
+    pub stats_tx: std::sync::mpsc::Sender<(
+        usize,
+        String,
+        crate::engine::agent_runtime::execution::AgentStats,
+    )>,
     /// Tracks when the last stats query was dispatched so we don't spam.
     pub last_stats_poll: std::time::Instant,
+    /// `(tab index, slot step name)` pairs with a stats query still running.
+    /// A container-runtime `stats()` call can take longer than the poll
+    /// interval on a busy daemon; without this guard every tick would pile
+    /// another query onto the same slot until the runtime CLI is swamped and
+    /// no slot's numbers stay current.
+    pub in_flight_stats: Arc<std::sync::Mutex<std::collections::HashSet<(usize, String)>>>,
+    /// The active tab index as of the previous tick (WI 0112). Lets the tick
+    /// notice a switch *away* from the squad tab and hand focus back to the
+    /// command box, without every tab-switching path having to know.
+    pub last_active_tab: usize,
+    /// Squad daemon health for the bottom-row indicator (WI 0112). Written by
+    /// the app-level `SquadIndicatorPoller` started in `tui::run`; read by
+    /// the renderer. Starts `Unknown` and stays so in unit tests, which never
+    /// start the poller.
+    pub squad_indicator: crate::frontend::tui::squad_indicator::SharedSquadIndicator,
 }
 
 impl App {
     pub fn new(
         catalogue: &'static CommandCatalogue,
         engines: Engines,
-        session_manager: Arc<RwLock<SessionManager>>,
+        session_manager: Arc<SessionManager>,
         initial_tab: Tab,
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
         let (stats_tx, stats_rx) = std::sync::mpsc::channel();
+        // `App` accepts a pre-built tab for rendering, but the manager owns
+        // the Session object. This also covers the synthetic squad tab.
+        if session_manager.get(&initial_tab.session_id).is_none() {
+            session_manager
+                .create(initial_tab.session.clone())
+                .expect("initial tab session id must be unique");
+        }
         Self {
             tabs: vec![initial_tab],
             active_tab: 0,
@@ -103,10 +175,44 @@ impl App {
             needs_redraw: true,
             command_dialog_active: false,
             runtime_handle,
+            squad_gateway: None,
+            squad_startup_rx: None,
             stats_rx: Some(stats_rx),
             stats_tx,
             last_stats_poll: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            in_flight_stats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            last_active_tab: 0,
+            squad_indicator: Arc::new(std::sync::Mutex::new(
+                crate::frontend::tui::squad_indicator::SquadIndicator::Unknown,
+            )),
         }
+    }
+
+    /// Whether the active tab is the squad tab showing its card grid — the
+    /// state in which the command box is permanently inactive and the grid
+    /// always holds focus (WI 0112). False while an attach session owns the
+    /// tab's slots: the tab then behaves as an ordinary container tab.
+    pub fn squad_grid_active(&self) -> bool {
+        let tab = self.active_tab();
+        tab.is_squad && tab.container_slots.is_empty()
+    }
+
+    /// Keep `focus` consistent with the active tab (WI 0112), once per tick:
+    /// on the squad grid, focus is always the grid; leaving the squad tab for
+    /// a normal tab restores the command box. A normal-to-normal switch leaves
+    /// focus alone, exactly as before.
+    fn normalize_focus_for_active_tab(&mut self) {
+        if self.squad_grid_active() {
+            self.focus = Focus::ExecutionWindow;
+        } else if self.active_tab != self.last_active_tab
+            && self
+                .tabs
+                .get(self.last_active_tab)
+                .is_some_and(|tab| tab.is_squad)
+        {
+            self.focus = Focus::CommandBox;
+        }
+        self.last_active_tab = self.active_tab;
     }
 
     pub fn active_tab(&self) -> &Tab {
@@ -142,11 +248,307 @@ impl App {
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len().saturating_sub(1);
         }
+        // The removed index must not survive as `last_active_tab`, or a tab
+        // that later lands on it could be mistaken for the one that closed.
+        self.last_active_tab = self.last_active_tab.min(self.tabs.len().saturating_sub(1));
+    }
+
+    /// Focus the existing squad tab, or create the singleton one — asking
+    /// first when that would also start a daemon.
+    ///
+    /// On failure nothing is created: the error text — which already names
+    /// `awman api` (daemon conflict) or the sandbox runtime — is surfaced
+    /// verbatim in the status bar, never a generic "could not connect".
+    /// Idempotent: a second call focuses the tab created by the first.
+    ///
+    /// WI 0110: opening the tab starts a long-lived background process when no
+    /// squad daemon is running, so that case raises
+    /// [`Dialog::SquadStartConfirm`] and builds nothing until the user answers
+    /// `y` ([`App::build_and_install_squad_tab`]). With a daemon already
+    /// running there is nothing to consent to and no dialog is raised.
+    pub fn open_or_focus_squad_tab(&mut self) {
+        if let Some(idx) = self.tabs.iter().position(|t| t.is_squad) {
+            self.active_tab = idx;
+            self.needs_redraw = true;
+            return;
+        }
+        // The runtime refusal comes first: a sandbox-class runtime cannot back
+        // squad at all, so asking whether to start a daemon would be asking a
+        // question whose "yes" could not be honoured.
+        if let Err(error) = SquadGatewayResolver::admit_runtime(&self.engines) {
+            self.status_bar.text = error.to_string();
+            return;
+        }
+        match Self::squad_daemon_is_running() {
+            Ok(true) => self.build_and_install_squad_tab(),
+            Ok(false) => {
+                self.active_dialog = Some(Dialog::SquadStartConfirm);
+                self.needs_redraw = true;
+            }
+            // Whether a daemon is running could not be determined (an
+            // unreadable squad root, say). Fall through to the ordinary build,
+            // whose error text is the specific one worth showing.
+            Err(_) => self.build_and_install_squad_tab(),
+        }
+    }
+
+    /// Whether a squad daemon is already running for this squad root. Starts
+    /// nothing and writes nothing — see [`SquadGatewayResolver::daemon_is_running`].
+    ///
+    /// [`SquadGatewayResolver::daemon_is_running`]: crate::command::commands::squad::supervisor::SquadGatewayResolver::daemon_is_running
+    fn squad_daemon_is_running() -> Result<bool, crate::command::error::CommandError> {
+        SquadGatewayResolver::from_env(&Env::from_process())?.daemon_is_running()
+    }
+
+    /// Start the squad tab and install it as the active tab, starting the
+    /// daemon if it is not already running. The second half of
+    /// [`App::open_or_focus_squad_tab`], separated so the daemon-start
+    /// confirmation can call it on `y`.
+    ///
+    /// Starting a daemon means spawning a process and then waiting — up to ten
+    /// seconds — for it to publish its endpoint. Doing that inline froze the
+    /// event loop for the whole wait: the terminal could not redraw, so the
+    /// confirmation the user had just answered stayed painted on screen until
+    /// the wait ended, and a failure surfaced only as a status-bar line under
+    /// a modal that had appeared to hang. The wait now runs on the tokio
+    /// runtime, this returns immediately with a "Starting…" modal on screen,
+    /// and [`App::poll_squad_startup`] installs the tab (or reports the
+    /// failure in a modal of its own) when the daemon answers.
+    pub fn build_and_install_squad_tab(&mut self) {
+        if let Some(idx) = self.tabs.iter().position(|t| t.is_squad) {
+            self.active_tab = idx;
+            self.needs_redraw = true;
+            return;
+        }
+        // A second `y` while the first start is still in flight must not spawn
+        // a second daemon.
+        if self.squad_startup_rx.is_some() {
+            return;
+        }
+        // The runtime refusal is synchronous and immediate — there is nothing
+        // to wait for — so it is reported without ever showing a "Starting…"
+        // modal the user would watch fail.
+        if let Err(error) = SquadGatewayResolver::admit_runtime(&self.engines) {
+            self.status_bar.text = error.to_string();
+            self.needs_redraw = true;
+            return;
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let engines = self.engines.clone();
+        self.runtime_handle.spawn(async move {
+            let _ = tx.send(Self::ensure_squad_gateway(engines).await);
+        });
+        self.squad_startup_rx = Some(rx);
+        self.active_dialog = Some(Dialog::Loading {
+            title: "Starting squad daemon".to_string(),
+        });
+        self.needs_redraw = true;
+    }
+
+    /// Mint a new squad bearer key and restart the daemon onto it, then open
+    /// the tab. The `y` answer to [`Dialog::SquadKeyMissing`].
+    ///
+    /// Shares `squad_startup_rx` and [`App::poll_squad_startup`] with an
+    /// ordinary start: a refresh ends in the same place a first run does — a
+    /// live gateway and a a minted key to display — so there is
+    /// one drain, one progress modal, and one error path rather than two.
+    pub fn start_squad_key_refresh(&mut self) {
+        if self.squad_startup_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.runtime_handle.spawn(async move {
+            let _ = tx.send(Self::refresh_squad_key().await);
+        });
+        self.squad_startup_rx = Some(rx);
+        self.active_dialog = Some(Dialog::Loading {
+            title: "Refreshing the squad key".to_string(),
+        });
+        self.needs_redraw = true;
+    }
+
+    /// Drain a completed daemon startup, if one has finished since the last
+    /// tick. Called from [`App::tick_all_tabs`]; a no-op when no start is in
+    /// flight or the daemon has not answered yet.
+    ///
+    /// A failure is raised as a modal rather than written to the status bar:
+    /// the user explicitly asked for a daemon, so "it did not start, and here
+    /// is why" is the answer to a question they asked, not an aside they may
+    /// or may not notice before the next command overwrites it.
+    pub(crate) fn poll_squad_startup(&mut self) {
+        let Some(rx) = self.squad_startup_rx.as_ref() else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(SquadStartError::Other(
+                "squad daemon startup was interrupted".to_string(),
+            )),
+        };
+        self.squad_startup_rx = None;
+        // Only this dialog is dismissed: an error or notice raised while the
+        // start was running belongs to the user, not to us.
+        if matches!(self.active_dialog, Some(Dialog::Loading { .. })) {
+            self.active_dialog = None;
+        }
+        self.needs_redraw = true;
+
+        match result.and_then(|startup| Self::assemble_squad_tab(startup, &self.runtime_handle)) {
+            Ok(build) => {
+                self.squad_gateway = Some(build.gateway);
+                self.tabs.push(build.tab);
+                self.active_tab = self.tabs.len() - 1;
+                if let Some(key_setup) = build.key_setup {
+                    self.active_dialog = Some(Dialog::Notice {
+                        title: "squad authentication".to_string(),
+                        body: key_setup.body,
+                        copy_key: Some(key_setup.key),
+                        copy_zshrc_snippet: Some(key_setup.zshrc_snippet),
+                    });
+                }
+            }
+            // A daemon this process cannot authenticate to is not worth a tab:
+            // every poll would 401 and the grid would show nothing but that.
+            // Offer the one recovery there is instead, and build nothing until
+            // it is taken — see `Dialog::SquadKeyMissing`.
+            Err(SquadStartError::KeyMissing) => {
+                self.active_dialog = Some(Dialog::SquadKeyMissing);
+            }
+            Err(error) => self.report_squad_start_failure(&error),
+        }
+    }
+
+    /// Raise a squad start failure as a modal, and leave its text in the
+    /// status bar behind it. Every variant but `KeyMissing` lands here: each
+    /// already carries text that names the problem, so there is nothing to
+    /// classify — see [`SquadStartError`].
+    fn report_squad_start_failure(&mut self, error: &SquadStartError) {
+        let message = error.to_string();
+        self.status_bar.text = message.clone();
+        self.active_dialog = Some(Dialog::Notice {
+            title: "squad daemon did not start".to_string(),
+            body: message,
+            copy_key: None,
+            copy_zshrc_snippet: None,
+        });
+    }
+
+    /// Build the singleton squad tab: ensure the daemon is running, obtain a
+    /// gateway, construct the synthetic-session tab, and start its poller.
+    /// Shared by [`App::open_or_focus_squad_tab`] and `tui::run`'s
+    /// `InitialTab::Squad` path. On failure returns the specific error text
+    /// (naming `awman api` or the sandbox runtime), never a generic message.
+    pub(crate) fn build_squad_tab(
+        engines: &crate::command::dispatch::Engines,
+        runtime_handle: &tokio::runtime::Handle,
+    ) -> Result<SquadTabStart, SquadStartError> {
+        // A sandbox-class runtime cannot back squad: report the runtime error,
+        // never a generic connection failure.
+        SquadGatewayResolver::admit_runtime(engines)?;
+
+        // `ensure_squad_gateway` is async, but the caller may be on a tokio
+        // worker thread where `Handle::block_on` would panic. Drive it on the
+        // runtime and block on the result channel instead
+        // (see /awman/context/workflow/deviations.md, D-tui-3).
+        //
+        // Blocking here is only tolerable because this path runs *before* the
+        // event loop exists (bare `awman squad`). Once the TUI is up, the
+        // daemon-start confirmation uses `build_and_install_squad_tab`, which
+        // waits on the runtime instead of freezing the screen.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let owned_engines = engines.clone();
+        runtime_handle.spawn(async move {
+            let _ = tx.send(Self::ensure_squad_gateway(owned_engines).await);
+        });
+        let startup = match rx.recv() {
+            Ok(result) => result,
+            Err(_) => Err(SquadStartError::Other(
+                "squad daemon startup was interrupted".to_string(),
+            )),
+        };
+        match startup {
+            Ok(startup) => Self::assemble_squad_tab(startup, runtime_handle)
+                .map(|build| SquadTabStart::Ready(Box::new(build))),
+            Err(SquadStartError::KeyMissing) => Ok(SquadTabStart::KeyMissing),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Ensure a squad daemon is running and return a gateway to it, together
+    /// with what this process can authenticate to it with.
+    ///
+    /// This is the whole waiting half of opening the squad tab, and the only
+    /// half that is async. The caller decides how to wait for it: on the
+    /// runtime (the TUI's daemon-start confirmation) or by blocking
+    /// (`build_squad_tab`, before there is an event loop to freeze).
+    pub(crate) async fn ensure_squad_gateway(
+        engines: crate::command::dispatch::Engines,
+    ) -> Result<SquadStartup, SquadStartError> {
+        SquadGatewayResolver::open_from_env(&Env::from_process(), &engines).await
+    }
+
+    /// Mint a new bearer key, restart the daemon onto it, and return the same
+    /// startup an ordinary open does — so the caller drains both through one
+    /// path. The key is always `Minted` here, which is the point: the recovery
+    /// ends by showing the user the key they were missing.
+    pub(crate) async fn refresh_squad_key() -> Result<SquadStartup, SquadStartError> {
+        SquadGatewayResolver::refresh_key_from_env(&Env::from_process()).await
+    }
+
+    /// Turn a live startup into the squad tab: the squad-root session, the tab
+    /// itself, and its task-list poller. Pure local work — nothing here waits
+    /// on the daemon, so it is safe to run on the event-loop thread.
+    fn assemble_squad_tab(
+        startup: SquadStartup,
+        runtime_handle: &tokio::runtime::Handle,
+    ) -> Result<SquadTabBuild, SquadStartError> {
+        let session = Session::open_squad_root(&Env::from_process()).map_err(|error| {
+            SquadStartError::Other(format!("failed to open squad tab: {error}"))
+        })?;
+
+        let gateway = startup.gateway;
+
+        let mut tab = Tab::new_squad(session);
+        {
+            // Ensure a runtime context so the poller's `tokio::spawn` works even
+            // when this runs off a runtime thread.
+            let _guard = runtime_handle.enter();
+            let (poller, cancel) = {
+                let state = tab
+                    .squad
+                    .as_ref()
+                    .expect("new_squad always installs squad state");
+                (
+                    crate::frontend::tui::squad_poll::SquadTaskPoller::new(gateway.clone(), state),
+                    state.cancel.clone(),
+                )
+            };
+            let handle = poller.start(cancel);
+            tab.squad
+                .as_mut()
+                .expect("new_squad always installs squad state")
+                .set_poll_handle(handle);
+        }
+        Ok(SquadTabBuild {
+            tab,
+            gateway,
+            key_setup: startup.key_setup,
+        })
     }
 
     /// Spawn a parsed command as an async tokio task, wiring up all channels
     /// between the event loop and the command thread.
     pub fn spawn_command(&mut self, _command_text: &str, parsed: ParsedCommandBoxInput) {
+        let path_refs: Vec<&str> = parsed.path.iter().map(String::as_str).collect();
+        if let Err(error) =
+            Dispatch::<TuiCommandFrontend>::validate_runtime_admission(&self.engines, &path_refs)
+        {
+            self.status_bar.text = error.to_string();
+            return;
+        }
+
         // Capture the runtime class before borrowing the tab mutably: a
         // sandbox-class runtime (e.g. docker-sbx-experimental) labels the
         // overlay "(sandboxed)" rather than "(containerized)".
@@ -162,28 +564,13 @@ impl App {
         }
         tab.scroll_offset = 0;
 
-        // Reset the vt100 parser so the previous container's output is gone.
-        let (rows, cols) = tab.vt100_parser.screen().size();
-        tab.vt100_parser = vt100::Parser::new(
-            rows,
-            cols,
-            tab.session.effective_config().scrollback_lines(),
-        );
-        tab.container_scroll_offset = 0;
-        tab.container_rendered = false;
-        tab.mouse_selection = None;
-        tab.agent_alt_screen = false;
-        tab.agent_alternate_scroll = false;
-        tab.region_scroll.reset();
-        tab.last_container_summary = None;
-
-        // Clear previous workflow state so the strip resets for the new command.
-        // Also clear the strip hit-test rect so stale rects from a previous
+        // Clear previous workflow state so the overview resets for the new command.
+        // Also clear the overview hit-test rect so stale rects from a previous
         // workflow don't intercept mouse-scroll events meant for the container.
         if let Ok(mut guard) = tab.workflow_state.lock() {
             *guard = None;
         }
-        tab.last_strip_rect = None;
+        tab.last_overview_rect = None;
         if let Ok(mut guard) = tab.yolo_state.lock() {
             *guard = None;
         }
@@ -210,7 +597,14 @@ impl App {
         // inside the container, like Claude, would render against an 80x24
         // default until the first SIGWINCH).
         let initial_size = match crossterm::terminal::size() {
-            Ok((cols, rows)) => crate::frontend::tui::compute_container_inner_size(cols, rows),
+            Ok((cols, rows)) => {
+                let sidebar =
+                    crate::frontend::tui::git_sidebar::sidebar_width(cols, tab.git_sidebar_state);
+                crate::frontend::tui::event_loop::compute_container_inner_size(
+                    cols.saturating_sub(sidebar),
+                    rows,
+                )
+            }
             Err(_) => (80u16, 24u16),
         };
 
@@ -227,9 +621,14 @@ impl App {
         // `Arc<Mutex<...>>` between the engine-side frontend impl and the
         // renderer.
         tab.container_name_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+        tab.container_exit_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         tab.stdin_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         tab.resize_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
         tab.engine_tx_shared = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let attach_context = tab
+            .squad
+            .as_ref()
+            .map(|state| (state.attach_session.clone(), state.daemon_reachable.clone()));
         let frontend = TuiCommandFrontend::new(
             parsed.clone(),
             tab.status_log.clone(),
@@ -241,6 +640,7 @@ impl App {
             tab.yolo_cancel_flag.clone(),
             tab.pty_reset_flag.clone(),
             tab.container_name_shared.clone(),
+            tab.container_exit_shared.clone(),
             tab.stdin_tx_shared.clone(),
             tab.resize_tx_shared.clone(),
             tab.engine_tx_shared.clone(),
@@ -248,12 +648,13 @@ impl App {
             tab.active_worktree_path.clone(),
             tab.status_dashboard.clone(),
             tab.tui_context_shared.clone(),
+            tab.container_slot_events.clone(),
+        )
+        .with_squad_attach_context(
+            attach_context.as_ref().map(|(session, _)| session.clone()),
+            attach_context.map(|(_, reachable)| reachable),
         );
 
-        // Store the receiving/sending ends in the tab.
-        tab.container_stdout_rx = Some(stdout_rx);
-        tab.container_stdin_tx = Some(stdin_tx);
-        tab.container_resize_tx = Some(resize_tx);
         tab.command_result_rx = Some(result_rx);
         tab.dialog_request_rx = Some(dialog_req_rx);
         tab.dialog_response_tx = Some(dialog_resp_tx);
@@ -261,18 +662,27 @@ impl App {
         let command_name = parsed.path.join(" ");
         let agent_display = agent_name_from_parsed(&parsed, &tab.session);
 
-        // Pre-populate ContainerInfo so the overlay title bar can show the
-        // command name and elapsed time even before the engine reports the
-        // actual container's name. The engine may overwrite the container
-        // name later via `report_status`.
-        tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
-            agent_display_name: agent_display.clone(),
-            container_name: String::new(),
-            start_time: std::time::Instant::now(),
-            latest_stats: None,
-            stats_history: Vec::new(),
-            sandboxed,
-        });
+        // Install the command's container slot (the N==1 case of the unified
+        // slot model), replacing any slots from the previous command. Its
+        // `ContainerInfo` lets the overlay title show the agent name and
+        // elapsed time before the engine reports the actual container name;
+        // the parser starts at the computed overlay size so agents never lay
+        // out against an 80x24 default.
+        tab.start_container(
+            agent_display.clone(),
+            String::new(),
+            initial_size.0,
+            initial_size.1,
+        );
+        if let Some(slot) = tab.focused_slot_mut() {
+            slot.container_stdout_rx = Some(stdout_rx);
+            slot.container_stdin_tx = Some(stdin_tx);
+            slot.container_resize_tx = Some(resize_tx);
+            if let Some(info) = slot.container_info.as_mut() {
+                info.sandboxed = sandboxed;
+            }
+        }
+        tab.suppress_container_auto_open = false;
 
         // Show the "Interactive Mode" banner for containerized commands.
         let is_containerized = matches!(
@@ -340,84 +750,172 @@ impl App {
 
         // Build the dispatch and spawn the command using the tab's session
         // so commands execute in the correct working directory.
-        let tab_session = self.active_tab().session.clone();
-        let session = Arc::new(RwLock::new(tab_session));
+        let session_id = self.active_tab().session_id;
+        let session = match self.session_manager.get(&session_id) {
+            Some(session) => session,
+            None => {
+                // Test and extension callers may install a prebuilt Tab
+                // directly. Normalize that legacy construction at the
+                // ownership boundary before dispatching against it.
+                self.session_manager
+                    .create(self.active_tab().session.clone())
+                    .expect("tab session id must be unique");
+                self.session_manager
+                    .get(&session_id)
+                    .expect("registered tab session must be retrievable")
+            }
+        };
         let engines = self.engines.clone();
         let path_owned: Vec<String> = parsed.path.clone();
+        // WI 0102: in-tab `squad` actions reach the daemon through the same
+        // gateway the CLI subcommands use, injected into Dispatch. Without it
+        // they fail with 0101's "squad tasks are served by the squad daemon"
+        // error.
+        let squad_gateway = self.squad_gateway.clone();
 
         self.runtime_handle.spawn(async move {
-            let dispatch = Dispatch::new(frontend, session, engines);
+            let mut dispatch = Dispatch::new(frontend, session, engines);
+            if path_owned.first().map(String::as_str) == Some("squad") {
+                if let Some(gateway) = squad_gateway {
+                    dispatch = dispatch.with_squad_gateway(gateway);
+                }
+            }
             let path_refs: Vec<&str> = path_owned.iter().map(|s| s.as_str()).collect();
             let result = dispatch.run_command(&path_refs).await;
             let _ = result_tx.send(result);
         });
     }
 
-    /// Add a new tab backed by the given session. Returns the index of the
-    /// new tab.
-    pub fn add_tab(&mut self, session: Session) -> usize {
-        let tab = Tab::new(session);
+    /// Open and register a directory session, then create its tab view.
+    pub fn add_tab(
+        &mut self,
+        dir: std::path::PathBuf,
+        opts: crate::data::session::SessionOpenOptions,
+    ) -> Result<usize, crate::data::error::DataError> {
+        let session_id = self.session_manager.open_or_create(dir, opts)?;
+        let session = self
+            .session_manager
+            .get(&session_id)
+            .expect("newly-created session must be registered")
+            .try_read()
+            .expect("newly-created session must not be locked")
+            .clone();
+        let tab = Tab::new_with_git_engine(session, self.engines.git_engine.clone());
         self.tabs.push(tab);
-        self.tabs.len() - 1
+        Ok(self.tabs.len() - 1)
     }
 
     /// Tick all tabs: drain container output, poll for command completion,
     /// poll for stats results, and recompute the per-tab stuck flag.
     pub fn tick_all_tabs(&mut self) {
+        // A squad daemon start runs on the runtime, so the tick is where its
+        // result lands — before the tab loop, so a tab installed by this call
+        // is polled on the very same tick it appears.
+        self.poll_squad_startup();
+        self.normalize_focus_for_active_tab();
+
         let active = self.active_tab;
-        for tab in self.tabs.iter_mut() {
+        for (idx, tab) in self.tabs.iter_mut().enumerate() {
+            // WI 0102: drive the squad tab's poll loop — it fetches only while
+            // focused — and publish the selected task name for the poller
+            // so it never reads UI state directly.
+            if let Some(state) = tab.squad.as_ref() {
+                state
+                    .focused
+                    .store(idx == active, std::sync::atomic::Ordering::Relaxed);
+                if let Ok(mut selected) = state.poll_selected.lock() {
+                    *selected = state.selected_name();
+                }
+            }
+
+            // Maintain container_slots before draining output (a Launched
+            // event may carry the channels the drain reads) and before
+            // aggregating stuck/yolo (drain_stuck_events reads slot flags).
+            tab.drain_container_slot_events();
             tab.drain_container_output();
+            tab.poll_container_exit();
             tab.poll_command_completion();
             tab.drain_stuck_events();
+            // Restart the git poll task if the worktree path changed.
+            tab.refresh_git_poll();
 
-            // TUI-4: Sync the vt100 parser size with the actual rendered
-            // container overlay dimensions. The overlay size varies with
-            // workflow strip height and other dynamic chrome; the initial
-            // `compute_container_inner_size` estimate may not match.
+            // TUI-4: keep every slot's parser and PTY in lockstep with the
+            // actual rendered overlay dimensions. The overlay size varies
+            // with Workflow Overview height and other dynamic chrome; the
+            // initial `compute_container_inner_size` estimate may not match.
+            // All slots render into the same maximized overlay when focused,
+            // so they all track the same size; syncing the background slots
+            // too means Ctrl-S never swaps in a stale grid.
             if tab.container_window_state
                 != crate::frontend::tui::tabs::ContainerWindowState::Hidden
             {
                 if let Some(inner) = tab.container_inner_area {
-                    let (vt_rows, vt_cols) = tab.vt100_parser.screen().size();
-                    if vt_cols != inner.width || vt_rows != inner.height {
-                        tab.vt100_parser
-                            .screen_mut()
-                            .set_size(inner.height, inner.width);
-                        if let Some(ref tx) = tab.container_resize_tx {
-                            let _ = tx.send((inner.width, inner.height));
+                    for slot in &mut tab.container_slots {
+                        let (vt_rows, vt_cols) = slot.vt100_parser.screen().size();
+                        if vt_cols != inner.width || vt_rows != inner.height {
+                            slot.vt100_parser
+                                .screen_mut()
+                                .set_size(inner.height, inner.width);
+                            if let Some(ref tx) = slot.container_resize_tx {
+                                let _ = tx.send((inner.width, inner.height));
+                            }
                         }
                     }
                 }
             }
 
             // Pick up the container name from the engine (set via
-            // `report_status(Running { container_name })`).
-            // Also handles workflow step transitions: the engine clears the
-            // shared name (setting it to None) then sets a new name when the
-            // next container reports Running. We must clear the tab's
-            // container_name so the new name gets picked up.
-            if let Some(ref mut info) = tab.container_info {
-                if let Ok(mut name_guard) = tab.container_name_shared.lock() {
-                    if let Some(name) = name_guard.take() {
+            // `report_status(Running { container_name })`) into the focused
+            // slot. Also handles sequential workflow step transitions: the
+            // engine clears the shared name then sets a new one when the
+            // next container reports Running. During a parallel group the
+            // backbone slot is dormant and per-slot names arrive via
+            // `ContainerSlotEvent::ContainerName` instead, so the shared
+            // name is left alone to avoid mislabeling a group slot.
+            if tab.dormant_slots.is_empty() {
+                let name = tab
+                    .container_name_shared
+                    .lock()
+                    .ok()
+                    .and_then(|mut g| g.take());
+                if let Some(name) = name {
+                    if let Some(info) = tab
+                        .focused_slot_mut()
+                        .and_then(|s| s.container_info.as_mut())
+                    {
                         info.container_name = name;
                         info.latest_stats = None;
                     }
+                    // A fresh container is running — let its output
+                    // auto-open the window again after a mid-workflow
+                    // container exit closed it.
+                    tab.suppress_container_auto_open = false;
                 }
             }
 
-            // Pick up new stdin/resize senders from workflow step transitions.
-            // When `recreate_container_io()` runs on the engine thread, it
-            // publishes new senders via the shared slots. We swap the tab's
-            // senders here so keystrokes and resize events reach the new
-            // container.
-            if let Ok(mut guard) = tab.stdin_tx_shared.lock() {
-                if let Some(new_tx) = guard.take() {
-                    tab.container_stdin_tx = Some(new_tx);
-                }
-            }
-            if let Ok(mut guard) = tab.resize_tx_shared.lock() {
-                if let Some(new_tx) = guard.take() {
-                    tab.container_resize_tx = Some(new_tx);
+            // Pick up new stdin/resize senders from sequential workflow step
+            // transitions. When `recreate_container_io()` runs on the engine
+            // thread, it publishes new senders via the shared slots; swap
+            // them into the focused (backbone) slot so keystrokes and resize
+            // events reach the new container.
+            let new_stdin = tab.stdin_tx_shared.lock().ok().and_then(|mut g| g.take());
+            let new_resize = tab.resize_tx_shared.lock().ok().and_then(|mut g| g.take());
+            if new_stdin.is_some() || new_resize.is_some() {
+                // These only come from the sequential path; if a parallel
+                // group is active the backbone is dormant — apply them there
+                // so they aren't lost (or misrouted to a group slot).
+                let target = if tab.dormant_slots.is_empty() {
+                    tab.focused_slot_mut()
+                } else {
+                    tab.dormant_slots.first_mut()
+                };
+                if let Some(slot) = target {
+                    if let Some(new_tx) = new_stdin {
+                        slot.container_stdin_tx = Some(new_tx);
+                    }
+                    if let Some(new_tx) = new_resize {
+                        slot.container_resize_tx = Some(new_tx);
+                    }
                 }
             }
         }
@@ -433,8 +931,8 @@ impl App {
                 .enumerate()
                 .map(|(i, t)| {
                     let container_name = t
-                        .container_info
-                        .as_ref()
+                        .focused_slot()
+                        .and_then(|s| s.container_info.as_ref())
                         .map(|info| info.container_name.clone())
                         .filter(|n| !n.is_empty());
                     let command_label = match &t.execution_phase {
@@ -459,18 +957,27 @@ impl App {
             }
         }
 
-        // Drain any completed stats results.
+        // Drain any completed stats results, routing each sample to the
+        // slot it was polled for (matched by step name; a stale sample whose
+        // slot has since exited is simply dropped).
         if let Some(ref rx) = self.stats_rx {
-            while let Ok((tab_idx, stats)) = rx.try_recv() {
-                if tab_idx < self.tabs.len() {
-                    if let Some(ref mut info) = self.tabs[tab_idx].container_info {
-                        info.stats_history
-                            .push((stats.cpu_percent, stats.memory_mb));
-                        if info.container_name.is_empty() {
-                            info.container_name = stats.name.clone();
-                        }
-                        info.latest_stats = Some(stats);
+            while let Ok((tab_idx, slot_step, stats)) = rx.try_recv() {
+                if tab_idx >= self.tabs.len() {
+                    continue;
+                }
+                let tab = &mut self.tabs[tab_idx];
+                let info = tab
+                    .container_slots
+                    .iter_mut()
+                    .find(|s| s.step_name == slot_step)
+                    .and_then(|s| s.container_info.as_mut());
+                if let Some(info) = info {
+                    info.stats_history
+                        .push((stats.cpu_percent, stats.memory_mb));
+                    if info.container_name.is_empty() {
+                        info.container_name = stats.name.clone();
                     }
+                    info.latest_stats = Some(stats);
                 }
             }
         }
@@ -491,50 +998,77 @@ impl App {
                 ) {
                     continue;
                 }
-                if tab.container_info.is_none() {
-                    continue;
-                }
-                let container_name = tab
-                    .container_info
-                    .as_ref()
-                    .map(|info| info.container_name.clone())
-                    .unwrap_or_default();
-                let runtime = self.engines.runtime.clone();
-                let tx = self.stats_tx.clone();
-                let tab_idx = i;
-                self.runtime_handle.spawn_blocking(move || {
-                    if !container_name.is_empty() {
-                        // Fast path: name is known, query stats directly.
-                        let handle = crate::data::session::AgentHandle {
-                            id: container_name.clone(),
-                            name: container_name,
-                            image_tag: String::new(),
-                            started_at: chrono::Utc::now(),
-                        };
-                        if let Ok(stats) = runtime.stats(&handle) {
-                            let _ = tx.send((tab_idx, stats));
+
+                for (step_name, target) in stats_poll_targets(tab) {
+                    let container_name = match target {
+                        StatsPollTarget::Named(name) => name,
+                        StatsPollTarget::FirstRunning => String::new(),
+                    };
+                    let tab_idx = i;
+                    // One query per slot at a time; a still-running one keeps
+                    // its slot's turn.
+                    let key = (tab_idx, step_name.clone());
+                    match self.in_flight_stats.lock() {
+                        Ok(mut guard) => {
+                            if !guard.insert(key.clone()) {
+                                continue;
+                            }
                         }
-                    } else {
-                        // Slow path: name unknown, list containers and pick the first.
-                        if let Ok(handles) = runtime.list_running_all() {
-                            if let Some(handle) = handles.first() {
-                                if let Ok(stats) = runtime.stats(handle) {
-                                    let _ = tx.send((tab_idx, stats));
+                        Err(_) => continue,
+                    }
+                    let runtime = self.engines.runtime.clone();
+                    let tx = self.stats_tx.clone();
+                    let in_flight = self.in_flight_stats.clone();
+                    self.runtime_handle.spawn_blocking(move || {
+                        if !container_name.is_empty() {
+                            // Fast path: name is known, query stats directly.
+                            let handle = crate::data::session::AgentHandle {
+                                id: container_name.clone(),
+                                name: container_name,
+                                image_tag: String::new(),
+                                started_at: chrono::Utc::now(),
+                            };
+                            if let Ok(stats) = runtime.stats(&handle) {
+                                let _ = tx.send((tab_idx, step_name, stats));
+                            }
+                        } else {
+                            // Slow path: name unknown, list containers and
+                            // pick the first.
+                            if let Ok(handles) = runtime.list_running_all() {
+                                if let Some(handle) = handles.first() {
+                                    if let Ok(stats) = runtime.stats(handle) {
+                                        let _ = tx.send((tab_idx, step_name, stats));
+                                    }
                                 }
                             }
                         }
-                    }
-                });
+                        if let Ok(mut guard) = in_flight.lock() {
+                            guard.remove(&key);
+                        }
+                    });
+                }
             }
         }
 
         // Engine-driven yolo countdown: the engine sets yolo_state via the
         // frontend trait; the TUI renders it as a non-modal overlay dialog.
-        let yolo_snapshot = self.tabs[active]
-            .yolo_state
-            .lock()
-            .ok()
-            .and_then(|g| g.clone());
+        //
+        // During a parallel group (`dormant_slots` non-empty) yolo countdowns
+        // are per-slot: only the slot actually rendered maximized gets the
+        // modal here — other yoloing slots show their countdown in the
+        // minimized bar instead (`render_one_minimized_bar`). Rotating the
+        // focus with Ctrl-S onto/off of a yoloing slot naturally opens/closes
+        // the modal on the next tick since this is recomputed fresh each time.
+        let active_tab = &self.tabs[active];
+        let yolo_snapshot = if active_tab.dormant_slots.is_empty() {
+            active_tab.yolo_state.lock().ok().and_then(|g| g.clone())
+        } else if active_tab.container_overlay_active() {
+            active_tab
+                .focused_slot()
+                .and_then(|s| s.yolo_state.lock().ok().and_then(|g| g.clone()))
+        } else {
+            None
+        };
         if let Some(state) = yolo_snapshot {
             if !self.command_dialog_active {
                 self.active_dialog = Some(Dialog::WorkflowYoloCountdown(
@@ -546,6 +1080,59 @@ impl App {
             }
         } else if matches!(self.active_dialog, Some(Dialog::WorkflowYoloCountdown(_))) {
             self.active_dialog = None;
+        }
+
+        // WI 0102: keep the squad task-detail modal live from the active
+        // tab's snapshot, matching on the task name it was opened for.
+        if matches!(self.active_dialog, Some(Dialog::SquadTaskDetail(_))) {
+            let snapshot = self.tabs[active]
+                .squad
+                .as_ref()
+                .and_then(|state| state.snapshot.lock().ok().map(|g| g.clone()));
+            if let (Some(Dialog::SquadTaskDetail(detail)), Some(snapshot)) =
+                (&mut self.active_dialog, snapshot)
+            {
+                if let Some(task) = snapshot.tasks.iter().find(|c| c.name == detail.name) {
+                    detail.task = task.clone();
+                }
+            }
+        }
+
+        // The run-history modal is kept live the same way. `snapshot.runs`
+        // holds the history of the *selected* task, so it is only copied in
+        // while the selection is still the task the modal was opened for —
+        // otherwise the modal would quietly start showing another task's runs.
+        if matches!(self.active_dialog, Some(Dialog::SquadTaskHistory(_))) {
+            let polled = self.tabs[active].squad.as_ref().and_then(|state| {
+                let selected = state.selected_name()?;
+                let runs = state.snapshot.lock().ok().map(|g| g.runs.clone())?;
+                Some((selected, runs))
+            });
+            if let (Some(Dialog::SquadTaskHistory(history)), Some((selected, runs))) =
+                (&mut self.active_dialog, polled)
+            {
+                if selected == history.name {
+                    history.runs = runs;
+                    // A shrinking history (older runs pruned) must not leave
+                    // the table scrolled past its end.
+                    history.scroll = history.scroll.min(history.runs.len().saturating_sub(1));
+                }
+            }
+        }
+
+        // WI 0102: while an attach session owns the squad tab and the daemon is
+        // unreachable, surface the frozen-overview indicator (the attached
+        // container slots keep streaming from their direct runtime connections).
+        if let Some(state) = self.tabs[active].squad.as_ref() {
+            if state.attached_task().is_some()
+                && !state
+                    .daemon_reachable
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.status_bar.text =
+                    "squad daemon not reachable — workflow overview frozen; attached containers still live"
+                        .to_string();
+            }
         }
     }
 
@@ -578,10 +1165,20 @@ impl App {
                         editor,
                     }
                 }
-                DialogRequest::MultilineInput { title, prompt } => Dialog::MultilineInput {
+                DialogRequest::MultilineInput {
                     title,
                     prompt,
-                    editor: TextEdit::new(true),
+                    default_text,
+                } => Dialog::MultilineInput {
+                    title,
+                    prompt,
+                    editor: {
+                        let mut editor = TextEdit::new(true);
+                        if let Some(text) = default_text {
+                            editor.set_text(&text);
+                        }
+                        editor
+                    },
                 },
                 DialogRequest::ListPicker { title, items } => Dialog::ListPicker {
                     title,
@@ -592,7 +1189,6 @@ impl App {
                     Dialog::KindSelect { title, options }
                 }
                 DialogRequest::WorkflowControlBoard(state) => Dialog::WorkflowControlBoard(state),
-                DialogRequest::WorkflowStepError(state) => Dialog::WorkflowStepError(state),
                 DialogRequest::WorkflowYoloCountdown(state) => Dialog::WorkflowYoloCountdown(state),
                 DialogRequest::WorkflowStepConfirm(state) => Dialog::WorkflowStepConfirm(state),
                 DialogRequest::AgentSetup(state) => Dialog::AgentSetup(state),
@@ -601,17 +1197,60 @@ impl App {
                 DialogRequest::QuitConfirm => Dialog::QuitConfirm,
                 DialogRequest::CloseTabConfirm => Dialog::CloseTabConfirm,
                 DialogRequest::WorkflowCancelConfirm => Dialog::WorkflowCancelConfirm,
-                DialogRequest::ConfigShow { rows } => {
-                    Dialog::ConfigShow(crate::frontend::tui::dialogs::ConfigShowState {
+                DialogRequest::ConfigShow {
+                    rows,
+                    selected,
+                    rejected,
+                } => {
+                    let selected = selected.min(rows.len().saturating_sub(1));
+                    let mut state = crate::frontend::tui::dialogs::ConfigShowState {
                         rows,
-                        selected: 0,
+                        selected,
                         editing: false,
                         edit_column: 0,
                         editor: TextEdit::new(false),
-                    })
+                        new_entry: None,
+                        error: None,
+                    };
+                    // A rejected edit reopens in edit mode with the typed
+                    // value preserved and the reason displayed, so the user
+                    // corrects it instead of retyping from scratch.
+                    if let Some(rej) = rejected {
+                        let has_row = state.rows.iter().any(|r| r.field == rej.field);
+                        let new_mapping_key = if has_row {
+                            None
+                        } else {
+                            rej.field
+                                .strip_prefix("dynamicWorkflows.agentsToModels.")
+                                .map(str::to_string)
+                        };
+                        if has_row || new_mapping_key.is_some() {
+                            state.error = Some(rej.reason);
+                            state.editing = true;
+                            state.edit_column = if rej.global { 0 } else { 1 };
+                            state.editor.set_text(&rej.value);
+                            // A rejected Ctrl+N mapping has no row yet —
+                            // resume the add flow in its value phase.
+                            state.new_entry = new_mapping_key.map(|key| {
+                                crate::frontend::tui::dialogs::NewMapEntryPhase::Value { key }
+                            });
+                        }
+                    }
+                    Dialog::ConfigShow(state)
                 }
                 DialogRequest::Loading { title } => Dialog::Loading { title },
                 DialogRequest::Custom { title, body, keys } => Dialog::Custom { title, body, keys },
+                DialogRequest::KeySetupNotice {
+                    title,
+                    body,
+                    copy_key,
+                    copy_zshrc_snippet,
+                } => Dialog::Notice {
+                    title,
+                    body,
+                    copy_key: Some(copy_key),
+                    copy_zshrc_snippet: Some(copy_zshrc_snippet),
+                },
             };
             self.active_dialog = Some(dialog);
             self.command_dialog_active = true;
@@ -637,16 +1276,58 @@ impl App {
     }
 }
 
+/// How one container slot's stats are obtained this tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StatsPollTarget {
+    /// The engine published this slot's container name — query it directly.
+    Named(String),
+    /// The name hasn't arrived yet; ask the runtime for the first running
+    /// container instead.
+    FirstRunning,
+}
+
+/// Which of a tab's container slots to poll for stats this tick, keyed by the
+/// slot's step name (empty for the single/backbone slot of a plain command)
+/// so the drain can route each sample back to the slot it was polled for.
+///
+/// Every slot whose container name is known is polled — during a parallel
+/// group that means all N containers, not just the focused one.
+///
+/// The "first running container" fallback covers the brief window before a
+/// plain `chat`/`exec` container reports its name. It is deliberately limited
+/// to a lone slot outside a parallel group: with several containers live,
+/// "the first running container" is an arbitrary sibling, and because the
+/// drain adopts a sample's name for a still-unnamed slot, one guess would pin
+/// that slot to a sibling's stats for the rest of the run. A group slot with
+/// no name yet simply waits for its `ContainerSlotEvent::ContainerName`.
+pub(crate) fn stats_poll_targets(tab: &Tab) -> Vec<(String, StatsPollTarget)> {
+    let in_parallel_group = !tab.dormant_slots.is_empty();
+    let sole_slot = tab.container_slots.len() == 1 && !in_parallel_group;
+    let mut targets = Vec::with_capacity(tab.container_slots.len());
+    for slot in &tab.container_slots {
+        let Some(info) = slot.container_info.as_ref() else {
+            continue;
+        };
+        if !info.container_name.is_empty() {
+            targets.push((
+                slot.step_name.clone(),
+                StatsPollTarget::Named(info.container_name.clone()),
+            ));
+        } else if sole_slot {
+            targets.push((slot.step_name.clone(), StatsPollTarget::FirstRunning));
+        }
+    }
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use tokio::sync::RwLock;
-
     use crate::command::dispatch::catalogue::CommandCatalogue;
     use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
     use crate::data::session_manager::SessionManager;
     use crate::frontend::tui::tabs::Tab;
+    use std::sync::Arc;
 
     fn make_test_session() -> Session {
         let tmp = tempfile::tempdir().unwrap();
@@ -660,44 +1341,25 @@ mod tests {
     }
 
     fn make_engines() -> crate::command::dispatch::Engines {
-        let runtime = Arc::new(crate::engine::container::ContainerRuntime::docker());
-        let overlay = Arc::new(crate::engine::overlay::OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(std::path::PathBuf::from(
-                "/tmp",
-            )),
-        ));
-        let git_engine = Arc::new(crate::engine::git::GitEngine::new());
-        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            overlay.clone(),
-            runtime.clone(),
-        ));
-        let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home("/tmp"),
-            crate::data::fs::api_paths::ApiPaths::at_root("/tmp"),
-        ));
-        let workflow_state_store = {
-            let tmp = tempfile::tempdir().unwrap();
-            Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
-                tmp.path(),
-            ))
-        };
-        crate::command::dispatch::Engines {
-            runtime: runtime.clone(),
-            container_runtime: Some(runtime),
-            sandbox_runtime: None,
-            git_engine,
-            overlay_engine: overlay,
-            auth_engine,
-            agent_engine,
-            workflow_state_store,
-        }
+        crate::command::dispatch::Engines::for_tests(std::path::Path::new("/tmp"))
+    }
+
+    /// Shared across every test in this module for the same reason as
+    /// `tui::tests::test_runtime_handle`: leaking a fresh multi-threaded
+    /// `Runtime` per call exhausts the OS thread budget once enough tests
+    /// have run in the same process.
+    fn test_runtime_handle() -> tokio::runtime::Handle {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RUNTIME
+            .get_or_init(|| tokio::runtime::Runtime::new().unwrap())
+            .handle()
+            .clone()
     }
 
     fn make_app() -> App {
-        let rt = Box::leak(Box::new(tokio::runtime::Runtime::new().unwrap()));
         let catalogue = CommandCatalogue::get();
         let engines = make_engines();
-        let session_manager = Arc::new(RwLock::new(SessionManager::in_memory()));
+        let session_manager = Arc::new(SessionManager::in_memory());
         let session = make_test_session();
         let tab = Tab::new(session);
         App::new(
@@ -705,7 +1367,7 @@ mod tests {
             engines,
             session_manager,
             tab,
-            rt.handle().clone(),
+            test_runtime_handle(),
         )
     }
 
@@ -850,34 +1512,32 @@ mod tests {
         tab.execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
             command: "chat".into(),
         };
-        tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
-            agent_display_name: "Claude".into(),
-            container_name: "awman-test-1234".into(),
-            start_time: std::time::Instant::now(),
-            latest_stats: None,
-            stats_history: Vec::new(),
-            sandboxed: false,
-        });
-        assert!(app
-            .active_tab()
-            .container_info
-            .as_ref()
+        // The command's single slot, as spawn_command installs it.
+        tab.start_container("Claude".into(), "awman-test-1234".into(), 80, 24);
+        assert!(tab
+            .focused_slot()
+            .and_then(|s| s.container_info.as_ref())
             .unwrap()
             .latest_stats
             .is_none());
 
-        // Simulate a stats result arriving on the channel.
+        // Simulate a stats result arriving on the channel (empty step name =
+        // the single/backbone slot).
         let stats = crate::engine::agent_runtime::execution::AgentStats {
             name: "awman-test-1234".into(),
             cpu_percent: 42.5,
             memory_mb: 256.0,
         };
-        app.stats_tx.send((0, stats)).unwrap();
+        app.stats_tx.send((0, String::new(), stats)).unwrap();
 
         // tick_all_tabs drains the channel.
         app.tick_all_tabs();
 
-        let info = app.active_tab().container_info.as_ref().unwrap();
+        let tab = app.active_tab();
+        let info = tab
+            .focused_slot()
+            .and_then(|s| s.container_info.as_ref())
+            .unwrap();
         assert!(
             info.latest_stats.is_some(),
             "latest_stats must be populated after drain"
@@ -890,20 +1550,207 @@ mod tests {
     }
 
     #[test]
+    fn stats_drain_routes_parallel_samples_to_the_right_slot() {
+        use crate::frontend::tui::tabs::ContainerSlot;
+
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        tab.execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
+            command: "exec workflow".into(),
+        };
+        tab.container_slots
+            .push(ContainerSlot::new("build".into(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("test".into(), "codex".into(), 1000));
+
+        let stats = crate::engine::agent_runtime::execution::AgentStats {
+            name: "awman-test-1".into(),
+            cpu_percent: 12.5,
+            memory_mb: 64.0,
+        };
+        app.stats_tx.send((0, "test".into(), stats)).unwrap();
+        app.tick_all_tabs();
+
+        let tab = app.active_tab();
+        let test_info = tab.container_slots[1].container_info.as_ref().unwrap();
+        assert_eq!(
+            test_info.latest_stats.as_ref().map(|s| s.cpu_percent),
+            Some(12.5),
+            "the sample must land on the slot it was polled for"
+        );
+        let build_info = tab.container_slots[0].container_info.as_ref().unwrap();
+        assert!(
+            build_info.latest_stats.is_none(),
+            "the other slot must be untouched"
+        );
+    }
+
+    // ── stats poll targets ───────────────────────────────────────────────
+
+    fn named_slot(step: &str, container: &str) -> crate::frontend::tui::tabs::ContainerSlot {
+        let mut slot =
+            crate::frontend::tui::tabs::ContainerSlot::new(step.into(), "claude".into(), 1000);
+        if let Some(info) = slot.container_info.as_mut() {
+            info.container_name = container.into();
+        }
+        slot
+    }
+
+    #[test]
+    fn stats_poll_targets_covers_every_named_slot_in_a_parallel_group() {
+        let mut tab = Tab::new(make_test_session());
+        // A parallel group: the sequential backbone is dormant and every
+        // group slot has had its container name published by the engine.
+        tab.dormant_slots
+            .push(crate::frontend::tui::tabs::ContainerSlot::new(
+                String::new(),
+                "claude".into(),
+                1000,
+            ));
+        tab.container_slots.push(named_slot("build", "awman-b-1"));
+        tab.container_slots.push(named_slot("test", "awman-t-2"));
+        tab.container_slots.push(named_slot("docs", "awman-d-3"));
+
+        assert_eq!(
+            stats_poll_targets(&tab),
+            vec![
+                ("build".into(), StatsPollTarget::Named("awman-b-1".into())),
+                ("test".into(), StatsPollTarget::Named("awman-t-2".into())),
+                ("docs".into(), StatsPollTarget::Named("awman-d-3".into())),
+            ],
+            "every container in a parallel group must be polled, not just the focused one"
+        );
+    }
+
+    #[test]
+    fn stats_poll_targets_never_guesses_a_container_inside_a_parallel_group() {
+        let mut tab = Tab::new(make_test_session());
+        tab.dormant_slots
+            .push(crate::frontend::tui::tabs::ContainerSlot::new(
+                String::new(),
+                "claude".into(),
+                1000,
+            ));
+        // The group is down to one slot and its name hasn't arrived yet.
+        tab.container_slots
+            .push(crate::frontend::tui::tabs::ContainerSlot::new(
+                "build".into(),
+                "claude".into(),
+                1000,
+            ));
+
+        assert!(
+            stats_poll_targets(&tab).is_empty(),
+            "a group slot with no name yet must wait for it rather than adopting \
+             an arbitrary running container's stats"
+        );
+    }
+
+    #[test]
+    fn stats_poll_targets_falls_back_for_a_lone_unnamed_container() {
+        let mut tab = Tab::new(make_test_session());
+        tab.start_container("Claude".into(), String::new(), 80, 24);
+
+        assert_eq!(
+            stats_poll_targets(&tab),
+            vec![(String::new(), StatsPollTarget::FirstRunning)],
+            "a plain command's slot still gets stats before its name arrives"
+        );
+    }
+
+    #[test]
+    fn tick_all_tabs_shows_yolo_modal_for_focused_slot_in_parallel_group() {
+        use crate::frontend::tui::tabs::{ContainerSlot, ContainerWindowState, YoloState};
+
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        // A parallel group is active: the backbone is stashed in
+        // `dormant_slots` and the group's own slots are in `container_slots`.
+        tab.dormant_slots
+            .push(ContainerSlot::new(String::new(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("build".into(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("test".into(), "codex".into(), 1000));
+        tab.focused_slot_idx = 1; // "test" is the maximized slot
+        tab.container_window_state = ContainerWindowState::Maximized;
+        *tab.container_slots[1].yolo_state.lock().unwrap() = Some(YoloState {
+            step_name: "test".into(),
+            remaining_secs: 12,
+        });
+
+        app.tick_all_tabs();
+
+        match &app.active_dialog {
+            Some(Dialog::WorkflowYoloCountdown(state)) => {
+                assert_eq!(state.step_name, "test");
+                assert_eq!(state.remaining_secs, 12);
+            }
+            _ => panic!("expected WorkflowYoloCountdown for the focused slot"),
+        }
+    }
+
+    #[test]
+    fn tick_all_tabs_hides_yolo_modal_when_yoloing_slot_is_not_focused() {
+        use crate::frontend::tui::tabs::{ContainerSlot, ContainerWindowState, YoloState};
+
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        tab.dormant_slots
+            .push(ContainerSlot::new(String::new(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("build".into(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("test".into(), "codex".into(), 1000));
+        tab.focused_slot_idx = 0; // "build" is maximized; "test" is a bar
+        tab.container_window_state = ContainerWindowState::Maximized;
+        *tab.container_slots[1].yolo_state.lock().unwrap() = Some(YoloState {
+            step_name: "test".into(),
+            remaining_secs: 12,
+        });
+
+        app.tick_all_tabs();
+
+        assert!(
+            app.active_dialog.is_none(),
+            "the countdown for a non-focused slot belongs in its minimized bar, not a modal"
+        );
+    }
+
+    #[test]
+    fn tick_all_tabs_hides_yolo_modal_when_group_is_minimized() {
+        use crate::frontend::tui::tabs::{ContainerSlot, ContainerWindowState, YoloState};
+
+        let mut app = make_app();
+        let tab = app.active_tab_mut();
+        tab.dormant_slots
+            .push(ContainerSlot::new(String::new(), "claude".into(), 1000));
+        tab.container_slots
+            .push(ContainerSlot::new("test".into(), "codex".into(), 1000));
+        tab.focused_slot_idx = 0;
+        // Nothing is rendered maximized while Minimized — every slot is a bar.
+        tab.container_window_state = ContainerWindowState::Minimized;
+        *tab.container_slots[0].yolo_state.lock().unwrap() = Some(YoloState {
+            step_name: "test".into(),
+            remaining_secs: 12,
+        });
+
+        app.tick_all_tabs();
+
+        assert!(
+            app.active_dialog.is_none(),
+            "no slot is maximized, so no modal should show"
+        );
+    }
+
+    #[test]
     fn container_name_picked_up_from_shared_state() {
         let mut app = make_app();
         let tab = app.active_tab_mut();
         tab.execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
             command: "chat".into(),
         };
-        tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
-            agent_display_name: "Claude".into(),
-            container_name: String::new(),
-            start_time: std::time::Instant::now(),
-            latest_stats: None,
-            stats_history: Vec::new(),
-            sandboxed: false,
-        });
+        tab.start_container("Claude".into(), String::new(), 80, 24);
 
         // Simulate the engine reporting the container name.
         if let Ok(mut guard) = tab.container_name_shared.lock() {
@@ -912,7 +1759,11 @@ mod tests {
 
         app.tick_all_tabs();
 
-        let info = app.active_tab().container_info.as_ref().unwrap();
+        let info = app
+            .active_tab()
+            .focused_slot()
+            .and_then(|s| s.container_info.as_ref())
+            .unwrap();
         assert_eq!(info.container_name, "awman-new-container");
     }
 
@@ -923,18 +1774,18 @@ mod tests {
         tab.execution_phase = crate::frontend::tui::tabs::ExecutionPhase::Running {
             command: "exec workflow".into(),
         };
-        tab.container_info = Some(crate::frontend::tui::tabs::ContainerInfo {
-            agent_display_name: "Claude".into(),
-            container_name: "awman-old-container".into(),
-            start_time: std::time::Instant::now(),
-            latest_stats: Some(crate::engine::agent_runtime::execution::AgentStats {
+        tab.start_container("Claude".into(), "awman-old-container".into(), 80, 24);
+        if let Some(info) = tab
+            .focused_slot_mut()
+            .and_then(|s| s.container_info.as_mut())
+        {
+            info.latest_stats = Some(crate::engine::agent_runtime::execution::AgentStats {
                 name: "awman-old-container".into(),
                 cpu_percent: 10.0,
                 memory_mb: 100.0,
-            }),
-            stats_history: vec![(10.0, 100.0)],
-            sandboxed: false,
-        });
+            });
+            info.stats_history = vec![(10.0, 100.0)];
+        }
 
         // Simulate a workflow step transition reporting a new container name.
         if let Ok(mut guard) = tab.container_name_shared.lock() {
@@ -943,7 +1794,11 @@ mod tests {
 
         app.tick_all_tabs();
 
-        let info = app.active_tab().container_info.as_ref().unwrap();
+        let info = app
+            .active_tab()
+            .focused_slot()
+            .and_then(|s| s.container_info.as_ref())
+            .unwrap();
         assert_eq!(info.container_name, "awman-step2-container");
         assert!(
             info.latest_stats.is_none(),
@@ -956,9 +1811,7 @@ mod tests {
         use crate::engine::agent_runtime::execution::AgentStats;
         use crate::frontend::tui::tabs::ContainerInfo;
 
-        let mut app = make_app();
-        let tab = app.active_tab_mut();
-        tab.container_info = Some(ContainerInfo {
+        let info = ContainerInfo {
             agent_display_name: "Claude".into(),
             container_name: "awman-test".into(),
             start_time: std::time::Instant::now(),
@@ -969,9 +1822,9 @@ mod tests {
             }),
             stats_history: Vec::new(),
             sandboxed: false,
-        });
+        };
 
-        let title = crate::frontend::tui::container_view::build_stats_title_for_test(tab);
+        let title = crate::frontend::tui::container_view::build_stats_title_from_info(&info);
         assert!(title.contains("42.5%"), "title must contain CPU: {title}");
         assert!(
             title.contains("256MiB"),
@@ -981,5 +1834,106 @@ mod tests {
             title.contains("awman-test"),
             "title must contain name: {title}"
         );
+    }
+
+    // ── ConfigShow dialog request: rejected-edit reopen ──────────────────
+
+    fn config_show_row(field: &str) -> crate::frontend::tui::dialogs::ConfigShowRow {
+        crate::frontend::tui::dialogs::ConfigShowRow {
+            field: field.to_string(),
+            global: String::new(),
+            repo: String::new(),
+            effective: String::new(),
+            read_only: false,
+            global_writable: false,
+            repo_writable: true,
+            value_hint: None,
+        }
+    }
+
+    fn deliver_config_show(
+        app: &mut App,
+        rows: Vec<crate::frontend::tui::dialogs::ConfigShowRow>,
+        rejected: Option<crate::frontend::tui::dialogs::ConfigShowRejectedEdit>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.tabs[0].dialog_request_rx = Some(rx);
+        tx.send(DialogRequest::ConfigShow {
+            rows,
+            selected: 0,
+            rejected,
+        })
+        .unwrap();
+        app.poll_dialog_requests();
+    }
+
+    #[test]
+    fn config_show_request_without_rejection_opens_in_browse_mode() {
+        let mut app = make_app();
+        deliver_config_show(&mut app, vec![config_show_row("agent")], None);
+
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("ConfigShow request must open the dialog");
+        };
+        assert!(!state.editing);
+        assert_eq!(state.error, None);
+    }
+
+    #[test]
+    fn config_show_request_with_rejection_reopens_edit_with_input_preserved() {
+        let mut app = make_app();
+        deliver_config_show(
+            &mut app,
+            vec![config_show_row("dynamicWorkflows.defaultLeader")],
+            Some(crate::frontend::tui::dialogs::ConfigShowRejectedEdit {
+                field: "dynamicWorkflows.defaultLeader".into(),
+                value: "claude".into(),
+                global: false,
+                reason: "expected agent::model".into(),
+            }),
+        );
+
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("ConfigShow request must open the dialog");
+        };
+        assert!(
+            state.editing,
+            "a rejected edit must reopen in edit mode so the input is not lost"
+        );
+        assert_eq!(state.edit_column, 1, "repo-scoped edit stays on Repo");
+        assert_eq!(
+            state.editor.text, "claude",
+            "the rejected input must be preserved for correction"
+        );
+        assert_eq!(state.error.as_deref(), Some("expected agent::model"));
+    }
+
+    #[test]
+    fn config_show_request_with_rejected_new_mapping_resumes_value_phase() {
+        // A rejected Ctrl+N mapping has no table row yet; the dialog must
+        // resume the add flow in its value phase for the same key.
+        let mut app = make_app();
+        deliver_config_show(
+            &mut app,
+            vec![config_show_row("agent")],
+            Some(crate::frontend::tui::dialogs::ConfigShowRejectedEdit {
+                field: "dynamicWorkflows.agentsToModels.maki".into(),
+                value: "model-a, model-b".into(),
+                global: false,
+                reason: "could not write config".into(),
+            }),
+        );
+
+        let Some(Dialog::ConfigShow(state)) = &app.active_dialog else {
+            panic!("ConfigShow request must open the dialog");
+        };
+        assert_eq!(
+            state.new_entry,
+            Some(crate::frontend::tui::dialogs::NewMapEntryPhase::Value { key: "maki".into() }),
+            "the add-mapping flow must resume in the value phase"
+        );
+        assert!(state.editing);
+        assert_eq!(state.editor.text, "model-a, model-b");
+        assert_eq!(state.error.as_deref(), Some("could not write config"));
     }
 }

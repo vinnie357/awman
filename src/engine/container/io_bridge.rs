@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::engine::agent_runtime::execution::StuckEvent;
 use crate::engine::agent_runtime::frontend::AgentIo;
+use crate::engine::agent_runtime::output_tail::OutputTail;
 use crate::engine::error::EngineError;
 
 /// Shared last-activity timestamp. Updated by reader threads on every byte
@@ -41,6 +42,17 @@ pub(crate) struct BridgeConfig {
     /// this to force the container to exit so callers' `wait()` futures
     /// resolve with a failure status.
     pub cancel_on_grace_expired: Option<CancelFn>,
+    /// Rolling buffer of the container's recent combined stdout/stderr. The
+    /// reader threads append every byte chunk here (in addition to forwarding
+    /// it to the frontend) so a failure log can be written if the container
+    /// exits unexpectedly.
+    pub output_tail: Arc<OutputTail>,
+    /// Optional live tap on the output stream: every chunk the reader threads
+    /// forward is also broadcast here. Used by the attach rendezvous socket
+    /// (`attach_socket.rs`) on runtimes without a native attach, so connected
+    /// attach clients see exactly what the launching frontend sees. `None`
+    /// keeps the existing behaviour.
+    pub output_broadcast: Option<Arc<tokio::sync::broadcast::Sender<Vec<u8>>>>,
 }
 
 /// Bundle returned by `bridge_pty` / `bridge_piped` containing the artifacts
@@ -50,6 +62,9 @@ pub(crate) struct BridgeResult {
     pub stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// Broadcast sender for stuck events — stored in `AgentExecution`.
     pub stuck_tx: Arc<tokio::sync::broadcast::Sender<StuckEvent>>,
+    /// The rolling output tail the reader threads feed — stored in
+    /// `AgentExecution` so the workflow engine can read it after `wait()`.
+    pub output_tail: Arc<OutputTail>,
 }
 
 fn update_activity(activity: &SharedActivity, first_byte: &Arc<AtomicBool>) {
@@ -85,7 +100,7 @@ fn update_activity(activity: &SharedActivity, first_byte: &Arc<AtomicBool>) {
 ///   2. *Stuck* — once `first_byte` flips to `true`, the detector
 ///      switches to the regular Stuck/Unstuck loop driven by the last
 ///      activity timestamp and `stuck_timeout`. Grace is discarded.
-fn spawn_stuck_detector(
+pub(crate) fn spawn_stuck_detector(
     activity: SharedActivity,
     first_byte: Arc<AtomicBool>,
     grace_timeout: Duration,
@@ -168,19 +183,53 @@ fn spawn_stuck_detector(
 /// the `BridgeResult`.
 type PtyMaster = Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>;
 
+pub(crate) struct PtyBridgeFailure {
+    pub error: EngineError,
+    pub pair: portable_pty::PtyPair,
+    pub reader: Option<Box<dyn std::io::Read + Send>>,
+    pub io: AgentIo,
+    pub config: BridgeConfig,
+}
+
 pub(crate) fn bridge_pty(
     io: AgentIo,
     pair: portable_pty::PtyPair,
     config: BridgeConfig,
 ) -> Result<(PtyMaster, BridgeResult), EngineError> {
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| EngineError::Container(format!("clone pty reader: {e}")))?;
-    let mut writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| EngineError::Container(format!("take pty writer: {e}")))?;
+    bridge_pty_owned(io, pair, config).map_err(|failure| failure.error)
+}
+
+// The direct error preserves all post-spawn PTY custody without another allocation.
+#[allow(clippy::result_large_err)]
+pub(crate) fn bridge_pty_owned(
+    io: AgentIo,
+    pair: portable_pty::PtyPair,
+    config: BridgeConfig,
+) -> Result<(PtyMaster, BridgeResult), PtyBridgeFailure> {
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            return Err(PtyBridgeFailure {
+                error: EngineError::Container(format!("clone pty reader: {error}")),
+                pair,
+                reader: None,
+                io,
+                config,
+            });
+        }
+    };
+    let mut writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            return Err(PtyBridgeFailure {
+                error: EngineError::Container(format!("take pty writer: {error}")),
+                pair,
+                reader: Some(reader),
+                io,
+                config,
+            });
+        }
+    };
 
     let activity: SharedActivity = Arc::new(Mutex::new(None));
     let first_byte = Arc::new(AtomicBool::new(false));
@@ -190,10 +239,14 @@ pub(crate) fn bridge_pty(
     // If the frontend's stdout sink dies (drain task panics or exits early),
     // we keep draining the PTY but discard bytes — the container must not be
     // backpressured by a dead sink. Activity tracking continues so stuck
-    // detection reflects what the container is actually emitting.
+    // detection reflects what the container is actually emitting. The output
+    // tail is fed unconditionally (even after the sink dies) so a failure log
+    // always reflects what the container really printed.
     let stdout_tx = io.stdout;
     let act = Arc::clone(&activity);
     let fb = Arc::clone(&first_byte);
+    let tail = Arc::clone(&config.output_tail);
+    let broadcast = config.output_broadcast.clone();
     std::thread::spawn(move || {
         use std::io::Read;
         let mut buf = [0u8; 4096];
@@ -203,6 +256,16 @@ pub(crate) fn bridge_pty(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     update_activity(&act, &fb);
+                    tail.push_bytes(&buf[..n]);
+                    if let Some(tx) = &broadcast {
+                        // Copy only when someone is attached; a lagged client
+                        // drops chunks. (A new client's subscription always
+                        // precedes the repaint its initial resize triggers,
+                        // so this gate can't starve it.)
+                        if tx.receiver_count() > 0 {
+                            let _ = tx.send(buf[..n].to_vec());
+                        }
+                    }
                     if sink_open && stdout_tx.send(buf[..n].to_vec()).is_err() {
                         sink_open = false;
                     }
@@ -259,6 +322,7 @@ pub(crate) fn bridge_pty(
         BridgeResult {
             stdin_injector: stdin_tx,
             stuck_tx,
+            output_tail: config.output_tail,
         },
     ))
 }
@@ -271,9 +335,45 @@ pub(crate) fn bridge_pty(
 /// - Writer task: `io.stdin_rx` → child stdin
 ///
 /// The child's stdout/stderr/stdin pipes are taken from the `Child`.
+pub(crate) struct PipedChildIo {
+    pub stdin: Option<std::process::ChildStdin>,
+    pub stdout: Option<std::process::ChildStdout>,
+    pub stderr: Option<std::process::ChildStderr>,
+}
+
+impl PipedChildIo {
+    pub(crate) fn empty() -> Self {
+        Self {
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        }
+    }
+
+    pub(crate) fn take_from(&mut self, child: &mut std::process::Child) {
+        self.stdin = child.stdin.take();
+        self.stdout = child.stdout.take();
+        self.stderr = child.stderr.take();
+    }
+
+    pub(crate) fn take(child: &mut std::process::Child) -> Self {
+        let mut pipes = Self::empty();
+        pipes.take_from(child);
+        pipes
+    }
+}
+
 pub(crate) fn bridge_piped(
     io: AgentIo,
     child: &mut std::process::Child,
+    config: BridgeConfig,
+) -> BridgeResult {
+    bridge_piped_io(io, PipedChildIo::take(child), config)
+}
+
+pub(crate) fn bridge_piped_io(
+    io: AgentIo,
+    mut pipes: PipedChildIo,
     config: BridgeConfig,
 ) -> BridgeResult {
     let activity: SharedActivity = Arc::new(Mutex::new(None));
@@ -285,10 +385,12 @@ pub(crate) fn bridge_piped(
     // a piped child will block on stdout if we stop reading. Activity
     // tracking continues unconditionally so the stuck detector reflects what
     // the container actually produces.
-    if let Some(child_stdout) = child.stdout.take() {
+    if let Some(child_stdout) = pipes.stdout.take() {
         let stdout_tx = io.stdout;
         let act = Arc::clone(&activity);
         let fb = Arc::clone(&first_byte);
+        let tail = Arc::clone(&config.output_tail);
+        let broadcast = config.output_broadcast.clone();
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stdout;
@@ -299,6 +401,12 @@ pub(crate) fn bridge_piped(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         update_activity(&act, &fb);
+                        tail.push_bytes(&buf[..n]);
+                        if let Some(tx) = &broadcast {
+                            if tx.receiver_count() > 0 {
+                                let _ = tx.send(buf[..n].to_vec());
+                            }
+                        }
                         if sink_open && stdout_tx.send(buf[..n].to_vec()).is_err() {
                             sink_open = false;
                         }
@@ -309,10 +417,13 @@ pub(crate) fn bridge_piped(
     }
 
     // stderr reader thread — same drain-after-sink-dies semantics as stdout.
-    if let Some(child_stderr) = child.stderr.take() {
+    // Feeds the same tail as stdout so the buffer holds combined output.
+    if let Some(child_stderr) = pipes.stderr.take() {
         let stderr_tx = io.stderr;
         let act = Arc::clone(&activity);
         let fb = Arc::clone(&first_byte);
+        let tail = Arc::clone(&config.output_tail);
+        let broadcast = config.output_broadcast.clone();
         std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stderr;
@@ -323,6 +434,12 @@ pub(crate) fn bridge_piped(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         update_activity(&act, &fb);
+                        tail.push_bytes(&buf[..n]);
+                        if let Some(tx) = &broadcast {
+                            if tx.receiver_count() > 0 {
+                                let _ = tx.send(buf[..n].to_vec());
+                            }
+                        }
                         if sink_open && stderr_tx.send(buf[..n].to_vec()).is_err() {
                             sink_open = false;
                         }
@@ -334,7 +451,7 @@ pub(crate) fn bridge_piped(
 
     // stdin writer task
     let stdin_tx = io.stdin_tx;
-    if let Some(child_stdin) = child.stdin.take() {
+    if let Some(child_stdin) = pipes.stdin.take() {
         let mut stdin_rx = io.stdin_rx;
         tokio::spawn(async move {
             use std::io::Write;
@@ -362,6 +479,7 @@ pub(crate) fn bridge_piped(
     BridgeResult {
         stdin_injector: stdin_tx,
         stuck_tx,
+        output_tail: config.output_tail,
     }
 }
 
@@ -700,6 +818,8 @@ mod tests {
                 stuck_timeout: Duration::from_secs(30),
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: None,
+                output_tail: Arc::new(OutputTail::with_default_capacity()),
+                output_broadcast: None,
             },
         );
         // Non-interactive flow: drop the engine's stdin handle so the writer
@@ -756,6 +876,8 @@ mod tests {
                 stuck_timeout: Duration::from_secs(30),
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: None,
+                output_tail: Arc::new(OutputTail::with_default_capacity()),
+                output_broadcast: None,
             },
         );
         drop(bridge.stdin_injector);
@@ -811,6 +933,8 @@ mod tests {
                 stuck_timeout: Duration::from_secs(30),
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: None,
+                output_tail: Arc::new(OutputTail::with_default_capacity()),
+                output_broadcast: None,
             },
         );
         // Drop the engine's stdin sender so `cat` sees EOF after the payload.
@@ -886,6 +1010,8 @@ mod tests {
                 stuck_timeout: Duration::from_secs(30),
                 container_start_delay: Duration::ZERO,
                 cancel_on_grace_expired: None,
+                output_tail: Arc::new(OutputTail::with_default_capacity()),
+                output_broadcast: None,
             },
         );
         drop(bridge.stdin_injector);

@@ -17,38 +17,53 @@ use crate::engine::agent_runtime::execution::{
     AgentExecution, AgentExitInfo, AgentHandlePreview, AgentInstance, AgentStats, ExecutionBackend,
 };
 use crate::engine::container::backend::ContainerBackend;
-use crate::engine::container::instance::{handle_now, ContainerId};
+use crate::engine::container::gated_launch::LaunchRetentionRegistry;
 use crate::engine::container::options::{ContainerName, ImageRef, ResolvedContainerOptions};
+use crate::engine::container::process::{ContainerCli, ContainerInstance};
+use crate::engine::credential_refresh::register_container_leases;
 use crate::engine::error::EngineError;
 
 /// Docker label applied to every amux-spawned container so `list_running`
-/// can filter to ours.
-const AWMAN_LABEL: &str = "awman=true";
+/// can filter to ours. Lives on `ContainerCli` so the shared process module
+/// and this backend cannot drift apart.
+const AWMAN_LABEL: &str = ContainerCli::DOCKER.label;
 
 #[derive(Debug, Default)]
 pub(super) struct DockerBackend;
 
 impl DockerBackend {
-    pub(super) fn new() -> Self {
-        Self
-    }
-
-    /// Probe whether the docker daemon is reachable. Returns `false` quietly
-    /// when the binary is missing, the daemon is down, or the probe times out.
-    pub(super) fn is_available() -> bool {
-        let child = Command::new("docker")
-            .args(["info", "--format", "{{.ServerVersion}}"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        match child {
-            Ok(child) => {
-                super::runtime::wait_with_timeout(child, std::time::Duration::from_secs(10))
-                    .map(|s| s.success())
-                    .unwrap_or(false)
-            }
-            Err(_) => false,
+    fn build_common(
+        &self,
+        options: ResolvedContainerOptions,
+        launch_retention: Option<std::sync::Arc<LaunchRetentionRegistry>>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        if options
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some())
+            && launch_retention.is_none()
+        {
+            return Err(EngineError::Config(
+                "orchestrated launch retention is unavailable".into(),
+            ));
         }
+        let image = options
+            .image
+            .clone()
+            .ok_or_else(|| EngineError::MissingRequiredOption("Image".into()))?;
+        let name = options.name.clone().unwrap_or_else(|| {
+            ContainerName::new(crate::engine::container::naming::generate_container_name())
+        });
+        let leases = register_container_leases(&options, &name.0);
+        Ok(Box::new(ContainerInstance::new_with_launch_retention(
+            ContainerCli::DOCKER,
+            image,
+            name,
+            options,
+            leases,
+            None,
+            launch_retention,
+        )))
     }
 }
 
@@ -57,19 +72,15 @@ impl ContainerBackend for DockerBackend {
         &self,
         options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
-        let image = options
-            .image
-            .clone()
-            .ok_or_else(|| EngineError::MissingRequiredOption("Image".into()))?;
-        let name = options.name.clone().unwrap_or_else(|| {
-            ContainerName::new(crate::engine::container::naming::generate_container_name())
-        });
-        Ok(Box::new(DockerContainerInstance {
-            id: ContainerId::new(name.0.clone()),
-            name,
-            image,
-            options,
-        }))
+        self.build_common(options, None)
+    }
+
+    fn build_with_launch_retention(
+        &self,
+        options: ResolvedContainerOptions,
+        launch_retention: Option<std::sync::Arc<LaunchRetentionRegistry>>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.build_common(options, launch_retention)
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
@@ -179,6 +190,133 @@ impl ContainerBackend for DockerBackend {
         Ok(handles)
     }
 
+    fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
+        // Two-query deduplicated approach mirroring `list_running_all`: query
+        // by the awman label and by the legacy `awman-` name prefix. Each query
+        // adds `status=exited` and `status=dead` filters (OR'd within the same
+        // filter type) so only stopped containers are returned — running or
+        // paused containers are never included.
+        let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
+        let queries: &[&[&str]] = &[
+            &[
+                "ps",
+                "-a",
+                "--filter",
+                "label=awman=true",
+                "--filter",
+                "status=exited",
+                "--filter",
+                "status=dead",
+                "--format",
+                format,
+            ],
+            &[
+                "ps",
+                "-a",
+                "--filter",
+                "name=awman-",
+                "--filter",
+                "status=exited",
+                "--filter",
+                "status=dead",
+                "--format",
+                format,
+            ],
+        ];
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut handles: Vec<AgentHandle> = Vec::new();
+
+        for args in queries {
+            let output = Command::new("docker")
+                .args(*args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output();
+            let output = match output {
+                Ok(o) if o.status.success() => o,
+                _ => continue,
+            };
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let parts: Vec<&str> = line.splitn(4, '\t').collect();
+                if parts.len() < 4 {
+                    continue;
+                }
+                let id = parts[0].to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let name = parts[1].to_string();
+                let image_tag = parts[2].to_string();
+                let created = parts[3];
+                let started_at =
+                    chrono::DateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S %z %Z")
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now());
+                handles.push(AgentHandle {
+                    id,
+                    image_tag,
+                    name,
+                    started_at,
+                });
+            }
+        }
+
+        Ok(handles)
+    }
+
+    fn list_dangling_images(
+        &self,
+    ) -> Result<Vec<crate::engine::container::runtime::ContainerImageInfo>, EngineError> {
+        use crate::engine::container::runtime::ContainerImageInfo;
+        let format = "{{.ID}}\t{{.Repository}}:{{.Tag}}\t{{.Size}}";
+        let output = Command::new("docker")
+            .args([
+                "images",
+                "--filter",
+                "label=awman=true",
+                "--filter",
+                "dangling=true",
+                "--format",
+                format,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        let output = match output {
+            Ok(o) if o.status.success() => o,
+            // Docker missing or query failed: return an empty list. Callers use
+            // `is_available()` to decide whether Docker is reachable at all.
+            _ => return Ok(Vec::new()),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut images: Vec<ContainerImageInfo> = Vec::new();
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.splitn(3, '\t').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+            let id = parts[0].to_string();
+            if id.is_empty() {
+                continue;
+            }
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            images.push(ContainerImageInfo {
+                id,
+                repo_tag: parts[1].to_string(),
+                size: parts[2].to_string(),
+            });
+        }
+        Ok(images)
+    }
+
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError> {
         let output = Command::new("docker")
             .args([
@@ -210,37 +348,56 @@ impl ContainerBackend for DockerBackend {
         parse_stats_line(&line, &handle.name)
     }
 
-    fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
-        // Best-effort: stop, then rm. A nonzero exit (already gone) is fine.
-        let _ = Command::new("docker")
-            .args(["stop", &handle.name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let _ = Command::new("docker")
-            .args(["rm", &handle.name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        Ok(())
+    fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError> {
+        Ok(Box::new(AttachInstance {
+            handle: handle.clone(),
+        }))
     }
 
-    fn exec_args(
-        &self,
-        container_id: &str,
-        working_dir: &str,
-        entrypoint: &[&str],
-        env_vars: &[(&str, &str)],
-    ) -> Vec<String> {
-        let mut args = vec!["exec".to_string(), "-it".to_string()];
-        args.extend(["-w".to_string(), working_dir.to_string()]);
-        for (k, v) in env_vars {
-            args.push("-e".to_string());
-            args.push(format!("{k}={v}"));
+    fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError> {
+        let format = "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.CreatedAt}}";
+        let output = Command::new("docker")
+            .args([
+                "ps",
+                "--filter",
+                &format!("name={prefix}"),
+                "--format",
+                format,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+        let output = match output {
+            Ok(o) if o.status.success() => o,
+            // Docker missing or query failed: report nothing found rather than
+            // erroring — the caller treats an empty list as "no such agents".
+            _ => return Ok(Vec::new()),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut handles: Vec<AgentHandle> = Vec::new();
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.splitn(4, '\t').collect();
+            if parts.len() < 4 {
+                continue;
+            }
+            let id = parts[0].to_string();
+            let name = parts[1].to_string();
+            if id.is_empty() && name.is_empty() {
+                continue;
+            }
+            let image_tag = parts[2].to_string();
+            let created = parts[3];
+            let started_at = chrono::DateTime::parse_from_str(created, "%Y-%m-%d %H:%M:%S %z %Z")
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+            handles.push(AgentHandle {
+                id,
+                image_tag,
+                name,
+                started_at,
+            });
         }
-        args.push(container_id.to_string());
-        args.extend(entrypoint.iter().map(|s| s.to_string()));
-        args
+        Ok(handles)
     }
 
     fn name(&self) -> &'static str {
@@ -278,19 +435,60 @@ impl ContainerBackend for DockerBackend {
     }
 }
 
-struct DockerContainerInstance {
-    id: ContainerId,
-    name: ContainerName,
-    image: ImageRef,
-    options: ResolvedContainerOptions,
+// ─── Attach (re-attach into a foreign, already-running container) ───────────
+
+/// `BridgeConfig` for an attach session. Identical to `bridge_config_for`
+/// except `cancel_on_grace_expired` is `None`: the grace-expiry cancel issues
+/// `docker stop <name>`, which would be wrong for a container this process
+/// does not own. An attach session's own exit is authoritative.
+pub(super) fn attach_bridge_config(
+    grace_timeout: std::time::Duration,
+    stuck_timeout: std::time::Duration,
+) -> crate::engine::container::io_bridge::BridgeConfig {
+    crate::engine::container::io_bridge::BridgeConfig {
+        grace_timeout,
+        stuck_timeout,
+        container_start_delay: std::time::Duration::ZERO,
+        cancel_on_grace_expired: None,
+        output_tail: std::sync::Arc::new(
+            crate::engine::agent_runtime::output_tail::OutputTail::with_default_capacity(),
+        ),
+        output_broadcast: None,
+    }
 }
 
-impl AgentInstance for DockerContainerInstance {
+/// Kill only the local runtime attach client process. Never
+/// touches the target container — attach must never stop a container another
+/// process owns.
+pub(super) fn kill_local_exec(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        #[cfg(unix)]
+        {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid; // best-effort no-op; the container is never touched
+        }
+    }
+}
+
+/// Configured-but-not-running attach handle. `run_with_frontend` opens a
+/// `docker attach` session to PID 1's existing terminal and bridges it through
+/// the same PTY/piped machinery a fresh `docker run` uses.
+struct AttachInstance {
+    handle: AgentHandle,
+}
+
+impl AgentInstance for AttachInstance {
     fn handle_preview(&self) -> AgentHandlePreview {
         AgentHandlePreview {
-            id: self.id.0.clone(),
-            name: self.name.0.clone(),
-            image: self.image.0.clone(),
+            id: self.handle.id.clone(),
+            name: self.handle.name.clone(),
+            image: self.handle.image_tag.clone(),
         }
     }
 
@@ -298,70 +496,46 @@ impl AgentInstance for DockerContainerInstance {
         self: Box<Self>,
         mut frontend: Box<dyn crate::engine::agent_runtime::frontend::AgentFrontend>,
     ) -> Result<AgentExecution, EngineError> {
-        let argv = build_run_argv(&self.name, &self.image, &self.options);
         let started_at = chrono::Utc::now();
-        let seeded = self.options.seeded_prompt.clone();
-        let handle = handle_now(&self.id, &self.name, &self.image);
+        let handle = self.handle.clone();
 
         frontend.report_status(
             crate::engine::agent_runtime::frontend::AgentStatus::Running {
-                container_name: self.name.0.clone(),
+                container_name: handle.name.clone(),
             },
         );
 
-        // Read per-frontend timeouts before draining `take_io`,
-        // which leaves the frontend in a state where any further calls are
-        // implementation-defined.
         let grace_timeout = frontend.grace_timeout();
         let stuck_timeout = frontend.stuck_timeout();
         let io = frontend.take_io();
+        let bridge_cfg = attach_bridge_config(grace_timeout, stuck_timeout);
 
-        let bridge_cfg = bridge_config_for(&self.name, grace_timeout, stuck_timeout);
-
-        // PTY path: frontend requested interactive PTY bridging.
+        // `docker attach` reconnects to the container's primary process (the
+        // agent launched by `docker run -it`), rather than creating a sibling
+        // shell with `docker exec`. The outer bridge PTY carries terminal size
+        // and resize signals to the attach client.
+        //
+        // No `--sig-proxy=false`: every awman agent container has a TTY, where
+        // signal proxying is inapplicable — and newer Docker CLIs reject the
+        // flag outright for TTY containers, which made the attach client exit
+        // immediately and the TUI attach session collapse on arrival. Session
+        // teardown never relied on it either (`kill_local_exec` SIGKILLs the
+        // local client, and SIGKILL is never proxied).
+        let argv = vec!["attach".to_string(), handle.id.clone()];
         if io.initial_size.is_some() {
-            return spawn_pty_bridged_docker(
-                self, io, argv, seeded, started_at, handle, bridge_cfg,
-            );
+            return spawn_pty_bridged_attach(io, argv, started_at, handle, bridge_cfg);
         }
 
-        // Piped path: non-interactive or no PTY.
-        spawn_piped_docker(self, io, argv, seeded, started_at, handle, bridge_cfg)
+        spawn_piped_attach(io, argv, started_at, handle, bridge_cfg)
     }
 }
 
-/// Build a `BridgeConfig` for this container, including a cancel callback
-/// that runs `docker stop <name>` so the startup-grace detector can kill a
-/// container that never produced output. We construct the same `docker stop`
-/// invocation the backend's `cancel_handle` would issue.
-fn bridge_config_for(
-    name: &ContainerName,
-    grace_timeout: std::time::Duration,
-    stuck_timeout: std::time::Duration,
-) -> crate::engine::container::io_bridge::BridgeConfig {
-    let container_name = name.0.clone();
-    let cancel: crate::engine::container::io_bridge::CancelFn = std::sync::Arc::new(move || {
-        let _ = Command::new("docker")
-            .args(["stop", &container_name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    });
-    crate::engine::container::io_bridge::BridgeConfig {
-        grace_timeout,
-        stuck_timeout,
-        container_start_delay: std::time::Duration::ZERO,
-        cancel_on_grace_expired: Some(cancel),
-    }
-}
-
-/// Spawn `docker run -it` via `portable-pty` and bridge the PTY master to
-/// the frontend's `AgentIo` channels via the shared I/O bridge.
-fn spawn_pty_bridged_docker(
-    instance: Box<DockerContainerInstance>,
+/// Spawn `docker attach` via `portable-pty` and bridge the PTY master to the
+/// frontend's `AgentIo`. Mirrors `spawn_pty_bridged_docker` but substitutes
+/// the exec argv and produces an `AttachExecution`.
+fn spawn_pty_bridged_attach(
     io: crate::engine::agent_runtime::frontend::AgentIo,
     argv: Vec<String>,
-    _seeded: Option<String>,
     started_at: chrono::DateTime<chrono::Utc>,
     handle: crate::data::session::AgentHandle,
     bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
@@ -387,37 +561,34 @@ fn spawn_pty_bridged_docker(
     let child = pair
         .slave
         .spawn_command(cmd)
-        .map_err(|e| EngineError::Container(format!("spawn docker via pty: {e}")))?;
-
-    // Interactive PTY runs pass the seeded prompt as a CLI positional arg
-    // (appended by `build_run_argv`), so it must NOT also be written to stdin.
-    // Writing it here would cause the PTY to echo the prompt text into the
-    // terminal output, painting it over the TUI before the agent starts.
+        .map_err(|e| EngineError::Container(format!("spawn docker attach via pty: {e}")))?;
+    let child_pid = child.process_id();
 
     let (master_arc, bridge) =
         crate::engine::container::io_bridge::bridge_pty(io, pair, bridge_cfg)?;
 
-    let backend = DockerExecution {
+    let backend = AttachExecution {
         child: None,
         pty_child: Some(child),
         pty_master: Some(master_arc),
         stdin_injector: Some(bridge.stdin_injector),
-        container_name: instance.name.0.clone(),
+        child_pid,
         started_at,
     };
     Ok(AgentExecution::new(
         handle,
         Box::new(backend),
         bridge.stuck_tx,
+        Some(bridge.output_tail),
     ))
 }
 
-/// Spawn `docker run` with piped stdio and bridge through `AgentIo`.
-fn spawn_piped_docker(
-    instance: Box<DockerContainerInstance>,
+/// Spawn `docker attach` with piped stdio and bridge through `AgentIo`. Mirrors
+/// `spawn_piped_docker` but substitutes the exec argv and produces an
+/// `AttachExecution`.
+fn spawn_piped_attach(
     io: crate::engine::agent_runtime::frontend::AgentIo,
     argv: Vec<String>,
-    seeded: Option<String>,
     started_at: chrono::DateTime<chrono::Utc>,
     handle: crate::data::session::AgentHandle,
     bridge_cfg: crate::engine::container::io_bridge::BridgeConfig,
@@ -434,68 +605,52 @@ fn spawn_piped_docker(
                 binary: "docker".into(),
             }
         } else {
-            EngineError::Container(format!("spawn docker: {e}"))
+            EngineError::Container(format!("spawn docker attach: {e}"))
         }
     })?;
-
-    // Write seeded prompt into stdin channel before the writer task starts.
-    if let Some(prompt) = seeded {
-        let _ = io.stdin_tx.send(prompt.into_bytes());
-        let _ = io.stdin_tx.send(b"\n".to_vec());
-    }
+    let child_pid = Some(child.id());
 
     let bridge = crate::engine::container::io_bridge::bridge_piped(io, &mut child, bridge_cfg);
-
-    // Non-interactive (piped) path: drop the engine's stdin_injector so the
-    // writer task sees EOF after draining the seeded prompt and closes the
-    // child's stdin pipe. Without this, an agent that probes stdin for EOF
-    // would hang waiting for input that will never come.
-    // `try_inject_stdin` falls back to launching a fresh container — which
-    // is the correct behaviour for a non-interactive run that has already
-    // consumed its single prompt.
+    // Non-interactive attach: close the child's stdin after the bridge wires up
+    // so a shell that reads to EOF exits cleanly (matches the run piped path).
     drop(bridge.stdin_injector);
 
-    let backend = DockerExecution {
+    let backend = AttachExecution {
         child: Some(child),
         pty_child: None,
         pty_master: None,
         stdin_injector: None,
-        container_name: instance.name.0.clone(),
+        child_pid,
         started_at,
     };
     Ok(AgentExecution::new(
         handle,
         Box::new(backend),
         bridge.stuck_tx,
+        Some(bridge.output_tail),
     ))
 }
 
-struct DockerExecution {
-    /// Set when running with piped stdio.
+/// Execution backend for an attach session. Identical to `DockerExecution`
+/// except cancellation kills only the local `docker attach` client — never
+/// `docker stop <name>`, because the target container belongs to another
+/// process.
+struct AttachExecution {
     child: Option<std::process::Child>,
-    /// Set when running PTY-bridged. `portable_pty::Child` has its own wait
-    /// API and cannot be unified with `std::process::Child`.
     pty_child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
-    /// Master PTY end. Held alive so the resize task can call into it and so
-    /// the PTY isn't torn down before the child has finished writing.
     pty_master: Option<std::sync::Arc<std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
-    /// Stdin sender — same channel the writer task drains. Used by
-    /// `try_inject_stdin` so workflow `ContinueInCurrentContainer` can push a
-    /// fresh prompt into the running container.
     stdin_injector: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
-    container_name: String,
+    /// PID of the local `docker attach` client, captured at spawn.
+    child_pid: Option<u32>,
     started_at: chrono::DateTime<chrono::Utc>,
 }
 
-impl ExecutionBackend for DockerExecution {
+impl ExecutionBackend for AttachExecution {
     fn wait_blocking(mut self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
-        // PTY-bridged path: wait on the portable-pty child.
         if let Some(mut child) = self.pty_child.take() {
             let status = child
                 .wait()
-                .map_err(|e| EngineError::Container(format!("wait docker (pty): {e}")))?;
-            // Drop the master AFTER the child exits so the reader thread sees
-            // EOF cleanly.
+                .map_err(|e| EngineError::Container(format!("wait docker attach (pty): {e}")))?;
             self.pty_master = None;
             let exit_code = status.exit_code().try_into().unwrap_or(-1);
             return Ok(AgentExitInfo {
@@ -506,18 +661,14 @@ impl ExecutionBackend for DockerExecution {
             });
         }
 
-        // Piped path: wait on std::process::Child.
         let mut child = self
             .child
             .take()
             .ok_or_else(|| EngineError::Container("execution already waited".into()))?;
         let status = child
             .wait()
-            .map_err(|e| EngineError::Container(format!("wait docker: {e}")))?;
+            .map_err(|e| EngineError::Container(format!("wait docker attach: {e}")))?;
 
-        // After interactive runs, docker may leave stdio in O_NONBLOCK mode
-        // on Unix. Restore it.
-        #[cfg(unix)]
         clear_stdio_nonblocking();
 
         let exit_code = status.code().unwrap_or(-1);
@@ -547,39 +698,57 @@ impl ExecutionBackend for DockerExecution {
     }
 
     fn cancel(&self) -> Result<(), EngineError> {
-        // Best-effort: docker stop will SIGTERM then SIGKILL after a grace
-        // period. Then docker rm to clean up.
-        let _ = Command::new("docker")
-            .args(["stop", &self.container_name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let _ = Command::new("docker")
-            .args(["rm", &self.container_name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        kill_local_exec(self.child_pid);
         Ok(())
     }
 
     fn cancel_handle(&self) -> Option<crate::engine::agent_runtime::execution::CancelHandle> {
-        let name = self.container_name.clone();
+        let pid = self.child_pid;
         Some(crate::engine::agent_runtime::execution::CancelHandle::new(
             move || {
-                let _ = Command::new("docker")
-                    .args(["stop", &name])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-                let _ = Command::new("docker")
-                    .args(["rm", &name])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                kill_local_exec(pid);
                 Ok(())
             },
         ))
     }
+}
+
+/// The declared `env()` passthrough names that actually resolve on this host,
+/// paired with their values.
+///
+/// This is the one place the passthrough gate is decided, so `build_run_argv`
+/// (which emits the name-only `-e NAME`) and the spawn paths in `process.rs`
+/// (which set the value on the child's environment) can never disagree about
+/// which names are being passed through.
+///
+/// Resolution goes through [`host_var`](crate::data::config::env::host_var), so
+/// a squad daemon sees values pushed into its in-memory overlay as well as its
+/// own process environment. A name that resolves to `Some("")` is still
+/// included: that is bit-for-bit today's `std::env::var(..).is_ok()` gate, and
+/// changing it would silently alter CLI/TUI behaviour for a variable that is
+/// deliberately set to the empty string.
+pub(super) fn resolve_env_passthrough(options: &ResolvedContainerOptions) -> Vec<(String, String)> {
+    options
+        .env_passthrough
+        .iter()
+        .filter(|envvar| is_env_var_name(&envvar.0))
+        .filter_map(|envvar| {
+            crate::data::config::env::host_var(&envvar.0).map(|value| (envvar.0.clone(), value))
+        })
+        .collect()
+}
+
+/// Whether a passthrough name is a usable environment variable name.
+///
+/// `env()` validates this at the front door, but a task created before that
+/// validation existed still carries whatever it was given, and these names now
+/// reach `Command::env` on the spawn paths: a `=` there produces a malformed
+/// environment entry rather than a passthrough, and a NUL fails the spawn
+/// outright. Such a name could never have worked, so dropping it is not a
+/// behaviour change anyone can depend on.
+fn is_env_var_name(name: &str) -> bool {
+    name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Translate `ResolvedContainerOptions` into a `docker run` argv (without the
@@ -593,7 +762,15 @@ pub(super) fn build_run_argv(
     if options.remove_on_exit {
         args.push("--rm".into());
     }
-    if options.interactive {
+    if options.acp {
+        // ACP launch: piped stdio, never a PTY — even for an interactive run.
+        // A newline-delimited JSON-RPC 2.0 channel must never pass through a
+        // PTY's cooked-mode / echo / ANSI layer, so we allocate `-i` (stdin
+        // attached, no `-t`). This adds NO new host exposure — no ports, no
+        // `--network`, no new mounts (aspec/architecture/security.md): the
+        // JSON-RPC bytes ride the exact stdio pipes `-i` already wires up.
+        args.push("-i".into());
+    } else if options.interactive {
         // Interactive runs always allocate a PTY. When a seeded prompt is also
         // present, the prompt is appended as a positional argv arg below so the
         // agent receives it without piping; stdin stays inherited for the user.
@@ -607,17 +784,23 @@ pub(super) fn build_run_argv(
 
     args.push("--name".into());
     args.push(name.0.clone());
+    if options.startup_gate.is_some() && options.startup_gate_runtime_user.is_some() {
+        args.extend(["--user".into(), "0".into()]);
+    }
 
     // Standard awman label so `list_running` can filter.
     args.push("--label".into());
     args.push(AWMAN_LABEL.into());
 
-    // Session-scoped label — emitted when the option-builder threaded the
-    // session id through. Lets `list_running` attribute containers to a
-    // specific awman session.
-    if let Some(session_id) = &options.session_label {
+    // Caller-supplied labels — emitted one `--label key=value` each, in the
+    // order they were ingested, immediately after the hardcoded `awman=true`.
+    // Lets `list_running` attribute containers to a specific awman session
+    // (`awman.session=<id>`) and squad mark its background agents
+    // (`awman.squad.task=<name>`). These are for human `docker ps`
+    // inspection only — awman never reads a label back.
+    for (key, value) in &options.labels {
         args.push("--label".into());
-        args.push(format!("awman.session={session_id}"));
+        args.push(format!("{key}={value}"));
     }
 
     // Working dir.
@@ -641,22 +824,44 @@ pub(super) fn build_run_argv(
         ));
     }
 
-    // Env passthrough — only emit when the variable is set on the host.
-    for envvar in &options.env_passthrough {
-        if let Ok(value) = std::env::var(&envvar.0) {
-            args.push("-e".into());
-            args.push(format!("{}={}", envvar.0, value));
-        }
+    // Env passthrough — only emit when the variable resolves on the host. Like
+    // the credential block just below, this is name-only (`-e NAME`): argv is
+    // world-readable through `/proc/<pid>/cmdline` (or `ps`), so a host value
+    // that may be a secret must never be written into it. The value reaches the
+    // container the way an agent credential's does — it is set on the spawned
+    // CLI child's own environment (see [`resolve_env_passthrough`] and the
+    // spawn paths in `process.rs`), and the container-runtime CLI resolves a
+    // name-only `-e` from its own process env.
+    //
+    // The gate is `host_var`, not `std::env::var`: inside the squad daemon a
+    // task's `env()` value arrives over the authenticated socket and lives in
+    // the Layer 0 daemon overlay, never in the daemon's real process
+    // environment. Gating on `std::env::var` there emits no `-e` at all and the
+    // container starts silently without the variable — the regression WI 0116
+    // exists to end. Injecting the resolved value onto the child is what makes
+    // the overlay case work, because ambient inheritance cannot.
+    for (name, _) in resolve_env_passthrough(options) {
+        args.push("-e".into());
+        args.push(name);
     }
-    // Env literals.
+    // Env literals — unlike env_passthrough above, these keep the `KEY=VALUE`
+    // form. Literal values are constants awman itself supplies (e.g.
+    // `COPILOT_OFFLINE=true`), never a user secret, so there is nothing here
+    // that argv's world-readability could expose.
     for lit in &options.env_literal {
         args.push("-e".into());
         args.push(format!("{}={}", lit.key, lit.value));
     }
-    // Agent credentials are env-vars by another name.
-    for (k, v) in &options.agent_credentials {
+    // Agent credentials are env-vars by another name. Emit the NAME ONLY
+    // (`-e KEY`); the value is set on the spawned CLI child's own environment
+    // (see the spawn paths below) and the container-runtime CLI resolves a
+    // name-only `-e` from its process env. This keeps the secret value out of
+    // the argument vector, so it never appears in `ps` / `/proc/<pid>/cmdline`
+    // while the client process runs. Both the docker CLI and the Apple
+    // `container` CLI (which shares this argv builder) support this form.
+    for (k, _v) in &options.agent_credentials {
         args.push("-e".into());
-        args.push(format!("{k}={v}"));
+        args.push(k.clone());
     }
 
     // Allow Docker socket: mount and add docker group.
@@ -723,6 +928,16 @@ pub(super) fn build_run_argv(
         }
     }
 
+    // ACP launches are complete at the entrypoint (`cline --acp`). Everything an
+    // ACP agent needs — the prompt, model, tool policy, permission decisions — is
+    // delivered over the JSON-RPC 2.0 channel (`session/*`), never as argv. Any
+    // stdio-mode flag or positional appended past the entrypoint would be handed
+    // to the agent as raw argv and corrupt the launch (e.g. `cline --acp task`,
+    // `cline --acp task --yolo`). So emit nothing after the entrypoint for ACP.
+    if options.acp {
+        return args;
+    }
+
     // Mode flags appended to the agent argv.
     if let Some(flag) = &options.non_interactive_flag {
         // Some agents take a sub-command (e.g. "run") rather than a flag.
@@ -779,11 +994,22 @@ pub(super) fn build_run_argv(
         args.push(container_path.display().to_string());
     }
 
-    // Interactive + seeded prompt: pass the prompt as the final positional arg
-    // so the agent receives it as its initial task. Stdin stays inherited.
-    // Non-interactive + seeded prompt is handled via stdin piping at spawn time.
-    if options.interactive {
+    // Interactive + seeded prompt: deliver the prompt so the agent receives it
+    // as its initial task. Most agents take it as the final positional arg;
+    // agents that declare an `interactive_seed_flag` (e.g. opencode `--prompt`)
+    // take it as a flag pair, because their bare positional means something else
+    // (opencode treats it as a project directory and `open()`s it → ENAMETOOLONG).
+    // Stdin stays inherited. Non-interactive + seeded prompt is handled via
+    // stdin piping at spawn time.
+    //
+    // ACP is excluded: an ACP session delivers its prompt over the JSON-RPC
+    // channel (`session/prompt`), never as argv — appending it here would pass
+    // raw prompt text to `cline --acp` as a positional and corrupt the launch.
+    if options.interactive && !options.acp {
         if let Some(prompt) = &options.seeded_prompt {
+            if let Some(flag) = &options.interactive_seed_flag {
+                args.push(flag.clone());
+            }
             args.push(prompt.clone());
         }
     }
@@ -873,21 +1099,29 @@ fn host_docker_group_gid() -> Option<u32> {
 /// reliably restore them on exit. Without this, the next read/write returns
 /// EAGAIN ("Resource temporarily unavailable", os error 35 on macOS / 11 on
 /// Linux).
-#[cfg(unix)]
-fn clear_stdio_nonblocking() {
-    use nix::fcntl::{fcntl, FcntlArg, OFlag};
-    fn clear_fd(fd: impl std::os::fd::AsFd) {
-        if let Ok(flags) = fcntl(&fd, FcntlArg::F_GETFL) {
-            let mut o = OFlag::from_bits_truncate(flags);
-            if o.contains(OFlag::O_NONBLOCK) {
-                o.remove(OFlag::O_NONBLOCK);
-                let _ = fcntl(&fd, FcntlArg::F_SETFL(o));
+///
+/// This is the Docker backend's `process::PostWaitHook`: `ContainerCli::DOCKER`
+/// names it, and `ContainerExecution::wait_blocking` runs it after every piped
+/// child exits. Apple's `container` leaves the fds alone and uses
+/// `process::no_post_wait`. A no-op off Unix, so the hook type stays a plain
+/// `fn()` on every platform.
+pub(super) fn clear_stdio_nonblocking() {
+    #[cfg(unix)]
+    {
+        use nix::fcntl::{fcntl, FcntlArg, OFlag};
+        fn clear_fd(fd: impl std::os::fd::AsFd) {
+            if let Ok(flags) = fcntl(&fd, FcntlArg::F_GETFL) {
+                let mut o = OFlag::from_bits_truncate(flags);
+                if o.contains(OFlag::O_NONBLOCK) {
+                    o.remove(OFlag::O_NONBLOCK);
+                    let _ = fcntl(&fd, FcntlArg::F_SETFL(o));
+                }
             }
         }
+        clear_fd(std::io::stdin());
+        clear_fd(std::io::stdout());
+        clear_fd(std::io::stderr());
     }
-    clear_fd(std::io::stdin());
-    clear_fd(std::io::stdout());
-    clear_fd(std::io::stderr());
 }
 
 #[cfg(test)]
@@ -918,6 +1152,88 @@ mod tests {
         assert_eq!(argv.last().map(String::as_str), Some("img:latest"));
     }
 
+    /// WI 0101 §2.2: `ContainerOption::SessionLabel` became the general
+    /// `Label { key, value }`. `awman=true` must still come first, then exactly
+    /// one `--label k=v` per accumulated entry, in ingest order.
+    #[test]
+    fn build_run_argv_emits_the_awman_label_then_one_flag_per_supplied_label() {
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::Label {
+                key: "awman.session".into(),
+                value: "sid-1".into(),
+            },
+            ContainerOption::Label {
+                key: "awman.squad.task".into(),
+                value: "issue-triage".into(),
+            },
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        let labels: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| a.as_str() == "--label" && *i + 1 < argv.len())
+            .map(|(i, _)| &argv[i + 1])
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                &AWMAN_LABEL.to_string(),
+                &"awman.session=sid-1".to_string(),
+                &"awman.squad.task=issue-triage".to_string(),
+            ],
+            "argv was: {argv:?}"
+        );
+        assert_eq!(
+            argv.iter().filter(|a| a.as_str() == "--label").count(),
+            3,
+            "one --label flag per label, no more"
+        );
+    }
+
+    /// Regression guard for the pre-refactor behaviour: a lone session label
+    /// still renders exactly as it did when it had its own dedicated field.
+    #[test]
+    fn build_run_argv_renders_a_lone_session_label_exactly_as_before_the_refactor() {
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::Label {
+                key: "awman.session".into(),
+                value: "abc-123".into(),
+            },
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        let awman = argv
+            .iter()
+            .position(|a| a == AWMAN_LABEL)
+            .expect("the hardcoded awman=true label must be present");
+        assert_eq!(argv[awman + 1], "--label");
+        assert_eq!(
+            argv[awman + 2],
+            "awman.session=abc-123",
+            "the session label must immediately follow awman=true"
+        );
+    }
+
+    #[test]
+    fn build_run_argv_emits_only_the_awman_label_when_no_labels_are_supplied() {
+        let resolved = resolve(vec![ContainerOption::Image(ImageRef::new("img:latest"))]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        assert_eq!(argv.iter().filter(|a| a.as_str() == "--label").count(), 1);
+    }
+
     #[test]
     fn build_run_argv_includes_overlay_volumes() {
         let resolved = resolve(vec![
@@ -940,22 +1256,146 @@ mod tests {
 
     #[test]
     fn build_run_argv_env_passthrough_only_when_set() {
+        use crate::engine::container::options::EnvLiteral;
+
         std::env::set_var("AWMAN_TEST_ENV_DOCKER", "v1");
         let resolved = resolve(vec![
             ContainerOption::Image(ImageRef::new("img:latest")),
             ContainerOption::EnvPassthrough(EnvVar("AWMAN_TEST_ENV_DOCKER".into())),
             ContainerOption::EnvPassthrough(EnvVar("AWMAN_TEST_NEVER_SET_DOCKER".into())),
+            ContainerOption::EnvLiteral(EnvLiteral {
+                key: "MY_KEY".into(),
+                value: "my_value".into(),
+            }),
         ]);
         let argv = build_run_argv(
             &ContainerName::new("ctr"),
             &ImageRef::new("img:latest"),
             &resolved,
         );
-        assert!(argv.contains(&"AWMAN_TEST_ENV_DOCKER=v1".to_string()));
-        assert!(!argv
-            .iter()
-            .any(|a| a.contains("AWMAN_TEST_NEVER_SET_DOCKER")));
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "AWMAN_TEST_ENV_DOCKER"),
+            "passthrough must be emitted as name-only `-e AWMAN_TEST_ENV_DOCKER`; argv: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "AWMAN_TEST_ENV_DOCKER=v1"),
+            "the passthrough value must never ride argv as NAME=VALUE; argv: {argv:?}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.contains("AWMAN_TEST_NEVER_SET_DOCKER")),
+            "an unset passthrough name must emit nothing at all; argv: {argv:?}"
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "MY_KEY=my_value"),
+            "a literal must still be emitted as -e KEY=VALUE, unlike passthrough; argv: {argv:?}"
+        );
         std::env::remove_var("AWMAN_TEST_ENV_DOCKER");
+    }
+
+    /// WI 0116 §1/D1 — the regression this work item exists to end.
+    ///
+    /// A squad daemon holds a task's `env()` value in the Layer 0 overlay, not
+    /// in its own process environment. Gating the `-e` on `std::env::var`
+    /// emitted nothing at all there, so the container started silently without
+    /// the variable. The gate is `host_var`, so the name must be emitted; the
+    /// value must be reachable through `resolve_env_passthrough` (which the
+    /// spawn paths set on the child) and must never appear in argv.
+    #[test]
+    fn build_run_argv_passes_through_a_name_held_only_in_the_daemon_overlay() {
+        use crate::data::config::env::{
+            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
+        };
+
+        let _guard = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Unique name, and explicitly *not* in the process environment: this is
+        // the daemon's situation exactly.
+        let name = "AWMAN_TEST_DOCKER_OVERLAY_ONLY";
+        std::env::remove_var(name);
+        set_daemon_overlay(DaemonEnvMap::from_pairs([(name, "overlay-secret")]));
+
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::EnvPassthrough(EnvVar(name.into())),
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+
+        assert!(
+            argv.windows(2).any(|w| w[0] == "-e" && w[1] == name),
+            "a name held only in the daemon overlay must still emit `-e {name}`; argv: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("overlay-secret")),
+            "the overlay value must never reach argv; argv: {argv:?}"
+        );
+        assert_eq!(
+            resolve_env_passthrough(&resolved),
+            vec![(name.to_string(), "overlay-secret".to_string())],
+            "the spawn paths take the value from here and set it on the child",
+        );
+
+        set_daemon_overlay(DaemonEnvMap::new());
+    }
+
+    /// A task created before `env()` validated its argument still carries
+    /// whatever it was given, and these names now reach `Command::env` on the
+    /// spawn paths (review-security F11).
+    #[test]
+    fn resolve_env_passthrough_drops_a_name_that_is_not_an_environment_variable_name() {
+        use crate::data::config::env::{
+            set_daemon_overlay, DaemonEnvMap, DAEMON_OVERLAY_TEST_LOCK,
+        };
+
+        let _guard = DAEMON_OVERLAY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The overlay, not the process environment: the OS itself refuses to
+        // set a variable whose name contains `=`, which is part of why such a
+        // name must never become a `Command::env` key.
+        let bad = "AWMAN_TEST_DOCKER=INVALID";
+        set_daemon_overlay(DaemonEnvMap::from_pairs([(bad, "v")]));
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::EnvPassthrough(EnvVar(bad.into())),
+        ]);
+        assert!(
+            resolve_env_passthrough(&resolved).is_empty(),
+            "a malformed key must never reach Command::env"
+        );
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        assert!(!argv.iter().any(|a| a.contains(bad)), "argv: {argv:?}");
+        set_daemon_overlay(DaemonEnvMap::new());
+    }
+
+    /// D15 — `Some("")` still emits, for bit-for-bit parity with the old
+    /// `std::env::var(..).is_ok()` gate. Only the *push* path treats an empty
+    /// value as absent.
+    #[test]
+    fn resolve_env_passthrough_keeps_a_variable_set_to_the_empty_string() {
+        let name = "AWMAN_TEST_DOCKER_EMPTY_PASSTHROUGH";
+        std::env::set_var(name, "");
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::EnvPassthrough(EnvVar(name.into())),
+        ]);
+        assert_eq!(
+            resolve_env_passthrough(&resolved),
+            vec![(name.to_string(), String::new())]
+        );
+        std::env::remove_var(name);
     }
 
     #[test]
@@ -991,6 +1431,66 @@ mod tests {
         let print_pos = argv.iter().position(|a| a == "--print").unwrap();
         assert!(img_pos < claude_pos, "entrypoint must come after image");
         assert!(claude_pos < print_pos, "entrypoint args must be in order");
+    }
+
+    #[test]
+    fn agy_and_legacy_alias_build_canonical_chat_and_exec_argv_with_model() {
+        use crate::engine::agent::agent_matrix::{entrypoint_for, matrix_for, model_flag_for};
+
+        for input in ["agy", "antigravity"] {
+            let matrix = matrix_for(input).expect("agy input spelling must resolve");
+
+            let chat = resolve(vec![
+                ContainerOption::Image(ImageRef::new("img:latest")),
+                ContainerOption::Entrypoint(entrypoint_for(&matrix, false)),
+                ContainerOption::Interactive(true),
+                ContainerOption::Model {
+                    flag: model_flag_for(&matrix, "gemini-3.5-pro").unwrap(),
+                },
+                ContainerOption::SeededPrompt("review this".into()),
+            ]);
+            let chat_argv = build_run_argv(
+                &ContainerName::new("ctr"),
+                &ImageRef::new("img:latest"),
+                &chat,
+            );
+            let chat_image = chat_argv
+                .iter()
+                .position(|arg| arg == "img:latest")
+                .unwrap();
+            assert_eq!(
+                &chat_argv[chat_image + 1..],
+                &["agy", "--model", "gemini-3.5-pro", "review this"],
+                "chat argv must use the canonical executable and SpaceArg model for {input}"
+            );
+
+            let exec = resolve(vec![
+                ContainerOption::Image(ImageRef::new("img:latest")),
+                ContainerOption::Entrypoint(entrypoint_for(&matrix, true)),
+                ContainerOption::Model {
+                    flag: model_flag_for(&matrix, "gemini-3.5-pro").unwrap(),
+                },
+                ContainerOption::SeededPrompt("review this".into()),
+            ]);
+            let exec_argv = build_run_argv(
+                &ContainerName::new("ctr"),
+                &ImageRef::new("img:latest"),
+                &exec,
+            );
+            let exec_image = exec_argv
+                .iter()
+                .position(|arg| arg == "img:latest")
+                .unwrap();
+            assert_eq!(
+                &exec_argv[exec_image + 1..],
+                &["agy", "--print", "--model", "gemini-3.5-pro"],
+                "exec prompt argv must use the canonical executable and SpaceArg model for {input}"
+            );
+            assert!(
+                !exec_argv.iter().any(|arg| arg == "antigravity"),
+                "the removed executable name must never reach argv: {exec_argv:?}"
+            );
+        }
     }
 
     #[test]
@@ -1088,6 +1588,177 @@ mod tests {
     }
 
     #[test]
+    fn build_run_argv_interactive_seed_flag_delivers_prompt_via_flag_not_positional() {
+        // opencode-shaped delivery: a seed flag is present, so the prompt must
+        // be emitted as `<flag> <text>` rather than a bare positional (which
+        // opencode would treat as a project dir and open() → ENAMETOOLONG).
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::Interactive(true),
+            ContainerOption::SeededPrompt("do the task".into()),
+            ContainerOption::InteractiveSeedFlag("--prompt".into()),
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "--prompt" && w[1] == "do the task"),
+            "seed flag must deliver the prompt as `--prompt <text>`; got {argv:?}"
+        );
+        // The prompt must never appear as a lone positional immediately after
+        // the image (which is what breaks opencode).
+        let img_idx = argv.iter().position(|a| a == "img:latest").unwrap();
+        assert_ne!(
+            argv.get(img_idx + 1).map(|s| s.as_str()),
+            Some("do the task"),
+            "prompt must not be a bare positional after the image; got {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_run_argv_interactive_acp_emits_i_not_it() {
+        // ACP framing must never pass through a PTY, so an interactive ACP run
+        // allocates `-i` (piped stdin, no `-t`) rather than `-it`.
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::Interactive(true),
+            ContainerOption::Acp(true),
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        assert!(
+            argv.contains(&"-i".to_string()),
+            "interactive ACP run needs -i; argv: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&"-it".to_string()),
+            "interactive ACP run must NOT allocate a PTY via -it; argv: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_run_argv_non_interactive_acp_still_emits_i() {
+        // A headless (`-n`) ACP run still needs stdin piped open for the
+        // bidirectional JSON-RPC exchange.
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::Acp(true),
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        assert!(
+            argv.contains(&"-i".to_string()),
+            "non-interactive ACP run still needs -i; argv: {argv:?}"
+        );
+        assert!(
+            !argv.contains(&"-it".to_string()),
+            "ACP run must never use -it; argv: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_run_argv_acp_does_not_deliver_seeded_prompt_as_positional() {
+        // The ACP prompt travels over JSON-RPC (`session/prompt`), never argv.
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::Interactive(true),
+            ContainerOption::Acp(true),
+            ContainerOption::SeededPrompt("do the task".into()),
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        assert!(
+            !argv.iter().any(|a| a == "do the task"),
+            "ACP must not append the seeded prompt as an argv positional; argv: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_run_argv_acp_emits_nothing_after_the_entrypoint() {
+        // Regression for the "corrupted ACP argv" blocker: an ACP launch that
+        // also carries a non-interactive subcommand flag and agent mode flags
+        // (as every `exec workflow` / `--non-interactive` / `--yolo` ACP launch
+        // does) must NOT graft any of them onto `cline --acp` — the ACP argv is
+        // complete at the entrypoint. Before the fix this produced
+        // `cline --acp task --yolo`, silently corrupting the JSON-RPC launch.
+        use crate::engine::container::options::Entrypoint;
+        let resolved = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::Entrypoint(Entrypoint::new(["cline", "--acp"])),
+            ContainerOption::Acp(true),
+            ContainerOption::NonInteractivePrintFlag("task".into()),
+            ContainerOption::AgentModeFlags(vec!["--yolo".into()]),
+            ContainerOption::SeededPrompt("do the task".into()),
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        let img_pos = argv.iter().position(|a| a == "img:latest").unwrap();
+        assert_eq!(
+            &argv[img_pos + 1..],
+            &["cline".to_string(), "--acp".to_string()],
+            "ACP argv must end exactly at the entrypoint, with no stdio flags \
+             (task/--yolo/prompt) appended; argv: {argv:?}"
+        );
+    }
+
+    /// Regression guard for the security constraint (aspec/architecture/
+    /// security.md): the ACP argv path must introduce NO new host exposure —
+    /// no published ports, no host/custom `--network`, no added mounts beyond
+    /// what a non-ACP run of the same options would already emit.
+    #[test]
+    fn build_run_argv_acp_introduces_no_ports_or_network_flags() {
+        let acp = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::Interactive(true),
+            ContainerOption::Acp(true),
+        ]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &acp,
+        );
+        for banned in ["-p", "--publish", "--network", "--net", "--add-host"] {
+            assert!(
+                !argv.iter().any(|a| a == banned),
+                "ACP argv must never contain {banned}; argv: {argv:?}"
+            );
+        }
+
+        // And the ACP flag must not add any `-v` mount that a plain
+        // interactive run of the same options wouldn't already produce.
+        let plain = resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::Interactive(true),
+        ]);
+        let plain_argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &plain,
+        );
+        let count_v = |v: &[String]| v.iter().filter(|a| a.as_str() == "-v").count();
+        assert_eq!(
+            count_v(&argv),
+            count_v(&plain_argv),
+            "ACP must not introduce any new -v mount; acp: {argv:?} plain: {plain_argv:?}"
+        );
+    }
+
+    #[test]
     fn build_run_argv_interactive_adds_it_flag() {
         let resolved = resolve(vec![
             ContainerOption::Image(ImageRef::new("img:latest")),
@@ -1169,7 +1840,7 @@ mod tests {
         // must surface `None` rather than panic. Works regardless of whether
         // the docker daemon is reachable, because `Command::output` errors
         // collapse to `None` too.
-        let backend = DockerBackend::new();
+        let backend = DockerBackend;
         let bogus = "awman-test-image-that-does-not-exist:tag-xyz123";
         assert!(backend.image_home_dir(bogus).is_none());
     }
@@ -1183,5 +1854,125 @@ mod tests {
     #[test]
     fn parse_cpu_percent_strips_percent() {
         assert!((parse_cpu_percent("5.23%") - 5.23).abs() < 0.001);
+    }
+
+    // ── WI-0098 Finding A: agent credential values must never enter argv ──────
+    //
+    // `build_run_argv` emits credentials as the NAME-ONLY form `-e KEY`; the
+    // value is set on the spawned CLI child's own environment (see the spawn
+    // paths) so nothing secret is visible via `ps` / `/proc/<pid>/cmdline`.
+    // These tests assert the value is absent from the built argv while still
+    // being carried out-of-band on the resolved options (the source the spawn
+    // code feeds to `Command::env`). `build_run_argv` is shared verbatim by the
+    // Apple backend, so this coverage applies to both container backends.
+
+    fn credential_opts(pairs: &[(&str, &str)]) -> ResolvedContainerOptions {
+        resolve(vec![
+            ContainerOption::Image(ImageRef::new("img:latest")),
+            ContainerOption::AgentCredentials {
+                env_vars: pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            },
+        ])
+    }
+
+    #[test]
+    fn build_run_argv_agent_credentials_use_name_only_form() {
+        let resolved = credential_opts(&[("ANTHROPIC_API_KEY", "sk-secret-value")]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        // The name-only `-e KEY` pair must be present.
+        assert!(
+            argv.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "ANTHROPIC_API_KEY"),
+            "credential must be emitted as name-only `-e ANTHROPIC_API_KEY`; argv: {argv:?}"
+        );
+        // The secret value must appear nowhere in argv, in any form.
+        assert!(
+            !argv.iter().any(|a| a.contains("sk-secret-value")),
+            "credential VALUE must never appear in argv; argv: {argv:?}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a == "ANTHROPIC_API_KEY=sk-secret-value"),
+            "the `KEY=VALUE` argv form must not be used for credentials; argv: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_run_argv_credential_value_with_equals_stays_out_of_argv() {
+        // A value containing `=` must survive the env-inheritance path and must
+        // never leak into argv.
+        let resolved = credential_opts(&[("TOKEN", "a=b=c")]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        assert!(
+            argv.windows(2).any(|w| w[0] == "-e" && w[1] == "TOKEN"),
+            "credential name must still be present as `-e TOKEN`; argv: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains("a=b=c")),
+            "credential value containing `=` must not appear in argv; argv: {argv:?}"
+        );
+        // Carried out-of-band, verbatim, for the child-process env map.
+        assert_eq!(
+            resolved.agent_credentials,
+            vec![("TOKEN".to_string(), "a=b=c".to_string())],
+            "the value must be preserved verbatim on the options for `Command::env`"
+        );
+    }
+
+    #[test]
+    fn build_run_argv_credential_value_with_newline_stays_out_of_argv() {
+        let resolved = credential_opts(&[("MULTILINE", "line1\nline2")]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        assert!(
+            argv.windows(2).any(|w| w[0] == "-e" && w[1] == "MULTILINE"),
+            "credential name must be present as `-e MULTILINE`; argv: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a.contains('\n')),
+            "no argv element may contain a newline from the credential value; argv: {argv:?}"
+        );
+        assert_eq!(
+            resolved.agent_credentials,
+            vec![("MULTILINE".to_string(), "line1\nline2".to_string())],
+            "the newline-bearing value must be preserved verbatim for `Command::env`"
+        );
+    }
+
+    #[test]
+    fn build_run_argv_multiple_credentials_all_name_only() {
+        let resolved = credential_opts(&[("KEY_A", "aaa"), ("KEY_B", "bbb")]);
+        let argv = build_run_argv(
+            &ContainerName::new("ctr"),
+            &ImageRef::new("img:latest"),
+            &resolved,
+        );
+        for name in ["KEY_A", "KEY_B"] {
+            assert!(
+                argv.windows(2).any(|w| w[0] == "-e" && w[1] == name),
+                "{name} must be emitted name-only; argv: {argv:?}"
+            );
+        }
+        for value in ["aaa", "bbb"] {
+            assert!(
+                !argv.iter().any(|a| a.contains(value)),
+                "credential value {value} must never appear in argv; argv: {argv:?}"
+            );
+        }
     }
 }

@@ -1,22 +1,28 @@
-//! Container/PTY overlay rendering — ports the old-amux container window
-//! to the new architecture.
+//! Container/PTY overlay rendering.
 //!
-//! Three render modes:
-//! - **Maximized** (`render_container_maximized`): a centered overlay that
-//!   covers ~95% of the parent area. Shows the agent name (left title), live
-//!   container stats (right title), an optional scrollback indicator (top
-//!   center), and a copy hint (bottom center) when the user has a selection.
-//!   Cells are drawn into `frame.buffer_mut()` directly so cursor placement,
-//!   wide chars, italic/inverse modifiers, and selection highlight all work.
-//! - **Minimized** (`render_container_minimized`): a 3-row green rounded
-//!   strip below the execution window with `agent | container | cpu | mem | t`.
+//! Everything renders from `Tab::container_slots` — a plain containerized
+//! command is a one-slot group, a parallel workflow group is N slots.
+//! Render pieces:
+//! - **Maximized overlay** (`render_container_maximized`): the focused slot
+//!   in a centered overlay covering ~95% of the parent area. Shows the agent
+//!   name and workflow step (left title), live container stats (right
+//!   title), an optional scrollback indicator (top center), and a copy hint
+//!   (bottom center) when the user has a selection. Cells are drawn into
+//!   `frame.buffer_mut()` directly so cursor placement, wide chars,
+//!   italic/inverse modifiers, and selection highlight all work.
+//! - **Minimized bars** (`render_container_bars`): 3-row green rounded
+//!   strips with `agent [step] | container | cpu | mem | t` — one per
+//!   non-focused slot while the overlay is up, or one per slot when the
+//!   whole group is minimized.
 //! - **Summary** (`render_container_summary`): a 3-row dashed-border strip
 //!   shown after the container exits, with averaged stats and the exit code.
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use crate::frontend::tui::tabs::{format_duration, LastContainerSummary, Tab, TextSelection};
+use crate::frontend::tui::tabs::{
+    format_duration, ContainerSlot, LastContainerSummary, Tab, TextSelection,
+};
 
 /// Render the container overlay when Maximized.
 ///
@@ -25,19 +31,19 @@ use crate::frontend::tui::tabs::{format_duration, LastContainerSummary, Tab, Tex
 /// terminal coords into vt100 cell coords; and temporarily mutates the
 /// vt100 scrollback offset to render the user's chosen scrollback view.
 ///
-/// `workflow_strip_height` is the number of rows occupied by the workflow
-/// strip below the execution window — the container overlay must not
+/// `workflow_overview_height` is the number of rows occupied by the Workflow
+/// Overview below the execution window — the container overlay must not
 /// cover it.
 pub fn render_container_maximized(
     tab: &mut Tab,
     outer_area: Rect,
-    workflow_strip_height: u16,
+    workflow_overview_height: u16,
     frame: &mut Frame,
 ) {
     // 95% of the execution window area (between tab bar and command box).
     // Tab bar = 3 rows at top, status bar + command box + suggestion = 5 rows at bottom.
     let top_reserved: u16 = 3;
-    let bottom_reserved: u16 = 5 + workflow_strip_height;
+    let bottom_reserved: u16 = 5 + workflow_overview_height;
     let exec_height = outer_area
         .height
         .saturating_sub(top_reserved + bottom_reserved);
@@ -54,21 +60,44 @@ pub fn render_container_maximized(
         height: container_height,
     };
 
+    // The focused slot owns the overlay; without one there is nothing to
+    // render (the window state is Hidden whenever no slots exist).
+    let Some(focused_slot) = tab.focused_slot() else {
+        return;
+    };
+
     frame.render_widget(Clear, container_area);
 
     // Title strings.
-    let agent_name = tab
-        .container_info
-        .as_ref()
+    let info = focused_slot.container_info.as_ref();
+    let agent_name = info
         .map(|i| i.agent_display_name.as_str())
         .unwrap_or("Agent");
-    let runtime_label = if tab.container_info.as_ref().is_some_and(|i| i.sandboxed) {
+    let runtime_label = if info.is_some_and(|i| i.sandboxed) {
         "sandboxed"
     } else {
         "containerized"
     };
-    let left_title = format!(" \u{1F512} {} ({}) ", agent_name, runtime_label);
-    let right_title = build_stats_title(tab);
+    // While a workflow runs, show the step this container is executing: the
+    // slot's own step (parallel group slots), otherwise the workflow's
+    // current step (sequential steps run in the backbone slot, whose
+    // step_name is empty).
+    let step_name: Option<String> = Some(focused_slot.step_name.clone())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            tab.workflow_state
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().and_then(|v| v.current_step.clone()))
+        });
+    let left_title = match step_name {
+        Some(step) => format!(
+            " \u{1F512} {} ({}) \u{2014} {} ",
+            agent_name, runtime_label, step
+        ),
+        None => format!(" \u{1F512} {} ({}) ", agent_name, runtime_label),
+    };
+    let right_title = info.map(build_stats_title_from_info).unwrap_or_default();
 
     let mut block = Block::default()
         .title(Line::from(left_title).alignment(Alignment::Left))
@@ -85,8 +114,9 @@ pub fn render_container_maximized(
     // depth without crashing. We probe by setting the requested offset
     // and reading back the clamped value, then probe the depth via
     // `set_scrollback(usize::MAX)`. Reset to live before rendering.
+    let focused_idx = tab.focused_slot_idx;
     let (effective_scroll_offset, max_scrollback) = if tab.container_scroll_offset > 0 {
-        let screen = tab.vt100_parser.screen_mut();
+        let screen = tab.container_slots[focused_idx].vt100_parser.screen_mut();
         screen.set_scrollback(tab.container_scroll_offset);
         let eff = screen.scrollback();
         screen.set_scrollback(usize::MAX);
@@ -128,7 +158,7 @@ pub fn render_container_maximized(
     // Publish the inner area for the mouse handler.
     tab.container_inner_area = Some(inner);
 
-    let screen = tab.vt100_parser.screen_mut();
+    let screen = tab.container_slots[focused_idx].vt100_parser.screen_mut();
     if effective_scroll_offset > 0 {
         screen.set_scrollback(effective_scroll_offset);
         render_vt100_screen(frame, screen, inner, selection.as_ref(), false);
@@ -136,32 +166,6 @@ pub fn render_container_maximized(
     } else {
         render_vt100_screen(frame, screen, inner, selection.as_ref(), true);
     }
-}
-
-/// Render the minimized container bar. A single 3-row green rounded strip
-/// showing the agent name, container name, CPU, memory, and elapsed time.
-pub fn render_container_minimized(tab: &Tab, area: Rect, frame: &mut Frame) {
-    let agent_name = tab
-        .container_info
-        .as_ref()
-        .map(|i| i.agent_display_name.as_str())
-        .unwrap_or("Agent");
-    let stats_title = build_stats_title(tab);
-
-    let content = format!("\u{1F512} {} | {}", agent_name, stats_title.trim());
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Green));
-
-    let para = Paragraph::new(Line::from(vec![Span::styled(
-        format!(" {}", content),
-        Style::default().fg(Color::Green),
-    )]))
-    .block(block);
-
-    frame.render_widget(para, area);
 }
 
 /// Render the post-exit container summary bar. Shown for the previous
@@ -215,21 +219,115 @@ pub fn render_container_summary(summary: &LastContainerSummary, area: Rect, fram
     frame.render_widget(para, area);
 }
 
-// ─── Internals ──────────────────────────────────────────────────────────
+/// Number of terminal rows one minimized container bar occupies (a 3-row
+/// rounded-border strip).
+pub const PARALLEL_BAR_HEIGHT: u16 = 3;
 
-/// Test-accessible wrapper for `build_stats_title`.
-#[cfg(test)]
-pub fn build_stats_title_for_test(tab: &Tab) -> String {
-    build_stats_title(tab)
+/// Render the stacked minimized container status bars: one 3-row
+/// rounded-border strip per slot, showing the agent, workflow step (when
+/// any), container name, and live stats.
+///
+/// `skip_focused` selects the display mode: `true` while the focused slot is
+/// shown maximized (it gets no bar — its info is in the overlay title);
+/// `false` when the whole group is minimized and every slot renders as a bar.
+/// Stuck slots get a `⚠` prefix and yellow color; slots in a yolo countdown
+/// flash purple/yellow on a per-second parity.
+pub fn render_container_bars(tab: &Tab, area: Rect, frame: &mut Frame, skip_focused: bool) {
+    let mut row: u16 = 0;
+    for (idx, slot) in tab.container_slots.iter().enumerate() {
+        if skip_focused && idx == tab.focused_slot_idx {
+            continue; // the focused slot is shown maximized, not as a bar
+        }
+        if row + PARALLEL_BAR_HEIGHT > area.height {
+            break;
+        }
+        // Draw only stdio slots here; ACP slots are drawn by
+        // `acp_view::render_acp_bars`. Both walk the slots in the same order
+        // and advance one bar height per non-focused slot, so the two passes
+        // tile a mixed group's bars without overlap. For an all-stdio tab this
+        // is unchanged — every slot is drawn.
+        if !slot.is_acp() {
+            let bar_area = Rect::new(area.x, area.y + row, area.width, PARALLEL_BAR_HEIGHT);
+            render_one_minimized_bar(slot, bar_area, frame);
+        }
+        row += PARALLEL_BAR_HEIGHT;
+    }
 }
+
+fn render_one_minimized_bar(slot: &ContainerSlot, area: Rect, frame: &mut Frame) {
+    let (color, prefix) = if slot.stuck {
+        // Yellow + ⚠ prefix for stuck bars.
+        (Color::Yellow, "\u{26a0} ")
+    } else if slot.yolo_mode {
+        // Purple/yellow flash keyed off the same per-second parity the tab
+        // header uses.
+        let c = if slot.elapsed_secs().is_multiple_of(2) {
+            Color::Magenta
+        } else {
+            Color::Yellow
+        };
+        (c, "")
+    } else {
+        (Color::Green, "")
+    };
+
+    // While yoloing (and not shown maximized — see `render_container_bars`'
+    // `skip_focused`), show the same countdown the per-slot modal would, so
+    // the user can see time-to-auto-advance without switching focus to it.
+    let yolo_suffix = if slot.yolo_mode {
+        slot.yolo_state
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .map(|s| format!(" | Yolo in {}s", s.remaining_secs))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    // `🔒 {agent} [{step}] | {container} | {cpu} | {mem} | {dur}`, with the
+    // `[step]` segment omitted for slots that aren't a parallel workflow
+    // step (plain commands, sequential steps).
+    let stats_title = slot
+        .container_info
+        .as_ref()
+        .map(build_stats_title_from_info)
+        .unwrap_or_default();
+    let step_segment = if slot.step_name.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", slot.step_name)
+    };
+    let content = format!(
+        "{}\u{1F512} {}{} | {}{}",
+        prefix,
+        slot.agent_name(),
+        step_segment,
+        stats_title.trim(),
+        yolo_suffix
+    );
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(color));
+
+    let para = Paragraph::new(Line::from(vec![Span::styled(
+        format!(" {}", content),
+        Style::default().fg(color),
+    )]))
+    .block(block);
+
+    frame.render_widget(para, area);
+}
+
+// ─── Internals ──────────────────────────────────────────────────────────
 
 /// Build the right-side stats title: `" {container} | {cpu} | {mem} | {dur} "`.
 /// Falls back to placeholder values until the first stats sample arrives.
-fn build_stats_title(tab: &Tab) -> String {
-    let info = match &tab.container_info {
-        Some(i) => i,
-        None => return String::new(),
-    };
+pub(crate) fn build_stats_title_from_info(
+    info: &crate::frontend::tui::tabs::ContainerInfo,
+) -> String {
     let elapsed = info.start_time.elapsed().as_secs();
     let time_str = format_duration(elapsed);
     if let Some(ref stats) = info.latest_stats {
@@ -400,5 +498,202 @@ mod tests {
     #[test]
     fn cell_in_selection_none_returns_false() {
         assert!(!cell_in_selection(None, 5, 5));
+    }
+
+    // ── WI-0096 minimized-bar rendering (E2E) ───────────────────────────────
+
+    use crate::data::session::{Session, SessionOpenOptions, StaticGitRootResolver};
+    use crate::frontend::tui::tabs::{ContainerSlot, ContainerSlotEvent, Tab};
+
+    fn make_test_session() -> Session {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        Session::open(
+            tmp.path().to_path_buf(),
+            &resolver,
+            SessionOpenOptions::default(),
+        )
+        .unwrap()
+    }
+
+    fn render_bars_to_text(tab: &Tab, width: u16, height: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_container_bars(tab, area, frame, true);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let area = *buf.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn slot(name: &str) -> ContainerSlot {
+        ContainerSlot::new(name.to_string(), "claude".to_string(), 1000)
+    }
+
+    #[test]
+    fn minimized_bars_render_only_non_focused_slots_and_swap_on_ctrl_s() {
+        let mut tab = Tab::new(make_test_session());
+        tab.container_slots.push(slot("build"));
+        tab.container_slots.push(slot("test"));
+        tab.focused_slot_idx = 0; // "build" is maximized (no bar)
+
+        // Only the non-focused slot renders a minimized status bar.
+        let text = render_bars_to_text(&tab, 60, 4);
+        assert!(
+            text.contains("[test]"),
+            "non-focused slot renders as a bar: {text}"
+        );
+        assert!(
+            !text.contains("[build]"),
+            "the focused (maximized) slot is not drawn as a bar: {text}"
+        );
+
+        // Ctrl-S swaps focus → now "build" is the minimized bar, "test" maximized.
+        tab.cycle_focused_slot();
+        let text = render_bars_to_text(&tab, 60, 4);
+        assert!(
+            text.contains("[build]"),
+            "after swap 'build' is the bar: {text}"
+        );
+        assert!(
+            !text.contains("[test]"),
+            "after swap the focused 'test' has no bar: {text}"
+        );
+    }
+
+    #[test]
+    fn minimized_bar_disappears_when_its_slot_exits() {
+        let mut tab = Tab::new(make_test_session());
+        tab.container_slots.push(slot("build"));
+        tab.container_slots.push(slot("test"));
+        tab.focused_slot_idx = 0;
+
+        let text = render_bars_to_text(&tab, 60, 4);
+        assert!(text.contains("[test]"));
+
+        // The background step exits → its slot is evicted and the bar is gone.
+        tab.container_slot_events
+            .lock()
+            .unwrap()
+            .push_back(ContainerSlotEvent::Exited {
+                step_name: "test".to_string(),
+            });
+        tab.drain_container_slot_events();
+
+        let text = render_bars_to_text(&tab, 60, 4);
+        assert!(
+            !text.contains("[test]"),
+            "the exited slot's bar must disappear: {text}"
+        );
+    }
+
+    #[test]
+    fn minimized_bar_is_a_bordered_strip_with_container_stats() {
+        let mut tab = Tab::new(make_test_session());
+        tab.container_slots.push(slot("build"));
+        let mut bg = slot("test");
+        if let Some(info) = bg.container_info.as_mut() {
+            info.container_name = "awman-test-77".into();
+            info.latest_stats = Some(crate::engine::agent_runtime::execution::AgentStats {
+                name: "awman-test-77".into(),
+                cpu_percent: 42.5,
+                memory_mb: 256.0,
+            });
+        }
+        tab.container_slots.push(bg);
+        tab.focused_slot_idx = 0;
+
+        // Same 3-row rounded strip as the single-container minimized bar.
+        let text = render_bars_to_text(&tab, 80, PARALLEL_BAR_HEIGHT);
+        assert!(
+            text.contains('\u{256d}') && text.contains('\u{2570}'),
+            "bar must have a rounded rect border: {text}"
+        );
+        assert!(text.contains("[test]"), "bar shows the step name: {text}");
+        assert!(
+            text.contains("awman-test-77"),
+            "bar shows the container name: {text}"
+        );
+        assert!(text.contains("42.5%"), "bar shows CPU: {text}");
+        assert!(text.contains("256MiB"), "bar shows memory: {text}");
+    }
+
+    #[test]
+    fn two_background_slots_stack_two_three_row_bars() {
+        let mut tab = Tab::new(make_test_session());
+        tab.container_slots.push(slot("build"));
+        tab.container_slots.push(slot("test-a"));
+        tab.container_slots.push(slot("test-b"));
+        tab.focused_slot_idx = 0;
+
+        let text = render_bars_to_text(&tab, 80, 2 * PARALLEL_BAR_HEIGHT);
+        assert!(text.contains("[test-a]"), "first bar rendered: {text}");
+        assert!(text.contains("[test-b]"), "second bar rendered: {text}");
+        // Each bar contributes its own top border.
+        let top_corners = text.matches('\u{256d}').count();
+        assert_eq!(top_corners, 2, "two stacked bordered bars: {text}");
+    }
+
+    #[test]
+    fn minimized_stuck_bar_shows_warning_glyph() {
+        let mut tab = Tab::new(make_test_session());
+        tab.container_slots.push(slot("build"));
+        let mut stuck = slot("test");
+        stuck.stuck = true;
+        tab.container_slots.push(stuck);
+        tab.focused_slot_idx = 0;
+
+        let text = render_bars_to_text(&tab, 60, 4);
+        assert!(
+            text.contains('\u{26a0}'),
+            "a stuck minimized bar shows the ⚠ glyph: {text}"
+        );
+    }
+
+    #[test]
+    fn minimized_yolo_bar_shows_countdown_text() {
+        let mut tab = Tab::new(make_test_session());
+        tab.container_slots.push(slot("build"));
+        let mut yoloing = slot("test");
+        yoloing.yolo_mode = true;
+        *yoloing.yolo_state.lock().unwrap() = Some(crate::frontend::tui::tabs::YoloState {
+            step_name: "test".into(),
+            remaining_secs: 7,
+        });
+        tab.container_slots.push(yoloing);
+        tab.focused_slot_idx = 0;
+
+        let text = render_bars_to_text(&tab, 80, 4);
+        assert!(
+            text.contains("Yolo in 7s"),
+            "a yoloing minimized bar shows its remaining time: {text}"
+        );
+    }
+
+    #[test]
+    fn minimized_non_yolo_bar_has_no_countdown_text() {
+        let mut tab = Tab::new(make_test_session());
+        tab.container_slots.push(slot("build"));
+        tab.container_slots.push(slot("test"));
+        tab.focused_slot_idx = 0;
+
+        let text = render_bars_to_text(&tab, 80, 4);
+        assert!(
+            !text.contains("Yolo in"),
+            "a non-yoloing minimized bar shows no countdown: {text}"
+        );
     }
 }

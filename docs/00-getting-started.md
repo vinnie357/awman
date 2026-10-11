@@ -66,9 +66,11 @@ That's it — you have an isolated agent working in your repo.
 - [Using the TUI](02-using-the-tui.md) — tabs, keybindings, the container window
 - [Agent Sessions](03-agent-sessions.md) — all `chat` flags and session management
 - [Workflows](05-workflows.md) — multi-step agent runs with setup and teardown
-- [Yolo Mode](06-yolo-mode.md) — fully autonomous operation
-- [GitHub Integration](11-github-integration.md) — drive `new spec`, `exec workflow`, and `exec prompt` from GitHub issues with `--issue`
-- [Runtimes](12-runtimes.md) — Docker, Apple Containers, and Docker Sandboxes (microVM) isolation
+- [Dynamic Workflows](06-dynamic-workflows.md) — let a leader agent design and run a workflow for you, no file to write
+- [Permission modes](03-agent-sessions.md#permission-modes) — `--plan`, `--auto`, and fully autonomous `--yolo`
+- [GitHub Integration](10-github-integration.md) — drive `new spec`, `exec workflow`, and `exec prompt` from GitHub issues with `--issue`
+- [squad](12-squad.md) — hand recurring work to a group of agents that watches for it and runs a workflow unattended
+- [Runtimes](11-runtimes.md) — Docker, Apple Containers, and Docker Sandboxes (microVM) isolation
 
 ---
 
@@ -79,9 +81,34 @@ That's it — you have an isolated agent working in your repo.
 | Method | Command |
 |--------|---------|
 | Installer script | `curl -s https://prettysmart.dev/install/awman.sh \| sh` |
-| mise | `mise use -g github:prettysmartdev/awman` (pin: `@0.10.0`) |
+| mise | `mise use -g github:prettysmartdev/awman` (pin: `@0.12.0`) |
 | GitHub Releases | Download the asset for your platform, `chmod +x`, move onto `PATH` |
 | From source | `git clone https://github.com/prettysmartdev/awman.git && cd awman && make install` (Rust 1.94+) |
+
+## Altana startup-gate fork candidate
+
+The upstream `0.12.0` release does not include the orchestrator startup gate.
+The `vinnie357/awman` fork identifies its reviewed candidate as `0.12.1`, based
+on upstream commit `c730732b`. This candidate has not been tagged or published;
+deployment records should retain both that upstream base and the exact fork
+commit used to build the binary.
+
+Callers should detect the extension from CLI metadata already exposed by awman:
+
+```sh
+awman chat --help | grep -- --startup-gate-control
+awman exec prompt --help | grep -- --startup-gate-control
+awman exec workflow --help | grep -- --startup-gate-control
+```
+
+All three checks must succeed before an orchestrator sends gate flags. Do not
+infer support from `awman --version` alone: the downstream package version
+identifies the fork candidate, while the command capability check establishes
+that a particular binary exposes the extension.
+
+After a reviewed `v0.12.1` tag and release assets exist, the intended fork
+installation form is `mise use -g github:vinnie357/awman@0.12.1`. Do not use
+that command as evidence that the unpublished candidate is available.
 
 Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-amd64`, `awman-macos-arm64`, `awman-windows-amd64.exe`.
 

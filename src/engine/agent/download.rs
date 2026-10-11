@@ -15,7 +15,12 @@ pub const DOCKERFILE_RAW_URL_PREFIX: &str =
 
 /// Construct the canonical raw URL for an agent Dockerfile.
 pub fn dockerfile_url_for(agent: &str) -> String {
-    format!("{DOCKERFILE_RAW_URL_PREFIX}/Dockerfile.{agent}")
+    let asset_name = if matches!(agent, "agy" | "antigravity") {
+        "antigravity"
+    } else {
+        agent
+    };
+    format!("{DOCKERFILE_RAW_URL_PREFIX}/Dockerfile.{asset_name}")
 }
 
 /// Write `body` to `dest` atomically (tmp file + rename) so a partial failure
@@ -84,5 +89,18 @@ pub async fn download_agent_dockerfile(
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agy_and_legacy_alias_download_the_existing_dockerfile_asset() {
+        let expected = format!("{DOCKERFILE_RAW_URL_PREFIX}/Dockerfile.antigravity");
+
+        assert_eq!(dockerfile_url_for("agy"), expected);
+        assert_eq!(dockerfile_url_for("antigravity"), expected);
     }
 }

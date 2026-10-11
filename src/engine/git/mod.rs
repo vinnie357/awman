@@ -4,7 +4,8 @@
 //! methods are the only public surface. Implements Layer 0's
 //! `GitRootResolver` trait so `Session::open` can use it.
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use crate::data::error::DataError;
@@ -53,6 +54,44 @@ fn run_git_logged(
 pub struct GitVersion {
     pub major: u32,
     pub minor: u32,
+}
+
+/// How a file changed relative to `HEAD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitFileChangeType {
+    Added,
+    Modified,
+    Deleted,
+}
+
+/// A single changed file with its per-file line counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitFileEntry {
+    pub path: String,
+    pub change: GitFileChangeType,
+    pub added: u32,
+    pub removed: u32,
+    /// `git diff --numstat` reports `-\t-\tpath` for binary files. We surface
+    /// these as `+0 -0` with a `(binary)` suffix rather than dropping them.
+    pub binary: bool,
+}
+
+/// The full diff snapshot returned by [`GitEngine::diff_summary`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitDiffSummary {
+    pub branch: Option<String>,
+    pub files: Vec<GitFileEntry>,
+    pub added: u32,
+    pub removed: u32,
+}
+
+/// One parsed `git diff --numstat` row. `added`/`removed` are `None` for
+/// binary files (git prints `-` in those columns).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumstatEntry {
+    pub path: String,
+    pub added: Option<u32>,
+    pub removed: Option<u32>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -133,6 +172,64 @@ impl GitEngine {
             .filter(|l| !l.trim().is_empty())
             .map(|l| l.to_string())
             .collect())
+    }
+
+    /// Return the branch, changed files, and line counts for `root`.
+    ///
+    /// Porcelain status remains the source of truth for the file set, while
+    /// numstat supplies tracked-file counts. Untracked files are counted from
+    /// the working tree, and a repository without commits reports every
+    /// status entry as Added with zero counts, matching the sidebar's former
+    /// behavior exactly.
+    pub fn diff_summary(&self, root: &Path) -> Result<GitDiffSummary, EngineError> {
+        let porcelain_out = run_git_summary(&["status", "--porcelain"], root)?;
+        let porcelain = parse_porcelain_status(&porcelain_out);
+
+        // Empty output means detached HEAD; surface it as None so callers can
+        // choose their own presentation fallback.
+        let branch = run_git_summary(&["branch", "--show-current"], root)
+            .ok()
+            .map(|out| out.trim().to_string())
+            .filter(|name| !name.is_empty());
+
+        // numstat fails when there are no commits (no HEAD). Fall back to an
+        // empty list + "no commits" flag so we still render the file set.
+        let (numstat, has_commits) = match run_git_summary(&["diff", "--numstat", "HEAD"], root) {
+            Ok(out) => (parse_numstat(&out), true),
+            Err(numstat_error) => {
+                if run_git_summary(&["rev-parse", "--verify", "HEAD"], root).is_ok() {
+                    return Err(numstat_error);
+                }
+                (Vec::new(), false)
+            }
+        };
+
+        // No-commits fallback: treat every file as Added with 0 line counts.
+        if !has_commits {
+            let porcelain: Vec<(String, GitFileChangeType)> = porcelain
+                .into_iter()
+                .map(|(path, _)| (path, GitFileChangeType::Added))
+                .collect();
+            let mut summary = build_summary(&porcelain, &[], &HashMap::new());
+            summary.branch = branch;
+            return Ok(summary);
+        }
+
+        // Count lines for untracked files (`??`) not covered by numstat.
+        let mut untracked_lines = HashMap::new();
+        for (path, change) in &porcelain {
+            if *change == GitFileChangeType::Added && !numstat.iter().any(|n| &n.path == path) {
+                let count = match repo_relative_file_path(root, path) {
+                    Some(file_path) => count_file_lines(&file_path),
+                    None => 0,
+                };
+                untracked_lines.insert(path.clone(), count);
+            }
+        }
+
+        let mut summary = build_summary(&porcelain, &numstat, &untracked_lines);
+        summary.branch = branch;
+        Ok(summary)
     }
 
     /// `~/.awman/worktrees/<repo-name>/<NNNN>/` for a work-item.
@@ -320,6 +417,61 @@ impl GitEngine {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(EngineError::Git(format!(
                 "git clone failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read the URL configured for `remote` in `repo_dir`, exactly as stored
+    /// in that repository's git config.
+    ///
+    /// Deliberately uses `git config --get remote.<name>.url` rather than
+    /// `git remote get-url`: the latter applies the user's `url.*.insteadOf`
+    /// rewrites, which would mask the stored value this is meant to inspect.
+    pub fn remote_url(&self, repo_dir: &Path, remote: &str) -> Result<String, EngineError> {
+        let key = format!("remote.{remote}.url");
+        let output = Command::new("git")
+            .args(["config", "--get", &key])
+            .current_dir(repo_dir)
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git config --get {key}`: {e}")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(EngineError::Git(format!(
+                "git config --get {key} failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Fetch the latest commit from `origin` and reset the worktree to the
+    /// remote's default branch. This intentionally discards local changes in
+    /// a managed library clone.
+    pub fn pull_latest(&self, repo_dir: &Path) -> Result<(), EngineError> {
+        let fetch = Command::new("git")
+            .args(["fetch", "origin"])
+            .current_dir(repo_dir)
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git fetch origin`: {e}")))?;
+        if !fetch.status.success() {
+            let stderr = String::from_utf8_lossy(&fetch.stderr);
+            return Err(EngineError::Git(format!(
+                "git fetch origin failed: {}",
+                stderr.trim()
+            )));
+        }
+
+        let reset = Command::new("git")
+            .args(["reset", "--hard", "origin/HEAD"])
+            .current_dir(repo_dir)
+            .output()
+            .map_err(|e| EngineError::Git(format!("invoke `git reset --hard origin/HEAD`: {e}")))?;
+        if !reset.status.success() {
+            let stderr = String::from_utf8_lossy(&reset.stderr);
+            return Err(EngineError::Git(format!(
+                "git reset --hard origin/HEAD failed: {}",
                 stderr.trim()
             )));
         }
@@ -518,13 +670,30 @@ impl GitEngine {
         Ok(())
     }
 
+    /// Merge `branch` into the current branch. With `squash: true` this stages
+    /// the changes via `git merge --squash` and commits `Implement <branch>`;
+    /// with `squash: false` it runs a plain `git merge`, preserving the
+    /// branch's individual commits (fast-forwarding when possible).
+    /// Returns `EngineError::MergeConflict` when the merge fails.
     pub fn merge_branch_logged(
         &self,
         git_root: &Path,
         branch: &str,
         worktree_path: &Path,
+        squash: bool,
         sink: &mut dyn UserMessageSink,
     ) -> Result<(), EngineError> {
+        if !squash {
+            let message = format!("Merge {branch}");
+            let output = run_git_logged(&["merge", "-m", &message, branch], git_root, sink)?;
+            if !output.status.success() {
+                return Err(EngineError::MergeConflict {
+                    branch: branch.to_string(),
+                    worktree_path: worktree_path.to_path_buf(),
+                });
+            }
+            return Ok(());
+        }
         let output = run_git_logged(&["merge", "--squash", branch], git_root, sink)?;
         if !output.status.success() {
             return Err(EngineError::MergeConflict {
@@ -612,6 +781,33 @@ impl GitEngine {
         Ok(())
     }
 
+    /// Logged variant of [`pull_latest`]. Streams each command and its
+    /// combined stdout/stderr through `sink`.
+    pub fn pull_latest_logged(
+        &self,
+        repo_dir: &Path,
+        sink: &mut dyn UserMessageSink,
+    ) -> Result<(), EngineError> {
+        let fetch = run_git_logged(&["fetch", "origin"], repo_dir, sink)?;
+        if !fetch.status.success() {
+            let stderr = String::from_utf8_lossy(&fetch.stderr);
+            return Err(EngineError::Git(format!(
+                "git fetch origin failed: {}",
+                stderr.trim()
+            )));
+        }
+
+        let reset = run_git_logged(&["reset", "--hard", "origin/HEAD"], repo_dir, sink)?;
+        if !reset.status.success() {
+            let stderr = String::from_utf8_lossy(&reset.stderr);
+            return Err(EngineError::Git(format!(
+                "git reset --hard origin/HEAD failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
     /// Logged variant of [`checkout_or_create_branch`]. Forwards every git
     /// invocation and its output to `sink`. The first `git checkout <branch>`
     /// failure is expected (it's how we detect "branch doesn't exist yet") so
@@ -636,6 +832,170 @@ impl GitEngine {
             )));
         }
         Ok("created")
+    }
+}
+
+/// Parse `git status --porcelain` output into `(path, change)` pairs.
+pub fn parse_porcelain_status(stdout: &str) -> Vec<(String, GitFileChangeType)> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        // Porcelain v1 lines are `XY<space>PATH`: two status columns, a
+        // separator space, then the path. Anything shorter is malformed.
+        if line.len() < 4 {
+            continue;
+        }
+        let code = &line[..2];
+        let rest = &line[3..];
+        let path = rename_target(rest);
+        let change = if code == "??" {
+            GitFileChangeType::Added
+        } else if code.contains('D') {
+            GitFileChangeType::Deleted
+        } else {
+            GitFileChangeType::Modified
+        };
+        out.push((path, change));
+    }
+    out
+}
+
+/// Resolve a porcelain rename entry (`old -> new`) to its destination path.
+fn rename_target(rest: &str) -> String {
+    match rest.rfind(" -> ") {
+        Some(idx) => rest[idx + 4..].to_string(),
+        None => rest.to_string(),
+    }
+}
+
+/// Parse `git diff --numstat HEAD` output into per-file entries.
+pub fn parse_numstat(stdout: &str) -> Vec<NumstatEntry> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let (Some(a), Some(d), Some(p)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let added = if a == "-" { None } else { a.parse().ok() };
+        let removed = if d == "-" { None } else { d.parse().ok() };
+        out.push(NumstatEntry {
+            path: resolve_numstat_path(p),
+            added,
+            removed,
+        });
+    }
+    out
+}
+
+/// Resolve a numstat rename path. Handles the two git forms:
+/// `prefix{old => new}suffix` and the bare `old => new`.
+fn resolve_numstat_path(raw: &str) -> String {
+    if let (Some(open), Some(close)) = (raw.find('{'), raw.find('}')) {
+        if open < close {
+            let prefix = &raw[..open];
+            let inner = &raw[open + 1..close];
+            let suffix = &raw[close + 1..];
+            let new_part = inner
+                .split("=>")
+                .nth(1)
+                .map(str::trim)
+                .unwrap_or_else(|| inner.trim());
+            return format!("{prefix}{new_part}{suffix}");
+        }
+    }
+    if raw.contains("=>") {
+        if let Some(new_part) = raw.split("=>").nth(1) {
+            return new_part.trim().to_string();
+        }
+    }
+    raw.to_string()
+}
+
+/// Combine porcelain change-types, numstat line counts, and pre-counted
+/// untracked-file line totals into a [`GitDiffSummary`].
+pub fn build_summary(
+    porcelain: &[(String, GitFileChangeType)],
+    numstat: &[NumstatEntry],
+    untracked_lines: &HashMap<String, u32>,
+) -> GitDiffSummary {
+    let mut files = Vec::new();
+    let mut added = 0u32;
+    let mut removed = 0u32;
+
+    for (path, change) in porcelain {
+        let (file_added, file_removed, binary) =
+            if let Some(entry) = numstat.iter().find(|n| &n.path == path) {
+                match (entry.added, entry.removed) {
+                    (Some(a), Some(r)) => (a, r, false),
+                    // A `-` in either column means git treated it as binary.
+                    _ => (0, 0, true),
+                }
+            } else if let Some(&count) = untracked_lines.get(path) {
+                (count, 0, false)
+            } else {
+                (0, 0, false)
+            };
+
+        added = added.saturating_add(file_added);
+        removed = removed.saturating_add(file_removed);
+        files.push(GitFileEntry {
+            path: path.clone(),
+            change: *change,
+            added: file_added,
+            removed: file_removed,
+            binary,
+        });
+    }
+
+    GitDiffSummary {
+        branch: None,
+        files,
+        added,
+        removed,
+    }
+}
+
+/// Run a git command with explicit args in `root`.
+fn run_git_summary(args: &[&str], root: &Path) -> Result<String, EngineError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .map_err(|e| EngineError::Git(format!("invoke `git {}`: {e}", args.join(" "))))?;
+    if !output.status.success() {
+        return Err(EngineError::Git(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn repo_relative_file_path(root: &Path, rel: &str) -> Option<PathBuf> {
+    let rel = Path::new(rel);
+    if rel.is_absolute() {
+        return None;
+    }
+    if rel.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    Some(root.join(rel))
+}
+
+/// Count the lines in an untracked file. Missing/unreadable files count as 0.
+fn count_file_lines(path: &Path) -> u32 {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        _ => return 0,
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).lines().count() as u32,
+        Err(_) => 0,
     }
 }
 
@@ -864,5 +1224,260 @@ mod tests {
         assert_eq!(actual, expected, "should resolve to main repo .git dir");
 
         g.remove_worktree(repo_tmp.path(), &wt_path).unwrap();
+    }
+
+    // ─── pull_latest ──────────────────────────────────────────────────────────
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to invoke git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Create a local upstream: a `source` working repo pushed to a `bare`
+    /// repo. The `bare` repo's `file://` URL is a network-free stand-in for a
+    /// GitHub remote. Returns `(source, bare)`; keep both alive for the test.
+    fn setup_upstream() -> (tempfile::TempDir, tempfile::TempDir) {
+        let source = tempfile::tempdir().unwrap();
+        init_repo(source.path());
+        let bare = tempfile::tempdir().unwrap();
+        run_git(bare.path(), &["init", "--bare"]);
+        // Deterministic default branch regardless of the host git version.
+        run_git(source.path(), &["branch", "-M", "main"]);
+        let bare_url = format!("file://{}", bare.path().display());
+        run_git(source.path(), &["remote", "add", "origin", &bare_url]);
+        run_git(source.path(), &["push", "-u", "origin", "main"]);
+        // Point the bare repo's HEAD at main so `origin/HEAD` resolves on clone.
+        run_git(bare.path(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        (source, bare)
+    }
+
+    fn bare_url(bare: &tempfile::TempDir) -> String {
+        format!("file://{}", bare.path().display())
+    }
+
+    #[test]
+    fn pull_latest_picks_up_new_upstream_commit() {
+        let (source, bare) = setup_upstream();
+        let g = GitEngine::new();
+        let work = tempfile::tempdir().unwrap();
+        let clone_dir = work.path().join("clone");
+        g.clone_repo(&bare_url(&bare), None, &clone_dir).unwrap();
+        assert!(
+            !clone_dir.join("NEW.md").exists(),
+            "new file must not exist before the upstream commit is pulled"
+        );
+
+        // Add a commit upstream and push it.
+        std::fs::write(source.path().join("NEW.md"), "new upstream content").unwrap();
+        run_git(source.path(), &["add", "."]);
+        run_git(source.path(), &["commit", "-m", "add NEW.md"]);
+        run_git(source.path(), &["push", "origin", "main"]);
+
+        g.pull_latest(&clone_dir)
+            .expect("pull_latest must succeed against a reachable remote");
+        assert!(
+            clone_dir.join("NEW.md").exists(),
+            "pull_latest must bring the new upstream commit into the working tree"
+        );
+    }
+
+    #[test]
+    fn pull_latest_hard_resets_dirty_working_tree() {
+        let (_source, bare) = setup_upstream();
+        let g = GitEngine::new();
+        let work = tempfile::tempdir().unwrap();
+        let clone_dir = work.path().join("clone");
+        g.clone_repo(&bare_url(&bare), None, &clone_dir).unwrap();
+
+        // `init_repo` committed README.md == "init". Dirty it locally.
+        std::fs::write(clone_dir.join("README.md"), "LOCAL UNCOMMITTED EDIT").unwrap();
+
+        g.pull_latest(&clone_dir)
+            .expect("pull_latest must succeed and discard local changes");
+        assert_eq!(
+            std::fs::read_to_string(clone_dir.join("README.md")).unwrap(),
+            "init",
+            "a dirty working tree must be hard-reset back to the upstream content"
+        );
+    }
+
+    #[test]
+    fn pull_latest_errors_on_nonexistent_dir() {
+        let g = GitEngine::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let err = g
+            .pull_latest(&missing)
+            .expect_err("pull_latest on a non-existent dir must error");
+        assert!(
+            matches!(err, EngineError::Git(_)),
+            "must be EngineError::Git; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn pull_latest_errors_on_non_git_dir() {
+        let g = GitEngine::new();
+        let tmp = tempfile::tempdir().unwrap();
+        // A real directory that is not a git repository.
+        let err = g
+            .pull_latest(tmp.path())
+            .expect_err("pull_latest on a non-git dir must error");
+        assert!(
+            matches!(err, EngineError::Git(_)),
+            "must be EngineError::Git; got {err:?}"
+        );
+    }
+
+    #[test]
+    fn porcelain_parser_preserves_sidebar_mappings() {
+        assert_eq!(
+            parse_porcelain_status(
+                "?? newfile.rs\nD  deleted.rs\n D gone.rs\nM  staged.rs\n M changed.rs\nR  old.rs -> new.rs\nM\n"
+            ),
+            vec![
+                ("newfile.rs".into(), GitFileChangeType::Added),
+                ("deleted.rs".into(), GitFileChangeType::Deleted),
+                ("gone.rs".into(), GitFileChangeType::Deleted),
+                ("staged.rs".into(), GitFileChangeType::Modified),
+                ("changed.rs".into(), GitFileChangeType::Modified),
+                ("new.rs".into(), GitFileChangeType::Modified),
+            ]
+        );
+    }
+
+    #[test]
+    fn numstat_parser_handles_counts_binary_and_renames() {
+        assert_eq!(
+            parse_numstat(
+                "5\t2\tsrc/foo.rs\n-\t-\timg.png\n3\t1\t{old.rs => new.rs}\n1\t0\tsrc/{old => new}/file.rs\n2\t2\told.rs => other.rs\ngarbage\n"
+            ),
+            vec![
+                NumstatEntry {
+                    path: "src/foo.rs".into(),
+                    added: Some(5),
+                    removed: Some(2)
+                },
+                NumstatEntry {
+                    path: "img.png".into(),
+                    added: None,
+                    removed: None
+                },
+                NumstatEntry {
+                    path: "new.rs".into(),
+                    added: Some(3),
+                    removed: Some(1)
+                },
+                NumstatEntry {
+                    path: "src/new/file.rs".into(),
+                    added: Some(1),
+                    removed: Some(0)
+                },
+                NumstatEntry {
+                    path: "other.rs".into(),
+                    added: Some(2),
+                    removed: Some(2)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn build_summary_combines_tracked_binary_and_untracked_counts() {
+        let porcelain = vec![
+            ("src/foo.rs".into(), GitFileChangeType::Modified),
+            ("img.png".into(), GitFileChangeType::Added),
+            ("new.txt".into(), GitFileChangeType::Added),
+        ];
+        let numstat = vec![
+            NumstatEntry {
+                path: "src/foo.rs".into(),
+                added: Some(5),
+                removed: Some(2),
+            },
+            NumstatEntry {
+                path: "img.png".into(),
+                added: None,
+                removed: None,
+            },
+        ];
+        let mut untracked = HashMap::new();
+        untracked.insert("new.txt".into(), 10);
+        let summary = build_summary(&porcelain, &numstat, &untracked);
+
+        assert_eq!(summary.added, 15);
+        assert_eq!(summary.removed, 2);
+        assert_eq!(summary.files[0].change, GitFileChangeType::Modified);
+        assert_eq!((summary.files[0].added, summary.files[0].removed), (5, 2));
+        assert!(summary.files[1].binary);
+        assert_eq!((summary.files[2].added, summary.files[2].removed), (10, 0));
+    }
+
+    #[test]
+    fn diff_summary_counts_untracked_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_repo(tmp.path());
+        std::fs::write(tmp.path().join("new.txt"), "one\ntwo\n").unwrap();
+
+        let summary = GitEngine::new().diff_summary(tmp.path()).unwrap();
+        let new_file = summary
+            .files
+            .iter()
+            .find(|file| file.path == "new.txt")
+            .expect("untracked file should be included");
+        assert_eq!(new_file.change, GitFileChangeType::Added);
+        assert_eq!(new_file.added, 2);
+        assert_eq!(new_file.removed, 0);
+        assert_eq!(summary.added, 2);
+    }
+
+    #[test]
+    fn diff_summary_empty_repo_marks_everything_added_with_zero_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        std::fs::write(tmp.path().join("new.txt"), "one\ntwo\n").unwrap();
+
+        let summary = GitEngine::new().diff_summary(tmp.path()).unwrap();
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(summary.files[0].path, "new.txt");
+        assert_eq!(summary.files[0].change, GitFileChangeType::Added);
+        assert_eq!((summary.added, summary.removed), (0, 0));
+        assert_eq!((summary.files[0].added, summary.files[0].removed), (0, 0));
+    }
+
+    #[test]
+    fn untracked_path_validation_rejects_escape_paths() {
+        let root = Path::new("/repo");
+        assert!(repo_relative_file_path(root, "/tmp/outside").is_none());
+        assert!(repo_relative_file_path(root, "../outside").is_none());
+        assert!(repo_relative_file_path(root, "src/../../outside").is_none());
+        assert_eq!(
+            repo_relative_file_path(root, "src/main.rs").unwrap(),
+            PathBuf::from("/repo/src/main.rs")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_line_count_does_not_follow_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "one\ntwo\n").unwrap();
+        let link = tmp.path().join("outside-link");
+        symlink(outside.path(), &link).unwrap();
+        assert_eq!(count_file_lines(&link), 0);
     }
 }

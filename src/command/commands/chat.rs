@@ -11,7 +11,7 @@ use crate::command::commands::{
     collect_all_overlay_specs, parse_overlay_list, report_session_end, resolve_agent,
     resolve_context_overlays, warn_legacy_config,
 };
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::{AgentName, Session};
@@ -20,6 +20,8 @@ use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 
 #[derive(Debug, Clone)]
 pub struct ChatCommandFlags {
+    pub startup_gate_control: Option<std::path::PathBuf>,
+    pub startup_gate_timeout: u64,
     pub non_interactive: bool,
     pub plan: bool,
     pub allow_docker: bool,
@@ -27,6 +29,7 @@ pub struct ChatCommandFlags {
     pub auto: bool,
     pub agent: Option<String>,
     pub model: Option<String>,
+    pub launch_mode: Option<crate::data::config::repo::LaunchMode>,
     pub overlay: Vec<String>,
 }
 
@@ -42,6 +45,7 @@ pub trait ChatCommandFrontend:
     + AgentSetupFrontend
     + AgentAuthFrontend
     + crate::command::commands::agent_setup::HasAgentFrontend
+    + crate::engine::acp::AcpFrontend
     + Send
     + Sync
 {
@@ -64,6 +68,7 @@ pub struct ChatCommand {
     flags: ChatCommandFlags,
     engines: Engines,
     session: Session,
+    startup_gate: Option<crate::data::startup_gate::StartupGateSpec>,
 }
 
 impl ChatCommand {
@@ -72,11 +77,67 @@ impl ChatCommand {
             flags,
             engines,
             session,
+            startup_gate: None,
         }
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10).
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        if ctx.flags.supplied("startup-gate-timeout") && !ctx.flags.supplied("startup-gate-control")
+        {
+            return Err(CommandError::Other(
+                "chat: --startup-gate-timeout requires --startup-gate-control".into(),
+            ));
+        }
+        let command = Self::new(
+            ChatCommandFlags {
+                startup_gate_control: ctx.flags.path("startup-gate-control"),
+                startup_gate_timeout: ctx
+                    .flags
+                    .string("startup-gate-timeout")
+                    .as_deref()
+                    .unwrap_or("120")
+                    .parse()
+                    .map_err(|_| {
+                        CommandError::Other(
+                            "chat: --startup-gate-timeout must be an integer in 1..=3600".into(),
+                        )
+                    })?,
+                non_interactive: ctx.flags.bool("non-interactive"),
+                plan: ctx.flags.bool("plan"),
+                allow_docker: ctx.flags.bool("allow-docker"),
+                yolo: ctx.flags.bool("yolo"),
+                auto: ctx.flags.bool("auto"),
+                agent: ctx.flags.string("agent"),
+                model: ctx.flags.string("model"),
+                launch_mode: crate::command::dispatch::parse_launch_mode(
+                    ctx.flags.string("launch-mode"),
+                    &ctx.path(),
+                )?,
+                overlay: ctx.flags.strs("overlay").to_vec(),
+            },
+            ctx.engines.clone(),
+            ctx.session.clone(),
+        );
+        let startup_gate = crate::command::commands::preflight_startup_gate(
+            "chat",
+            command.flags.startup_gate_control.as_deref(),
+            command.flags.startup_gate_timeout,
+            command.flags.allow_docker,
+        )?;
+        Ok(Self {
+            startup_gate,
+            ..command
+        })
     }
 
     pub fn flags(&self) -> &ChatCommandFlags {
         &self.flags
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_gate(&self) -> Option<&crate::data::startup_gate::StartupGateSpec> {
+        self.startup_gate.as_ref()
     }
 }
 
@@ -89,6 +150,15 @@ impl Command for ChatCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        let startup_gate = match self.startup_gate.clone() {
+            Some(gate) => Some(gate),
+            None => crate::command::commands::preflight_startup_gate(
+                "chat",
+                self.flags.startup_gate_control.as_deref(),
+                self.flags.startup_gate_timeout,
+                self.flags.allow_docker,
+            )?,
+        };
         // 1. Resolve the agent: --agent flag wins over the repo / global default.
         let session = self.session;
         let agent = match resolve_agent(&self.flags.agent, &session) {
@@ -102,11 +172,34 @@ impl Command for ChatCommand {
             }
         };
 
+        // Launch mode is independent of agent resolution.  Resolve it before
+        // mount/overlay/setup work so an unsupported ACP request cannot touch
+        // the container path.
+        let config = command_effective_config(&session, &self.flags);
+        let explicit_acp = self.flags.launch_mode
+            == Some(crate::data::config::repo::LaunchMode::Acp)
+            || (self.flags.agent.is_none()
+                && session.repo_config().agent.is_some()
+                && session.repo_config().launch_mode
+                    == Some(crate::data::config::repo::LaunchMode::Acp));
+        let launch_decision =
+            match crate::command::commands::resolve_launch_mode(&config, &agent, explicit_acp) {
+                Ok(decision) => decision,
+                Err(e) => return Err(CommandError::from(e)),
+            };
+        if launch_decision == crate::command::commands::LaunchModeDecision::StdioWithFallbackWarning
+        {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: crate::command::commands::acp_fallback_warning(&agent),
+            });
+        }
+
         if agent.as_str() == "gemini" {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Warning,
                 text: "The 'gemini' agent is deprecated by Google. \
-                       Migrate to 'antigravity' — run 'awman chat antigravity' \
+                       Migrate to 'antigravity' — run 'awman chat --agent antigravity' \
                        (or 'awman config set agent antigravity' to change your default)."
                     .to_string(),
             });
@@ -201,7 +294,7 @@ impl Command for ChatCommand {
             level: MessageLevel::Info,
             text: "Resolving agent credentials…".into(),
         });
-        let credentials = match self
+        let resolved_credentials = match self
             .engines
             .auth_engine
             .resolve_agent_auth(&session, &agent)
@@ -214,6 +307,17 @@ impl Command for ChatCommand {
                 });
                 return Err(CommandError::from(e));
             }
+        };
+        // File delivery is container-only. Keep sbx on its legacy env-only
+        // keychain path without changing dsbx itself.
+        let credentials = if self.engines.runtime.capabilities().kit_declarative
+            && matches!(
+                resolved_credentials.delivery,
+                crate::engine::auth::CredentialDelivery::File(_)
+            ) {
+            self.engines.auth_engine.agent_env_credentials(&agent)?
+        } else {
+            resolved_credentials
         };
 
         // 5. Resolve context overlays.
@@ -228,6 +332,7 @@ impl Command for ChatCommand {
 
         // 6. Build the run options from flags + credentials.
         let run_opts = AgentRunOptions {
+            startup_gate,
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),
@@ -244,6 +349,12 @@ impl Command for ChatCommand {
             named_skills: collected.named_skills,
             system_prompt,
             context_overlays,
+            launch_mode: match launch_decision {
+                crate::command::commands::LaunchModeDecision::Acp => {
+                    crate::data::config::repo::LaunchMode::Acp
+                }
+                _ => crate::data::config::repo::LaunchMode::Stdio,
+            },
             ..Default::default()
         };
 
@@ -254,7 +365,7 @@ impl Command for ChatCommand {
             &session,
             &agent,
             &run_opts,
-            &credentials.env_vars,
+            &credentials,
             self.engines.runtime.as_ref(),
         ) {
             Ok(o) => o,
@@ -284,27 +395,53 @@ impl Command for ChatCommand {
             level: MessageLevel::Info,
             text: format!("Launching agent ({})…", self.engines.runtime.display_name()),
         });
-        frontend.set_pty_active(true);
-        let container_frontend = frontend.container_frontend_for_pty();
-        let mut execution = match instance.run_with_frontend(container_frontend) {
-            Ok(e) => e,
-            Err(e) => {
-                frontend.set_pty_active(false);
-                frontend.replay_queued();
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("chat: failed to launch agent: {e}"),
-                });
+        let exit = if launch_decision == crate::command::commands::LaunchModeDecision::Acp {
+            let (runtime_frontend, transport) = crate::engine::acp::AcpTransport::channel();
+            let execution = match instance.run_with_frontend(Box::new(runtime_frontend)) {
+                Ok(execution) => execution,
+                Err(e) => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("chat: failed to launch ACP agent: {e}"),
+                    });
+                    return Err(CommandError::from(e));
+                }
+            };
+            let mut acp = crate::engine::acp::AcpSession::from_transport(
+                execution,
+                transport,
+                Box::new(crate::data::message::StderrMessageSink::new()),
+                run_opts.yolo.unwrap_or(YoloMode::Disabled),
+                run_opts.auto.unwrap_or(AutoMode::Disabled),
+            );
+            if let Err(e) = acp.initialize("/workspace").await {
+                // Reap the launched container before returning so it is not left
+                // running after a failed handshake.
+                let _ = acp.shutdown().await;
                 return Err(CommandError::from(e));
             }
+            acp.drive(frontend.as_mut()).await
+        } else {
+            frontend.set_pty_active(true);
+            let container_frontend = frontend.container_frontend_for_pty();
+            let mut execution = match instance.run_with_frontend(container_frontend) {
+                Ok(e) => e,
+                Err(e) => {
+                    frontend.set_pty_active(false);
+                    frontend.replay_queued();
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("chat: failed to launch agent: {e}"),
+                    });
+                    return Err(CommandError::from(e));
+                }
+            };
+            frontend.set_stuck_sender(execution.stuck_sender());
+            let exit = execution.wait().await;
+            frontend.set_pty_active(false);
+            frontend.replay_queued();
+            exit
         };
-        // Publish the stuck sender so the TUI can color the tab when the
-        // agent stops producing output (mirrors the workflow engine's
-        // set_stuck_sender call after each step launch).
-        frontend.set_stuck_sender(execution.stuck_sender());
-        let exit = execution.wait().await;
-        frontend.set_pty_active(false);
-        frontend.replay_queued();
 
         report_session_end(frontend.as_mut(), "chat", &exit);
 
@@ -314,6 +451,23 @@ impl Command for ChatCommand {
             exit_code,
         })
     }
+}
+
+fn command_effective_config(
+    session: &Session,
+    command_flags: &ChatCommandFlags,
+) -> crate::data::config::effective::EffectiveConfig {
+    let current = session.effective_config();
+    let mut flags = current.flags().clone();
+    flags.agent = command_flags.agent.clone();
+    flags.model = command_flags.model.clone();
+    flags.launch_mode = command_flags.launch_mode;
+    crate::data::config::effective::EffectiveConfig::new(
+        flags,
+        current.env().clone(),
+        current.repo().clone(),
+        current.global().clone(),
+    )
 }
 
 pub(crate) async fn ensure_agent_setup(

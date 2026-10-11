@@ -24,14 +24,15 @@ use crate::command::commands::agent_auth::{AgentAuthDecision, AgentAuthFrontend}
 use crate::command::commands::agent_setup::{
     AgentSetupDecision, AgentSetupFrontend, HasAgentFrontend,
 };
-use crate::command::commands::api_server::ApiServeConfig;
-use crate::command::commands::api_server::ApiServerCommandFrontend;
+use crate::command::commands::api_server::{ApiServerCommandFrontend, ApiServerRuntime};
 use crate::command::commands::auth::AuthCommandFrontend;
 use crate::command::commands::chat::ChatCommandFrontend;
 use crate::command::commands::config::{ConfigCommandFrontend, ConfigEditRequest, ConfigFieldRow};
 use crate::command::commands::download::DownloadCommandFrontend;
 use crate::command::commands::exec_prompt::ExecPromptCommandFrontend;
-use crate::command::commands::exec_workflow::{ExecWorkflowCommandFrontend, WorkflowSummary};
+use crate::command::commands::exec_workflow::{
+    ExecWorkflowCommandFrontend, WorkflowResumeDecision, WorkflowResumePrompt, WorkflowSummary,
+};
 use crate::command::commands::mount_scope::{MountScopeDecision, MountScopeFrontend};
 use crate::command::commands::new::NewCommandFrontend;
 use crate::command::commands::remote::RemoteCommandFrontend;
@@ -39,15 +40,17 @@ use crate::command::commands::specs::SpecsCommandFrontend;
 use crate::command::commands::status::StatusCommandFrontend;
 use crate::command::commands::worktree_lifecycle::{
     ExistingWorktreeDecision, PostWorkflowWorktreeAction, PreWorktreeDecision,
-    WorktreeLifecycleFrontend,
+    WorktreeLifecycleFrontend, WorktreeMergeMode,
 };
+use crate::command::dispatch::catalogue::{CommandCatalogue, FrontendKind};
+use crate::command::dispatch::projections::raw_args::ParsedArgs;
 use crate::command::dispatch::CommandFrontend;
 use crate::command::error::CommandError;
 use crate::data::config::repo::WorkItemsConfig;
 use crate::data::message::{UserMessage, UserMessageSink};
 use crate::data::session::AgentName;
 use crate::data::workflow_definition::WorkflowStep;
-use crate::engine::agent_runtime::execution::AgentExitInfo;
+use crate::engine::acp::{AcpFrontend, PermissionDecision, PermissionRequest, SessionUpdate};
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentProgress, AgentStatus};
 use crate::engine::error::EngineError;
 use crate::engine::init::frontend::InitFrontend;
@@ -58,28 +61,21 @@ use crate::engine::ready::phase::ReadyPhase;
 use crate::engine::ready::summary::ReadySummary;
 use crate::engine::step_status::StepStatus;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
+    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::frontend::WorkflowFrontend;
 
-/// Parsed flag/argument store populated from the HTTP request's `args` vector.
-#[derive(Debug)]
-struct ParsedArgs {
-    bools: HashMap<String, bool>,
-    strings: HashMap<String, String>,
-    strings_vec: HashMap<String, Vec<String>>,
-    paths: HashMap<String, PathBuf>,
-    enums: HashMap<String, String>,
-    u16s: HashMap<String, u16>,
-    args: HashMap<String, String>,
-    args_vec: HashMap<String, Vec<String>>,
-}
-
 /// The API dispatch frontend. Emits typed events to an `EventBusSender`
 /// for distribution to logfile writers and SSE clients.
 pub struct ApiDispatchFrontend {
+    /// Typed flags/arguments parsed by Layer 2 (`CommandCatalogue::parse_raw_args`).
+    /// Empty when parsing failed; the error is surfaced via `parse_error`.
     parsed: ParsedArgs,
+    /// A structured parse error captured at construction time, if any. Every
+    /// `CommandFrontend` accessor returns it so Dispatch aborts the command
+    /// rather than running with silently-dropped flags. `None` on success.
+    parse_error: Option<CommandError>,
     event_bus: EventBusSender,
     line_buffer_stdout: String,
     line_buffer_stderr: String,
@@ -95,6 +91,38 @@ pub struct ApiDispatchFrontend {
     done_emitted: std::sync::atomic::AtomicBool,
     /// Throttle: last time a yolo countdown status message was emitted.
     last_sink_message_time: Option<std::time::Instant>,
+    /// What the countdown currently being ticked will do when it expires
+    /// (WI-0115 §3). An API consumer reading "auto-advancing" through a
+    /// failure retry would draw the wrong conclusion about its run.
+    countdown_kind: CountdownKind,
+}
+
+#[async_trait::async_trait]
+impl crate::command::commands::squad::commands::SquadCommandFrontend for ApiDispatchFrontend {}
+
+impl crate::command::commands::squad::attach::SquadAttachFrontend for ApiDispatchFrontend {
+    fn ask_pick_candidate(
+        &mut self,
+        _candidates: &[crate::command::commands::squad::attach::SquadContainer],
+    ) -> Result<Option<usize>, CommandError> {
+        Err(CommandError::NotAvailableForFrontend {
+            command: "squad attach".into(),
+            frontend: "api".into(),
+        })
+    }
+
+    fn on_slot_attached(
+        &mut self,
+        _step: &str,
+        _instance: Box<dyn crate::engine::agent_runtime::AgentInstance>,
+    ) -> Result<(), CommandError> {
+        Err(CommandError::NotAvailableForFrontend {
+            command: "squad attach".into(),
+            frontend: "api".into(),
+        })
+    }
+
+    fn on_slot_exited(&mut self, _step: &str) {}
 }
 
 impl ApiDispatchFrontend {
@@ -103,11 +131,27 @@ impl ApiDispatchFrontend {
     /// `event_bus` is the sender handle for emitting execution events.
     /// `subcommand` is the command path (e.g. "exec prompt" → ["exec", "prompt"]).
     /// `args` is the raw args vector from the HTTP request body.
+    ///
+    /// Parsing is delegated wholesale to Layer 2
+    /// ([`CommandCatalogue::parse_raw_args_with_profile`]): the API frontend
+    /// hands the raw HTTP strings straight to the catalogue and keeps no
+    /// parsing, type-coercion, or flag-default policy of its own (work item
+    /// 0097, Findings A + D). The `Api` frontend profile is what forces
+    /// `non-interactive=true` and defaults `yolo=true`.
     pub fn new(subcommand: &str, args: &[String], event_bus: EventBusSender) -> Self {
-        let parsed = parse_args_to_flags(subcommand, args);
+        let path: Vec<&str> = subcommand.split_whitespace().collect();
+        let (parsed, parse_error) = match CommandCatalogue::get().parse_raw_args_with_profile(
+            &path,
+            args,
+            FrontendKind::Api,
+        ) {
+            Ok(parsed) => (parsed, None),
+            Err(e) => (ParsedArgs::default(), Some(e)),
+        };
 
         Self {
             parsed,
+            parse_error,
             event_bus,
             line_buffer_stdout: String::new(),
             line_buffer_stderr: String::new(),
@@ -115,6 +159,7 @@ impl ApiDispatchFrontend {
             phase_emitted: std::sync::Mutex::new(false),
             done_emitted: std::sync::atomic::AtomicBool::new(false),
             last_sink_message_time: None,
+            countdown_kind: CountdownKind::StuckStep,
         }
     }
 
@@ -187,147 +232,6 @@ impl Drop for ApiDispatchFrontend {
     }
 }
 
-/// Parse a raw args vector (CLI-style flags/positionals) into typed storage.
-fn parse_args_to_flags(subcommand: &str, args: &[String]) -> ParsedArgs {
-    let mut bools = HashMap::new();
-    let mut strings = HashMap::new();
-    let mut strings_vec: HashMap<String, Vec<String>> = HashMap::new();
-    let mut paths = HashMap::new();
-    let mut enums = HashMap::new();
-    let mut u16s = HashMap::new();
-    let mut positional_args = HashMap::new();
-    let positional_args_vec: HashMap<String, Vec<String>> = HashMap::new();
-
-    let mut i = 0;
-    let mut positionals: Vec<String> = Vec::new();
-    let mut after_double_dash = false;
-
-    while i < args.len() {
-        let arg = &args[i];
-
-        if arg == "--" {
-            after_double_dash = true;
-            i += 1;
-            continue;
-        }
-
-        if after_double_dash {
-            positionals.push(arg.clone());
-            i += 1;
-            continue;
-        }
-
-        if let Some(flag_name) = arg.strip_prefix("--") {
-            if let Some((key, val)) = flag_name.split_once('=') {
-                strings.insert(key.to_string(), val.to_string());
-                strings_vec
-                    .entry(key.to_string())
-                    .or_default()
-                    .push(val.to_string());
-            } else if i + 1 < args.len() && !args[i + 1].starts_with("--") {
-                let next = &args[i + 1];
-                if next == "true" || next == "false" {
-                    bools.insert(flag_name.to_string(), next == "true");
-                } else if let Ok(n) = next.parse::<u16>() {
-                    u16s.insert(flag_name.to_string(), n);
-                    strings.insert(flag_name.to_string(), next.clone());
-                } else {
-                    strings.insert(flag_name.to_string(), next.clone());
-                    strings_vec
-                        .entry(flag_name.to_string())
-                        .or_default()
-                        .push(next.clone());
-                    enums.insert(flag_name.to_string(), next.clone());
-                    paths.insert(flag_name.to_string(), PathBuf::from(next));
-                }
-                i += 1;
-            } else {
-                bools.insert(flag_name.to_string(), true);
-            }
-        } else {
-            positionals.push(arg.clone());
-        }
-        i += 1;
-    }
-
-    // Map positionals to argument names based on subcommand.
-    match subcommand {
-        "exec prompt" => {
-            if !positionals.is_empty() {
-                positional_args.insert("prompt".to_string(), positionals.join(" "));
-            }
-        }
-        "exec workflow" => {
-            if let Some(wf) = positionals.first() {
-                positional_args.insert("workflow".to_string(), wf.clone());
-                paths.insert("workflow".to_string(), PathBuf::from(wf));
-            }
-        }
-        "specs amend" => {
-            if let Some(wi) = positionals.first() {
-                positional_args.insert("work_item".to_string(), wi.clone());
-            }
-        }
-        "config get" => {
-            if let Some(f) = positionals.first() {
-                positional_args.insert("field".to_string(), f.clone());
-            }
-        }
-        "config set" => {
-            if let Some(f) = positionals.first() {
-                positional_args.insert("field".to_string(), f.clone());
-            }
-            if let Some(v) = positionals.get(1) {
-                positional_args.insert("value".to_string(), v.clone());
-            }
-        }
-        "remote exec workflow" => {
-            if let Some(wf) = positionals.first() {
-                positional_args.insert("workflow".to_string(), wf.clone());
-                paths.insert("workflow".to_string(), PathBuf::from(wf));
-            }
-        }
-        "remote exec prompt" => {
-            if !positionals.is_empty() {
-                positional_args.insert("prompt".to_string(), positionals.join(" "));
-            }
-        }
-        "remote session start" => {}
-        "remote session kill" => {
-            if let Some(s) = positionals.first() {
-                positional_args.insert("session_id".to_string(), s.clone());
-            }
-        }
-        _ => {
-            // For other commands, first positional is a generic argument.
-            if let Some(first) = positionals.first() {
-                positional_args.insert("prompt".to_string(), first.clone());
-            }
-        }
-    }
-
-    // --yolo and --non-interactive are always implied for API dispatch.
-    // Each command is invoked over HTTP — no human is attached to the
-    // worker's stdin even when the API server itself was launched in the
-    // foreground with a TTY. Forcing non_interactive=true keeps the engine
-    // from requesting a PTY for the agent container, which on Apple's
-    // `container` CLI surfaces as `ENOTTY` / "Inappropriate ioctl for
-    // device" when stdin is piped.
-    bools.insert("non-interactive".to_string(), true);
-    bools.insert("yolo".to_string(), true);
-
-    ParsedArgs {
-        bools,
-        strings,
-        strings_vec,
-        paths,
-        enums,
-        u16s,
-        args: positional_args,
-        args_vec: positional_args_vec,
-    }
-}
-
 // ─── UserMessageSink ────────────────────────────────────────────────────────
 
 impl UserMessageSink for ApiDispatchFrontend {
@@ -349,9 +253,22 @@ impl UserMessageSink for ApiDispatchFrontend {
 
 // ─── CommandFrontend (flag/argument access) ─────────────────────────────────
 
+impl ApiDispatchFrontend {
+    /// Re-materialize the construction-time parse error, if any. The first
+    /// accessor Dispatch calls returns this so a malformed request aborts the
+    /// command instead of running with silently-dropped flags.
+    fn check_parse(&self) -> Result<(), CommandError> {
+        match &self.parse_error {
+            None => Ok(()),
+            Some(e) => Err(clone_parse_error(e)),
+        }
+    }
+}
+
 impl CommandFrontend for ApiDispatchFrontend {
     fn flag_bool(&self, _command_path: &[&str], flag: &str) -> Result<Option<bool>, CommandError> {
-        Ok(self.parsed.bools.get(flag).copied())
+        self.check_parse()?;
+        Ok(self.parsed.flag_bool(flag))
     }
 
     fn flag_string(
@@ -359,7 +276,8 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<String>, CommandError> {
-        Ok(self.parsed.strings.get(flag).cloned())
+        self.check_parse()?;
+        Ok(self.parsed.flag_string(flag))
     }
 
     fn flag_strings(
@@ -367,12 +285,8 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Vec<String>, CommandError> {
-        Ok(self
-            .parsed
-            .strings_vec
-            .get(flag)
-            .cloned()
-            .unwrap_or_default())
+        self.check_parse()?;
+        Ok(self.parsed.flag_strings(flag))
     }
 
     fn flag_path(
@@ -380,7 +294,8 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<PathBuf>, CommandError> {
-        Ok(self.parsed.paths.get(flag).cloned())
+        self.check_parse()?;
+        Ok(self.parsed.flag_path(flag))
     }
 
     fn flag_enum(
@@ -388,19 +303,75 @@ impl CommandFrontend for ApiDispatchFrontend {
         _command_path: &[&str],
         flag: &str,
     ) -> Result<Option<String>, CommandError> {
-        Ok(self.parsed.enums.get(flag).cloned())
+        self.check_parse()?;
+        Ok(self.parsed.flag_enum(flag))
     }
 
     fn flag_u16(&self, _command_path: &[&str], flag: &str) -> Result<Option<u16>, CommandError> {
-        Ok(self.parsed.u16s.get(flag).copied())
+        self.check_parse()?;
+        Ok(self.parsed.flag_u16(flag))
+    }
+
+    fn flag_usize(
+        &self,
+        _command_path: &[&str],
+        flag: &str,
+    ) -> Result<Option<usize>, CommandError> {
+        self.check_parse()?;
+        Ok(self.parsed.flag_usize(flag))
     }
 
     fn argument(&self, _command_path: &[&str], name: &str) -> Result<Option<String>, CommandError> {
-        Ok(self.parsed.args.get(name).cloned())
+        self.check_parse()?;
+        Ok(self.parsed.argument(name))
     }
 
     fn arguments(&self, _command_path: &[&str], name: &str) -> Result<Vec<String>, CommandError> {
-        Ok(self.parsed.args_vec.get(name).cloned().unwrap_or_default())
+        self.check_parse()?;
+        Ok(self.parsed.arguments(name))
+    }
+}
+
+/// Reconstruct a parse-stage [`CommandError`] so accessors can return it more
+/// than once from `&self` (the type is not `Clone` because it wraps engine/data
+/// errors, but the parse-stage variants carry only owned string data).
+fn clone_parse_error(e: &CommandError) -> CommandError {
+    match e {
+        CommandError::UnknownCommand { path } => {
+            CommandError::UnknownCommand { path: path.clone() }
+        }
+        CommandError::UnknownFlag { command, flag } => CommandError::UnknownFlag {
+            command: command.clone(),
+            flag: flag.clone(),
+        },
+        CommandError::InvalidFlagValue {
+            command,
+            flag,
+            reason,
+        } => CommandError::InvalidFlagValue {
+            command: command.clone(),
+            flag: flag.clone(),
+            reason: reason.clone(),
+        },
+        CommandError::MissingRequiredFlag { command, flag } => CommandError::MissingRequiredFlag {
+            command: command.clone(),
+            flag: flag.clone(),
+        },
+        CommandError::MissingRequiredArgument { command, argument } => {
+            CommandError::MissingRequiredArgument {
+                command: command.clone(),
+                argument: argument.clone(),
+            }
+        }
+        CommandError::UnexpectedArgument { command, argument } => {
+            CommandError::UnexpectedArgument {
+                command: command.clone(),
+                argument: argument.clone(),
+            }
+        }
+        // parse_raw_args only produces the variants above; anything else is
+        // rendered to a stable string so the command still aborts cleanly.
+        other => CommandError::Other(other.to_string()),
     }
 }
 
@@ -503,8 +474,6 @@ impl HasAgentFrontend for ApiDispatchFrontend {
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink {
             event_bus: self.event_bus.clone(),
-            line_buffer_stdout: String::new(),
-            line_buffer_stderr: String::new(),
         })
     }
 }
@@ -512,8 +481,6 @@ impl HasAgentFrontend for ApiDispatchFrontend {
 /// Standalone container frontend that emits events to the EventBus.
 struct ApiContainerSink {
     event_bus: EventBusSender,
-    line_buffer_stdout: String,
-    line_buffer_stderr: String,
 }
 
 impl UserMessageSink for ApiContainerSink {
@@ -687,21 +654,26 @@ impl WorkflowFrontend for ApiDispatchFrontend {
             .map(|t| t.elapsed() >= YOLO_SINK_THROTTLE_INTERVAL)
             .unwrap_or(true);
         if should_emit {
+            let what = match self.countdown_kind {
+                CountdownKind::StuckStep => "auto-advancing",
+                CountdownKind::FailureRetry => "retrying after failure",
+            };
             self.event_bus.emit(EventPayload::StatusMessage {
                 phase: "yolo_countdown".to_string(),
-                message: format!(
-                    "Step '{}': auto-advancing in {}s",
-                    step_name,
-                    remaining.as_secs()
-                ),
+                message: format!("Step '{}': {what} in {}s", step_name, remaining.as_secs()),
             });
             self.last_sink_message_time = Some(std::time::Instant::now());
         }
         Ok(YoloTickOutcome::Continue)
     }
 
+    fn yolo_countdown_started(&mut self, _step_name: &str, kind: CountdownKind) {
+        self.countdown_kind = kind;
+    }
+
     fn yolo_countdown_finished(&mut self, _step_name: &str) {
         self.last_sink_message_time = None;
+        self.countdown_kind = CountdownKind::default();
     }
 
     fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
@@ -723,6 +695,32 @@ impl WorkflowFrontend for ApiDispatchFrontend {
     }
 
     fn report_step_output(&mut self, _step: &WorkflowStep, _output: StepOutput) {}
+
+    fn report_parallel_step_launched(&mut self, step_name: &str, agent: &str, model: Option<&str>) {
+        let idx = self.step_index_for(step_name);
+        self.event_bus
+            .emit(EventPayload::WorkflowParallelStepLaunched {
+                step_name: step_name.to_string(),
+                step_index: idx,
+                agent: agent.to_string(),
+                model: model.map(|m| m.to_string()),
+            });
+    }
+
+    fn report_parallel_step_exited(&mut self, step_name: &str, exit_code: i32) {
+        let idx = self.step_index_for(step_name);
+        self.event_bus
+            .emit(EventPayload::WorkflowParallelStepExited {
+                step_name: step_name.to_string(),
+                step_index: idx,
+                exit_code,
+            });
+    }
+
+    fn report_parallel_group_finished(&mut self) {
+        self.event_bus
+            .emit(EventPayload::WorkflowParallelGroupFinished);
+    }
 
     fn report_workflow_progress(
         &mut self,
@@ -754,13 +752,9 @@ impl WorkflowFrontend for ApiDispatchFrontend {
         Ok(true)
     }
 
-    fn user_choose_after_step_failure(
-        &mut self,
-        _step: &WorkflowStep,
-        _exit: &AgentExitInfo,
-    ) -> Result<StepFailureChoice, EngineError> {
-        Ok(StepFailureChoice::Abort)
-    }
+    // `supports_interactive_recovery` keeps its `false` default: an API run has
+    // no user to ask, so a failed step takes the engine's countdown-and-retry
+    // path (WI-0115 §3).
 
     fn on_setup_step_started(&mut self, description: &str) {
         self.event_bus.emit(EventPayload::StatusMessage {
@@ -920,8 +914,9 @@ impl WorktreeLifecycleFrontend for ApiDispatchFrontend {
         Ok(Some(suggested_message.to_string()))
     }
 
-    fn confirm_squash_merge(&mut self, _branch: &str) -> Result<bool, CommandError> {
-        Ok(true)
+    fn ask_merge_mode(&mut self, _branch: &str) -> Result<WorktreeMergeMode, CommandError> {
+        // Headless API runs keep the historical behaviour: squash merge.
+        Ok(WorktreeMergeMode::Squash)
     }
 
     fn confirm_worktree_cleanup(
@@ -990,8 +985,6 @@ impl InitFrontend for ApiDispatchFrontend {
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink {
             event_bus: self.event_bus.clone(),
-            line_buffer_stdout: String::new(),
-            line_buffer_stderr: String::new(),
         })
     }
     fn report_summary(&mut self, _summary: &InitSummary) {}
@@ -1024,8 +1017,6 @@ impl ReadyFrontend for ApiDispatchFrontend {
     fn container_frontend(&mut self) -> Box<dyn AgentFrontend> {
         Box::new(ApiContainerSink {
             event_bus: self.event_bus.clone(),
-            line_buffer_stdout: String::new(),
-            line_buffer_stderr: String::new(),
         })
     }
     fn report_summary(&mut self, _summary: &ReadySummary) {}
@@ -1044,14 +1035,30 @@ impl ConfigCommandFrontend for ApiDispatchFrontend {
     fn present_config_table(
         &mut self,
         _rows: &[ConfigFieldRow],
+        _rejected: Option<&crate::command::commands::config::ConfigEditRejection>,
     ) -> Result<Option<ConfigEditRequest>, CommandError> {
         Ok(None)
     }
 }
 
+// `awman clean` is blocked for the API frontend at the catalogue layer
+// (`api_allowed: false`); this impl exists only to satisfy the `DispatchFrontend`
+// supertrait bound and never runs. It never confirms a deletion.
+impl crate::command::commands::clean::CleanCommandFrontend for ApiDispatchFrontend {
+    fn confirm_deletion(
+        &mut self,
+        _summary: &crate::command::commands::clean::CleanSummary,
+    ) -> Result<bool, CommandError> {
+        Ok(false)
+    }
+}
+
 #[async_trait]
 impl ApiServerCommandFrontend for ApiDispatchFrontend {
-    async fn serve_until_shutdown(&mut self, _config: ApiServeConfig) -> Result<(), CommandError> {
+    async fn serve_until_shutdown(
+        &mut self,
+        _runtime: ApiServerRuntime,
+    ) -> Result<(), CommandError> {
         Err(CommandError::Other(
             "Cannot start a nested API server from within API dispatch".into(),
         ))
@@ -1060,6 +1067,26 @@ impl ApiServerCommandFrontend for ApiDispatchFrontend {
 
 impl ChatCommandFrontend for ApiDispatchFrontend {
     fn set_pty_active(&mut self, _active: bool) {}
+}
+
+impl AcpFrontend for ApiDispatchFrontend {
+    fn render_update(&mut self, update: SessionUpdate) {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "acp".to_string(),
+            message: crate::engine::acp::protocol::summarize_update(&update),
+        });
+    }
+
+    fn request_permission(&mut self, _request: PermissionRequest) -> PermissionDecision {
+        // Fail closed: `AcpSession` only reaches the frontend when neither
+        // `--yolo` nor `--auto` is set, and API dispatch has no way to ask a
+        // human, so it must deny rather than silently approve a tool call.
+        PermissionDecision::Cancelled
+    }
+
+    fn next_prompt(&mut self) -> Option<String> {
+        None
+    }
 }
 
 impl ExecPromptCommandFrontend for ApiDispatchFrontend {}
@@ -1076,14 +1103,28 @@ impl ExecWorkflowCommandFrontend for ApiDispatchFrontend {
             ),
         });
     }
-    fn ask_workflow_resume_or_fresh(
+    /// No interactive prompt, so keep the API default of preserving work:
+    /// resume at the step the previous run stopped on.
+    fn ask_workflow_resume(
         &mut self,
-        _workflow_name: &str,
-        _completed_steps: usize,
-        _total_steps: usize,
-    ) -> Result<bool, CommandError> {
-        // API mode has no interactive prompt; resume by default.
-        Ok(true)
+        prompt: &WorkflowResumePrompt,
+    ) -> Result<WorkflowResumeDecision, CommandError> {
+        Ok(prompt.resume_from_stop_point())
+    }
+
+    fn notify_dynamic_workflow_resume_unavailable(
+        &mut self,
+        work_item: u32,
+        reason: &str,
+    ) -> Result<(), CommandError> {
+        self.event_bus.emit(EventPayload::StatusMessage {
+            phase: "workflow".to_string(),
+            message: format!(
+                "cannot resume the previous dynamic workflow for work item {work_item:04}: \
+                 {reason}"
+            ),
+        });
+        Ok(())
     }
 }
 
@@ -1111,55 +1152,68 @@ mod tests {
     }
 
     #[test]
-    fn flag_bool_with_explicit_true_value() {
-        let f = make_frontend("chat", &["--background", "true"]);
+    fn flag_bool_presence_sets_true() {
+        // Bools are `SetTrue` (clap parity): presence implies true; no value
+        // token is consumed. `--background` is visible on `squad start`.
+        let f = make_frontend("squad start", &["--background"]);
         assert_eq!(
-            f.flag_bool(&["api", "start"], "background").unwrap(),
+            f.flag_bool(&["squad", "start"], "background").unwrap(),
             Some(true)
         );
     }
 
     #[test]
-    fn flag_bool_with_explicit_false_value() {
-        let f = make_frontend("chat", &["--background", "false"]);
-        assert_eq!(
-            f.flag_bool(&["api", "start"], "background").unwrap(),
-            Some(false)
-        );
+    fn unknown_flag_surfaces_structured_error_from_accessor() {
+        // Catalogue-driven parsing rejects an undeclared flag rather than
+        // silently dropping it; the error surfaces on the first accessor call.
+        let f = make_frontend("exec prompt", &["--not-a-real-flag"]);
+        let err = f.flag_bool(&["exec", "prompt"], "yolo").unwrap_err();
+        assert!(matches!(err, CommandError::UnknownFlag { .. }));
     }
 
     // ─── flag_string ──────────────────────────────────────────────────────────
 
     #[test]
     fn flag_string_parses_value_after_flag() {
-        let f = make_frontend("chat", &["--session", "sess-123"]);
+        let f = make_frontend("exec prompt", &["--agent", "claude"]);
         assert_eq!(
-            f.flag_string(&["chat"], "session").unwrap().as_deref(),
-            Some("sess-123")
+            f.flag_string(&["exec", "prompt"], "agent")
+                .unwrap()
+                .as_deref(),
+            Some("claude")
         );
     }
 
     #[test]
     fn flag_string_parses_equals_syntax() {
-        let f = make_frontend("chat", &["--session=sess-456"]);
+        let f = make_frontend("exec prompt", &["--agent=claude"]);
         assert_eq!(
-            f.flag_string(&["chat"], "session").unwrap().as_deref(),
-            Some("sess-456")
+            f.flag_string(&["exec", "prompt"], "agent")
+                .unwrap()
+                .as_deref(),
+            Some("claude")
         );
     }
 
     #[test]
     fn flag_string_absent_returns_none() {
-        let f = make_frontend("chat", &[]);
-        assert_eq!(f.flag_string(&["chat"], "session").unwrap(), None);
+        let f = make_frontend("exec prompt", &[]);
+        assert_eq!(f.flag_string(&["exec", "prompt"], "agent").unwrap(), None);
     }
 
     // ─── flag_u16 ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn flag_u16_parses_port_value() {
-        let f = make_frontend("api start", &["--port", "9876"]);
-        assert_eq!(f.flag_u16(&["api", "start"], "port").unwrap(), Some(9876));
+    fn flag_u16_parses_visible_port_and_rejects_out_of_range() {
+        let f = make_frontend("squad start", &["--port", "9876"]);
+        assert_eq!(f.flag_u16(&["squad", "start"], "port").unwrap(), Some(9876));
+
+        let invalid = make_frontend("squad start", &["--port", "65536"]);
+        let error = invalid.flag_u16(&["squad", "start"], "port").unwrap_err();
+        assert!(matches!(
+            error,
+            CommandError::InvalidFlagValue { flag, .. } if flag == "port"
+        ));
     }
 
     // ─── argument (positional) ────────────────────────────────────────────────
@@ -1201,10 +1255,35 @@ mod tests {
 
     #[test]
     fn flag_strings_collects_multiple_values() {
-        let f = make_frontend("api start", &["--workdirs", "/a", "--workdirs", "/b"]);
-        let dirs = f.flag_strings(&["api", "start"], "workdirs").unwrap();
-        assert!(dirs.contains(&"/a".to_string()));
-        assert!(dirs.contains(&"/b".to_string()));
+        let f = make_frontend(
+            "exec prompt",
+            &["--overlay", "dir(/a)", "--overlay", "dir(/b)"],
+        );
+        let dirs = f.flag_strings(&["exec", "prompt"], "overlay").unwrap();
+        assert!(dirs.contains(&"dir(/a)".to_string()));
+        assert!(dirs.contains(&"dir(/b)".to_string()));
+    }
+
+    #[test]
+    fn api_start_cli_only_flags_are_rejected_instead_of_silently_deleted() {
+        for (flag, args) in [
+            ("background", &["--background"][..]),
+            ("port", &["--port", "9876"][..]),
+            ("workdirs", &["--workdirs", "/a"][..]),
+        ] {
+            let f = make_frontend("api start", args);
+            let error = f.flag_bool(&["api", "start"], "background").unwrap_err();
+            match error {
+                CommandError::UnknownFlag {
+                    command,
+                    flag: actual,
+                } => {
+                    assert_eq!(command, vec!["api".to_string(), "start".to_string()]);
+                    assert_eq!(actual, flag);
+                }
+                other => panic!("expected exact API visibility rejection, got {other:?}"),
+            }
+        }
     }
 
     // ─── Drop emits Done and flushes partial lines ─────────────────────────────
@@ -1314,6 +1393,67 @@ mod tests {
             }
         }
         count
+    }
+
+    /// Collect the `yolo_countdown` status messages emitted so far.
+    fn countdown_messages(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::data::execution_event::ExecutionEvent>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            if let EventPayload::StatusMessage { phase, message } = &evt.payload {
+                if phase == "yolo_countdown" {
+                    out.push(message.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// WI-0115 §3: a failure retry and a stuck-step advance share one reporting
+    /// channel, but they mean opposite things. An API consumer told a failing
+    /// run is "auto-advancing" would conclude the workflow is making progress.
+    #[tokio::test]
+    async fn a_failure_retry_countdown_is_not_reported_as_auto_advancing() {
+        use crate::engine::workflow::frontend::WorkflowFrontend as _;
+        let bus = crate::frontend::api::event_bus::EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let mut fe = ApiDispatchFrontend::new("exec workflow", &[], bus.sender());
+
+        fe.yolo_countdown_started("build", CountdownKind::FailureRetry);
+        fe.yolo_countdown_tick(
+            "build",
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let messages = countdown_messages(&mut rx);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("retrying after failure"),
+            "a retry must say so: {}",
+            messages[0]
+        );
+
+        // And the kind resets, so the next stuck-step countdown reads normally.
+        fe.yolo_countdown_finished("build");
+        fe.yolo_countdown_tick(
+            "test",
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(60),
+        )
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let messages = countdown_messages(&mut rx);
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("auto-advancing"),
+            "a stuck-step countdown must keep its own wording: {}",
+            messages[0]
+        );
     }
 
     /// Ten rapid ticks must produce exactly one `yolo_countdown` status message

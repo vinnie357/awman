@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::command::dispatch::catalogue::{ArgumentKind, CommandCatalogue, CommandSpec, FlagKind};
+use crate::command::dispatch::catalogue::{
+    ArgumentKind, CommandCatalogue, CommandSpec, FlagKind, FrontendVisibility,
+};
 use crate::command::error::CommandError;
 
 /// Result of `parse_command_box_input`. `path` is the resolved canonical
@@ -94,6 +96,15 @@ pub fn parse(
                 let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                 CommandError::unknown_flag(&path_strs, name)
             })?;
+            if !matches!(
+                flag_spec.frontends,
+                FrontendVisibility::All
+                    | FrontendVisibility::TuiOnly
+                    | FrontendVisibility::CliAndTui
+            ) {
+                let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+                return Err(CommandError::unknown_flag(&path_strs, name));
+            }
             // Helper closure to read a value: prefer inline; otherwise advance idx.
             let mut read_value =
                 |inline: Option<String>, msg: &str| -> Result<String, CommandError> {
@@ -124,7 +135,7 @@ pub fn parse(
                     let value = read_value(inline_value, &format!("flag --{name} needs a value"))?;
                     flags.insert(name.to_string(), FlagValue::String(value));
                 }
-                FlagKind::U16 => {
+                FlagKind::U16 | FlagKind::UsizeAtLeastOne => {
                     let raw = read_value(inline_value, &format!("flag --{name} needs a number"))?;
                     flags.insert(name.to_string(), FlagValue::String(raw));
                 }
@@ -151,7 +162,15 @@ pub fn parse(
             let flag_spec = current
                 .flags
                 .iter()
-                .find(|f| f.short == Some(ch))
+                .find(|f| {
+                    f.short == Some(ch)
+                        && matches!(
+                            f.frontends,
+                            FrontendVisibility::All
+                                | FrontendVisibility::TuiOnly
+                                | FrontendVisibility::CliAndTui
+                        )
+                })
                 .ok_or_else(|| {
                     let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
                     CommandError::unknown_flag(&path_strs, format!("-{ch}"))
@@ -173,6 +192,30 @@ pub fn parse(
         } else {
             positionals.push(tok.clone());
             idx += 1;
+        }
+    }
+
+    // Keep the TUI command box in parity with the clap and API projections:
+    // all frontends must reject mutually-exclusive catalogue flags before a
+    // command is built or any host-side operation can run.
+    for flag in current.flags {
+        if !flags.contains_key(flag.long) {
+            continue;
+        }
+        if let Some(conflicting) = flag
+            .conflicts_with
+            .iter()
+            .find(|conflicting| flags.contains_key::<str>(*conflicting))
+        {
+            let path_strs: Vec<&str> = path.iter().map(|segment| segment.as_str()).collect();
+            return Err(CommandError::InvalidFlagValue {
+                command: path_strs
+                    .iter()
+                    .map(|segment| (*segment).to_string())
+                    .collect(),
+                flag: flag.long.to_string(),
+                reason: format!("--{} conflicts with --{}", flag.long, conflicting),
+            });
         }
     }
 
@@ -202,6 +245,13 @@ pub fn parse(
         }
     }
     let _ = last_was_var;
+
+    // Keep parity with clap and the API projection: a positional the command
+    // never declared is a usage error, not a token to drop on the floor.
+    if let Some(extra) = positionals.get(pos_idx) {
+        let path_strs: Vec<&str> = path.iter().map(|s| s.as_str()).collect();
+        return Err(CommandError::unexpected_argument(&path_strs, extra.clone()));
+    }
 
     Ok(ParsedCommandBoxInput {
         path,
@@ -245,9 +295,11 @@ mod tests {
         let cat = CommandCatalogue::get();
         let parsed = parse(r#"remote exec prompt "hello world""#, cat).unwrap();
         assert_eq!(parsed.path, vec!["remote", "exec", "prompt"]);
+        // `prompt` is a greedy trailing positional (TrailingVarArgs), so a
+        // single quoted token collects into a one-element Multi.
         assert!(matches!(
             parsed.arguments.get("prompt"),
-            Some(ArgValue::Single(s)) if s == "hello world"
+            Some(ArgValue::Multi(v)) if v == &["hello world".to_string()]
         ));
     }
 
@@ -265,6 +317,23 @@ mod tests {
         assert!(matches!(err, CommandError::UnknownFlag { .. }));
     }
 
+    /// The TUI command box must reject a positional the command never declared,
+    /// exactly as clap and the API projection do. `new skill` declares none, so
+    /// a stray skill name next to `--pull` is a usage error (WI-0103).
+    #[test]
+    fn parse_rejects_positional_the_command_never_declared() {
+        let cat = CommandCatalogue::get();
+        let err = parse("new skill --pull owner/library accidental-name", cat)
+            .expect_err("new skill takes no positional argument");
+        assert!(
+            matches!(
+                &err,
+                CommandError::UnexpectedArgument { argument, .. } if argument == "accidental-name"
+            ),
+            "expected UnexpectedArgument naming the stray name, got: {err:?}"
+        );
+    }
+
     #[test]
     fn parse_empty_string_returns_command_box_parse_error() {
         let cat = CommandCatalogue::get();
@@ -280,11 +349,13 @@ mod tests {
         let cat = CommandCatalogue::get();
         let parsed = parse(r#"exec prompt "do something complex""#, cat).unwrap();
         assert_eq!(parsed.path, vec!["exec", "prompt"]);
+        // `prompt` is a greedy trailing positional: a single quoted token
+        // collects into a one-element Multi (the TUI frontend joins it back).
         match parsed.arguments.get("prompt") {
-            Some(ArgValue::Single(s)) => {
-                assert_eq!(s, "do something complex");
+            Some(ArgValue::Multi(v)) => {
+                assert_eq!(v, &["do something complex".to_string()]);
             }
-            other => panic!("expected Single prompt argument, got: {other:?}"),
+            other => panic!("expected Multi prompt argument, got: {other:?}"),
         }
     }
 
@@ -300,5 +371,22 @@ mod tests {
             ),
             "-n must map to non-interactive flag"
         );
+    }
+
+    #[test]
+    fn command_box_rejects_cli_only_startup_gate_flags() {
+        let cat = CommandCatalogue::get();
+        for raw in [
+            "chat --startup-gate-control /orchestrator/gate",
+            "exec prompt --startup-gate-timeout 30 review",
+            "exec workflow workflow.toml --startup-gate-control /orchestrator/gate",
+        ] {
+            let error = parse(raw, cat)
+                .expect_err("the TUI command box must reject CLI-only startup-gate flags");
+            assert!(
+                matches!(error, CommandError::UnknownFlag { .. }),
+                "a TUI-invisible flag must behave as unavailable for {raw:?}: {error:?}"
+            );
+        }
     }
 }

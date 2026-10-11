@@ -33,11 +33,14 @@ awman exec workflow aspec/workflows/implement-hard.toml --issue 84
 
 # Run a workflow without a work item
 awman exec workflow aspec/workflows/dependency-upgrade.toml
+
+# Let awman design and run the workflow automatically for a work item
+awman exec workflow --dynamic --work-item 42
 ```
 
-Use `exec workflow` to run any workflow file. The work item is optional — associate one with `--work-item` if you want template variable substitution, or with `--issue` to use a GitHub issue directly. See [API Mode](09-api-mode.md) for usage in CI and scripting contexts. For more on GitHub integration, see [GitHub Integration](11-github-integration.md).
+Use `exec workflow` to run any workflow file. If you don't want to write a workflow file yourself, see [Dynamic Workflows](06-dynamic-workflows.md) — `--dynamic` launches a leader agent that designs a purpose-built workflow for your work item and then executes it automatically. The work item is optional — associate one with `--work-item` if you want template variable substitution, or with `--issue` to use a GitHub issue directly. See [API mode](09-api-and-remote-mode.md) for usage in CI and scripting contexts. For more on GitHub integration, see [GitHub Integration](10-github-integration.md).
 
-The TUI shows a **workflow status strip** between the execution window and the command box, with one coloured box per step. After each step completes, a confirmation dialog appears — press **Enter** to advance, **q** to pause. State is saved to disk so you can resume later.
+The TUI shows the **Workflow Overview** between the execution window and the command box, with one coloured box per step. After each step completes, a confirmation dialog appears — press **Enter** to advance, **q** to pause. State is saved to disk so you can resume later.
 
 ---
 
@@ -129,7 +132,7 @@ Writes to `~/.awman/workflows/<name>.<ext>` instead of the current repo. Use thi
 
 ## Workflow file formats
 
-awman supports two workflow file formats: **TOML** (`.toml`) and **YAML** (`.yml` / `.yaml`). The format is detected automatically from the file extension. Both formats produce identical execution behaviour — you can pass either to `--workflow` interchangeably.
+awman supports two workflow file formats: **TOML** (`.toml`) and **YAML** (`.yml` / `.yaml`). The format is detected automatically from the file extension. Both formats produce identical execution behaviour — you can pass either to `exec workflow` interchangeably.
 
 | Extension | Format |
 |-----------|--------|
@@ -151,10 +154,12 @@ All steps support the same fields:
 | `name` | string | yes | Unique step identifier within the workflow |
 | `prompt` | string | yes | Prompt template sent to the agent |
 | `depends_on` | array of strings | no | Names of steps that must complete before this one runs |
-| `agent` | string | no | Run this step with a specific agent instead of the default. Valid values: `claude`, `codex`, `opencode`, `maki`, `gemini` |
+| `agent` | string | no | Run this step with a specific agent instead of the default. Valid values: `claude`, `codex`, `opencode`, `maki`, `gemini`, `antigravity`, `copilot`, `crush`, `cline` |
 | `model` | string | no | Run this step with a specific model. Overrides any `--model` flag |
+| `overlays` | array of strings | no | Overlays applied to this step only — see [Workflow step overlays](08-overlays.md#workflow-step-overlays) |
+| `abort_on_failure` | bool | no | When `true`, a failure here stops the whole workflow (and kills any running parallel peers) instead of prompting. Defaults to `false` |
 
-Field names are **lowercase only** (`name`, `depends_on`, `agent`, `model`, `prompt`). Uppercase variants are not accepted. Unknown fields (e.g. `dependson`, `Prompt`) are rejected as errors so that typos do not silently take effect.
+Field names are **lowercase only** (`name`, `depends_on`, `agent`, `model`, `prompt`, `overlays`, `abort_on_failure`). Uppercase variants are not accepted. Unknown fields (e.g. `dependson`, `Prompt`) are rejected as errors so that typos do not silently take effect.
 
 ### TOML (`.toml`)
 
@@ -259,8 +264,8 @@ Setup steps are defined in a `[[setup]]` (TOML) or `setup:` (YAML) array. Each s
 
 | Type | Fields | Description |
 |------|--------|-------------|
-| `clone_repo` | `url` (string, required), `branch` (string, optional), `into` (string, optional) | Clone a repository. `branch` checks out a specific branch. `into` specifies the target directory (relative to workdir); omit to use the repo name. Useful for cloning additional repos needed by the workflow (for the primary repo, use the session's `repo_url` and `branch` fields instead). |
-| `checkout_create_branch` | `branch` (string, required), `base` (string, optional) | Check out an existing branch or create a new one. If `base` is specified, the branch is created from that ref. Attempts to fetch from the remote first; if unavailable or not configured, falls back to local creation. |
+| `clone_repo` | `url` (string, required), `branch` (string, optional), `into` (string, optional), `conflict_mode` (string, optional) | Clone a repository. `branch` checks out a specific branch. `into` specifies the target directory (relative to workdir); omit to use the repo name. `conflict_mode` controls what happens when the target directory already contains a clone of the same URL: `skip` (default) logs that the repo is already cloned and succeeds without re-cloning, `replace` deletes the existing clone and clones a fresh copy, and `error` fails the step. A target directory occupied by anything other than a clone of the same URL always fails the step, regardless of mode. Useful for cloning additional repos needed by the workflow (for the primary repo, use the session's `repo_url` and `branch` fields instead). |
+| `checkout_create_branch` | `branch` (string, required), `base` (string, optional) | Check out an existing branch or create a new one. If `base` is specified, the branch is created from that ref. Attempts to fetch from the remote first; if unavailable or not configured, falls back to local creation. **Skipped when the workflow runs in an isolated worktree** (`--worktree`, or implied by `--yolo`/`--dynamic`): the run is already on its own branch, so awman skips the step with a warning instead of failing. |
 | `pull_branch` | `remote` (string, optional), `branch` (string, optional) | Pull the latest changes from a remote branch. Equivalent to `git pull <remote> <branch>`. Omit both to use `git pull` with defaults. |
 | `run_shell` | `command` (string, required), `env` (object, optional) | Execute a shell command. `env` is an optional object of environment variables to inject (`{"KEY": "value"}`). |
 | `run_script` | `path` (string, required), `env` (object, optional) | Execute a shell script file (relative to the workdir). `env` is an optional object of environment variables. |
@@ -411,6 +416,36 @@ setup:
 | `model` | string | no | Inherited from workflow | The model to use for remediation. If omitted, uses the workflow's default model or the `--model` flag value. |
 | `max_attempts` | integer | yes | — | Maximum number of remediation and retry cycles before the step fails permanently. Must be ≥ 1. |
 
+**Automatic failure output capture for teardown steps:**
+
+When a **teardown** step's `on_failure` remediation agent launches, awman automatically captures the failed command's full stdout and stderr and writes it to a file the agent can read — you don't need to describe the failure yourself or paste logs into `prompt`:
+
+- If the workflow has a writable `context(workflow)` overlay active (see [Overlays](08-overlays.md)), the file is written into that shared directory and shows up in the agent's container at `/awman/context/workflow/teardown-failure-<step-name>.txt`.
+- Otherwise, awman creates a dedicated directory for this workflow run and mounts it read-only in the remediation agent's container at `/awman/remediation/teardown-failure-<step-name>.txt`.
+- The step name is sanitized into a safe filename (special characters become `-`).
+- The file looks like:
+
+  ```
+  === FAILED COMMAND: cargo test ===
+
+  --- STDOUT ---
+  ...output, or "(empty)" if the command wrote nothing...
+
+  --- STDERR ---
+  ...output, or "(empty)" if the command wrote nothing...
+  ```
+
+  Output is capped at the last 100 KB per stream; anything beyond that is dropped with a truncation notice so a runaway command can't bloat the agent's context.
+- awman automatically prepends a note to the top of the remediation prompt telling the agent where the file is and to read it before attempting a fix — you don't need to reference the path in your own `on_failure.prompt`. You're still free to point at it explicitly for emphasis, e.g.:
+
+  ```toml
+  [teardown.on_failure]
+  prompt = "Read the captured stdout/stderr file first, then fix the root cause of the failure — don't just retry blindly."
+  max_attempts = 2
+  ```
+- If the same step fails again on a later retry attempt, the file is overwritten with that attempt's output, so the agent always sees the most recent failure, not a stale one.
+- This capture applies only to **teardown** steps; `on_failure` on **setup** steps behaves as before, with no automatic file.
+
 **Full example with custom agent and model:**
 
 ```toml
@@ -472,7 +507,7 @@ setup:
 
 **Best practices:**
 
-- **Be specific in your prompt:** The remediation agent doesn't automatically see logs unless you reference them. Include context about what failed and what the agent should try.
+- **Be specific in your prompt:** For teardown steps, the failed command's stdout/stderr is captured automatically (see above), but the agent still benefits from you describing what a good fix looks like. For setup steps, there's no automatic capture — include context about what failed and what the agent should try.
 - **Keep `max_attempts` small:** Each attempt retries the full step, so 2–3 attempts is usually sufficient.
 - **Use for fixable failures:** Remediation works best for transient issues, dependency problems, or test failures with clear causes. For structural errors, fail fast instead.
 - **Combine with `poll_ci`:** A common pattern is a teardown that tries to fix code, commits, pushes, then polls CI to verify the fix worked.
@@ -895,7 +930,7 @@ Per-step `model` values are persisted in the workflow state file. On resume, the
 exec workflow aspec/workflows/implement-hard.toml --work-item 0027
 ```
 
-A **workflow status strip** appears, showing each step as a coloured box:
+The **Workflow Overview** appears, showing each step as a coloured box:
 
 | Colour | Status |
 |--------|--------|
@@ -942,6 +977,9 @@ Press [r] to retry, or any other key to abort:
 | `--worktree` | Run all steps in an isolated Git worktree |
 | `--overlay=<SPEC>` | Apply overlay(s) to every step; see [Overlays](08-overlays.md) |
 | `--yolo` | Fully autonomous mode; implies `--worktree`; auto-advances stuck steps |
+| `--dynamic` | Let a leader agent design the workflow file from your work item; see [Dynamic Workflows](06-dynamic-workflows.md) |
+| `--leader=<agent::model>` | Override the agent and model used as the leader when `--dynamic` is set; format: `agent::model` |
+| `--max-concurrent=<N>` | Cap on concurrently-running steps for this invocation (must be ≥ 1); overrides `maxConcurrentAgents` in config — see [Parallel workflows](05-workflows.md#parallel-workflows) |
 
 ---
 
@@ -1025,11 +1063,59 @@ In command mode, the "same container" prompt is skipped entirely and the explana
 
 Ctrl+W works at any time when a workflow is active in the current tab — there are no other preconditions. It works mid-step, between steps, during a yolo countdown, or while another dialog is open (the existing dialog is dismissed first).
 
+### When a step fails
+
+If an agent step's container exits unexpectedly, awman does **not** end the workflow. It opens the control board with the failure attached, so you can recover in place:
+
+```
+╭──── Workflow Control — step failed ────╮
+│ Failed step: implement                 │
+│   Exit code: 1                         │
+│   Ran for 214s                         │
+│                                        │
+│    ↑ Restart failed step               │
+│                                        │
+│ ← Cancel to prev  → Skip to 'review'   │
+│                                        │
+│    ↓ Next: same container              │
+│      the failed step's container has   │
+│      exited                            │
+│                                        │
+│ [^C] Cancel workflow   [Esc] Pause     │
+╰────────────────────────────────────────╯
+```
+
+| Key | Effect |
+|-----|--------|
+| **↑** | Restart the failed step in a fresh container |
+| **←** | Go back to the previous step and re-run it — both it and the failed step return to pending, so the failed step runs again once its predecessor succeeds |
+| **→** | Skip the failed step and start the next one in a new container |
+| **Esc** | Pause the workflow — the state file is kept, so a later run can resume from here |
+| **Ctrl+C** | Cancel the workflow |
+
+There is no "Enter to finish workflow" on a failure board — finishing a run on a failed step is never what you want, so **Ctrl+C** is the deliberate way out. The container's recent output is also saved to a log file; see [Container failure logs](#container-failure-logs).
+
+An arrow the board does not offer does nothing. On the *first* step there is no previous step to go back to, and on the *last* one there is nothing to skip ahead to; those arrows are shown greyed out with the reason, and pressing them leaves the board where it is.
+
+In command mode the same choices are printed as a menu on stderr (`[r]` restart, `[b]` back, `[n]` next, `[p]` pause, `[a]` abort), and only the ones that apply are listed.
+
+If several steps of a [parallel group](#parallel-workflows) fail, the board opens once per failed step, in the order the containers exited. Each failure is a separate decision — recovering one does not quietly decide the others.
+
+### Failed steps without a user (squad, API, `--non-interactive`)
+
+An unattended run has nobody to ask, so the engine handles a failed step itself:
+
+1. It starts a 60-second countdown, reported through the same channel as a stuck-step countdown — but labelled as a retry, so a run that is recovering is never mistaken for one that is advancing.
+2. When the countdown expires, it retries the failed step **once**.
+3. If the same step fails again, the whole workflow fails with that step's exit code.
+
+A step marked `abort_on_failure = true` still stops the workflow immediately, with no countdown and no retry. The retry allowance is per step, and separate from the one a step gets for a credential refresh — a step can use both.
+
 ---
 
-## Workflow strip and step status
+## Workflow Overview and step status
 
-The **workflow status strip** shows the state of every step in the workflow:
+The **Workflow Overview** shows the state of every step in the workflow:
 
 ```
 Running: plan     ┃  ● implement    ✓ review    ⚠️ docs
@@ -1044,13 +1130,37 @@ Running: plan     ┃  ● implement    ✓ review    ⚠️ docs
 | **✗** (Red, bold) | Step encountered an error |
 | **🔧** (Magenta, bold) | Step failed and remediation is in progress (on_failure agent running) |
 
+### Agent and model labels
+
+When a step declares its own `agent` and/or `model`, the box shows the resolved **`agent/model`** on its top border (for example `claude/opus-4-8`) so you can see at a glance which agent and model will run each step:
+
+```
+ ╭claude/opus-4-8──╮   ╭gemini───────────╮
+ │ ● implement     │ → │ ○ review        │
+ ╰─────────────────╯   ╰─────────────────╯
+```
+
+Steps that declare **neither** an `agent` nor a `model` field inherit the project-default agent and model, so they carry no label — an unlabelled box always means "project defaults". If a step overrides only one of the two, the label shows just that part. The label is truncated to fit narrow boxes.
+
+### Setup and teardown steps
+
+Setup and teardown steps get their own dedicated column at the start and end of the overview — never mixed in with the main steps' columns, however those happen to be grouped by `depends_on`. Each box carries the same status glyph and colour as any other step, with a `[setup]` or `[teardown]` title on the top border instead of an `agent/model` label:
+
+```
+╭[setup]──────────╮   ╭claude/opus-4-8──╮   ╭[teardown]────────╮
+│ ✓ install deps  │ → │ ● implement     │ → │ ○ push and clean │
+╰─────────────────╯   ╰─────────────────╯   ╰─────────────────╯
+```
+
+Multiple setup (or teardown) steps share that one leading (or trailing) column, and collapse to a `N steps…` summary in the minimized overview the same way a parallel group of main steps does — the `[setup]`/`[teardown]` title stays on the collapsed box too.
+
 ### Remediation in progress
 
 When a setup or teardown step fails and has an `on_failure` block, the step status changes to **🔧** (remediating) while the agent runs. The workflow status indicator shows which remediation attempt is in progress (e.g., "attempt 1 of 2"). After the agent completes, the original step is automatically retried. The status returns to **●** (running) for the retry.
 
 ### Stuck steps
 
-When a step produces no output for more than 30 seconds, it is marked as stuck in the strip. Stuck steps show a warning indicator (⚠️) both in the strip box and in the tab label.
+When a step produces no output for more than 30 seconds, it is marked as stuck in the overview. Stuck steps show a warning indicator (⚠️) both in the overview box and in the tab label.
 
 Stuck steps trigger automatic behavior depending on the mode:
 - In **yolo mode**: the engine starts a 60-second countdown. When it expires, the step is auto-advanced. If the user cancels (Esc) and the step re-stucks, the countdown restarts from 60 seconds with no backoff.
@@ -1061,7 +1171,18 @@ You can always open the control board manually via **Ctrl+W** regardless of stuc
 
 ### Parallel step groups
 
-Steps that share the same dependencies form a **parallel group** and execute sequentially in file order. In the workflow strip, they are stacked vertically with slight indentation. If a group has more than two steps, the additional steps are shown as `+ N more…`. Use **mouse wheel** to scroll within the strip and view hidden parallel steps.
+Steps that share the same dependencies form a **parallel group** and run concurrently, each in its own container, up to the [`maxConcurrentAgents`](07-configuration.md#reference) cap (unlimited by default).
+
+The overview shows a parallel group in one of two ways, toggled with **Ctrl-O**:
+
+- **Minimized** (the default) — the whole group is one box reading `3 steps…`, coloured by the group's overall state (a failed step colours the box red, otherwise a running step colours it blue, and so on). The overview stays 3 rows tall no matter how wide the workflow fans out.
+- **Maximized** — every step in the group gets its own box, stacked vertically at the same indent, keeping its full name, its `agent/model` label, and its own status colour for the whole run. Completed steps are never rolled up or hidden behind finished siblings.
+
+The maximized overview grows to fill the vertical space between the tab bar and the command box — half of it when a container window is maximized too, since **Ctrl-O** and **Ctrl-M** are independent and neither puts the other away. If a group is larger than the overview's height, the last box becomes a `+ N more…` marker — use the **mouse wheel** over the overview to scroll through the rest.
+
+In the TUI, running steps beyond the concurrency cap wait their turn with a `·` prefix on their name until a slot frees up.
+
+See [Parallel workflows](05-workflows.md#parallel-workflows) for the full scheduling model, and [Using the TUI](02-using-the-tui.md#parallel-containers) for how multiple running containers are displayed and switched between.
 
 ### Viewing the full control board
 
@@ -1071,14 +1192,87 @@ When a step completes, awman shows the lightweight confirmation dialog. To see a
 
 ## Auto-advance when stuck (yolo mode)
 
-When a running workflow step produces no output for **30 seconds**, the engine is notified that the step is stuck:
+When a running workflow step produces **no output for 30 seconds**, the engine marks that step stuck. What happens next depends on the permission mode:
 
-- In **yolo mode**: the engine starts a 60-second countdown. If the countdown expires, the step is automatically advanced. Pressing Esc cancels the countdown; if the step re-stucks, the countdown restarts from 60 seconds with no backoff.
-- In **non-yolo mode**: the workflow control board opens automatically so you can decide what to do.
+- **In [yolo mode](03-agent-sessions.md#--yolo):** a **60-second countdown** starts, and the workflow auto-advances when it expires.
+- **In every other mode:** the [workflow control board](#workflow-control-board-tui-only) opens automatically so you can decide what to do.
 
-Stuck detection fires independently per tab — background tabs detect and report stuck state to their own engine. In yolo mode, background tabs show a live countdown in the tab bar. See [Yolo Mode — Background yolo countdown](06-yolo-mode.md#background-yolo-countdown).
+Stuck detection is unified across all frontends (TUI, CLI, and API) and runs continuously inside the container engine, which tracks output activity on stdout and stderr. Any new output — even a single byte — immediately clears the stuck state. Each container is tracked independently, so one noisy agent never masks detection on its siblings.
 
-**Active-tab suppression:** If you are actively pressing keys or scrolling on the currently active tab, the stuck timer is held back even if the container is silent. The timer starts only once both the container and the user have been idle for 30 seconds. Background tabs are always checked using output time alone.
+**Active-tab suppression:** if you are actively pressing keys or scrolling on the currently active tab, the stuck timer is held back even while the container is silent — the timer starts only once both the container and you have been idle for 30 seconds. Background tabs are always judged on output time alone.
+
+### How the countdown appears
+
+**TUI — Active tab (yolo countdown dialog):**
+
+When the stuck tab is currently active in the TUI, the countdown dialog opens:
+
+```
+╭─────── Yolo: Auto-Advance ──────────────╮
+│ Step: implement                          │
+│                                          │
+│  No activity detected.                   │
+│  Advancing to next step in  47s...       │
+│                                          │
+│                    [Esc] cancel          │
+╰──────────────────────────────────────────╯
+```
+
+The dialog updates every ~100 ms to show the remaining time.
+
+**TUI — Background tab (tab bar countdown):**
+
+When the stuck tab is in the background, no dialog opens. Instead, the tab bar shows a live countdown: the tab alternates between yellow and purple every second, with the label cycling between `⚠️ yolo in N` and `🤘 yolo in N` (where `N` is the remaining seconds):
+
+```
+┌─ Tab 1: myproject ─────────┬─ Tab 2 ⚠️  yolo in 38 ─────┐
+│  chat                        │                              │
+└──────────────────────────────┴──────────────────────────────┘
+```
+
+This lets you monitor all tabs' countdown state without leaving your current work.
+
+**CLI and API:** countdown status messages go to the message sink (stderr for the CLI, the event stream for the API) and are **throttled to one every 10 seconds**, even though the countdown updates internally every ~100 ms. The TUI receives every tick and renders the countdown at full granularity.
+
+### Interacting with a countdown
+
+- **Switching to a tab that is counting down** opens the yolo dialog immediately at the remaining time — the timer is never restarted from 60 seconds.
+- **Switching away** with **Ctrl+A** / **Ctrl+D** while the dialog is open closes the dialog and lets the countdown continue in the background. You are never forced to resolve it first.
+- **Esc** dismisses the active-tab dialog manually. If the container goes silent again, a fresh 60-second countdown begins — there is no backoff.
+- **Output resuming mid-countdown** clears the stuck state, cancels the countdown, and returns the tab to its normal colour.
+
+**When the countdown expires:**
+
+- If this is not the last step — awman kills the stuck step's container and advances to the next step in a new container
+- If this is the last step — the workflow transitions to complete
+- In the TUI, the killed container's window closes immediately, leaving the [summary bar](02-using-the-tui.md#when-the-container-exits) behind — the window only closes on actual container death, never while the container is merely stuck or while the countdown is still running
+
+In the background this happens without you switching to the tab; the tab returns to its normal colour and label as soon as it moves on to the next step.
+
+---
+
+## Container failure logs
+
+While a workflow runs, awman keeps a rolling buffer of the **last ~100 lines** of combined stdout/stderr for each step's container. If a step container exits with a **non-zero exit code that awman did not cause**, awman writes that buffer to a log file and prints an error telling you where it went:
+
+```
+Step 'build' container 'awman-quick-brown-fox' exited with code 1. Recent output saved to /home/you/.awman/logs/9f8c…-build-awman-quick-brown-fox.log
+```
+
+The log path follows the pattern:
+
+```
+~/.awman/logs/{workflow-id}-{step-name}-{container-name}.log
+```
+
+- `{workflow-id}` is the workflow's invocation id (a UUID), so re-runs never overwrite each other.
+- `{step-name}` and `{container-name}` identify exactly which step and container failed — useful when several steps run in parallel.
+
+This gives you the container's final output for debugging even after the TUI has scrolled it away or the container has been removed.
+
+**When a log is *not* written:** awman only writes a failure log when the container failed on its own. Containers that awman itself stops — yolo auto-advance, control-board **Abort**/**Pause**/**Finish**, a stuck-step cancel, `abort_on_failure` killing sibling steps, or a startup-grace kill — exit as *expected*, so no log is written for them. Sandbox-class runtimes (`docker-sbx-experimental`) don't use the container I/O bridge and don't produce these logs.
+
+The `~/.awman/logs/` directory is created on demand and is never cleaned automatically; delete old logs whenever you like.
 
 ---
 
@@ -1094,14 +1288,39 @@ The file records the status of every step, the container ID used for each step, 
 
 ### Resuming
 
-If a saved state file exists when you run `exec workflow`, awman offers to resume:
+If a saved state file exists when you run `exec workflow`, awman offers to resume from a named step:
 
 ```
-Found a saved workflow state for 'implement-feature' (work item 0027).
-  1) Resume from where you left off
-  2) Restart from the beginning
-  [1/2]:
+╭──── Resume previous workflow? ─────────────────────────────╮
+│ A previous run of 'implement-feature' left resumable state │
+│ on disk.                                                   │
+│                                                            │
+│ Workflow: implement-feature                                │
+│ Work item: 0027                                            │
+│ Progress: 2/5 step(s) completed.                           │
+│                                                            │
+│ Resume it from one of these steps, or start over?          │
+│                                                            │
+│  [1] Resume from 'implement' (the step that failed)        │
+│  [2] Resume from 'design' (the step before it)             │
+│  [3] Resume from 'review' (the step after it)              │
+│  [f] Discard the saved state and start over                │
+│                                                            │
+│  [Esc] cancel                                              │
+╰────────────────────────────────────────────────────────────╯
 ```
+
+This is the same prompt, with the same three start points, that [`--dynamic`](06-dynamic-workflows.md#resuming-a-failed-dynamic-run) shows — the two modes resume identically. Picking a step rewinds the saved state: everything from that step onwards runs again, and earlier steps that never succeeded are marked skipped so they don't block their dependents.
+
+The first start point is named after what actually stopped the run: *the step that failed*, *the step that was cancelled*, or *the step the run stopped on* when the run was interrupted rather than failed.
+
+**`f` is the only way to discard the saved run**, and it is not undoable — the state file goes, and in `--dynamic` mode the generated workflow goes with it. **Esc cancels the command instead**: nothing runs, nothing is created, nothing is deleted, and the same prompt is waiting the next time you run it. In command mode the same applies, with `[q]` alongside Esc; anything awman cannot read as an answer (a blank line, EOF, a typo) cancels rather than discards.
+
+The question is asked before the worktree is prepared, so cancelling really does leave the disk untouched.
+
+When the previous run completed every step there is nothing to resume, so awman says so and starts fresh rather than offering a choice with one sane answer.
+
+Runs with nobody at the keyboard (`--non-interactive`, the API server) resume at the step the previous run stopped on, preserving the work already done. The squad daemon is the exception: each scheduled evaluation is its own run, so it always starts over. None of them can cancel — there is nobody to press Esc.
 
 ### Workflow file changed
 
@@ -1116,20 +1335,115 @@ WARNING: The workflow file has changed since the last run.
 
 If you choose `2`, awman verifies that step names and `Depends-on` values are identical. If they differ, it forces a restart.
 
-### Interrupted steps
+### Unfinished steps
 
-If a step was running when awman last exited:
+Two kinds of step are terminal in the saved state but not actually *done*, and awman resets both to pending when it loads that state, naming them as it goes:
 
 ```
-Step 'implement' was running when the previous session ended.
-Start it over (s) or skip to next step (n)? [s/n]:
+awman: Interrupted steps detected (prior crash?): implement. Resetting to Pending.
+awman: Previous run left these steps unfinished: review, ship. Resetting to Pending.
 ```
+
+The first line covers a step that was still running when awman exited — a crash or a kill. The second covers steps a previous run left `Failed` or `Cancelled`, which is what a failed step and an aborted workflow leave behind.
+
+This reset matters more than it looks: an aborted run marks *every* remaining step cancelled, so without it the saved state would read as "all steps terminal" — indistinguishable from a finished run — and resuming would report success without executing anything. Steps that genuinely succeeded or were skipped are never touched, so a resume still picks up exactly where the previous run got to.
+
+A third case is steps the saved run knows about that the workflow file no longer defines — you renamed or deleted a step and then chose to resume anyway at the [changed-file prompt](#workflow-file-changed):
+
+```
+awman: The saved run has steps this workflow no longer defines: publish. Dropping them.
+```
+
+These are dropped rather than reset. They can never run again — the step graph is what decides what runs, and it has never heard of them — but they would still count against the run ever being finished, leaving it to end on "no ready steps remaining" instead of completing.
 
 ---
 
-## Parallel groups
+## Parallel workflows
 
-Steps that share the same `Depends-on` set form a **parallel group**. awman executes them sequentially in file order (true parallel container execution is a future enhancement). In the TUI they are rendered stacked vertically. If a group has more than two steps, the third box shows `+ N more…`.
+A workflow's steps don't have to run one at a time. Any steps that share the same [`depends_on`](#step-fields) set — meaning neither depends on the other — form a **parallel group**, and awman runs them concurrently, each in its own container. This section covers how many agents run at once, how the engine schedules them, and how stuck detection, yolo mode, and the control board behave when more than one agent is active.
+
+For how parallel containers appear on screen, see [Using the TUI](02-using-the-tui.md#parallel-containers) and [Parallel agents in interactive CLI mode](09-api-and-remote-mode.md#parallel-agents-in-interactive-cli-mode).
+
+### What parallelism means here
+
+Consider a workflow where `tests` and `docs` both depend only on `implement`, and nothing depends on either of them:
+
+```
+implement → tests
+          → docs
+       → review (depends on tests, docs)
+```
+
+`tests` and `docs` form a parallel group: once `implement` finishes, both become eligible to run, and awman launches both at once instead of waiting for one to finish before starting the other. `review` still waits for both to complete, since it depends on them.
+
+This is entirely driven by your workflow file's `depends_on` graph — you don't opt into parallelism explicitly. Any steps whose dependencies are satisfied at the same time run together, up to the concurrency cap described below.
+
+---
+
+### Configuring `maxConcurrentAgents`
+
+`maxConcurrentAgents` caps how many containers can run at once, machine-wide or per-repo. It's a plain [config field](07-configuration.md#reference), so it follows the same precedence as everything else:
+
+```
+--max-concurrent  >  AWMAN_MAX_CONCURRENT_AGENTS  >  repo config  >  global config  >  unlimited
+```
+
+```sh
+awman config set maxConcurrentAgents 3              # this repo
+awman config set --global maxConcurrentAgents 2     # every project on this machine
+awman exec workflow workflow.toml --max-concurrent 4   # this run only
+```
+
+Left unset at every level, there is **no cap** — every step whose dependencies are satisfied launches immediately. In practice you'll usually want a cap that matches your machine's CPU/memory headroom and your Docker daemon's capacity, since each parallel step is a full container running its own agent.
+
+A `maxConcurrentAgents` of `1` disables parallelism entirely: steps run one at a time, in the same order they would without any concurrency at all. `0` is rejected — if you want to pause parallelism, unset the field or set it to `1`.
+
+> `dynamicWorkflows.maxConcurrentSteps` is a different, unrelated setting: it's an advisory hint passed to the leader agent that *designs* a `--dynamic` workflow. `maxConcurrentAgents` is what the engine actually enforces at run time, for any workflow, dynamic or not.
+
+---
+
+### How the engine schedules steps
+
+When a parallel group becomes ready, awman launches as many of its steps as the concurrency cap allows, in the order they appear in the workflow file. Any remaining steps in the group wait in a queue.
+
+- **A slot frees up** whenever a running step finishes successfully. The next queued step (in file order) starts immediately into that slot.
+- **A step that fails** without `abort_on_failure` stops new steps from being queued into the group, but lets its already-running siblings keep going until they finish; you're then prompted the same way you would be for a sequential failure.
+- **A step with `abort_on_failure = true` that fails** kills every other active step in the group immediately and cancels anything still queued — the same all-stop behavior `abort_on_failure` has always had, just applied to every running peer at once instead of a single step.
+
+If a workflow resumes from a saved state mid-group, any steps that were interrupted are replayed; steps that had already succeeded stay succeeded.
+
+---
+
+### Stuck and yolo behavior, per container
+
+Every running container is tracked independently — one noisy or slow agent never masks or delays detection on its siblings.
+
+- **Stuck detection (yolo off):** if a container produces no output for 30 seconds, that container alone is marked stuck. Its siblings keep running unaffected. The stuck container's slot stays occupied — no new step launches into it — until you switch to it and send Ctrl-C to kill it, at which point its slot frees up like any other completion.
+- **Yolo mode:** each container gets its own independent 60-second auto-advance countdown. When one container's countdown expires, only that container is killed and its step marked advanced; the rest of the group is untouched, and the next queued step (if any) starts into the freed slot. If the group has nothing left queued, the remaining containers simply keep running until they finish.
+
+**Where the countdown appears in the TUI:** a yoloing container that is *not* the focused one shows its countdown in its minimized status bar (`Yolo in Ns`, flashing purple/yellow — see [Using the TUI: Parallel containers](02-using-the-tui.md#parallel-containers)). If it's the focused container, the countdown instead opens the same modal dialog a single container shows. Pressing **Ctrl-S** to rotate focus away closes that modal — the countdown itself keeps running in the background regardless — and rotating back onto a container still counting down reopens the modal automatically.
+
+See [Permission modes](03-agent-sessions.md#permission-modes) for the general countdown behavior this builds on.
+
+---
+
+### The workflow control board with multiple agents running
+
+Opening the control board (**Ctrl-W** in the TUI) while more than one agent is running scopes its actions to whichever container is currently **focused** — the one you'd switch to with Ctrl-S. The board makes this explicit: it names the focused step and shows how many peers are still running.
+
+Some actions only make sense once the whole group has settled and are unavailable while any peer is still active:
+
+| Action | Behavior with active peers |
+|---|---|
+| Restart current step | Disabled while any other agent in the group is still running, with a reason pointing you at Ctrl-S — restarting always targets the focused container, but only once its siblings have finished. |
+| Cancel to previous step | Disabled while any peer is still running: rewinding a step in a group that's still mid-flight isn't well-defined until the group finishes. |
+| Finish workflow | Disabled while any peer is still running, for the same reason. |
+| Pause | Always available — suspends the whole workflow, killing every active container in the group. |
+| Abort | Always available — same, but marks the workflow aborted rather than paused. |
+
+When an action is unavailable, the reason is shown alongside it rather than just being greyed out silently.
+
+Each parallel step gets its own control board when it completes or gets stuck; you're never blocked from acting on one step because another is still busy — you just can't ask the workflow as a whole to move backward or forward (cancel to a previous step, or finish) until the whole group has drained.
 
 ---
 
@@ -1192,15 +1506,17 @@ Steps that share the same `Depends-on` set form a **parallel group**. awman exec
 | `abort_on_failure = true` + `on_failure` block | Remediation loop runs first; only if all attempts fail does abort trigger |
 | Setup failure | Main workflow steps do not run; go directly to teardown (if `teardown_on_failure = true`) or exit |
 | Teardown step failure (non-zero exit) | Error is logged; execution continues to next teardown step (best-effort); same for `on_failure` remediation |
+| Teardown step with `on_failure` fails | Failed command's stdout/stderr is automatically captured to a file and referenced in the remediation agent's prompt — see [Automatic failure output capture](#step-remediation-with-on_failure) |
+| Retried teardown step fails again during remediation | The captured output file is overwritten with the latest attempt's stdout/stderr |
 | `checkout_create_branch` with no remote configured | Falls back to local branch creation from HEAD or specified `base` |
 | `run_script` step with non-existent path | Step fails with file-not-found error |
 | Setup interrupted and resumed | Full setup phase re-runs from the beginning; steps should be idempotent |
 | Work item file not found | Error before loading the workflow |
 | Workflow file not found / unreadable | Clear error with the file path |
 | Agent failure mid-workflow | Step marked Error; user prompted to retry or abort |
-| Very long step names | Truncated to 12 characters with `…` in the TUI strip |
+| Very long step names | Truncated to 12 characters with `…` in the TUI Workflow Overview |
 | Large number of parallel steps | Capped at 3 visible rows; extra shown as `+ N more…` |
-| Large number of sequential steps | `+ N more…` box at the far right of the strip |
+| Large number of sequential steps | `+ N more…` box at the far right of the Workflow Overview |
 | **d** pressed; auto-popup suppressed | Auto-open skipped until workflow advances; Ctrl+W still works |
 | Container window maximized (auto-open) | Dialog opens over the maximized terminal; input routes to dialog |
 | Another dialog already open | Both Ctrl+W and auto-open suppressed until open dialog is dismissed |
@@ -1211,11 +1527,10 @@ Steps that share the same `Depends-on` set form a **parallel group**. awman exec
 | User actively scrolling on active tab | Stuck timer suppressed; control board does not open while user is engaged |
 | User becomes idle after scrolling | Timer starts from idle moment; control board opens after another 10 s of silence |
 
-### Limitations (v0.3)
+### Known limitations
 
-- **Sequential only**: parallel groups run one step at a time. True concurrent container execution is not yet supported.
 - **TUI resume dialogs**: hash-mismatch and resume prompts use auto-restart behaviour rather than a full dialog.
 
 ---
 
-[← Security & Isolation](04-security-and-isolation.md) · [Next: Yolo Mode →](06-yolo-mode.md)
+[← Security & Isolation](04-security-and-isolation.md) · [Next: Dynamic Workflows →](06-dynamic-workflows.md)

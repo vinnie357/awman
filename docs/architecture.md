@@ -27,7 +27,7 @@ awman initially grew into three execution modes (CLI, TUI, API) that share the s
 ### Layers
 
 ```
-Layer 4: binary    main.rs — sets up frontends, delegates everything
+Layer 4: binary    main.rs — selects a frontend after Startup completes
 Layer 3: frontend  CLI, TUI, API — input/output only
 Layer 2: command   Dispatch, per-command business logic
 Layer 1: engine    ContainerRuntime, WorkflowEngine, GitEngine, OverlayEngine, AuthEngine
@@ -42,7 +42,7 @@ Layer 0: data      Session, config, filesystem, database, typed data
 
 **Layer 3 (frontend)** contains the CLI, TUI, and API server. Each is a presentation layer only: it translates user input into `Dispatch` calls and renders command output. All three frontends are fully functional. See [Layer 3 reference](#layer-3-frontend-srcfrontend) below.
 
-**Layer 4 (binary)** is `src/main.rs` — the real entrypoint that builds clap from `CommandCatalogue`, constructs engines, opens a `Session`, and routes to the CLI or TUI frontend. See [Layer 4 reference](#layer-4-binary-srcmainrs) below.
+**Layer 4 (binary)** is `src/main.rs` — the real entrypoint that builds clap from `CommandCatalogue`, calls Layer 2 `Startup`, and routes the resulting context to the CLI or TUI frontend. Session-backed engine construction is centralized in `Engines::build`; the API and squad daemons enter through `ApiServerRuntime` and `SquadDaemonHandles`. See [Layer 4 reference](#layer-4-binary-srcmainrs) below.
 
 ### Implementation Timeline
 
@@ -136,10 +136,11 @@ src/
       frontend.rs         InitFrontend trait
       summary.rs          InitSummary
   command/
+    startup.rs             Startup — ordered process/session startup
     mod.rs                Re-exports: CommandCatalogue, Dispatch, CommandFrontend, CommandOutcome, CommandError
     error.rs              CommandError (wraps EngineError and DataError)
     dispatch/
-      mod.rs              Dispatch<F>, Engines, CommandFrontend, CommandOutcome, BuiltCommand
+      mod.rs              Dispatch<F>, Engines::build, CommandFrontend, CommandOutcome, BuiltCommand
       catalogue.rs        CommandCatalogue, CommandSpec, FlagSpec, ArgumentSpec, FlagKind, FlagDefault, ArgumentKind, FrontendVisibility
       parsed_input.rs     ParsedCommandBoxInput (TUI command-box tokenized result)
       projections/
@@ -171,6 +172,8 @@ src/
       specs.rs            SpecsCommand, SpecsSubcommand, SpecsAmendFlags, SpecsOutcome
       status.rs           StatusCommand, StatusCommandFrontend, StatusCommandFlags, StatusCommandTuiContext, TuiTabSnapshot, StatusOutcome
       worktree_lifecycle.rs WorktreeLifecycle, WorktreeLifecycleFrontend, PreWorktreeDecision, ExistingWorktreeDecision, PostWorkflowWorktreeAction
+      api_server/runtime.rs ApiServerRuntime — API daemon bootstrap
+      squad/daemon_runtime.rs SquadDaemonHandles — squad daemon bootstrap
   frontend/
     mod.rs                Declares cli, tui, API sub-modules
     cli/
@@ -183,7 +186,7 @@ src/
         chat.rs           ChatCommandFrontend impl
         exec_prompt.rs    ExecPromptCommandFrontend impl
         exec_workflow.rs  ExecWorkflowCommandFrontend + ContainerFrontend + WorkflowFrontend impls
-        api.rs       ApiStartCommandFrontend impl (calls frontend::api::serve)
+        api.rs       ApiStartCommandFrontend impl (hands ApiServerRuntime to frontend::api::serve)
         init.rs           InitCommandFrontend + InitFrontend impls
         ready.rs          ReadyCommandFrontend + ReadyFrontend impls
         agent_auth.rs     AgentAuthFrontend impl
@@ -229,9 +232,9 @@ src/
       tabs.rs             (also see above)
       text_edit.rs        TextEdit — single-line/multiline text editing with cursor and word movement
       user_message.rs     TuiUserMessageSink, SharedStatusLog, StatusLogEntry
-      workflow_view.rs    render_workflow_strip() — per-step status strip
+      workflow_view.rs    render_workflow_overview() — per-step Workflow Overview
     API/
-      mod.rs              ApiServeConfig; placeholder serve() — ships in 0072
+      mod.rs              ApiServerRuntime handoff; router, listener, and serving
   main.rs                 Layer 4 binary entrypoint
 ```
 
@@ -499,6 +502,8 @@ impl EnvSnapshot {
     pub fn remote_addr(&self) -> Option<&str>;       // AWMAN_REMOTE_ADDR
     pub fn remote_session(&self) -> Option<&str>;    // AWMAN_REMOTE_SESSION
     pub fn api_key(&self) -> Option<&str>;           // AWMAN_API_KEY
+    pub fn squad_key(&self) -> Option<&str>;          // AWMAN_SQUAD_KEY
+    pub fn shell(&self) -> Option<&str>;             // SHELL
 }
 ```
 
@@ -514,6 +519,8 @@ Defined constants for every env var awman reads:
 | `AWMAN_REMOTE_ADDR` | `AWMAN_REMOTE_ADDR` | Override remote server address |
 | `AWMAN_REMOTE_SESSION` | `AWMAN_REMOTE_SESSION` | Sticky session id for remote ops |
 | `AWMAN_API_KEY` | `AWMAN_API_KEY` | API key for API server |
+| `AWMAN_SQUAD_KEY` | `AWMAN_SQUAD_KEY` | Bearer key for the squad daemon |
+| `SHELL` | `SHELL` | Login shell, used only to tailor the squad key-export snippet |
 
 #### `FlagConfig` (`config/flags.rs`)
 
@@ -589,7 +596,7 @@ impl SqliteSessionStore {
 }
 ```
 
-`SqliteSessionStore::open(root)` creates the database at `<root>/awman.db`, enables WAL mode, and runs schema migrations idempotently. The schema has two tables: `sessions` and `commands`.
+`SqliteSessionStore::open_at(path)` opens the database at `path`, enables WAL mode, and runs schema migrations idempotently. The database is shared by API mode and the squad daemon and lives at `<data_home>/data/awman.db`; it carries the `sessions` and `commands` tables plus squad's `squad_tasks` and `squad_runs`.
 
 `SessionRecord` and `CommandRecord` are plain structs (no Arc, no async) that carry the persisted metadata fields.
 
@@ -603,7 +610,7 @@ pub struct ApiPaths { root: PathBuf }
 impl ApiPaths {
     pub fn from_env(env: &EnvSnapshot) -> Result<Self, DataError>;
     pub fn root(&self) -> &Path;
-    pub fn db_path(&self) -> PathBuf;          // <root>/awman.db
+    pub fn db_path(&self) -> PathBuf;          // <data_home>/data/awman.db (shared)
     pub fn log_path(&self) -> PathBuf;         // <root>/awman.log
     pub fn pid_path(&self) -> PathBuf;         // <root>/awman.pid
     pub fn tls_dir(&self) -> PathBuf;          // <root>/tls/
@@ -661,6 +668,10 @@ Global skills live at `$HOME/.awman/skills/` (or `$AWMAN_CONFIG_HOME/skills/`). 
 #### `WorkflowDirs` (`fs/workflow_dirs.rs`)
 
 Typed access to global and per-repo workflow directories. Same structure as `SkillDirs`: global at `$HOME/.awman/workflows/`, per-repo at `<git_root>/.awman/workflows/`.
+
+#### `WorkflowLogPaths` (`fs/log_dirs.rs`)
+
+Resolves and writes per-container failure logs under `$HOME/.awman/logs/` (or `$AWMAN_CONFIG_HOME/logs/`). When a workflow step's container exits with a non-zero code that awman did not cause, the engine hands this type the buffered output tail and a `(workflow-id, step-name, container-name)` identity; it sanitises the name components, ensures the directory exists, and writes `{workflow-id}-{step-name}-{container-name}.log`. All filesystem access for the feature stays in Layer 0; the engine never touches `std::fs`.
 
 #### `OverlayPathResolver` (`fs/overlay_paths.rs`)
 
@@ -1000,18 +1011,27 @@ pub trait ContainerExecutionFactory: Send + Sync {
 #### `WorkflowFrontend` trait
 
 ```rust
-pub trait WorkflowFrontend: UserMessageSink + Send + Sync {
-    fn user_choose_next_action(&mut self, state, available) -> Result<NextAction, EngineError>;
+pub trait WorkflowFrontend: UserMessageSink + Send {
+    fn show_workflow_control_board(&mut self, state, available) -> Result<NextAction, EngineError>;
     fn confirm_resume(&mut self, mismatch: &ResumeMismatch) -> Result<bool, EngineError>;
-    fn user_choose_after_step_failure(&mut self, step, exit) -> Result<StepFailureChoice, EngineError>;
+    /// Capability, not a question: can a human here be asked what to do when a
+    /// step fails? Decides between the control board and countdown-and-retry.
+    fn supports_interactive_recovery(&self) -> bool { false }
     fn report_step_status(&mut self, step, status: WorkflowStepStatus);
     fn report_step_output(&mut self, step, output: StepOutput);
-    fn report_step_stuck(&mut self, step);
-    fn report_step_unstuck(&mut self, step);
-    fn yolo_countdown_tick(&mut self, remaining: Duration) -> Result<YoloTickOutcome, EngineError>;
+    fn report_container_exited(&mut self, exit_code: i32);
+    fn yolo_countdown_started(&mut self, step_name, kind: CountdownKind);
+    fn yolo_countdown_tick(&mut self, step_name, remaining, total) -> Result<YoloTickOutcome, EngineError>;
+    fn yolo_countdown_finished(&mut self, step_name);
     fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome);
+    // …plus setup/teardown and parallel-group notifications, all defaulted.
 }
 ```
+
+A failed step is *not* a separate frontend question. The engine asks
+`supports_interactive_recovery()` and then either opens the Workflow Control
+Board with `AvailableActions::step_failure` set, or runs a countdown and one
+automatic retry. The engine never learns which frontend is attached.
 
 #### Stuck detection and yolo countdown
 
@@ -1057,7 +1077,9 @@ impl GitEngine {
     pub fn create_worktree(&self, git_root, worktree_path, branch) -> Result<(), EngineError>;
     pub fn remove_worktree(&self, git_root, worktree_path) -> Result<(), EngineError>;
 
-    // Merge strategy: git merge --squash <branch> + git commit -m "Implement <branch>"
+    // Merge strategies:
+    //   squash: git merge --squash <branch> + git commit -m "Implement <branch>"
+    //   plain:  git merge -m "Merge <branch>" <branch> (preserves branch commits)
     pub fn merge_branch(&self, git_root: &Path, branch: &str) -> Result<(), EngineError>;
     pub fn commit_all(&self, path: &Path, message: &str) -> Result<(), EngineError>;
     pub fn delete_branch(&self, git_root: &Path, branch: &str) -> Result<(), EngineError>;
@@ -1811,6 +1833,8 @@ pub enum PreWorktreeDecision {
 pub enum ExistingWorktreeDecision { Resume, Recreate }
 
 pub enum PostWorkflowWorktreeAction { Merge, Discard, Keep }
+
+pub enum WorktreeMergeMode { Merge /* no squash */, Squash, LeaveBranch }
 ```
 
 #### `WorktreeLifecycleFrontend` trait
@@ -1824,7 +1848,7 @@ pub trait WorktreeLifecycleFrontend: UserMessageSink + Send + Sync {
     fn report_worktree_created(&mut self, path: &Path, branch: &str);
     fn ask_post_workflow_action(&mut self, branch: &str, had_error: bool) -> Result<PostWorkflowWorktreeAction, CommandError>;
     fn ask_worktree_commit_before_merge(&mut self, branch: &str, files: &[String]) -> Result<Option<String>, CommandError>;
-    fn confirm_squash_merge(&mut self, branch: &str) -> Result<bool, CommandError>;
+    fn ask_merge_mode(&mut self, branch: &str) -> Result<WorktreeMergeMode, CommandError>;
     fn confirm_worktree_cleanup(&mut self, branch: &str, path: &Path) -> Result<bool, CommandError>;
     fn report_merge_conflict(&mut self, branch: &str, worktree_path: &Path, git_root: &Path);
     fn report_worktree_discarded(&mut self, branch: &str);
@@ -1859,7 +1883,7 @@ impl WorktreeLifecycle {
 
 `prepare` steps: check for existing worktree → if exists call `ask_existing_worktree` (Resume or Recreate); check for uncommitted files → if present call `ask_pre_worktree_uncommitted_files`; create worktree; report.
 
-`finalize` steps: call `ask_post_workflow_action`; on Merge → optional commit → squash-merge → optional cleanup; on Discard → remove worktree + branch; on Keep → report.
+`finalize` steps: call `ask_post_workflow_action`; on Merge → `ask_merge_mode` (plain merge / squash / leave branch alone) → optional commit of uncommitted files (runs for every mode, including LeaveBranch) → merge per mode → optional cleanup; on Discard → remove worktree + branch; on Keep → report.
 
 Merge conflicts are non-fatal: `finalize` catches `EngineError::MergeConflict`, calls `report_merge_conflict`, and returns `Ok(())`. The user resolves the conflict manually.
 
@@ -2076,7 +2100,10 @@ pub struct RuntimeContext {
 }
 ```
 
-The bundle that `main.rs` constructs once at startup and passes to either `cli::run` or `tui::run`. Contains the current `Session` (wrapped for shared ownership) and all six engine handles. Constructed via `RuntimeContext::new(session, engines)`.
+The bundle that `Startup::run` produces and `main.rs` passes to either
+`cli::run` or `tui::run`. It contains the current `Session` (wrapped for
+shared ownership) and all engine handles. `RuntimeContext::new(session,
+engines)` only packages those already-built values for a frontend.
 
 #### Entry point (`mod.rs`)
 
@@ -2167,7 +2194,7 @@ Each module in this directory implements the richer `*CommandFrontend` trait (an
 | `chat.rs` | `ChatCommandFrontend` | Marker (no extra methods beyond `UserMessageSink`) |
 | `exec_prompt.rs` | `ExecPromptCommandFrontend` | Marker |
 | `exec_workflow.rs` | `ExecWorkflowCommandFrontend`, `ContainerFrontend`, `WorkflowFrontend` | Integrates container output, workflow control, and worktree lifecycle for the exec-workflow command path |
-| `api.rs` | `ApiStartCommandFrontend` | Calls `crate::frontend::api::serve(config)` — a peer Layer 3 call, not an upward call |
+| `api.rs` | `ApiStartCommandFrontend` | Hands `ApiServerRuntime` to `crate::frontend::api::serve` — a peer Layer 3 call, not an upward call |
 | `init.rs` | `InitCommandFrontend`, `InitFrontend` | Reports `InitPhase` transitions to stderr; prompts on stdin for aspec replacement, audit, and work-items config |
 | `ready.rs` | `ReadyCommandFrontend`, `ReadyFrontend` | Reports `ReadyPhase` transitions to stderr; prompts for Dockerfile creation and legacy-migration decisions |
 | `agent_auth.rs` | `AgentAuthFrontend` | Asks auth consent on stdin; defaults to `DeclineOnce` when stdin is not a TTY |
@@ -2270,6 +2297,8 @@ pub struct Tab {
 
 **`ContainerWindowState`** cycles Hidden → Minimized → Maximized → Hidden via `Ctrl+M`.
 
+**`WorkflowOverviewState`** toggles Minimized ↔ Maximized via `Ctrl+O`. Minimized (the default) draws one box per topological stage — a lone step's own box, or a `N steps…` summary in the stage's aggregate status colour. Maximized draws every step of every stage, rolling nothing up. It is fully independent of `ContainerWindowState`: `Ctrl+O` never writes `container_window_state` and `Ctrl+M` never writes `workflow_overview_state`. The two windows share the body rather than displacing each other — see [UI rendering](#ui-rendering-renderrs).
+
 **Pure functions** in `tabs.rs` — safe to unit-test without a terminal:
 
 | Function | Purpose |
@@ -2301,9 +2330,10 @@ Global shortcuts (available in all contexts except `ContainerMaximized`):
 | `Ctrl+D` | `NextTab` |
 | `Ctrl+C` | `CloseTabOrQuit` |
 | `Ctrl+M` | `CycleContainerWindow` |
+| `Ctrl+O` | `ToggleWorkflowOverview` |
 | `Ctrl+,` | `OpenConfigShow` |
 
-`ContainerMaximized` context: all keys except `Ctrl+Y` (copy) and `Ctrl+M` (toggle) are forwarded to the PTY as `Action::ForwardToPty(key)`. Global shortcuts are suppressed.
+`ContainerMaximized` context: all keys except `Ctrl+Y` (copy), `Ctrl+M` (toggle), and `Ctrl+O` (Workflow Overview) are forwarded to the PTY as `Action::ForwardToPty(key)`. Global shortcuts are suppressed.
 
 #### Command box (`command_box.rs`)
 
@@ -2341,8 +2371,7 @@ Available dialog variants:
 | `MultilineInput { title, prompt, editor }` | Multiline text input; Ctrl+Enter submits |
 | `ListPicker { title, items, selected }` | Arrow-key selection list; Enter selects |
 | `KindSelect { title, options }` | Numbered option select |
-| `WorkflowControlBoard(..)` | Workflow step navigation (→ ← ↑ ↓ d Ctrl+Enter Ctrl+C Esc) |
-| `WorkflowStepError(..)` | Step failure prompt: `[r]`/`[1]` retry, `[q]`/`[2]`/Esc pause, `[a]` abort |
+| `WorkflowControlBoard(..)` | Workflow step navigation (→ ← ↑ ↓ d Ctrl+Enter Ctrl+C Esc). Also the step-failure surface: a red frame and the failure's detail lines when `failure_lines` is non-empty. Arrows the engine has not enabled are inert |
 | `WorkflowYoloCountdown(..)` | Yolo countdown display; Esc dismisses |
 | `AgentSetup(..)` | Agent build/setup confirmation |
 | `MountScope(..)` | Git root vs CWD mount selection |
@@ -2379,14 +2408,18 @@ Commands with no interactive methods use marker impls that delegate to `UserMess
 | Slot | Height | Content |
 |------|--------|---------|
 | Tab bar | 3 rows | Colored tabs with project name and command label |
-| Execution window | fills remaining (min 5) | Status log or PTY output; border color by phase |
-| Minimized container bar | 3 rows (conditional) | One-line PTY summary |
-| Workflow strip | 3 rows (conditional) | Step status boxes |
+| Execution window | what the body has left (min 5 ahead of the bars) | Status log or PTY output; border color by phase |
+| Minimized container bar | 3 rows per slot (conditional, truncated last) | One-line PTY summary |
+| Workflow Overview | 3 rows minimized; N × 3 maximized (conditional) | Step status boxes |
 | Status bar | 1 row | Git root path; optional status text |
 | Command box | 3 rows | Text input with inline hint |
 | Suggestion row | 1 row | `> sugg1 · sugg2 · …` |
 
-Container overlay (Maximized) and active dialogs are rendered as floating layers on top of the base layout.
+The **body** is everything between the tab bar and the bottom chrome (status bar + command box + suggestion row). It is divided by explicit lengths, not by the constraint solver, because the three claimants rank against each other: the Workflow Overview is served first, clamped by `workflow_overview_height` to a whole number of box rows that fits its budget; the execution window then keeps a 5-row floor out of what remains; the container status bars take the rest and `render_container_bars` stops at the last bar that fits.
+
+The overview's **budget** is the whole body, except when the PTY overlay is on screen (`container_window_state == Maximized` and the tab has slots) *and* the overview is Maximized — then it is half the body, floored at one box row. That is the only coupling between the two windows: neither state ever overwrites the other, so `Ctrl+O` and `Ctrl+M` min/max the Workflow Overview and the container PTY independently.
+
+Container overlay (Maximized) and active dialogs are rendered as floating layers on top of the base layout. The overlay is drawn into `main_area` minus `workflow_overview_height + extra_bar_height`, so it never covers the Workflow Overview or the container status bars.
 
 **Welcome message** (Idle phase, no output): two dark-gray lines:
 ```
@@ -2425,11 +2458,12 @@ Running 'awman ready' to check your environment...
 
 ### API Frontend (`src/frontend/API/`)
 
-The API frontend is a full HTTP server (Axum + axum-server with optional rustls TLS) that dispatches commands through `Dispatch::run_command` rather than spawning child `awman` processes. It was completed in WI 0072 and is exercised end-to-end by `tests/api_parity/`.
+The API frontend is a full HTTP server (Axum + axum-server with optional rustls TLS) that dispatches commands through `Dispatch::run_command` rather than spawning child `awman` processes. `ApiServerRuntime::bootstrap` prepares the daemon state before the frontend builds its router and listener. It was completed in WI 0072 and is exercised end-to-end by `tests/api_parity/`.
 
 The HTTP routes are defined in `src/frontend/api/routes.rs`; the per-command frontends live alongside in `per_command/`. Sessions and commands are persisted to SQLite via `SqliteSessionStore` (`src/data/fs/api_db.rs`).
 
-`ApiServeConfig` is the configuration type that the CLI's `ApiStartCommandFrontend` impl populates and passes into `serve`:
+`ApiServeConfig` is the configuration type that the API command passes to
+`ApiServerRuntime::bootstrap` along with the shared engine bundle:
 
 ```rust
 pub struct ApiServeConfig {
@@ -2439,32 +2473,29 @@ pub struct ApiServeConfig {
 }
 ```
 
-The `serve(config)` function signature is the public contract that WI 0072 must preserve:
+The frontend receives the bootstrapped runtime:
 
 ```rust
-pub async fn serve(config: ApiServeConfig) -> Result<(), CommandError>
+impl ApiServerRuntime {
+    pub fn bootstrap(config: ApiServeConfig, engines: Engines) -> Result<ApiServerRuntime, CommandError>
+}
+
+pub async fn serve(runtime: ApiServerRuntime) -> Result<(), CommandError>
 ```
 
 ---
 
 ## Layer 4: Binary (`src/main.rs`)
 
-`main.rs` is the Layer 4 binary entrypoint. It contains no business logic: its sole responsibility is to construct the runtime context and route to the appropriate frontend.
+`main.rs` is the Layer 4 binary entrypoint. It contains no business logic: its sole responsibility is to invoke `Startup`, package the resulting context, and route to the appropriate frontend.
 
 ### Startup sequence
 
 1. **Build clap**: `CommandCatalogue::get().build_clap_command()` — the clap command is derived entirely from the catalogue; `main.rs` does not hard-code any subcommand or flag name.
 2. **Parse argv**: `clap_cmd.get_matches()` — clap handles `--help`, `--version`, and error formatting.
-3. **Load global config**: `GlobalConfig::load()` — used to select the container runtime.
-4. **Construct engines**:
-   - `ContainerRuntime::detect(&global_config)` — selects Docker or Apple Containers
-   - `GitEngine::new()` — used to resolve the git root
-   - `Session::open(working_dir, &git_engine, SessionOpenOptions::default())` — resolves git root, loads per-repo and global config, records timestamps
-   - `OverlayEngine::new(&session)` — resolves overlay paths from config
-   - `AuthEngine::new(&session)` — sets up the keychain credential path
-   - `AgentEngine::new(overlay_engine, runtime)` — wraps the overlay and runtime for agent execution
-   - `EngineWorkflowStateStore::at_git_root(session.git_root())` — filesystem workflow state store
-5. **Construct `RuntimeContext`**: `RuntimeContext::new(session, engines)` — wraps the session in `Arc<RwLock<Session>>`.
+3. **Run `Startup`**: `Startup::run(working_dir, env)` performs migrations, loads configuration, resolves the Git root, opens the `Session`, and calls `Engines::build(&global_config, &session)` for the shared session engine bundle.
+4. **Start daemon runtimes when requested**: API and squad daemon commands use their own Layer 2 entry points, `ApiServerRuntime::bootstrap` and `SquadDaemonHandles::bootstrap`, before handing the completed runtime to a frontend.
+5. **Construct `RuntimeContext`**: `RuntimeContext::new(session, engines)` packages the values for a frontend.
 6. **Route**: `matches.subcommand_name().is_some()` → `cli::run(matches, ctx)` (CLI); otherwise → `tui::run(matches, ctx)` (TUI).
 
 ### Routing rule
@@ -2489,4 +2520,4 @@ The binary crate opts out of all unsafe code at the crate level. Layer 3 and Lay
 
 ---
 
-[← Runtimes](12-runtimes.md) · [Contents](contents.md)
+[← Runtimes](11-runtimes.md) · [Contents](contents.md)

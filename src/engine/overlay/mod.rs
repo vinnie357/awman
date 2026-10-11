@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 
 use crate::data::fs::auth_paths::AuthPathResolver;
 use crate::data::fs::overlay_paths::OverlayPathResolver;
+use crate::data::fs::skill_library::read_library_meta;
 use crate::data::session::{AgentName, Session};
+use crate::engine::auth::credential::{CredentialFile, CredentialFingerprint};
 use crate::engine::container::options::{OverlayPermission, OverlaySpec};
 use crate::engine::error::EngineError;
 
@@ -28,7 +30,47 @@ pub const CLAUDE_DENYLIST: &[&str] = &[
     "ide",
     "shell-snapshots",
     "paste-cache",
+    // The host copy contains the refresh token.  Containers receive only the
+    // awman-authored, refresh-token-free replacement planted below. The
+    // case-insensitive, every-depth guard in `is_denied_credential_name` is the
+    // real enforcement (INV-2); this entry keeps the exact top-level name in the
+    // single-source list.
+    ".credentials.json",
 ];
+
+/// Credential filenames that must NEVER be copied into a staged Claude settings
+/// overlay at ANY recursion depth, matched case-insensitively so
+/// `.Credentials.json` (or any other case variant) cannot smuggle a copy of the
+/// host refresh token into the read-write `~/.claude` bind mount (INV-2).
+const CLAUDE_CREDENTIAL_DENYLIST: &[&str] = &[".credentials.json"];
+
+/// True when `name` is a host-credential filename we must never mount. Compared
+/// with `eq_ignore_ascii_case`, so case variants are rejected too.
+fn is_denied_credential_name(name: &str) -> bool {
+    CLAUDE_CREDENTIAL_DENYLIST
+        .iter()
+        .any(|denied| name.eq_ignore_ascii_case(denied))
+}
+
+/// Opaque filesystem identity used to reject a hard link or alias that points
+/// at the very same inode as the host `.credentials.json`, regardless of the
+/// name it wears. On unix this is `(dev, ino)`; elsewhere the canonical path.
+#[cfg(unix)]
+type FileIdentity = (u64, u64);
+#[cfg(not(unix))]
+type FileIdentity = PathBuf;
+
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    // `metadata` follows symlinks intentionally: an alias pointing at the host
+    // credential resolves to the same (dev, ino) as the credential itself.
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+#[cfg(not(unix))]
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    std::fs::canonicalize(path).ok()
+}
 
 /// Scope for a context overlay — lives here in Layer 1 so both the engine
 /// (Layer 1) and command (Layer 2) layers can reference it without an
@@ -68,6 +110,11 @@ pub struct OverlayRequest {
     pub container_home: Option<String>,
     /// Context-directory overlays (global/repo/workflow).
     pub context_overlays: Vec<ContextOverlay>,
+    /// Plant refreshable credential files into the staged agent-settings
+    /// overlay. This is enabled only for file-delivered container credentials;
+    /// passthrough/none auth modes must never cause host credentials to be
+    /// copied into a mount.
+    pub materialize_credentials: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,12 +140,30 @@ pub type AgentSecretFilesProvider = std::sync::Arc<
     dyn Fn(&AgentName) -> Vec<crate::engine::auth::keychain::AgentSecretFile> + Send + Sync,
 >;
 
+/// Test-injectable source of refreshable credential files. The production
+/// implementation reads the descriptor's host source and materializes its
+/// refresh-token-free container file; tests can replace it without touching a
+/// developer's keychain or host credential file.
+pub type AgentCredentialFileProvider =
+    std::sync::Arc<dyn Fn(&AgentName) -> Option<CredentialFile> + Send + Sync>;
+
+/// A credential file planted in one retained staged settings directory.
+/// Contains no secret material: only the path and a non-reversible fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedCredentialFile {
+    pub agent: AgentName,
+    pub path: PathBuf,
+    pub root: PathBuf,
+    pub fingerprint: CredentialFingerprint,
+}
+
 pub struct OverlayEngine {
     auth_resolver: AuthPathResolver,
     /// Source of file-form host-keychain artifacts to plant into agent
     /// settings overlays (e.g. `~/.gemini/antigravity-cli/...`). Injectable
     /// for testability; defaults to the real host-keychain reader.
     secret_files_provider: AgentSecretFilesProvider,
+    credential_provider: AgentCredentialFileProvider,
     /// Sanitized temp directories that back agent-settings overlays. Held
     /// here so the directories live as long as this engine instance and are
     /// removed on `Drop` (RAII via `tempfile::TempDir`). This prevents the
@@ -119,17 +184,21 @@ impl std::fmt::Debug for OverlayEngine {
 impl OverlayEngine {
     pub fn new(_session: &Session) -> Result<Self, EngineError> {
         let auth_resolver = AuthPathResolver::from_process_env().map_err(EngineError::Data)?;
+        let credential_provider = default_credential_provider(auth_resolver.clone());
         Ok(Self {
             auth_resolver,
             secret_files_provider: default_secret_files_provider(),
+            credential_provider,
             sanitized: std::sync::Mutex::new(Vec::new()),
         })
     }
 
     pub fn with_auth_resolver(auth_resolver: AuthPathResolver) -> Self {
+        let credential_provider = default_credential_provider(auth_resolver.clone());
         Self {
             auth_resolver,
             secret_files_provider: default_secret_files_provider(),
+            credential_provider,
             sanitized: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -139,6 +208,13 @@ impl OverlayEngine {
     /// reads a developer's real credentials.
     pub fn with_secret_files_provider(mut self, provider: AgentSecretFilesProvider) -> Self {
         self.secret_files_provider = provider;
+        self
+    }
+
+    /// Replace the refreshable-credential source. Tests use this to avoid any
+    /// host credential read while exercising staging behaviour.
+    pub fn with_credential_provider(mut self, provider: AgentCredentialFileProvider) -> Self {
+        self.credential_provider = provider;
         self
     }
 
@@ -159,7 +235,20 @@ impl OverlayEngine {
         session: &Session,
         request: &OverlayRequest,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
+        self.build_overlays_with_credentials(session, request)
+            .map(|(overlays, _)| overlays)
+    }
+
+    /// Build overlays and report the refreshable credential files planted in
+    /// staged settings directories. `build_overlays` remains the compatible
+    /// convenience wrapper for callers that do not need the file metadata.
+    pub fn build_overlays_with_credentials(
+        &self,
+        session: &Session,
+        request: &OverlayRequest,
+    ) -> Result<(Vec<OverlaySpec>, Vec<StagedCredentialFile>), EngineError> {
         let mut by_key: HashMap<String, OverlaySpec> = HashMap::new();
+        let mut staged_credentials = Vec::new();
 
         // 1. User-supplied directory overlays.
         for spec in &request.directories {
@@ -177,12 +266,15 @@ impl OverlayEngine {
         //    and the request's container_home so settings paths agree with
         //    user-supplied overlays.
         if let Some(agent) = &request.agent {
-            for spec in self.agent_settings_overlays_with(
+            let (agent_overlays, staged) = self.agent_settings_overlays_with_credentials(
                 agent,
                 request.yolo,
                 session.git_root(),
                 request.container_home.as_deref(),
-            )? {
+                request.materialize_credentials,
+            )?;
+            staged_credentials.extend(staged);
+            for spec in agent_overlays {
                 let key = OverlayPathResolver::conflict_key(&spec.host_path);
                 insert_or_merge(&mut by_key, key, spec);
             }
@@ -217,7 +309,7 @@ impl OverlayEngine {
 
         let mut out: Vec<OverlaySpec> = by_key.into_values().collect();
         out.sort_by(|a, b| a.host_path.cmp(&b.host_path));
-        Ok(out)
+        Ok((out, staged_credentials))
     }
 
     /// Resolve a single user-supplied overlay spec into its canonical form.
@@ -287,9 +379,28 @@ impl OverlayEngine {
         git_root: &Path,
         container_home_override: Option<&str>,
     ) -> Result<Vec<OverlaySpec>, EngineError> {
+        self.agent_settings_overlays_with_credentials(
+            agent,
+            yolo,
+            git_root,
+            container_home_override,
+            false,
+        )
+        .map(|(overlays, _)| overlays)
+    }
+
+    fn agent_settings_overlays_with_credentials(
+        &self,
+        agent: &AgentName,
+        yolo: bool,
+        git_root: &Path,
+        container_home_override: Option<&str>,
+        materialize_credentials: bool,
+    ) -> Result<(Vec<OverlaySpec>, Vec<StagedCredentialFile>), EngineError> {
         let home = self.auth_resolver.home();
         let paths = self.auth_resolver.resolve(agent.as_str());
         let mut out = Vec::new();
+        let mut staged_credentials = Vec::new();
         let container_home = container_home_override
             .map(|s| s.to_string())
             .or_else(|| detect_container_home(home, agent.as_str(), git_root))
@@ -345,25 +456,41 @@ impl OverlayEngine {
                     .unwrap_or(false);
                 if has_settings_dir {
                     let dir = paths.settings_dir.as_ref().unwrap();
-                    let host_path = match sanitize_claude_settings_dir(dir, yolo) {
-                        Ok((tmp, path)) => {
-                            let _retained = self.retain_tempdir(tmp);
-                            path
-                        }
-                        Err(_) => dir.clone(),
-                    };
-                    out.push(OverlaySpec {
-                        host_path,
-                        container_path: PathBuf::from(format!("{container_home}/.claude")),
-                        permission: OverlayPermission::ReadWrite,
+                    let staged = sanitize_claude_settings_dir(dir, yolo).or_else(|error| {
+                        tracing::warn!(
+                            path = %dir.display(),
+                            %error,
+                            "could not sanitize Claude settings; using an empty safe overlay"
+                        );
+                        synthesize_minimal_claude_settings_dir(yolo)
                     });
+                    if let Ok((tmp, path)) = staged {
+                        self.plant_credential_file(
+                            agent,
+                            &path,
+                            materialize_credentials,
+                            &mut staged_credentials,
+                        )?;
+                        let host_path = self.retain_tempdir(tmp);
+                        out.push(OverlaySpec {
+                            host_path,
+                            container_path: PathBuf::from(format!("{container_home}/.claude")),
+                            permission: OverlayPermission::ReadWrite,
+                        });
+                    }
                 } else {
                     // First-time user: no ~/.claude/ on host. Synthesize a
                     // minimal settings dir with LSP suppression.
                     if let Ok((tmp, path)) = synthesize_minimal_claude_settings_dir(yolo) {
-                        let _retained = self.retain_tempdir(tmp);
+                        self.plant_credential_file(
+                            agent,
+                            &path,
+                            materialize_credentials,
+                            &mut staged_credentials,
+                        )?;
+                        let host_path = self.retain_tempdir(tmp);
                         out.push(OverlaySpec {
-                            host_path: path,
+                            host_path,
                             container_path: PathBuf::from(format!("{container_home}/.claude")),
                             permission: OverlayPermission::ReadWrite,
                         });
@@ -392,7 +519,7 @@ impl OverlayEngine {
                     }
                 }
             }
-            "antigravity" => {
+            "agy" | "antigravity" => {
                 // Antigravity reads its OAuth token from a fixed file inside
                 // `~/.gemini/antigravity-cli/` when the in-container keyring
                 // (Secret Service / D-Bus) is unreachable — which is always
@@ -471,7 +598,35 @@ impl OverlayEngine {
             _ => {}
         }
 
-        Ok(out)
+        Ok((out, staged_credentials))
+    }
+
+    fn plant_credential_file(
+        &self,
+        agent: &AgentName,
+        staged_root: &Path,
+        materialize_credentials: bool,
+        staged: &mut Vec<StagedCredentialFile>,
+    ) -> Result<(), EngineError> {
+        if !materialize_credentials {
+            return Ok(());
+        }
+        let Some(file) = (self.credential_provider)(agent) else {
+            return Ok(());
+        };
+        write_credential_file_atomic(staged_root, &file)
+            .map_err(|error| EngineError::io(staged_root, error))?;
+        // The descriptor's materialized Claude JSON has the same deliberately
+        // refresh-token-free shape as the source parser accepts. Parse only the
+        // access token/expiry fields to create the monitor's opaque identity.
+        let fingerprint = credential_fingerprint_for_file(&file)?;
+        staged.push(StagedCredentialFile {
+            agent: agent.clone(),
+            path: staged_root.join(&file.relative_path),
+            root: staged_root.to_path_buf(),
+            fingerprint,
+        });
+        Ok(())
     }
 
     /// Build overlay specs for the global skills directory, mapping it to the
@@ -510,7 +665,9 @@ impl OverlayEngine {
             "codex" => format!("{container_home}/.codex/skills"),
             "opencode" => format!("{container_home}/.config/opencode/commands"),
             "gemini" => format!("{container_home}/.gemini/commands"),
-            "antigravity" => format!("{container_home}/.gemini/antigravity-cli/skills"),
+            "agy" | "antigravity" => {
+                format!("{container_home}/.gemini/antigravity-cli/skills")
+            }
             "copilot" => format!("{container_home}/.copilot/instructions"),
             "crush" => format!("{container_home}/.config/crush/commands"),
             "cline" => format!("{container_home}/.cline/skills"),
@@ -536,19 +693,83 @@ impl OverlayEngine {
         } else {
             let mut specs = Vec::new();
             for name in names {
-                let skill_dir = host_skills_dir.join(name);
-                if !skill_dir.exists() {
-                    return Err(EngineError::Other(format!(
-                        "named skill '{}' not found in {}",
-                        name,
-                        host_skills_dir.display()
-                    )));
+                match name.split_once('/') {
+                    // ── Single skill inside a pulled library: `library/skill` ──
+                    //
+                    // Mount only `<library>/<subdir>/<skill>` at
+                    // `{container_path}/<library>/<skill>`, preserving the
+                    // library namespace so `skill(lib)` and `skill(lib/skill)`
+                    // never collide on container path when both are requested.
+                    Some((library, skill)) => {
+                        validate_skill_reference_segment(library, name)?;
+                        validate_skill_reference_segment(skill, name)?;
+                        let library_dir = skill_dirs.library_dir(library);
+                        if !library_dir.exists() {
+                            return Err(EngineError::Other(format!(
+                                "skill library '{library}' not found in {} (for named skill '{name}')",
+                                skill_dirs.library_root().display()
+                            )));
+                        }
+                        let meta = read_library_meta(&library_dir).map_err(EngineError::Data)?;
+                        let subdir = validate_library_subdir(&meta.subdir)?;
+                        let skill_path = library_dir.join(&subdir).join(skill);
+                        // A skill is a directory holding a `SKILL.md`. Merely
+                        // existing is not enough: mounting an arbitrary
+                        // directory inside a clone would expose non-skill
+                        // content (including `.git/`) to the agent.
+                        if !skill_path.is_dir() || !skill_path.join("SKILL.md").is_file() {
+                            return Err(EngineError::Other(format!(
+                                "skill '{skill}' not found in library '{library}' (looked for a SKILL.md in {})",
+                                skill_path.display()
+                            )));
+                        }
+                        specs.push(OverlaySpec {
+                            host_path: OverlayPathResolver::canonicalize_lossy(&skill_path),
+                            container_path: PathBuf::from(format!(
+                                "{container_path}/{library}/{skill}"
+                            )),
+                            permission: OverlayPermission::ReadOnly,
+                        });
+                    }
+                    // ── No slash: a plain skill, or a whole pulled library ──
+                    None => {
+                        validate_skill_reference_segment(name, name)?;
+                        // 1. Plain skill wins — a user's own local skill is
+                        //    never shadowed by a same-named pulled library.
+                        let plain_dir = host_skills_dir.join(name);
+                        if plain_dir.exists() {
+                            specs.push(OverlaySpec {
+                                host_path: OverlayPathResolver::canonicalize_lossy(&plain_dir),
+                                container_path: PathBuf::from(format!("{container_path}/{name}")),
+                                permission: OverlayPermission::ReadOnly,
+                            });
+                            continue;
+                        }
+                        // 2. Whole library — mount `<library>/<subdir>` at
+                        //    `{container_path}/<name>`, giving the same mount
+                        //    shape as any other named skill (a directory of
+                        //    `<skill>/SKILL.md` entries).
+                        let library_dir = skill_dirs.library_dir(name);
+                        if library_dir.exists() {
+                            let meta =
+                                read_library_meta(&library_dir).map_err(EngineError::Data)?;
+                            let subdir = validate_library_subdir(&meta.subdir)?;
+                            let mount = library_dir.join(&subdir);
+                            specs.push(OverlaySpec {
+                                host_path: OverlayPathResolver::canonicalize_lossy(&mount),
+                                container_path: PathBuf::from(format!("{container_path}/{name}")),
+                                permission: OverlayPermission::ReadOnly,
+                            });
+                            continue;
+                        }
+                        // 3. Nothing resolved — name both search locations.
+                        return Err(EngineError::Other(format!(
+                            "named skill '{name}' not found in {} or {}",
+                            host_skills_dir.display(),
+                            skill_dirs.library_root().display()
+                        )));
+                    }
                 }
-                specs.push(OverlaySpec {
-                    host_path: OverlayPathResolver::canonicalize_lossy(&skill_dir),
-                    container_path: PathBuf::from(format!("{}/{}", container_path, name)),
-                    permission: OverlayPermission::ReadOnly,
-                });
             }
             Ok(specs)
         }
@@ -603,21 +824,40 @@ fn sanitize_claude_settings_dir(
         .prefix("awman-claude-dir-")
         .tempdir()?;
     let tmp_root = tmp.path().to_path_buf();
-    // Mirror only the entries that are not on the denylist.
+    // Mirror only the entries that are not on the denylist. The credential
+    // guard is applied fail-closed: the top-level noise denylist is exact, but
+    // the credential name is matched case-insensitively, symlinks and other
+    // non-regular entries are never copied, and any file sharing the host
+    // credential's inode identity is skipped at every depth (INV-2, BLOCKING-1).
     let denylist: std::collections::HashSet<&str> = CLAUDE_DENYLIST.iter().copied().collect();
+    let host_credential = file_identity(&src.join(".credentials.json"));
     if let Ok(entries) = std::fs::read_dir(src) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if denylist.contains(name_str.as_ref()) {
+            if denylist.contains(name_str.as_ref()) || is_denied_credential_name(&name_str) {
+                continue;
+            }
+            let src_path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&src_path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                // A symlink in ~/.claude being mounted RW would let the copy
+                // follow an alias to the host credential (or any host path).
                 continue;
             }
             let dest = tmp_root.join(&name);
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                copy_dir_all(&entry.path(), &dest)?;
-            } else {
-                std::fs::copy(entry.path(), dest)?;
+            if meta.is_dir() {
+                copy_claude_tree_secure(&src_path, &dest, &host_credential)?;
+            } else if meta.is_file() {
+                if file_identity(&src_path).is_some() && file_identity(&src_path) == host_credential
+                {
+                    continue;
+                }
+                std::fs::copy(&src_path, dest)?;
             }
+            // Any other file type (fifo, socket, device) is never mounted.
         }
     }
     // Inject (or update) settings.json to suppress LSP banner and optionally
@@ -779,12 +1019,108 @@ fn write_secret_file(
     Ok(())
 }
 
+/// Atomically replace a credential file in a staged settings directory.
+///
+/// The temporary file is deliberately created in `staged_root`: same-directory
+/// `rename` is atomic and is visible through both Docker and Apple Containers'
+/// existing RW bind mount. A missing staged root is a normal monitor race and
+/// is reported as `Ok(false)`, never as a partial write to a recycled path.
+pub fn write_credential_file_atomic(
+    staged_root: &Path,
+    file: &CredentialFile,
+) -> std::io::Result<bool> {
+    if !staged_root.is_dir() {
+        return Ok(false);
+    }
+    if file.relative_path.is_absolute()
+        || file
+            .relative_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "credential path must be relative to staged root",
+        ));
+    }
+    let target = staged_root.join(&file.relative_path);
+    let Some(parent) = target.parent() else {
+        return Ok(false);
+    };
+    if !parent.is_dir() {
+        return Ok(false);
+    }
+
+    use std::io::Write as _;
+    let mut temp = tempfile::NamedTempFile::new_in(staged_root)?;
+    temp.write_all(&file.contents)?;
+    temp.flush()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(file.mode))?;
+    }
+    // `persist` is a same-filesystem rename. It replaces an existing target
+    // without ever truncating that target in place.
+    temp.persist(&target)
+        .map_err(|error| error.error)
+        .map(|_| true)
+}
+
+/// Derive the initial monitor fingerprint from the descriptor's materialized
+/// Claude file without ever accepting a refresh-token field. This mirrors the
+/// credential-model parser's allow-list shape.
+fn credential_fingerprint_for_file(
+    file: &CredentialFile,
+) -> Result<CredentialFingerprint, EngineError> {
+    #[derive(serde::Deserialize)]
+    struct MaterializedClaudeCredential {
+        #[serde(rename = "claudeAiOauth")]
+        oauth: MaterializedClaudeOauth,
+    }
+    #[derive(serde::Deserialize)]
+    struct MaterializedClaudeOauth {
+        #[serde(rename = "accessToken")]
+        access_token: String,
+        #[serde(rename = "expiresAt", default)]
+        expires_at: Option<u64>,
+    }
+
+    let parsed: MaterializedClaudeCredential =
+        serde_json::from_slice(&file.contents).map_err(|_| {
+            EngineError::Other(
+                "refreshable credential materialization was not valid Claude JSON".into(),
+            )
+        })?;
+    let expires_at = parsed
+        .oauth
+        .expires_at
+        .map(|milliseconds| std::time::UNIX_EPOCH + std::time::Duration::from_millis(milliseconds));
+    Ok(CredentialFingerprint::of(
+        &crate::engine::auth::credential::CredentialSnapshot {
+            secret: crate::engine::auth::credential::SecretString::new(parsed.oauth.access_token),
+            expires_at,
+            extra: Default::default(),
+        },
+    ))
+}
+
 /// Production binding for `AgentSecretFilesProvider`: reads file-form
 /// keychain artifacts from the host OS keychain via
 /// `engine::auth::keychain::agent_keychain_files`.
 fn default_secret_files_provider() -> AgentSecretFilesProvider {
     std::sync::Arc::new(|agent: &AgentName| {
         crate::engine::auth::keychain::agent_keychain_files(agent)
+    })
+}
+
+fn default_credential_provider(auth_resolver: AuthPathResolver) -> AgentCredentialFileProvider {
+    std::sync::Arc::new(move |agent: &AgentName| {
+        let spec = crate::engine::auth::keychain::refreshable_spec_for(agent)?;
+        let source = (spec.source)(&auth_resolver);
+        let snapshot = (spec.read)(&source).ok()?;
+        Some((spec.materialize)(&snapshot))
     })
 }
 
@@ -798,6 +1134,48 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
             } else {
                 std::fs::copy(entry.path(), target)?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy a subtree of the host `~/.claude` into a staged overlay
+/// while applying the credential guard at EVERY depth (INV-2, BLOCKING-1):
+/// files whose name matches the credential denylist (case-insensitively),
+/// symlinks and other non-regular entries, and any file sharing the host
+/// credential's inode identity are all skipped. Unlike `copy_dir_all` this
+/// never follows a symlink and never copies a nested `.credentials.json`.
+fn copy_claude_tree_secure(
+    src: &Path,
+    dst: &Path,
+    host_credential: &Option<FileIdentity>,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    if let Ok(entries) = std::fs::read_dir(src) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if is_denied_credential_name(&name_str) {
+                continue;
+            }
+            let src_path = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&src_path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            let target = dst.join(&name);
+            if meta.is_dir() {
+                copy_claude_tree_secure(&src_path, &target, host_credential)?;
+            } else if meta.is_file() {
+                let identity = file_identity(&src_path);
+                if identity.is_some() && identity == *host_credential {
+                    continue;
+                }
+                std::fs::copy(&src_path, &target)?;
+            }
+            // Any other file type is never mounted.
         }
     }
     Ok(())
@@ -833,7 +1211,12 @@ pub(crate) fn detect_home_from_dockerfile(path: &Path) -> Option<String> {
 /// in `Dockerfile.<agent>` files under `<git_root>/.awman/` and `<home>/.awman/`.
 /// Returns `Some("/home/<name>")` when found, `None` otherwise.
 pub(crate) fn detect_container_home(home: &Path, agent: &str, git_root: &Path) -> Option<String> {
-    let dockerfile_name = format!("Dockerfile.{agent}");
+    let asset_name = if matches!(agent, "agy" | "antigravity") {
+        "antigravity"
+    } else {
+        agent
+    };
+    let dockerfile_name = format!("Dockerfile.{asset_name}");
     let search_dirs: Vec<PathBuf> = [git_root.join(".awman"), home.join(".awman")]
         .into_iter()
         .collect();
@@ -845,6 +1228,60 @@ pub(crate) fn detect_container_home(home: &Path, agent: &str, git_root: &Path) -
         }
     }
     None
+}
+
+/// Validate one segment of a `skill(...)` reference (a plain skill name, a
+/// library name, or a skill name inside a library) as a single, contained
+/// path component.
+///
+/// The overlay parser applies the same rule, but named skills also reach this
+/// function from config files and the API, so containment is re-checked here:
+/// an empty, `.`, or `..` segment would otherwise be joined onto a host path
+/// and resolve to a directory the reference was never meant to name (e.g.
+/// `skill(lib/..)` mounting the whole managed clone, `.git/` included).
+fn validate_skill_reference_segment(segment: &str, name: &str) -> Result<(), EngineError> {
+    let mut components = Path::new(segment).components();
+    let first = components.next();
+    let contained =
+        matches!(first, Some(std::path::Component::Normal(_))) && components.next().is_none();
+    if !contained {
+        return Err(EngineError::Other(format!(
+            "named skill '{name}' has an invalid path segment '{segment}'; segments must not be \
+             empty, '.', '..', or contain a path separator"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a persisted library `subdir` as a relative path *inside* the
+/// managed clone and return its normalized form. Rejects empty values and any
+/// absolute/root/prefix, `.`, or `..` component so a crafted `.awman.json`
+/// (or `--subdir` value that produced it) can never turn a library mount into
+/// a host path outside `skill_dirs.library_dir(<slug>)`. Mirrors the
+/// containment rule applied by the command-layer pull orchestration.
+fn validate_library_subdir(subdir: &str) -> Result<PathBuf, EngineError> {
+    let mut normalized = PathBuf::new();
+    let mut components = 0;
+    for component in Path::new(subdir).components() {
+        match component {
+            std::path::Component::Normal(part) => {
+                normalized.push(part);
+                components += 1;
+            }
+            _ => {
+                return Err(EngineError::Other(format!(
+                    "skill library subdir '{subdir}' must be a relative path inside the \
+                     library (no absolute, '.', or '..' components)"
+                )));
+            }
+        }
+    }
+    if components == 0 {
+        return Err(EngineError::Other(
+            "skill library subdir must not be empty".to_string(),
+        ));
+    }
+    Ok(normalized)
 }
 
 fn insert_or_merge(map: &mut HashMap<String, OverlaySpec>, key: String, spec: OverlaySpec) {
@@ -1064,6 +1501,93 @@ mod tests {
         assert!(staged_token.exists(), "synthesized dir must hold the token");
     }
 
+    #[test]
+    fn agy_and_legacy_alias_stage_existing_settings_at_the_legacy_container_home() {
+        for input in ["agy", "antigravity"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let gemini_dir = tmp.path().join(".gemini");
+            std::fs::create_dir_all(&gemini_dir).unwrap();
+            std::fs::write(gemini_dir.join("settings.json"), input).unwrap();
+            let awman_dir = tmp.path().join(".awman");
+            std::fs::create_dir_all(&awman_dir).unwrap();
+            std::fs::write(
+                awman_dir.join("Dockerfile.antigravity"),
+                "FROM scratch\nUSER awman\n",
+            )
+            .unwrap();
+            let engine = make_engine(tmp.path());
+            let agent = AgentName::new(input).unwrap();
+
+            let overlays = engine
+                .agent_settings_overlays_with(&agent, false, tmp.path(), None)
+                .unwrap();
+
+            assert_eq!(overlays.len(), 1, "input {input}: {overlays:?}");
+            assert_eq!(
+                overlays[0].container_path,
+                Path::new("/home/awman/.gemini"),
+                "input {input} must use the home from Dockerfile.antigravity"
+            );
+            assert_eq!(overlays[0].permission, OverlayPermission::ReadWrite);
+            assert_ne!(overlays[0].host_path, gemini_dir);
+            assert_eq!(
+                std::fs::read_to_string(overlays[0].host_path.join("settings.json")).unwrap(),
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn agy_and_legacy_alias_synthesize_settings_from_an_injected_keychain_file() {
+        use crate::engine::auth::keychain::AgentSecretFile;
+
+        for input in ["agy", "antigravity"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let token = format!("fixture-token-{input}").into_bytes();
+            let engine = make_engine_with_secrets(
+                tmp.path(),
+                vec![AgentSecretFile {
+                    relative_path: PathBuf::from("antigravity-cli").join("antigravity-oauth-token"),
+                    contents: token.clone(),
+                    mode: 0o600,
+                }],
+            );
+            let agent = AgentName::new(input).unwrap();
+
+            let overlays = engine
+                .agent_settings_overlays_with(&agent, false, tmp.path(), None)
+                .unwrap();
+
+            assert_eq!(overlays.len(), 1, "input {input}: {overlays:?}");
+            assert_eq!(overlays[0].container_path, Path::new("/root/.gemini"));
+            assert_eq!(overlays[0].permission, OverlayPermission::ReadWrite);
+            assert_eq!(
+                std::fs::read(
+                    overlays[0]
+                        .host_path
+                        .join("antigravity-cli/antigravity-oauth-token")
+                )
+                .unwrap(),
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn agy_and_legacy_alias_without_settings_or_keychain_have_no_overlay() {
+        for input in ["agy", "antigravity"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let engine = make_engine(tmp.path());
+            let agent = AgentName::new(input).unwrap();
+
+            let overlays = engine
+                .agent_settings_overlays_with(&agent, false, tmp.path(), None)
+                .unwrap();
+
+            assert!(overlays.is_empty(), "input {input}: {overlays:?}");
+        }
+    }
+
     // ─── antigravity skill_overlays ───────────────────────────────────────────
 
     #[test]
@@ -1171,6 +1695,54 @@ mod tests {
             "antigravity container path must end with .gemini/antigravity-cli/skills; got {:?}",
             specs[0].container_path
         );
+    }
+
+    #[test]
+    fn agy_and_legacy_alias_mount_all_and_named_skills_at_the_legacy_destination() {
+        let (tmp, skills_canon) = make_home_with_skills();
+        let lint_dir = tmp.path().join("skills/lint");
+        std::fs::create_dir_all(&lint_dir).unwrap();
+        std::fs::write(lint_dir.join("SKILL.md"), "# lint").unwrap();
+        let lint_canon = std::fs::canonicalize(&lint_dir).unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join("Dockerfile.antigravity"),
+            "FROM scratch\nUSER awman\n",
+        )
+        .unwrap();
+        let git_root = tmp.path().join("repo-without-agent-dockerfile");
+        std::fs::create_dir_all(&git_root).unwrap();
+        let engine = make_engine(tmp.path());
+
+        for input in ["agy", "antigravity"] {
+            let agent = AgentName::new(input).unwrap();
+            let all = with_awman_config_home(tmp.path(), || {
+                engine
+                    .skill_overlays(&agent, true, &[], &None, &git_root)
+                    .unwrap()
+            });
+            let named = with_awman_config_home(tmp.path(), || {
+                engine
+                    .skill_overlays(&agent, false, &["lint".to_string()], &None, &git_root)
+                    .unwrap()
+            });
+
+            assert_eq!(all.len(), 1, "all skills for input {input}: {all:?}");
+            assert_eq!(all[0].host_path, skills_canon);
+            assert_eq!(all[0].permission, OverlayPermission::ReadOnly);
+            assert_eq!(
+                all[0].container_path,
+                Path::new("/home/awman/.gemini/antigravity-cli/skills")
+            );
+            assert_eq!(named.len(), 1, "named skill for input {input}: {named:?}");
+            assert_eq!(named[0].host_path, lint_canon);
+            assert_eq!(named[0].permission, OverlayPermission::ReadOnly);
+            assert_eq!(
+                named[0].container_path,
+                Path::new("/home/awman/.gemini/antigravity-cli/skills/lint")
+            );
+        }
     }
 
     #[test]
@@ -1442,6 +2014,7 @@ mod tests {
             yolo: false,
             container_home: None,
             context_overlays: vec![],
+            materialize_credentials: false,
         };
         let overlays = engine.build_overlays(&session, &request).unwrap();
         // The two entries sharing the same canonicalized host path must collapse.
@@ -1625,6 +2198,45 @@ mod tests {
             Some("/home/appuser".to_string()),
             "detect_container_home must return /home/appuser for USER appuser"
         );
+    }
+
+    #[test]
+    fn agy_and_legacy_alias_find_the_legacy_dockerfile_in_repo_and_home() {
+        let repo_fixture = tempfile::tempdir().unwrap();
+        let repo_home = repo_fixture.path().join("home");
+        let repo_root = repo_fixture.path().join("repo");
+        std::fs::create_dir_all(repo_root.join(".awman")).unwrap();
+        std::fs::write(
+            repo_root.join(".awman/Dockerfile.antigravity"),
+            "FROM scratch\nUSER awman\n",
+        )
+        .unwrap();
+        assert!(!repo_root.join(".awman/Dockerfile.agy").exists());
+
+        let home_fixture = tempfile::tempdir().unwrap();
+        let global_home = home_fixture.path().join("home");
+        let global_repo = home_fixture.path().join("repo");
+        std::fs::create_dir_all(global_home.join(".awman")).unwrap();
+        std::fs::create_dir_all(&global_repo).unwrap();
+        std::fs::write(
+            global_home.join(".awman/Dockerfile.antigravity"),
+            "FROM scratch\nUSER awman\n",
+        )
+        .unwrap();
+        assert!(!global_home.join(".awman/Dockerfile.agy").exists());
+
+        for input in ["agy", "antigravity"] {
+            assert_eq!(
+                detect_container_home(&repo_home, input, &repo_root),
+                Some("/home/awman".to_string()),
+                "input {input} must use the repo-local legacy Dockerfile"
+            );
+            assert_eq!(
+                detect_container_home(&global_home, input, &global_repo),
+                Some("/home/awman".to_string()),
+                "input {input} must use the global legacy Dockerfile"
+            );
+        }
     }
 
     #[test]
@@ -1886,6 +2498,302 @@ mod tests {
         );
     }
 
+    // ─── skill_overlays: pulled libraries (WI-0103) ──────────────────────────
+
+    /// Seed a pulled library at `<home>/skills/.library/<slug>/` with the given
+    /// `subdir` and skill names (each a `<skill>/SKILL.md`), plus `.awman.json`.
+    fn seed_library(home: &Path, slug: &str, subdir: &str, skills: &[&str]) {
+        let lib_dir = home.join("skills").join(".library").join(slug);
+        for skill in skills {
+            let skill_dir = lib_dir.join(subdir).join(skill);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(skill_dir.join("SKILL.md"), format!("# {skill}")).unwrap();
+        }
+        crate::data::fs::skill_library::write_library_meta(
+            &lib_dir,
+            &crate::data::fs::skill_library::SkillLibraryMeta {
+                source: format!("https://github.com/someone/{slug}.git"),
+                owner: "someone".to_string(),
+                repo: slug.to_string(),
+                subdir: subdir.to_string(),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn skill_named_plain_skill_wins_over_same_named_library() {
+        let (tmp, _) = make_home_with_skills();
+        // A hand-authored plain skill named 'superpowers'.
+        let plain = tmp.path().join("skills").join("superpowers");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::write(plain.join("SKILL.md"), "# plain").unwrap();
+        // A pulled library ALSO named 'superpowers'.
+        seed_library(tmp.path(), "superpowers", "skills", &["brainstorming"]);
+
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let specs = with_awman_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(
+                    &agent,
+                    false,
+                    &["superpowers".to_string()],
+                    &None,
+                    Path::new("/"),
+                )
+                .unwrap()
+        });
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            specs[0].host_path,
+            std::fs::canonicalize(&plain).unwrap(),
+            "the plain skill must win over a same-named pulled library"
+        );
+    }
+
+    #[test]
+    fn skill_named_whole_library_mounts_subdir_at_library_container_path() {
+        let (tmp, _) = make_home_with_skills();
+        seed_library(
+            tmp.path(),
+            "superpowers",
+            "skills",
+            &["brainstorming", "debugging"],
+        );
+
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let specs = with_awman_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(
+                    &agent,
+                    false,
+                    &["superpowers".to_string()],
+                    &None,
+                    Path::new("/"),
+                )
+                .unwrap()
+        });
+
+        assert_eq!(specs.len(), 1);
+        let expected_host = std::fs::canonicalize(
+            tmp.path()
+                .join("skills")
+                .join(".library")
+                .join("superpowers")
+                .join("skills"),
+        )
+        .unwrap();
+        assert_eq!(
+            specs[0].host_path, expected_host,
+            "whole-library mount must point at .library/<slug>/<subdir>"
+        );
+        assert!(
+            specs[0]
+                .container_path
+                .to_string_lossy()
+                .ends_with("/superpowers"),
+            "container path must namespace the whole library under its name; got {:?}",
+            specs[0].container_path
+        );
+    }
+
+    #[test]
+    fn skill_named_single_library_skill_mounts_that_skill_dir() {
+        let (tmp, _) = make_home_with_skills();
+        seed_library(tmp.path(), "superpowers", "skills", &["brainstorming"]);
+
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let specs = with_awman_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(
+                    &agent,
+                    false,
+                    &["superpowers/brainstorming".to_string()],
+                    &None,
+                    Path::new("/"),
+                )
+                .unwrap()
+        });
+
+        assert_eq!(specs.len(), 1);
+        let expected_host = std::fs::canonicalize(
+            tmp.path()
+                .join("skills")
+                .join(".library")
+                .join("superpowers")
+                .join("skills")
+                .join("brainstorming"),
+        )
+        .unwrap();
+        assert_eq!(
+            specs[0].host_path, expected_host,
+            "single-skill mount must point at the individual skill directory"
+        );
+        assert!(
+            specs[0]
+                .container_path
+                .to_string_lossy()
+                .ends_with("/superpowers/brainstorming"),
+            "container path must preserve the library namespace; got {:?}",
+            specs[0].container_path
+        );
+    }
+
+    #[test]
+    fn skill_named_library_present_but_skill_missing_gives_distinct_error() {
+        let (tmp, _) = make_home_with_skills();
+        seed_library(tmp.path(), "superpowers", "skills", &["brainstorming"]);
+
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let result = with_awman_config_home(tmp.path(), || {
+            engine.skill_overlays(
+                &agent,
+                false,
+                &["superpowers/ghost".to_string()],
+                &None,
+                Path::new("/"),
+            )
+        });
+
+        let msg = result
+            .expect_err("a missing skill in a present library must error")
+            .to_string();
+        assert!(
+            msg.contains("not found in library")
+                && msg.contains("superpowers")
+                && msg.contains("ghost"),
+            "error must name both the library and the missing skill; got: {msg}"
+        );
+    }
+
+    /// A skill is a directory holding a `SKILL.md`. An arbitrary directory
+    /// inside a library's subdir must not be mountable just because it exists
+    /// (WI-0103 remediation).
+    #[test]
+    fn skill_named_library_dir_without_skill_md_is_rejected() {
+        let (tmp, _) = make_home_with_skills();
+        seed_library(tmp.path(), "superpowers", "skills", &["brainstorming"]);
+        // A directory inside the library's subdir with no SKILL.md.
+        let not_a_skill = tmp
+            .path()
+            .join("skills")
+            .join(".library")
+            .join("superpowers")
+            .join("skills")
+            .join("not-a-skill");
+        std::fs::create_dir_all(&not_a_skill).unwrap();
+        std::fs::write(not_a_skill.join("README.md"), "no skill here").unwrap();
+
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let result = with_awman_config_home(tmp.path(), || {
+            engine.skill_overlays(
+                &agent,
+                false,
+                &["superpowers/not-a-skill".to_string()],
+                &None,
+                Path::new("/"),
+            )
+        });
+
+        let msg = result
+            .expect_err("a directory without SKILL.md is not a skill")
+            .to_string();
+        assert!(
+            msg.contains("not-a-skill") && msg.contains("superpowers") && msg.contains("SKILL.md"),
+            "error must name the library, the missing skill, and SKILL.md; got: {msg}"
+        );
+    }
+
+    /// The parser rejects traversal segments, but named skills also arrive from
+    /// config files and the API, so `skill_overlays` re-checks containment
+    /// rather than joining `..` onto a host path (WI-0103 remediation).
+    #[test]
+    fn skill_named_traversal_segments_are_rejected_by_the_engine() {
+        let (tmp, _) = make_home_with_skills();
+        seed_library(tmp.path(), "superpowers", "skills", &["brainstorming"]);
+
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        for bad in ["superpowers/..", "superpowers/", "..", "../superpowers"] {
+            let result = with_awman_config_home(tmp.path(), || {
+                engine.skill_overlays(&agent, false, &[bad.to_string()], &None, Path::new("/"))
+            });
+            let msg = match result {
+                Ok(specs) => panic!("'{bad}' must be rejected, but produced specs: {specs:?}"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                msg.contains("invalid path segment"),
+                "'{bad}' must be rejected as an invalid segment; got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_named_neither_plain_nor_library_names_both_locations() {
+        let (tmp, _) = make_home_with_skills();
+        // Neither a plain skill nor a library called 'ghost' exists.
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let result = with_awman_config_home(tmp.path(), || {
+            engine.skill_overlays(&agent, false, &["ghost".to_string()], &None, Path::new("/"))
+        });
+
+        let msg = result
+            .expect_err("an unresolvable name must error")
+            .to_string();
+        assert!(
+            msg.contains("ghost"),
+            "error must name the skill; got: {msg}"
+        );
+        assert!(
+            msg.contains(&tmp.path().join("skills").display().to_string()),
+            "error must name the global skills dir; got: {msg}"
+        );
+        assert!(
+            msg.contains(".library"),
+            "error must name the .library location; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn skill_star_is_identical_with_and_without_populated_library() {
+        let (tmp, skills_canon) = make_home_with_skills();
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+
+        let before = with_awman_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, true, &[], &None, Path::new("/"))
+                .unwrap()
+        });
+
+        // Populate `.library/` — skill(*) must be entirely unaffected by it.
+        seed_library(tmp.path(), "superpowers", "skills", &["brainstorming"]);
+
+        let after = with_awman_config_home(tmp.path(), || {
+            engine
+                .skill_overlays(&agent, true, &[], &None, Path::new("/"))
+                .unwrap()
+        });
+
+        assert_eq!(
+            before, after,
+            "skill(*) must emit an identical OverlaySpec list regardless of .library/"
+        );
+        assert_eq!(before.len(), 1, "skill(*) is a single mount");
+        assert_eq!(
+            before[0].host_path, skills_canon,
+            "skill(*) still mounts the global skills dir as-is"
+        );
+    }
+
     // ─── build_overlays: least-permissive-wins ────────────────────────────────
 
     #[test]
@@ -1926,6 +2834,7 @@ mod tests {
             yolo: false,
             container_home: None,
             context_overlays: vec![],
+            materialize_credentials: false,
         };
 
         let overlays = engine.build_overlays(&session, &request).unwrap();
@@ -2109,6 +3018,301 @@ mod tests {
             crate::engine::container::options::OverlayPermission::ReadOnly,
             "ReadOnly must win over ReadWrite (most-restrictive); got {:?}",
             matching[0].permission
+        );
+    }
+
+    // ─── WI-0107: refresh-token denylist + credential-file staging ───────────
+
+    /// Build an engine with an explicit stub for the refreshable-credential
+    /// source. `None` means "no credential to plant" — the default for tests
+    /// that don't exercise materialization. Never touches a developer's real
+    /// host credential file or keychain.
+    fn make_engine_with_credential(home: &Path, file: Option<CredentialFile>) -> OverlayEngine {
+        OverlayEngine::with_auth_resolver(AuthPathResolver::at_home(home))
+            .with_secret_files_provider(std::sync::Arc::new(|_| Vec::new()))
+            .with_credential_provider(std::sync::Arc::new(move |_| file.clone()))
+    }
+
+    /// INV-2 checkable: a host `.credentials.json` (always present on Linux,
+    /// and on macOS whenever a keychain write failed) must never be copied
+    /// into the staged overlay, even though the source dir is otherwise
+    /// mirrored verbatim.
+    #[test]
+    fn sanitize_claude_settings_dir_denylists_host_credentials_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-HOST","refreshToken":"SENTINEL-REFRESH-MUST-NOT-LEAK"}}"#,
+        )
+        .unwrap();
+        std::fs::write(claude_dir.join("allowed.json"), r#"{"foo":"bar"}"#).unwrap();
+
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let overlays = engine.agent_settings_overlays(&agent, tmp.path()).unwrap();
+        let dir_overlay = overlays
+            .iter()
+            .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))
+            .expect("must have .claude dir overlay");
+
+        let staged_credentials_file = dir_overlay.host_path.join(".credentials.json");
+        assert!(
+            !staged_credentials_file.exists(),
+            "host .credentials.json must never be copied into the staged overlay"
+        );
+        assert!(
+            dir_overlay.host_path.join("allowed.json").exists(),
+            "non-denylisted files must still be mirrored"
+        );
+    }
+
+    /// BLOCKING-1 (INV-2): the denylist must not be bypassable by a symlink
+    /// alias, a case variant, a nested copy, or a hard link to the host
+    /// `.credentials.json`. The refresh-token sentinel must appear in NO file of
+    /// the staged tree, at any depth.
+    #[test]
+    fn sanitize_claude_settings_dir_denies_symlink_case_and_nested_credential_variants() {
+        const SENTINEL: &str = "SENTINEL-REFRESH-MUST-NOT-LEAK";
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let host_credential = claude_dir.join(".credentials.json");
+        std::fs::write(
+            &host_credential,
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"sk-ant-oat-HOST","refreshToken":"{SENTINEL}"}}}}"#
+            ),
+        )
+        .unwrap();
+        // Case variant of the credential filename.
+        std::fs::write(
+            claude_dir.join(".Credentials.json"),
+            format!(r#"{{"refreshToken":"{SENTINEL}"}}"#),
+        )
+        .unwrap();
+        // Nested copy in a non-denylisted subdirectory.
+        let nested = claude_dir.join("safe-subdir");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join(".credentials.json"),
+            format!(r#"{{"refreshToken":"{SENTINEL}"}}"#),
+        )
+        .unwrap();
+        // A benign file that MUST still be mirrored.
+        std::fs::write(claude_dir.join("allowed.json"), r#"{"foo":"bar"}"#).unwrap();
+        #[cfg(unix)]
+        {
+            // Symlink alias pointing straight at the host credential, plus a
+            // hard link under an innocuous name.
+            std::os::unix::fs::symlink(&host_credential, claude_dir.join("innocent-cache.json"))
+                .unwrap();
+            std::fs::hard_link(&host_credential, claude_dir.join("backup.json")).unwrap();
+        }
+
+        let engine = make_engine(tmp.path());
+        let agent = AgentName::new("claude").unwrap();
+        let overlays = engine.agent_settings_overlays(&agent, tmp.path()).unwrap();
+        let dir_overlay = overlays
+            .iter()
+            .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))
+            .expect("must have .claude dir overlay");
+
+        // Walk the whole staged tree; no file may contain the sentinel.
+        fn assert_no_sentinel(dir: &Path) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                let meta = std::fs::symlink_metadata(&path).unwrap();
+                assert!(
+                    !meta.file_type().is_symlink(),
+                    "staged overlay must contain no symlinks; found {}",
+                    path.display()
+                );
+                if meta.is_dir() {
+                    assert_no_sentinel(&path);
+                } else if let Ok(contents) = std::fs::read_to_string(&path) {
+                    assert!(
+                        !contents.contains(SENTINEL),
+                        "refresh-token sentinel leaked into staged file {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert_no_sentinel(&dir_overlay.host_path);
+        assert!(
+            dir_overlay.host_path.join("allowed.json").exists(),
+            "non-credential files must still be mirrored"
+        );
+    }
+
+    /// The awman-authored, refresh-token-free credential file is planted in
+    /// the staged dir when `materialize_credentials` is requested and the
+    /// (stubbed) descriptor has a credential to offer — even though the host
+    /// dir's own `.credentials.json` was denylisted above.
+    #[test]
+    fn materialize_credentials_plants_awman_authored_file_present_and_0600() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        // The host copy still carries a real (sentinel) refresh token; it must
+        // be denylisted while the awman-authored file (below) lands instead.
+        std::fs::write(
+            claude_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-HOST","refreshToken":"SENTINEL-REFRESH-MUST-NOT-LEAK"}}"#,
+        )
+        .unwrap();
+
+        let materialized = CredentialFile {
+            relative_path: PathBuf::from(".credentials.json"),
+            contents: br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-AWMAN"}}"#.to_vec(),
+            mode: 0o600,
+        };
+        let engine = make_engine_with_credential(tmp.path(), Some(materialized.clone()));
+        let agent = AgentName::new("claude").unwrap();
+        let session = make_session(tmp.path());
+
+        let request = OverlayRequest {
+            agent: Some(agent),
+            materialize_credentials: true,
+            ..Default::default()
+        };
+        let (overlays, staged) = engine
+            .build_overlays_with_credentials(&session, &request)
+            .unwrap();
+        let dir_overlay = overlays
+            .iter()
+            .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))
+            .expect("must have .claude dir overlay");
+
+        let planted_path = dir_overlay.host_path.join(".credentials.json");
+        let contents = std::fs::read_to_string(&planted_path).expect("planted file must exist");
+        assert!(contents.contains("sk-ant-oat-AWMAN"));
+        assert!(
+            !contents.contains("SENTINEL-REFRESH-MUST-NOT-LEAK"),
+            "the awman-authored file must have replaced the host's, not merged with it"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&planted_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "staged credential file must be mode 0600");
+        }
+
+        assert_eq!(staged.len(), 1, "exactly one credential file was planted");
+        assert_eq!(staged[0].path, planted_path);
+        assert_eq!(staged[0].root, dir_overlay.host_path);
+    }
+
+    /// Without `materialize_credentials`, no credential file is planted even
+    /// though the (stubbed) descriptor has one to offer — the flag is the
+    /// only gate.
+    #[test]
+    fn materialize_credentials_false_plants_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+
+        let materialized = CredentialFile {
+            relative_path: PathBuf::from(".credentials.json"),
+            contents: br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-AWMAN"}}"#.to_vec(),
+            mode: 0o600,
+        };
+        let engine = make_engine_with_credential(tmp.path(), Some(materialized));
+        let agent = AgentName::new("claude").unwrap();
+        let session = make_session(tmp.path());
+
+        let request = OverlayRequest {
+            agent: Some(agent),
+            materialize_credentials: false,
+            ..Default::default()
+        };
+        let (overlays, staged) = engine
+            .build_overlays_with_credentials(&session, &request)
+            .unwrap();
+        let dir_overlay = overlays
+            .iter()
+            .find(|o| o.container_path.to_string_lossy().ends_with("/.claude"))
+            .expect("must have .claude dir overlay");
+
+        assert!(
+            !dir_overlay.host_path.join(".credentials.json").exists(),
+            "no credential file must be planted when materialize_credentials is false"
+        );
+        assert!(staged.is_empty());
+    }
+
+    // ─── write_credential_file_atomic ─────────────────────────────────────────
+
+    /// INV-7 (path check, the third independent defense): a staged root that
+    /// no longer exists is a skip (`Ok(false)`), never an `Err` — the monitor
+    /// treats this as a normal dropped-lease race.
+    #[test]
+    fn write_credential_file_atomic_missing_staged_root_is_a_skip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing_root = tmp.path().join("never-created");
+        let file = CredentialFile {
+            relative_path: PathBuf::from(".credentials.json"),
+            contents: b"irrelevant".to_vec(),
+            mode: 0o600,
+        };
+        let result = write_credential_file_atomic(&missing_root, &file);
+        assert!(
+            matches!(result, Ok(false)),
+            "a missing staged root must be a skip, not an error: {result:?}"
+        );
+    }
+
+    /// INV-3: an injected writer failure must never leave the target
+    /// truncated or partially written — the previous complete content stays
+    /// exactly as it was. Simulated by making the staged directory
+    /// unwritable, so the temp file used for the atomic rename can never even
+    /// be created.
+    #[test]
+    #[cfg(unix)]
+    fn write_credential_file_atomic_failure_leaves_target_byte_identical() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let staged_root = tmp.path().join("staged");
+        std::fs::create_dir_all(&staged_root).unwrap();
+        let target = staged_root.join(".credentials.json");
+        let original = b"ORIGINAL-COMPLETE-CREDENTIAL".to_vec();
+        std::fs::write(&target, &original).unwrap();
+
+        // Revoke write permission on the staged dir so NamedTempFile::new_in
+        // (the writer this call injects) fails before touching the target.
+        let mut perms = std::fs::metadata(&staged_root).unwrap().permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&staged_root, perms).unwrap();
+
+        let file = CredentialFile {
+            relative_path: PathBuf::from(".credentials.json"),
+            contents: b"NEW-CONTENT-MUST-NOT-LAND".to_vec(),
+            mode: 0o600,
+        };
+        let result = write_credential_file_atomic(&staged_root, &file);
+
+        // Restore permissions so the TempDir can clean itself up.
+        let mut restore = std::fs::metadata(&staged_root).unwrap().permissions();
+        restore.set_mode(0o700);
+        std::fs::set_permissions(&staged_root, restore).unwrap();
+
+        assert!(
+            result.is_err(),
+            "the injected writer failure must surface as Err, not a silent skip"
+        );
+        let remaining = std::fs::read(&target).unwrap();
+        assert_eq!(
+            remaining, original,
+            "target must retain its previous complete content on write failure, \
+             never a truncated or partial file"
         );
     }
 }

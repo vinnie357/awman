@@ -10,7 +10,7 @@ use crate::command::commands::{
     collect_all_overlay_specs, parse_overlay_list, resolve_agent, resolve_context_overlays,
     warn_legacy_config, Command,
 };
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::data::session::{AgentName, Session};
@@ -19,6 +19,8 @@ use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 
 #[derive(Debug, Clone)]
 pub struct ExecPromptCommandFlags {
+    pub startup_gate_control: Option<std::path::PathBuf>,
+    pub startup_gate_timeout: u64,
     pub prompt: Option<String>,
     pub non_interactive: bool,
     pub plan: bool,
@@ -27,8 +29,9 @@ pub struct ExecPromptCommandFlags {
     pub auto: bool,
     pub agent: Option<String>,
     pub model: Option<String>,
+    pub launch_mode: Option<crate::data::config::repo::LaunchMode>,
     pub overlay: Vec<String>,
-    pub issue_source: crate::data::issue::IssueSourceFlags,
+    pub issue_source: crate::engine::issue::IssueSourceFlags,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,6 +46,7 @@ pub trait ExecPromptCommandFrontend:
     + AgentSetupFrontend
     + AgentAuthFrontend
     + crate::command::commands::agent_setup::HasAgentFrontend
+    + crate::engine::acp::AcpFrontend
     + Send
     + Sync
 {
@@ -103,6 +107,7 @@ pub struct ExecPromptCommand {
     flags: ExecPromptCommandFlags,
     engines: Engines,
     session: Session,
+    startup_gate: Option<crate::data::startup_gate::StartupGateSpec>,
 }
 
 impl ExecPromptCommand {
@@ -111,7 +116,70 @@ impl ExecPromptCommand {
             flags,
             engines,
             session,
+            startup_gate: None,
         }
+    }
+
+    /// Construct from the catalogue-resolved input (WI 0113 F-10). A
+    /// whitespace-only positional prompt is normalised to `None`; the
+    /// prompt-or-issue requirement is checked at run time, where `--issue`
+    /// can still supply the text.
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        if ctx.flags.supplied("startup-gate-timeout") && !ctx.flags.supplied("startup-gate-control")
+        {
+            return Err(CommandError::Other(
+                "exec prompt: --startup-gate-timeout requires --startup-gate-control".into(),
+            ));
+        }
+        let prompt = match ctx.args.get("prompt") {
+            Some(prompt) if prompt.trim().is_empty() => None,
+            other => other.map(str::to_string),
+        };
+        let command = Self::new(
+            ExecPromptCommandFlags {
+                startup_gate_control: ctx.flags.path("startup-gate-control"),
+                startup_gate_timeout: ctx
+                    .flags
+                    .string("startup-gate-timeout")
+                    .as_deref()
+                    .unwrap_or("120")
+                    .parse()
+                    .map_err(|_| {
+                        CommandError::Other(
+                            "exec prompt: --startup-gate-timeout must be an integer in 1..=3600"
+                                .into(),
+                        )
+                    })?,
+                prompt,
+                non_interactive: ctx.flags.bool("non-interactive"),
+                plan: ctx.flags.bool("plan"),
+                allow_docker: ctx.flags.bool("allow-docker"),
+                yolo: ctx.flags.bool("yolo"),
+                auto: ctx.flags.bool("auto"),
+                agent: ctx.flags.string("agent"),
+                model: ctx.flags.string("model"),
+                launch_mode: crate::command::dispatch::parse_launch_mode(
+                    ctx.flags.string("launch-mode"),
+                    &ctx.path(),
+                )?,
+                overlay: ctx.flags.strs("overlay").to_vec(),
+                issue_source: crate::engine::issue::IssueSourceFlags {
+                    issue: ctx.flags.string("issue"),
+                },
+            },
+            ctx.engines.clone(),
+            ctx.session.clone(),
+        );
+        let startup_gate = crate::command::commands::preflight_startup_gate(
+            "exec prompt",
+            command.flags.startup_gate_control.as_deref(),
+            command.flags.startup_gate_timeout,
+            command.flags.allow_docker,
+        )?;
+        Ok(Self {
+            startup_gate,
+            ..command
+        })
     }
 
     pub fn flags(&self) -> &ExecPromptCommandFlags {
@@ -128,6 +196,15 @@ impl Command for ExecPromptCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        let startup_gate = match self.startup_gate.clone() {
+            Some(gate) => Some(gate),
+            None => crate::command::commands::preflight_startup_gate(
+                "exec prompt",
+                self.flags.startup_gate_control.as_deref(),
+                self.flags.startup_gate_timeout,
+                self.flags.allow_docker,
+            )?,
+        };
         let session = self.session;
 
         // Validate that at least one of prompt and --issue is provided.
@@ -139,7 +216,10 @@ impl Command for ExecPromptCommand {
 
         // Resolve issue if --issue was provided.
         let issue_markdown = if let Some(ref issue_ref) = self.flags.issue_source.issue {
-            let router = crate::data::issue::router::IssueSourceRouter::default();
+            let router = crate::engine::issue::router::IssueSourceRouter::new(
+                std::sync::Arc::clone(&self.engines.git_engine),
+                session.env(),
+            );
             match router.fetch_issue_with_progress(issue_ref, session.git_root(), &mut *frontend) {
                 Ok((issue, source)) => {
                     let md = source.format_as_markdown(&issue);
@@ -177,11 +257,32 @@ impl Command for ExecPromptCommand {
                 return Err(e);
             }
         };
+        // Resolve ACP policy before overlays or container setup. A direct ACP
+        // request is deliberately never eligible for fallback.
+        let config = command_effective_config(&session, &self.flags);
+        let explicit_acp = self.flags.launch_mode
+            == Some(crate::data::config::repo::LaunchMode::Acp)
+            || (self.flags.agent.is_none()
+                && session.repo_config().agent.is_some()
+                && session.repo_config().launch_mode
+                    == Some(crate::data::config::repo::LaunchMode::Acp));
+        let launch_decision =
+            match crate::command::commands::resolve_launch_mode(&config, &agent, explicit_acp) {
+                Ok(decision) => decision,
+                Err(e) => return Err(CommandError::from(e)),
+            };
+        if launch_decision == crate::command::commands::LaunchModeDecision::StdioWithFallbackWarning
+        {
+            frontend.write_message(UserMessage {
+                level: MessageLevel::Warning,
+                text: crate::command::commands::acp_fallback_warning(&agent),
+            });
+        }
         if agent.as_str() == "gemini" {
             frontend.write_message(UserMessage {
                 level: MessageLevel::Warning,
                 text: "The 'gemini' agent is deprecated by Google. \
-                       Migrate to 'antigravity' — run 'awman chat antigravity' \
+                       Migrate to 'antigravity' — run 'awman chat --agent antigravity' \
                        (or 'awman config set agent antigravity' to change your default)."
                     .to_string(),
             });
@@ -253,7 +354,7 @@ impl Command for ExecPromptCommand {
             level: MessageLevel::Info,
             text: "Resolving agent credentials…".into(),
         });
-        let credentials = match self
+        let resolved_credentials = match self
             .engines
             .auth_engine
             .resolve_agent_auth(&session, &agent)
@@ -267,6 +368,17 @@ impl Command for ExecPromptCommand {
                 return Err(CommandError::from(e));
             }
         };
+        // File delivery is container-only; preserve sbx's existing env-only
+        // Claude credential path without touching its auth implementation.
+        let credentials = if self.engines.runtime.capabilities().kit_declarative
+            && matches!(
+                resolved_credentials.delivery,
+                crate::engine::auth::CredentialDelivery::File(_)
+            ) {
+            self.engines.auth_engine.agent_env_credentials(&agent)?
+        } else {
+            resolved_credentials
+        };
 
         let (context_overlays, system_prompt) = resolve_context_overlays(
             &collected.context_overlays,
@@ -278,13 +390,17 @@ impl Command for ExecPromptCommand {
         )?;
 
         let run_opts = AgentRunOptions {
+            startup_gate,
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),
             allow_docker: self.flags.allow_docker,
             non_interactive: self.flags.non_interactive,
             model: self.flags.model.clone(),
-            initial_prompt: Some(final_prompt),
+            // ACP sends its initial turn after the initialize/session-new
+            // handshake; stdio retains the existing seeded-launch behavior.
+            initial_prompt: (launch_decision != crate::command::commands::LaunchModeDecision::Acp)
+                .then(|| final_prompt.clone()),
             env_passthrough: if collected.env_passthrough.is_empty() {
                 None
             } else {
@@ -295,6 +411,12 @@ impl Command for ExecPromptCommand {
             named_skills: collected.named_skills,
             system_prompt,
             context_overlays,
+            launch_mode: match launch_decision {
+                crate::command::commands::LaunchModeDecision::Acp => {
+                    crate::data::config::repo::LaunchMode::Acp
+                }
+                _ => crate::data::config::repo::LaunchMode::Stdio,
+            },
             ..Default::default()
         };
 
@@ -302,7 +424,7 @@ impl Command for ExecPromptCommand {
             &session,
             &agent,
             &run_opts,
-            &credentials.env_vars,
+            &credentials,
             self.engines.runtime.as_ref(),
         ) {
             Ok(o) => o,
@@ -329,27 +451,58 @@ impl Command for ExecPromptCommand {
             level: MessageLevel::Info,
             text: format!("Launching agent ({})…", self.engines.runtime.display_name()),
         });
-        frontend.set_pty_active(true);
-        let container_frontend = frontend.container_frontend_for_pty();
-        let mut execution = match instance.run_with_frontend(container_frontend) {
-            Ok(e) => e,
-            Err(e) => {
-                frontend.set_pty_active(false);
-                frontend.replay_queued();
-                frontend.write_message(UserMessage {
-                    level: MessageLevel::Error,
-                    text: format!("exec prompt: agent launch failed: {e}"),
-                });
+        let exit = if launch_decision == crate::command::commands::LaunchModeDecision::Acp {
+            let (runtime_frontend, transport) = crate::engine::acp::AcpTransport::channel();
+            let execution = match instance.run_with_frontend(Box::new(runtime_frontend)) {
+                Ok(execution) => execution,
+                Err(e) => {
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("exec prompt: failed to launch ACP agent: {e}"),
+                    });
+                    return Err(CommandError::from(e));
+                }
+            };
+            let mut acp = crate::engine::acp::AcpSession::from_transport(
+                execution,
+                transport,
+                Box::new(crate::data::message::StderrMessageSink::new()),
+                run_opts.yolo.unwrap_or(YoloMode::Disabled),
+                run_opts.auto.unwrap_or(AutoMode::Disabled),
+            );
+            if let Err(e) = acp.initialize("/workspace").await {
+                // Reap the launched container before returning on a failed
+                // handshake so it is not left running.
+                let _ = acp.shutdown().await;
                 return Err(CommandError::from(e));
             }
+            // The seeded prompt is the first ACP turn, driven inside the same
+            // loop as follow-ups so its `session/update`s are rendered (the
+            // subscription is taken before the prompt is sent) and any
+            // permission request during that turn is serviced.
+            acp.drive_with_initial_prompt(frontend.as_mut(), Some(final_prompt))
+                .await
+        } else {
+            frontend.set_pty_active(true);
+            let container_frontend = frontend.container_frontend_for_pty();
+            let mut execution = match instance.run_with_frontend(container_frontend) {
+                Ok(e) => e,
+                Err(e) => {
+                    frontend.set_pty_active(false);
+                    frontend.replay_queued();
+                    frontend.write_message(UserMessage {
+                        level: MessageLevel::Error,
+                        text: format!("exec prompt: agent launch failed: {e}"),
+                    });
+                    return Err(CommandError::from(e));
+                }
+            };
+            frontend.set_stuck_sender(execution.stuck_sender());
+            let exit = execution.wait().await;
+            frontend.set_pty_active(false);
+            frontend.replay_queued();
+            exit
         };
-        // Publish the stuck sender so the TUI can color the tab when the
-        // agent stops producing output (mirrors the workflow engine's
-        // set_stuck_sender call after each step launch).
-        frontend.set_stuck_sender(execution.stuck_sender());
-        let exit = execution.wait().await;
-        frontend.set_pty_active(false);
-        frontend.replay_queued();
 
         crate::command::commands::report_session_end(frontend.as_mut(), "exec prompt", &exit);
 
@@ -359,6 +512,23 @@ impl Command for ExecPromptCommand {
             exit_code,
         })
     }
+}
+
+fn command_effective_config(
+    session: &Session,
+    command_flags: &ExecPromptCommandFlags,
+) -> crate::data::config::effective::EffectiveConfig {
+    let current = session.effective_config();
+    let mut flags = current.flags().clone();
+    flags.agent = command_flags.agent.clone();
+    flags.model = command_flags.model.clone();
+    flags.launch_mode = command_flags.launch_mode;
+    crate::data::config::effective::EffectiveConfig::new(
+        flags,
+        current.env().clone(),
+        current.repo().clone(),
+        current.global().clone(),
+    )
 }
 
 #[cfg(test)]
@@ -392,7 +562,7 @@ mod tests {
     #[test]
     fn build_prompt_issue_with_empty_body_uses_title_only_markdown() {
         // format_as_markdown with empty body produces "# Title Only".
-        use crate::data::issue::{Issue, IssueSource, IssueSourceError};
+        use crate::engine::issue::{Issue, IssueSource, IssueSourceError};
         use std::path::Path;
 
         struct FakeSource;

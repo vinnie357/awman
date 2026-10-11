@@ -9,7 +9,12 @@
 //! The engine is the single source of truth for ALL workflow state.
 //! No workflow execution state lives in the frontend — zero, none.
 
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use futures_util::stream::FuturesUnordered;
+use futures_util::StreamExt;
 
 use crate::data::config::effective::EffectiveConfig;
 use crate::data::session::{AgentName, Session};
@@ -18,13 +23,15 @@ use crate::data::workflow_definition::{Workflow, WorkflowStep};
 use crate::data::workflow_state::{StepState, WorkflowState, WORKFLOW_STATE_SCHEMA_VERSION};
 use crate::data::workflow_state_store::WorkflowStateStore;
 use crate::engine::agent_runtime::background::AgentExec;
-use crate::engine::agent_runtime::execution::{AgentExecution, AgentExitInfo, StuckEvent};
+use crate::engine::agent_runtime::execution::{
+    AgentExecution, AgentExitInfo, CancelHandle, StuckEvent, KILLED_EXIT_CODE,
+};
+use crate::engine::agent_runtime::output_tail::OutputTail;
+use crate::engine::container::options::OverlayPermission;
 use crate::engine::error::EngineError;
-use crate::engine::git::GitEngine;
-use crate::engine::overlay::OverlayEngine;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutcome, WorkflowOutcome,
-    WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
+    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepFailureContext, StepOutcome,
+    WorkflowOutcome, WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::factory::{AgentExecutionFactory, WorkflowRuntimeContext};
 use crate::engine::workflow::frontend::WorkflowFrontend;
@@ -63,6 +70,52 @@ enum MidStepOutcome {
     LoopContinue,
 }
 
+/// Result of one iteration of the outer `run_to_completion` loop (either a
+/// single-step iteration or a parallel-group run).
+enum IterationOutcome {
+    /// The iteration finished; re-evaluate the outer loop (find the next batch).
+    Continue,
+    /// A workflow-level action ended the run.
+    Ended(WorkflowOutcome),
+}
+
+/// A dynamically-sized set of container-wait futures, one per launched
+/// parallel step. Each future resolves to `(step_name, exit_result)` when its
+/// container terminates. Using `FuturesUnordered` (rather than a hand-rolled
+/// `select!` array) lets the engine poll an arbitrary number of concurrent
+/// containers.
+type ParallelWaits = FuturesUnordered<
+    std::pin::Pin<
+        Box<dyn std::future::Future<Output = (String, Result<AgentExitInfo, EngineError>)> + Send>,
+    >,
+>;
+
+/// Sender half of the unified stuck channel that fans every container's
+/// per-step stuck broadcast into a single fixed-arity `select!` branch.
+type StuckFanIn = tokio::sync::mpsc::UnboundedSender<(String, StuckEvent)>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowRetryPolicy {
+    Legacy,
+    SingleAttempt,
+}
+
+/// Result of `run_parallel_group`.
+enum GroupOutcome {
+    /// The whole group reached a terminal state. `failed` carries every
+    /// non-abort step failure (name + exit code), in the order the containers
+    /// exited, for the outer loop to walk through the failure recovery path;
+    /// empty when every member succeeded/cancelled.
+    ///
+    /// Every failure is carried, not just the first: a step left `Failed` is
+    /// not in `completed_steps`, so the DAG still reports it ready and the next
+    /// iteration would relaunch it — silently, with no recovery board and no
+    /// retry accounting (WI-0115 §1).
+    Drained { failed: Vec<(String, i32)> },
+    /// A workflow-level action ended the run (abort_on_failure, WCB abort/pause).
+    Ended(WorkflowOutcome),
+}
+
 /// Result of `step_once_interruptible`.
 enum InterruptibleStepResult {
     /// Step completed (naturally or while dialog was open).
@@ -85,15 +138,55 @@ pub use frontend::WorkflowFrontend as Frontend;
 /// the engine decides the response.
 #[derive(Debug, Clone)]
 pub enum EngineRequest {
-    /// User pressed Ctrl-W. Engine should show the WCB.
-    OpenControlBoard,
-    /// Frontend detected that the current step's container is stuck
+    /// User pressed Ctrl-W. Engine should show the WCB for `step_name`
+    /// (the currently-focused container in a parallel group; the single
+    /// running step otherwise).
+    OpenControlBoard { step_name: String },
+    /// Frontend detected that `step_name`'s container is stuck
     /// (no PTY output for STUCK_TIMEOUT). Engine responds: if --yolo,
     /// start yolo countdown; if not --yolo, open WCB.
-    StepStuck,
-    /// Frontend detected that the container is no longer stuck (new
-    /// PTY output arrived). Engine cancels any active yolo countdown.
-    StepUnstuck,
+    StepStuck { step_name: String },
+    /// Frontend detected that `step_name`'s container is no longer stuck
+    /// (new PTY output arrived). Engine cancels any active yolo countdown.
+    StepUnstuck { step_name: String },
+}
+
+/// One running (or just-launched) container in a parallel group.
+///
+/// The engine owns all concurrency state; this is the per-slot record it keeps
+/// while a step's container is alive. In the single-step path exactly one entry
+/// exists (`active_steps[0]`, the "focused" step) and it retains its
+/// `execution` for prompt injection / put-back. In the multi-step parallel
+/// path each launched step gets its own entry; the `execution` is moved into a
+/// background wait future, so the entry keeps only a `cancel_handle` for
+/// engine-initiated kills (yolo expiry, abort_on_failure, WCB abort/pause).
+struct ActiveParallelStep {
+    step_name: String,
+    /// Retained only by the single-step path (for inject / put-back after the
+    /// wait task resolves). `None` in the multi-step path, where the execution
+    /// lives inside the FuturesUnordered wait future.
+    execution: Option<AgentExecution>,
+    /// Standalone kill handle, extracted before the execution is moved into a
+    /// wait future. Used by the multi-step path to kill just this container.
+    cancel_handle: Option<CancelHandle>,
+    /// The container's name, retained so a failure log can be named after it
+    /// once the execution has been consumed by its wait future.
+    container_name: String,
+    /// Rolling buffer of this container's recent combined stdout/stderr,
+    /// extracted from the execution at launch so it outlives the wait future.
+    /// `None` for runtimes without a byte-stream bridge (e.g. sandbox-class).
+    output_tail: Option<Arc<OutputTail>>,
+    /// Set when awman itself terminated this container (yolo auto-advance, WCB
+    /// abort/pause/finish, stuck cancel, startup-grace kill, abort_on_failure
+    /// peer kill). A non-zero exit on an awman-killed container is expected and
+    /// must NOT produce a failure log.
+    awman_killed: bool,
+    /// Whether this step is currently marked stuck (non-yolo stuck handling).
+    stuck: bool,
+    /// When a per-step yolo countdown is running, the instant it expires.
+    yolo_deadline: Option<Instant>,
+    agent: AgentName,
+    model: Option<String>,
 }
 
 pub struct WorkflowEngine {
@@ -105,16 +198,29 @@ pub struct WorkflowEngine {
     effective_config: EffectiveConfig,
     frontend: Box<dyn WorkflowFrontend>,
     agent_factory: Box<dyn AgentExecutionFactory>,
-    git_engine: Arc<GitEngine>,
-    overlay_engine: Arc<OverlayEngine>,
-    current_execution: Option<AgentExecution>,
+    /// Containers currently alive. The single-step path keeps exactly one
+    /// entry (the focused step); the parallel path keeps up to `max_concurrent`.
+    active_steps: Vec<ActiveParallelStep>,
+    /// Resolved once at construction from `effective_max_concurrent_agents()`.
+    /// `None` means unlimited.
+    max_concurrent: Option<usize>,
     current_step_name: Option<String>,
     current_step_agent: Option<AgentName>,
     current_step_model: Option<String>,
     work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
+    workflow_context_permission: Option<OverlayPermission>,
     yolo: bool,
     abort_on_failure_triggered: bool,
     last_exit_info: Option<AgentExitInfo>,
+    /// Automatic credential refresh/retry is permitted once per workflow step.
+    /// Kept independently of an individual container slot so a relaunch cannot
+    /// reset the guard.
+    auth_retries_used: HashSet<String>,
+    /// Steps the unattended failure path has already auto-retried once. Kept
+    /// separate from `auth_retries_used` so a credential refresh and a failure
+    /// retry cannot consume each other.
+    auto_retried_steps: HashSet<String>,
+    retry_policy: WorkflowRetryPolicy,
     engine_rx: Option<tokio::sync::mpsc::UnboundedReceiver<EngineRequest>>,
 }
 
@@ -140,17 +246,114 @@ impl WorkflowEngine {
                 text: text.into(),
             });
     }
+    fn msg_error(&mut self, text: impl Into<String>) {
+        self.frontend
+            .write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Error,
+                text: text.into(),
+            });
+    }
+
+    /// Persist a failed step container's buffered output to
+    /// `~/.awman/logs/{workflow-id}-{step-name}-{container-name}.log` and point
+    /// the user at the file. Called only when a step container exits non-zero
+    /// on its own (awman did not kill it). Best-effort: a resolve/write failure
+    /// downgrades to a warning rather than derailing the workflow.
+    fn dump_container_failure_log(
+        &mut self,
+        step_name: &str,
+        container_name: &str,
+        tail: &OutputTail,
+        exit_code: i32,
+    ) {
+        let contents = tail.snapshot_text();
+        let paths = match crate::data::fs::WorkflowLogPaths::from_env(self.session.env()) {
+            Ok(p) => p,
+            Err(e) => {
+                self.msg_warning(format!(
+                    "Step '{step_name}' container '{container_name}' exited with code \
+                     {exit_code}, but the log directory could not be resolved to save its \
+                     output: {e}"
+                ));
+                return;
+            }
+        };
+        match paths.write_container_log(
+            self.state.invocation_id,
+            step_name,
+            container_name,
+            &contents,
+        ) {
+            Ok(path) => self.msg_error(format!(
+                "Step '{step_name}' container '{container_name}' exited with code {exit_code}. \
+                 Recent output saved to {}",
+                path.display()
+            )),
+            Err(e) => self.msg_warning(format!(
+                "Step '{step_name}' container '{container_name}' exited with code {exit_code}, \
+                 but writing its output log failed: {e}"
+            )),
+        }
+    }
+
+    /// If a just-finished step container failed on its own (non-zero exit that
+    /// awman did not cause) and a captured output tail exists, flush it to a
+    /// failure log. Reads the slot for `step_name` if it is still present.
+    fn maybe_dump_step_failure(&mut self, step_name: &str, exit_code: i32) {
+        if exit_code == 0 {
+            return;
+        }
+        let dump = self
+            .active_steps
+            .iter()
+            .find(|s| s.step_name == step_name)
+            .filter(|s| !s.awman_killed)
+            .and_then(|s| {
+                s.output_tail
+                    .clone()
+                    .map(|tail| (s.container_name.clone(), tail))
+            });
+        if let Some((container_name, tail)) = dump {
+            self.dump_container_failure_log(step_name, &container_name, &tail, exit_code);
+        }
+    }
+
+    /// Mark the focused (single-step) container as awman-killed so a subsequent
+    /// non-zero exit is treated as expected and produces no failure log.
+    fn mark_focused_killed(&mut self) {
+        if let Some(s) = self.active_steps.first_mut() {
+            s.awman_killed = true;
+        }
+    }
 
     pub fn new(
         session: &Session,
         workflow: Workflow,
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
+        frontend: Box<dyn WorkflowFrontend>,
+        agent_factory: Box<dyn AgentExecutionFactory>,
+    ) -> Result<Self, EngineError> {
+        Self::new_with_retry_policy(
+            session,
+            workflow,
+            work_item_context,
+            frontend,
+            agent_factory,
+            WorkflowRetryPolicy::Legacy,
+        )
+    }
+
+    pub fn new_with_retry_policy(
+        session: &Session,
+        workflow: Workflow,
+        work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
         agent_factory: Box<dyn AgentExecutionFactory>,
-        git_engine: Arc<GitEngine>,
-        overlay_engine: Arc<OverlayEngine>,
+        retry_policy: WorkflowRetryPolicy,
     ) -> Result<Self, EngineError> {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
+        let workflow_context_permission =
+            workflow_context_permission_from_overlay_strings(workflow.overlays.as_deref());
         let workflow_hash = compute_workflow_hash(&workflow);
         let work_item_number = work_item_context.as_ref().map(|c| c.number);
         let state = WorkflowState::new(
@@ -161,6 +364,11 @@ impl WorkflowEngine {
         );
         let state_store = WorkflowStateStore::new(session);
         let effective_config = session.effective_config();
+        let max_concurrent = effective_config.effective_max_concurrent_agents();
+        tracing::debug!(
+            ?max_concurrent,
+            "workflow_engine resolved max_concurrent_agents"
+        );
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         frontend.set_engine_sender(tx);
         Ok(Self {
@@ -172,16 +380,19 @@ impl WorkflowEngine {
             effective_config,
             frontend,
             agent_factory,
-            git_engine,
-            overlay_engine,
-            current_execution: None,
+            active_steps: Vec::new(),
+            max_concurrent,
             current_step_name: None,
             current_step_agent: None,
             current_step_model: None,
             work_item_context,
+            workflow_context_permission,
             yolo: false,
             abort_on_failure_triggered: false,
             last_exit_info: None,
+            auth_retries_used: HashSet::new(),
+            auto_retried_steps: HashSet::new(),
+            retry_policy,
             engine_rx: Some(rx),
         })
     }
@@ -190,23 +401,112 @@ impl WorkflowEngine {
         self.abort_on_failure_triggered
     }
 
+    /// The resolved per-workflow concurrency cap (`None` = unlimited). Resolved
+    /// once at construction from `effective_max_concurrent_agents()`. Frontends
+    /// read this to size the Workflow Overview / parallel UX.
+    pub fn max_concurrent(&self) -> Option<usize> {
+        self.max_concurrent
+    }
+
     pub fn set_yolo(&mut self, yolo: bool) {
         self.yolo = yolo;
     }
 
+    /// Override the active workflow-context overlay permission after the command
+    /// layer has merged config/env/CLI/workflow overlay sources.
+    pub fn set_workflow_context_permission(&mut self, permission: Option<OverlayPermission>) {
+        self.workflow_context_permission = permission;
+    }
+
+    /// The focused step's live execution (the single running step, or the first
+    /// parallel slot). `None` while a wait future owns it or between
+    /// launch/finalize.
+    fn focused_execution(&self) -> Option<&AgentExecution> {
+        self.active_steps.first().and_then(|s| s.execution.as_ref())
+    }
+
+    /// Put an execution back into the focused slot after its wait future
+    /// resolves (single-step path).
+    fn set_focused_execution(&mut self, exec: AgentExecution) {
+        if let Some(s) = self.active_steps.first_mut() {
+            s.execution = Some(exec);
+        }
+    }
+
+    /// Move the focused slot's execution out (single-step path spawns a wait
+    /// task that owns it).
+    fn take_focused_execution(&mut self) -> Option<AgentExecution> {
+        self.active_steps
+            .first_mut()
+            .and_then(|s| s.execution.take())
+    }
+
     /// Resume from persisted state. Calls `confirm_resume` on the frontend if
     /// the workflow hash has drifted.
+    ///
+    /// State is persisted under the session's git root, the same place
+    /// `exec workflow` has always kept it.
     pub async fn resume(
+        session: &Session,
+        workflow: Workflow,
+        work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
+        frontend: Box<dyn WorkflowFrontend>,
+        agent_factory: Box<dyn AgentExecutionFactory>,
+    ) -> Result<Self, EngineError> {
+        Self::resume_with_state_root(
+            session,
+            workflow,
+            work_item_context,
+            frontend,
+            agent_factory,
+            None,
+        )
+        .await
+    }
+
+    /// [`Self::resume`], with the workflow-state file rooted somewhere other
+    /// than the session's git root.
+    ///
+    /// The state store creates, rewrites and deletes its file, so a caller
+    /// whose session root must stay untouched between runs — a squad task
+    /// bound to its durable workspace (WI 0106 §6a) — points this at a
+    /// run-scoped directory instead. `None` keeps the session-rooted default.
+    pub async fn resume_with_state_root(
+        session: &Session,
+        workflow: Workflow,
+        work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
+        frontend: Box<dyn WorkflowFrontend>,
+        agent_factory: Box<dyn AgentExecutionFactory>,
+        state_root: Option<std::path::PathBuf>,
+    ) -> Result<Self, EngineError> {
+        Self::resume_with_state_root_and_retry_policy(
+            session,
+            workflow,
+            work_item_context,
+            frontend,
+            agent_factory,
+            state_root,
+            WorkflowRetryPolicy::Legacy,
+        )
+        .await
+    }
+
+    pub async fn resume_with_state_root_and_retry_policy(
         session: &Session,
         workflow: Workflow,
         work_item_context: Option<crate::data::workflow_prompt_template::WorkItemContext>,
         mut frontend: Box<dyn WorkflowFrontend>,
         agent_factory: Box<dyn AgentExecutionFactory>,
-        git_engine: Arc<GitEngine>,
-        overlay_engine: Arc<OverlayEngine>,
+        state_root: Option<std::path::PathBuf>,
+        retry_policy: WorkflowRetryPolicy,
     ) -> Result<Self, EngineError> {
         let dag = WorkflowDag::build(&workflow.steps).map_err(EngineError::Data)?;
-        let store = WorkflowStateStore::new(session);
+        let workflow_context_permission =
+            workflow_context_permission_from_overlay_strings(workflow.overlays.as_deref());
+        let store = match state_root {
+            Some(root) => WorkflowStateStore::at_git_root(root),
+            None => WorkflowStateStore::new(session),
+        };
         let workflow_name = workflow_name_for(&workflow);
         let work_item_number = work_item_context.as_ref().map(|c| c.number);
         let saved = store.load(work_item_number, &workflow_name)?;
@@ -243,6 +543,25 @@ impl WorkflowEngine {
             ),
         };
 
+        // Drop step entries the workflow no longer defines. A saved state is
+        // matched to the workflow by hash, and the user may have accepted the
+        // drift prompt above against a file that since lost or renamed a step.
+        // Such an entry can never be launched — `next_ready` reads the DAG, not
+        // `step_states` — but `is_complete()` reads `step_states`, so leaving a
+        // non-terminal orphan behind means the run can never finish: it would
+        // end on "no ready steps remaining" instead. Pruning is safe because
+        // the DAG is the only thing that decides what actually runs.
+        let orphans = state.retain_steps_in(&dag);
+        if !orphans.is_empty() {
+            frontend.write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Warning,
+                text: format!(
+                    "The saved run has steps this workflow no longer defines: {}. Dropping them.",
+                    orphans.join(", "),
+                ),
+            });
+        }
+
         let interrupted = state.interrupted_running_steps();
         if !interrupted.is_empty() {
             frontend.write_message(crate::data::message::UserMessage {
@@ -257,7 +576,35 @@ impl WorkflowEngine {
             }
         }
 
+        // Steps the saved run left `Failed` or `Cancelled` are reset the same
+        // way, for the same reason: they are terminal but not *done*.
+        //
+        // A run that ended on a failure — or was aborted, which cancels every
+        // remaining step — saves a state in which every step is terminal.
+        // `is_complete()` reads that as finished, so resuming it without this
+        // reset would report instant success and run nothing (WI-0115 §2).
+        // Succeeded and Skipped steps are untouched, so a resume still picks up
+        // where the previous run genuinely got to.
+        let unrecovered = state.unrecovered_steps();
+        if !unrecovered.is_empty() {
+            frontend.write_message(crate::data::message::UserMessage {
+                level: crate::data::message::MessageLevel::Warning,
+                text: format!(
+                    "Previous run left these steps unfinished: {}. Resetting to Pending.",
+                    unrecovered.join(", "),
+                ),
+            });
+            for name in &unrecovered {
+                state.set_status(name, StepState::Pending);
+            }
+        }
+
         let effective_config = session.effective_config();
+        let max_concurrent = effective_config.effective_max_concurrent_agents();
+        tracing::debug!(
+            ?max_concurrent,
+            "workflow_engine resolved max_concurrent_agents"
+        );
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         frontend.set_engine_sender(tx);
         Ok(Self {
@@ -269,16 +616,19 @@ impl WorkflowEngine {
             effective_config,
             frontend,
             agent_factory,
-            git_engine,
-            overlay_engine,
-            current_execution: None,
+            active_steps: Vec::new(),
+            max_concurrent,
             current_step_name: None,
             current_step_agent: None,
             current_step_model: None,
             work_item_context,
+            workflow_context_permission,
             yolo: false,
             abort_on_failure_triggered: false,
             last_exit_info: None,
+            auth_retries_used: HashSet::new(),
+            auto_retried_steps: HashSet::new(),
+            retry_policy,
             engine_rx: Some(rx),
         })
     }
@@ -320,134 +670,992 @@ impl WorkflowEngine {
                 return Ok(outcome);
             }
 
-            let interruptible_result = self.step_once_interruptible().await?;
-            let outcome = match interruptible_result {
-                InterruptibleStepResult::StepCompleted(o) => o,
-                InterruptibleStepResult::WorkflowEnded(wo) => return Ok(wo),
-                InterruptibleStepResult::LoopContinue => continue,
-            };
+            // Determine the current parallel group: every step whose
+            // dependencies are already satisfied (source-file order). When more
+            // than one is ready and the concurrency cap is not pinned to 1, run
+            // them through the parallel-group path; otherwise fall back to the
+            // single-step interactive path (behaviourally identical to the
+            // pre-WI-0096 sequential engine).
+            let ready = self.next_ready_steps()?;
+            let use_parallel = ready.len() > 1 && self.max_concurrent != Some(1);
 
-            if let WorkflowStepStatus::Failed { exit_code } = outcome.status {
-                let progress = self.workflow_progress_info();
-                self.frontend.report_workflow_progress(&progress);
-
-                let step = self.find_step(&outcome.step_name)?;
-
-                if step.abort_on_failure {
-                    self.msg_warning(format!(
-                        "Step '{}' failed (abort_on_failure); aborting workflow",
-                        outcome.step_name,
-                    ));
-                    self.abort_on_failure_triggered = true;
-                    for s in &self.workflow.steps {
-                        if !self.state.completed_steps.contains(&s.name) {
-                            self.state.set_status(&s.name, StepState::Cancelled);
-                        }
-                    }
-                    self.persist()?;
-                    let aborted = WorkflowOutcome::Aborted;
-                    self.frontend.report_workflow_completed(&aborted);
-                    return Ok(aborted);
-                }
-
-                let exit_info = self
-                    .last_exit_info
-                    .clone()
-                    .unwrap_or_else(|| AgentExitInfo {
-                        exit_code,
-                        signal: None,
-                        started_at: chrono::Utc::now(),
-                        ended_at: chrono::Utc::now(),
-                    });
-                let choice = self
-                    .frontend
-                    .user_choose_after_step_failure(&step, &exit_info)?;
-                match choice {
-                    StepFailureChoice::Retry => {
-                        self.msg_info(format!("Retrying step '{}'", outcome.step_name,));
-                        self.state
-                            .set_status(&outcome.step_name, StepState::Pending);
-                        self.persist()?;
-                        continue;
-                    }
-                    StepFailureChoice::Pause => {
-                        self.msg_info("Workflow paused");
-                        self.persist()?;
-                        let paused = WorkflowOutcome::Paused;
-                        self.frontend.report_workflow_completed(&paused);
-                        return Ok(paused);
-                    }
-                    StepFailureChoice::Abort => {
-                        self.msg_warning("Workflow aborted");
-                        for s in &self.workflow.steps {
-                            if !self.state.completed_steps.contains(&s.name) {
-                                self.state.set_status(&s.name, StepState::Cancelled);
+            if use_parallel {
+                match self.run_parallel_group(ready).await? {
+                    GroupOutcome::Ended(wo) => return Ok(wo),
+                    GroupOutcome::Drained { failed } => {
+                        // One board (or one unattended retry) per failed step,
+                        // in exit order. Recovering the first failure must not
+                        // leave its peers to be silently relaunched.
+                        for (name, exit_code) in failed {
+                            match self.handle_group_step_failure(&name, exit_code).await? {
+                                IterationOutcome::Continue => {}
+                                IterationOutcome::Ended(wo) => return Ok(wo),
                             }
                         }
-                        self.persist()?;
-                        let aborted = WorkflowOutcome::Aborted;
-                        self.frontend.report_workflow_completed(&aborted);
-                        return Ok(aborted);
+                        continue;
                     }
                 }
             }
 
-            // Step succeeded. Decide what to do next.
-            let workflow_just_completed = self.state.is_complete();
+            match self.run_single_step_iteration().await? {
+                IterationOutcome::Continue => continue,
+                IterationOutcome::Ended(wo) => return Ok(wo),
+            }
+        }
+    }
 
-            if !workflow_just_completed {
-                let progress = self.workflow_progress_info();
-                self.frontend.report_workflow_progress(&progress);
+    /// One iteration of the sequential (single-step) path: launch the first
+    /// ready step, drive its interactive lifecycle (mid-step WCB, yolo, stuck),
+    /// handle failure, then present the inter-step Workflow Control Board.
+    ///
+    /// This is the pre-WI-0096 `run_to_completion` loop body, preserved
+    /// verbatim so single-step and `max_concurrent == 1` workflows behave
+    /// exactly as before.
+    async fn run_single_step_iteration(&mut self) -> Result<IterationOutcome, EngineError> {
+        let interruptible_result = self.step_once_interruptible().await?;
+        let outcome = match interruptible_result {
+            InterruptibleStepResult::StepCompleted(o) => o,
+            InterruptibleStepResult::WorkflowEnded(wo) => return Ok(IterationOutcome::Ended(wo)),
+            InterruptibleStepResult::LoopContinue => return Ok(IterationOutcome::Continue),
+        };
 
-                if self.yolo {
-                    continue;
-                }
-            } else if self.yolo {
-                // Last step in yolo mode: always require explicit user
-                // confirmation before ending the workflow so the user can
-                // review the final step's output.
-                let progress = self.workflow_progress_info();
-                self.frontend.report_workflow_progress(&progress);
+        if let WorkflowStepStatus::Failed { exit_code } = outcome.status {
+            let progress = self.workflow_progress_info();
+            self.frontend.report_workflow_progress(&progress);
+
+            if self.retry_policy == WorkflowRetryPolicy::SingleAttempt {
+                let failed = WorkflowOutcome::Failed {
+                    last_step: outcome.step_name.clone(),
+                    exit_code,
+                };
+                self.frontend.report_workflow_completed(&failed);
+                return Ok(IterationOutcome::Ended(failed));
             }
 
-            if !workflow_just_completed || self.yolo {
+            if self.recover_auth_failure(&outcome.step_name)? {
+                self.state
+                    .set_status(&outcome.step_name, StepState::Pending);
+                self.persist()?;
+                return Ok(IterationOutcome::Continue);
+            }
+
+            let step = self.find_step(&outcome.step_name)?;
+
+            if step.abort_on_failure {
+                self.msg_warning(format!(
+                    "Step '{}' failed (abort_on_failure); aborting workflow",
+                    outcome.step_name,
+                ));
+                self.abort_on_failure_triggered = true;
+                for s in &self.workflow.steps {
+                    if !self.state.completed_steps.contains(&s.name) {
+                        self.state.set_status(&s.name, StepState::Cancelled);
+                    }
+                }
+                self.persist()?;
+                let aborted = WorkflowOutcome::Aborted;
+                self.frontend.report_workflow_completed(&aborted);
+                return Ok(IterationOutcome::Ended(aborted));
+            }
+
+            return self
+                .handle_step_failure(&outcome.step_name, exit_code)
+                .await;
+        }
+
+        // Step succeeded. Decide what to do next.
+        let workflow_just_completed = self.state.is_complete();
+
+        if !workflow_just_completed {
+            let progress = self.workflow_progress_info();
+            self.frontend.report_workflow_progress(&progress);
+
+            if self.yolo {
+                return Ok(IterationOutcome::Continue);
+            }
+        } else if self.yolo {
+            // Last step in yolo mode: always require explicit user
+            // confirmation before ending the workflow so the user can
+            // review the final step's output.
+            let progress = self.workflow_progress_info();
+            self.frontend.report_workflow_progress(&progress);
+        }
+
+        if !workflow_just_completed || self.yolo {
+            let available = self.compute_available_actions()?;
+            let action = self
+                .frontend
+                .show_workflow_control_board(&self.state, &available)?;
+            self.log_wcb_action(&action);
+            match action {
+                NextAction::Dismiss | NextAction::LaunchNext => {
+                    return Ok(IterationOutcome::Continue)
+                }
+                NextAction::ContinueInCurrentContainer { prompt } => {
+                    self.handle_continue_in_current_container(&prompt)?;
+                    return Ok(IterationOutcome::Continue);
+                }
+                NextAction::RestartCurrentStep => {
+                    self.reject_single_attempt_restart()?;
+                    if let Some(name) = self.current_step_name.clone() {
+                        self.state.set_status(&name, StepState::Pending);
+                        self.persist()?;
+                    }
+                    return Ok(IterationOutcome::Continue);
+                }
+                NextAction::CancelToPreviousStep => {
+                    self.handle_cancel_to_previous()?;
+                    return Ok(IterationOutcome::Continue);
+                }
+                NextAction::FinishWorkflow => {
+                    return Ok(IterationOutcome::Ended(self.handle_finish_workflow()?));
+                }
+                NextAction::Pause => {
+                    self.persist()?;
+                    let outcome = WorkflowOutcome::Paused;
+                    self.frontend.report_workflow_completed(&outcome);
+                    return Ok(IterationOutcome::Ended(outcome));
+                }
+                NextAction::Abort => {
+                    return Ok(IterationOutcome::Ended(self.handle_abort()?));
+                }
+            }
+        }
+
+        Ok(IterationOutcome::Continue)
+    }
+
+    // ── Parallel group execution (WI-0096 §2) ───────────────────────────────
+
+    /// Run a whole parallel group to completion. Launches up to
+    /// `max_concurrent` of `ready` (source-file order), queuing the rest, then
+    /// drives all live containers concurrently through a `FuturesUnordered`
+    /// select loop — launching queued steps as slots free up, running per-step
+    /// stuck detection and per-step yolo countdowns independently, and honoring
+    /// `abort_on_failure` / WCB pause+abort mid-group.
+    async fn run_parallel_group(
+        &mut self,
+        ready: Vec<WorkflowStep>,
+    ) -> Result<GroupOutcome, EngineError> {
+        let group_names: Vec<String> = ready.iter().map(|s| s.name.clone()).collect();
+        self.frontend.report_parallel_group_started(&group_names);
+        let slot_cap = match self.max_concurrent {
+            Some(n) => n.max(1),
+            None => ready.len().max(1),
+        };
+        self.msg_info(format!(
+            "Launching parallel group: {} step(s), up to {} at once",
+            group_names.len(),
+            slot_cap,
+        ));
+
+        let mut queue: VecDeque<WorkflowStep> = ready.into_iter().collect();
+        self.active_steps.clear();
+
+        let (stuck_tx, mut stuck_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, StuckEvent)>();
+        let mut waits: ParallelWaits = FuturesUnordered::new();
+
+        // Launch the initial batch.
+        while self.active_steps.len() < slot_cap {
+            match queue.pop_front() {
+                Some(step) => self.launch_parallel_step(step, &mut waits, &stuck_tx, false)?,
+                None => break,
+            }
+        }
+
+        let total = timing::YOLO_COUNTDOWN_DURATION;
+        let mut failed: Vec<(String, i32)> = Vec::new();
+
+        while !self.active_steps.is_empty() {
+            tokio::select! {
+                biased;
+                Some((name, result)) = waits.next() => {
+                    // Guard against futures for steps already finalized out of
+                    // band (yolo auto-advance kills the container but leaves its
+                    // wait future pending; it resolves here later as a no-op).
+                    if !self.active_steps.iter().any(|s| s.step_name == name) {
+                        continue;
+                    }
+                    let exit = result?;
+                    // Persist the buffered output on a genuine failure before the
+                    // slot (which owns the tail + container name) is removed.
+                    self.maybe_dump_step_failure(&name, exit.exit_code);
+                    let auth_recovered = exit.exit_code != 0 && self.recover_auth_failure(&name)?;
+                    self.remove_active_step(&name);
+                    self.last_exit_info = Some(exit.clone());
+
+                    let (status, step_state) = if exit.exit_code == 0 {
+                        (WorkflowStepStatus::Succeeded, StepState::Succeeded)
+                    } else if auth_recovered {
+                        (WorkflowStepStatus::Running, StepState::Pending)
+                    } else {
+                        (
+                            WorkflowStepStatus::Failed { exit_code: exit.exit_code },
+                            StepState::Failed { exit_code: exit.exit_code, error_message: None },
+                        )
+                    };
+                    let step = self.find_step(&name)?;
+                    self.state.set_status(&name, step_state);
+                    self.frontend.report_step_status(&step, status.clone());
+                    self.frontend.report_parallel_step_exited(&name, exit.exit_code);
+                    self.persist()?;
+                    let progress = self.workflow_progress_info();
+                    self.frontend.report_workflow_progress(&progress);
+
+                    if auth_recovered {
+                        // Put the same step back at the head of this parallel
+                        // batch. `auth_retries_used` ensures this automatic
+                        // relaunch can happen only once.
+                        queue.push_front(step);
+                        if self.active_steps.len() < slot_cap {
+                            if let Some(next) = queue.pop_front() {
+                                self.launch_parallel_step(next, &mut waits, &stuck_tx, true)?;
+                            }
+                        }
+                    } else if let WorkflowStepStatus::Failed { exit_code } = status {
+                        if step.abort_on_failure {
+                            self.msg_warning(format!(
+                                "Step '{}' failed (abort_on_failure); aborting parallel group",
+                                name,
+                            ));
+                            let wo = self.abort_parallel_group()?;
+                            return Ok(GroupOutcome::Ended(wo));
+                        }
+                        // Non-abort failure: record it, keep draining the rest
+                        // of the group, but do NOT launch further queued steps.
+                        // Every failure is recorded — each one gets its own
+                        // recovery board once the group drains.
+                        failed.push((name.clone(), exit_code));
+                    } else if self.active_steps.len() < slot_cap {
+                        if let Some(next) = queue.pop_front() {
+                            self.launch_parallel_step(next, &mut waits, &stuck_tx, true)?;
+                        }
+                    }
+                }
+                Some((name, event)) = stuck_rx.recv() => {
+                    self.handle_parallel_stuck_event(&name, event);
+                }
+                Some(req) = Self::recv_engine(&mut self.engine_rx) => {
+                    if let Some(wo) = self.handle_parallel_engine_request(req)? {
+                        return Ok(GroupOutcome::Ended(wo));
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    self.tick_parallel_yolo(&mut waits, &mut queue, slot_cap, total, &stuck_tx)?;
+                }
+            }
+        }
+
+        self.frontend.report_parallel_group_finished();
+        Ok(GroupOutcome::Drained { failed })
+    }
+
+    /// Launch one step of a parallel group: resolve agent/model, spawn the
+    /// container, wire its stuck broadcast into the fan-in channel, move its
+    /// execution into a wait future, and record an `ActiveParallelStep` slot.
+    fn launch_parallel_step(
+        &mut self,
+        step: WorkflowStep,
+        waits: &mut ParallelWaits,
+        stuck_tx: &StuckFanIn,
+        dequeued: bool,
+    ) -> Result<(), EngineError> {
+        let resolved_agent = self.resolve_agent(&step)?;
+        let resolved_model = self.resolve_model(&step);
+        tracing::info!(
+            step = %step.name,
+            agent = %resolved_agent.as_str(),
+            model = ?resolved_model,
+            "workflow_engine launching parallel step"
+        );
+
+        let workflow_step_info = self.build_workflow_step_info(&step.name);
+        let runtime = WorkflowRuntimeContext {
+            step_agent: resolved_agent.clone(),
+            step_model: resolved_model.clone(),
+            git_root: self.session.git_root().to_path_buf(),
+            session_id: self.session.id(),
+            workflow_invocation_id: self.state.invocation_id,
+            workflow_step_info,
+        };
+
+        self.frontend.report_step_interactive_launch(
+            &step,
+            resolved_agent.as_str(),
+            resolved_model.as_deref(),
+        );
+        self.state
+            .set_status(&step.name, StepState::Running { container_id: None });
+        self.frontend
+            .report_step_status(&step, WorkflowStepStatus::Running);
+        self.persist()?;
+
+        let execution = self
+            .agent_factory
+            .execution_for_step(&step, &self.session, &runtime)?;
+
+        self.state.set_status(
+            &step.name,
+            StepState::Running {
+                container_id: Some(execution.handle().id.clone()),
+            },
+        );
+        self.persist()?;
+
+        let stuck_sender = execution.stuck_sender();
+        let cancel_handle = execution.cancel_handle();
+        let container_name = execution.handle().name.clone();
+        let output_tail = execution.output_tail();
+
+        // Publish the per-step stuck sender so the frontend can subscribe for
+        // this specific container's status bar.
+        self.frontend
+            .set_parallel_step_stuck_sender(&step.name, stuck_sender.clone());
+        if dequeued {
+            self.frontend.report_parallel_step_dequeued(
+                &step.name,
+                resolved_agent.as_str(),
+                resolved_model.as_deref(),
+            );
+        } else {
+            self.frontend.report_parallel_step_launched(
+                &step.name,
+                resolved_agent.as_str(),
+                resolved_model.as_deref(),
+            );
+        }
+        // Published after the launch/dequeue event so the frontend's slot
+        // exists by the time the name arrives; drives per-container stats.
+        self.frontend
+            .report_parallel_step_container(&step.name, &execution.handle().name);
+
+        // Forward this container's stuck broadcast into the unified fan-in
+        // channel, tagged with the step name, so the select loop stays
+        // fixed-arity regardless of how many containers are live.
+        let mut rx = execution.subscribe_stuck();
+        let fwd = stuck_tx.clone();
+        let fwd_name = step.name.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if fwd.send((fwd_name.clone(), ev)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+
+        let name = step.name.clone();
+        waits.push(Box::pin(async move {
+            let mut execution = execution;
+            let r = execution.wait().await;
+            (name, r)
+        }));
+
+        self.active_steps.push(ActiveParallelStep {
+            step_name: step.name.clone(),
+            execution: None,
+            cancel_handle,
+            container_name,
+            output_tail,
+            awman_killed: false,
+            stuck: false,
+            yolo_deadline: None,
+            agent: resolved_agent,
+            model: resolved_model,
+        });
+        Ok(())
+    }
+
+    fn remove_active_step(&mut self, name: &str) {
+        self.active_steps.retain(|s| s.step_name != name);
+    }
+
+    /// Delegate auth-failure recognition and refresh to the command-layer
+    /// factory. Generic workflow code never knows an agent's signatures.
+    ///
+    /// The guard is recorded before the recovery attempt: even if the host
+    /// refresh cannot advance, a matching failed step may be relaunched at most
+    /// once during this workflow invocation.
+    fn recover_auth_failure(&mut self, step_name: &str) -> Result<bool, EngineError> {
+        if self.auth_retries_used.contains(step_name) {
+            return Ok(false);
+        }
+        let Some((agent, output_tail)) = self
+            .active_steps
+            .iter()
+            .find(|s| s.step_name == step_name)
+            .map(|s| {
+                (
+                    s.agent.clone(),
+                    s.output_tail
+                        .as_ref()
+                        .map(|tail| tail.snapshot_text())
+                        .unwrap_or_default(),
+                )
+            })
+        else {
+            return Ok(false);
+        };
+        if !self
+            .agent_factory
+            .recover_auth_failure(&agent, &output_tail)?
+        {
+            return Ok(false);
+        }
+        self.auth_retries_used.insert(step_name.to_string());
+        self.msg_warning(format!(
+            "Step '{step_name}' failed authentication; refreshed credentials and retrying once"
+        ));
+        Ok(true)
+    }
+
+    /// Handle a per-step stuck/unstuck transition inside a parallel group.
+    /// Independent per slot: a noisy sibling never masks a stuck step, and a
+    /// stuck step never blocks its siblings.
+    fn handle_parallel_stuck_event(&mut self, name: &str, event: StuckEvent) {
+        match event {
+            StuckEvent::Stuck => {
+                if self.yolo {
+                    let start_countdown = {
+                        match self.active_steps.iter_mut().find(|s| s.step_name == name) {
+                            Some(s) if s.yolo_deadline.is_none() => {
+                                s.yolo_deadline =
+                                    Some(Instant::now() + timing::YOLO_COUNTDOWN_DURATION);
+                                true
+                            }
+                            _ => false,
+                        }
+                    };
+                    if start_countdown {
+                        self.msg_info(format!(
+                            "Step '{}' appears stuck; starting yolo countdown",
+                            name,
+                        ));
+                        self.frontend.parallel_step_yolo_countdown_started(name);
+                    }
+                } else {
+                    if let Some(s) = self.active_steps.iter_mut().find(|s| s.step_name == name) {
+                        s.stuck = true;
+                    }
+                    self.msg_warning(format!("Step '{}' appears stuck (no output)", name));
+                    self.frontend.report_parallel_step_stuck(name);
+                }
+            }
+            StuckEvent::Unstuck => {
+                if let Some(s) = self.active_steps.iter_mut().find(|s| s.step_name == name) {
+                    let had_countdown = s.yolo_deadline.take().is_some();
+                    s.stuck = false;
+                    if had_countdown {
+                        self.frontend.parallel_step_yolo_countdown_finished(name);
+                    }
+                }
+                self.frontend.report_parallel_step_unstuck(name);
+            }
+            StuckEvent::StartupGraceExpired => {
+                // The bridge already killed the container; its wait future will
+                // resolve and be finalized as a failure. Mark the slot as
+                // awman-killed so the drain loop suppresses the failure log for
+                // this expected kill.
+                if let Some(s) = self.active_steps.iter_mut().find(|s| s.step_name == name) {
+                    s.awman_killed = true;
+                }
+            }
+        }
+    }
+
+    /// Drive every in-flight per-step yolo countdown one tick. Independent per
+    /// slot — expiry kills only that container and advances the queue.
+    fn tick_parallel_yolo(
+        &mut self,
+        waits: &mut ParallelWaits,
+        queue: &mut VecDeque<WorkflowStep>,
+        slot_cap: usize,
+        total: Duration,
+        stuck_tx: &StuckFanIn,
+    ) -> Result<(), EngineError> {
+        let now = Instant::now();
+        let ticking: Vec<(String, Instant)> = self
+            .active_steps
+            .iter()
+            .filter_map(|s| s.yolo_deadline.map(|d| (s.step_name.clone(), d)))
+            .collect();
+        for (name, deadline) in ticking {
+            let remaining = deadline.saturating_duration_since(now);
+            match self
+                .frontend
+                .parallel_step_yolo_countdown_tick(&name, remaining, total)?
+            {
+                YoloTickOutcome::Cancel => {
+                    if let Some(s) = self.active_steps.iter_mut().find(|s| s.step_name == name) {
+                        s.yolo_deadline = None;
+                    }
+                    self.frontend.parallel_step_yolo_countdown_finished(&name);
+                }
+                YoloTickOutcome::AdvanceNow => {
+                    self.yolo_advance_parallel(&name, waits, queue, slot_cap, stuck_tx)?;
+                }
+                YoloTickOutcome::Continue => {
+                    if remaining.is_zero() {
+                        self.yolo_advance_parallel(&name, waits, queue, slot_cap, stuck_tx)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Yolo countdown expired (or user forced advance) for one parallel slot:
+    /// kill just that container, mark the step Succeeded, free the slot, and
+    /// launch the next queued step if one is waiting.
+    fn yolo_advance_parallel(
+        &mut self,
+        name: &str,
+        waits: &mut ParallelWaits,
+        queue: &mut VecDeque<WorkflowStep>,
+        slot_cap: usize,
+        stuck_tx: &StuckFanIn,
+    ) -> Result<(), EngineError> {
+        self.msg_info(format!("Yolo auto-advancing past step '{}'", name));
+        self.frontend.parallel_step_yolo_countdown_finished(name);
+        if let Some(pos) = self.active_steps.iter().position(|s| s.step_name == name) {
+            if let Some(ch) = &self.active_steps[pos].cancel_handle {
+                let _ = ch.cancel();
+            }
+            self.active_steps.remove(pos);
+        }
+        self.frontend
+            .report_parallel_step_exited(name, KILLED_EXIT_CODE);
+        self.state.set_status(name, StepState::Succeeded);
+        let step = self.find_step(name)?;
+        self.frontend
+            .report_step_status(&step, WorkflowStepStatus::Succeeded);
+        self.persist()?;
+        let progress = self.workflow_progress_info();
+        self.frontend.report_workflow_progress(&progress);
+        if self.active_steps.len() < slot_cap {
+            if let Some(next) = queue.pop_front() {
+                self.launch_parallel_step(next, waits, stuck_tx, true)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Kill every live container in the current parallel group and cancel all
+    /// not-yet-completed steps, then proceed with the standard abort path.
+    fn abort_parallel_group(&mut self) -> Result<WorkflowOutcome, EngineError> {
+        self.abort_on_failure_triggered = true;
+        let names: Vec<String> = self
+            .active_steps
+            .iter()
+            .map(|s| s.step_name.clone())
+            .collect();
+        for s in &self.active_steps {
+            if let Some(ch) = &s.cancel_handle {
+                let _ = ch.cancel();
+            }
+        }
+        self.active_steps.clear();
+        for name in &names {
+            self.frontend
+                .report_parallel_step_exited(name, KILLED_EXIT_CODE);
+        }
+        for s in &self.workflow.steps {
+            if !self.state.completed_steps.contains(&s.name) {
+                self.state.set_status(&s.name, StepState::Cancelled);
+            }
+        }
+        self.persist()?;
+        self.frontend.report_parallel_group_finished();
+        let aborted = WorkflowOutcome::Aborted;
+        self.frontend.report_workflow_completed(&aborted);
+        Ok(aborted)
+    }
+
+    /// WCB Pause during a parallel group: kill all live containers, reset the
+    /// running steps to Pending so a resume replays them, and end the run.
+    fn pause_parallel_group(&mut self) -> Result<WorkflowOutcome, EngineError> {
+        let names: Vec<String> = self
+            .active_steps
+            .iter()
+            .map(|s| s.step_name.clone())
+            .collect();
+        for s in &self.active_steps {
+            if let Some(ch) = &s.cancel_handle {
+                let _ = ch.cancel();
+            }
+        }
+        self.active_steps.clear();
+        for name in &names {
+            self.frontend
+                .report_parallel_step_exited(name, KILLED_EXIT_CODE);
+            self.state.set_status(name, StepState::Pending);
+        }
+        self.persist()?;
+        self.frontend.report_parallel_group_finished();
+        let paused = WorkflowOutcome::Paused;
+        self.frontend.report_workflow_completed(&paused);
+        Ok(paused)
+    }
+
+    /// Route an `EngineRequest` received while a parallel group is running.
+    /// Returns `Some(outcome)` when the request ends the workflow (WCB
+    /// pause/abort), `None` otherwise.
+    fn handle_parallel_engine_request(
+        &mut self,
+        req: EngineRequest,
+    ) -> Result<Option<WorkflowOutcome>, EngineError> {
+        match req {
+            EngineRequest::StepStuck { step_name } => {
+                self.handle_parallel_stuck_event(&step_name, StuckEvent::Stuck);
+                Ok(None)
+            }
+            EngineRequest::StepUnstuck { step_name } => {
+                self.handle_parallel_stuck_event(&step_name, StuckEvent::Unstuck);
+                Ok(None)
+            }
+            EngineRequest::OpenControlBoard { step_name } => {
+                // Scope the board to the focused container; peers keep running.
+                self.focus_parallel_step(&step_name);
                 let available = self.compute_available_actions()?;
                 let action = self
                     .frontend
                     .show_workflow_control_board(&self.state, &available)?;
                 self.log_wcb_action(&action);
                 match action {
-                    NextAction::Dismiss | NextAction::LaunchNext => continue,
-                    NextAction::ContinueInCurrentContainer { prompt } => {
-                        self.handle_continue_in_current_container(&prompt)?;
-                        continue;
-                    }
-                    NextAction::RestartCurrentStep => {
-                        if let Some(name) = self.current_step_name.clone() {
-                            self.state.set_status(&name, StepState::Pending);
-                            self.persist()?;
-                        }
-                        continue;
-                    }
-                    NextAction::CancelToPreviousStep => {
-                        self.handle_cancel_to_previous()?;
-                        continue;
-                    }
-                    NextAction::FinishWorkflow => {
-                        return self.handle_finish_workflow();
-                    }
-                    NextAction::Pause => {
-                        self.persist()?;
-                        let outcome = WorkflowOutcome::Paused;
-                        self.frontend.report_workflow_completed(&outcome);
-                        return Ok(outcome);
-                    }
-                    NextAction::Abort => {
-                        return self.handle_abort();
-                    }
+                    NextAction::Pause => Ok(Some(self.pause_parallel_group()?)),
+                    NextAction::Abort => Ok(Some(self.abort_parallel_group()?)),
+                    // Back / finish / restart / continue / launch-next are all
+                    // scoped away while peers run (see compute_available_actions
+                    // §10); treat anything else as a dismiss — the group keeps
+                    // running undisturbed.
+                    _ => Ok(None),
                 }
             }
         }
+    }
+
+    /// Make `step_name` the focused slot (index 0) so `compute_available_actions`
+    /// evaluates the board relative to it. No-op if the name is unknown.
+    fn focus_parallel_step(&mut self, step_name: &str) {
+        if let Some(pos) = self
+            .active_steps
+            .iter()
+            .position(|s| s.step_name == step_name)
+        {
+            self.active_steps.swap(0, pos);
+            let s = &self.active_steps[0];
+            self.current_step_name = Some(s.step_name.clone());
+            self.current_step_agent = Some(s.agent.clone());
+            self.current_step_model = s.model.clone();
+        }
+    }
+
+    /// Compose the failure-scoped [`AvailableActions`] for the Workflow
+    /// Control Board (WI-0115 §1).
+    ///
+    /// The failed step's container is already dead, so "continue in the current
+    /// container" is never offered and Esc means Pause rather than Dismiss.
+    /// `can_finish_workflow` is forced off: there is no "Enter to finish
+    /// workflow" on a failure board — Ctrl-C aborts instead.
+    fn compute_failure_actions(
+        &self,
+        step_name: &str,
+        exit_code: i32,
+    ) -> Result<AvailableActions, EngineError> {
+        // `last_exit_info` tracks the most recent container to exit, which in a
+        // parallel group need not be the one that failed — a later-exiting peer
+        // overwrites it. Only trust it when its code matches this failure.
+        let exit = self
+            .last_exit_info
+            .clone()
+            .filter(|e| e.exit_code == exit_code);
+        let signal = exit.as_ref().and_then(|e| e.signal);
+
+        let mut detail_lines = Vec::new();
+        if let Some(sig) = signal {
+            detail_lines.push(format!("Container terminated by signal {sig}"));
+        }
+        detail_lines.push(format!("Exit code: {exit_code}"));
+        if let Some(e) = &exit {
+            let secs = e
+                .ended_at
+                .signed_duration_since(e.started_at)
+                .num_seconds()
+                .max(0);
+            detail_lines.push(format!("Ran for {secs}s"));
+        }
+
+        // The step LaunchNext will start: the first step that becomes ready
+        // once the failed step is treated as skipped.
+        let mut completed_if_skipped = self.state.completed_steps.clone();
+        completed_if_skipped.insert(step_name.to_string());
+        let next_step = self
+            .dag
+            .ready_steps(&completed_if_skipped)
+            .into_iter()
+            .next();
+        let previous_step = self.previous_step_name();
+
+        let restart_allowed = self.retry_policy != WorkflowRetryPolicy::SingleAttempt;
+        let previous_allowed = restart_allowed && previous_step.is_some();
+        Ok(AvailableActions {
+            can_launch_next: next_step.is_some(),
+            can_restart_current_step: restart_allowed,
+            can_cancel_to_previous_step: previous_allowed,
+            can_pause: true,
+            can_abort: true,
+            can_finish_workflow: false,
+            can_dismiss: false,
+            cancel_to_previous_unavailable_reason: previous_step
+                .is_none()
+                .then(|| "this is the first step".to_string())
+                .or_else(|| {
+                    (!restart_allowed).then(|| {
+                        "Returning to a previous step is unavailable because the startup gate is single-use"
+                            .into()
+                    })
+                }),
+            continue_unavailable_reason: Some("the failed step's container has exited".into()),
+            restart_unavailable_reason: (!restart_allowed)
+                .then(|| "Restart is unavailable because the startup gate is single-use".into()),
+            finish_workflow_unavailable_reason: Some(
+                "a step failed; choose a recovery action or Ctrl-C to cancel".into(),
+            ),
+            launch_next_label: next_step
+                .as_ref()
+                .map(|n| format!("Skip to '{n}' (new container)")),
+            step_failure: Some(StepFailureContext {
+                step_name: step_name.to_string(),
+                exit_code,
+                signal,
+                detail_lines,
+                previous_step,
+                next_step,
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// Decide what happens after a non-`abort_on_failure` step failure.
+    ///
+    /// Interactive frontends (CLI on a TTY, TUI) get the Workflow Control Board
+    /// with the failure attached and drive the recovery themselves. Unattended
+    /// frontends (squad daemon, API server, `--non-interactive`) get one yolo
+    /// countdown and one automatic retry; a second failure of the same step
+    /// fails the workflow (WI-0115 §1, §3).
+    async fn handle_step_failure(
+        &mut self,
+        step_name: &str,
+        exit_code: i32,
+    ) -> Result<IterationOutcome, EngineError> {
+        if self.frontend.supports_interactive_recovery() {
+            self.handle_step_failure_interactive(step_name, exit_code)
+        } else {
+            self.handle_step_failure_unattended(step_name, exit_code)
+                .await
+        }
+    }
+
+    /// Interactive recovery loop. Repeats until the user picks an action that
+    /// either resolves the failure or ends the workflow — a Dismiss (or any
+    /// action that is not meaningful on a failure board) re-presents it, since
+    /// leaving a failed step unanswered has nowhere to go.
+    fn handle_step_failure_interactive(
+        &mut self,
+        step_name: &str,
+        exit_code: i32,
+    ) -> Result<IterationOutcome, EngineError> {
+        self.msg_error(format!(
+            "Step '{step_name}' failed (exit {exit_code}); choose how to recover"
+        ));
+        loop {
+            let available = self.compute_failure_actions(step_name, exit_code)?;
+            // Each arm below narrates its own recovery, so `log_wcb_action`'s
+            // generic between-steps copy would only double up here.
+            let action = self
+                .frontend
+                .show_workflow_control_board(&self.state, &available)?;
+            match action {
+                NextAction::RestartCurrentStep => {
+                    self.reject_single_attempt_restart()?;
+                    self.msg_info(format!("Restarting failed step '{step_name}'"));
+                    self.state.set_status(step_name, StepState::Pending);
+                    self.persist()?;
+                    return Ok(IterationOutcome::Continue);
+                }
+                NextAction::CancelToPreviousStep => {
+                    self.reject_single_attempt_cancel_to_previous()?;
+                    let Some(prev) = available
+                        .step_failure
+                        .as_ref()
+                        .and_then(|f| f.previous_step.clone())
+                    else {
+                        continue;
+                    };
+                    self.msg_info(format!(
+                        "Cancelling failed step '{step_name}', returning to '{prev}'"
+                    ));
+                    self.state.set_status(step_name, StepState::Pending);
+                    self.state.set_status(&prev, StepState::Pending);
+                    self.persist()?;
+                    return Ok(IterationOutcome::Continue);
+                }
+                NextAction::LaunchNext => {
+                    let Some(next) = available
+                        .step_failure
+                        .as_ref()
+                        .and_then(|f| f.next_step.clone())
+                    else {
+                        continue;
+                    };
+                    self.msg_warning(format!(
+                        "Skipping failed step '{step_name}'; starting '{next}' in a new container"
+                    ));
+                    self.state.set_status(step_name, StepState::Skipped);
+                    self.persist()?;
+                    return Ok(IterationOutcome::Continue);
+                }
+                NextAction::Abort => return Ok(IterationOutcome::Ended(self.handle_abort()?)),
+                NextAction::Pause => {
+                    self.msg_info("Workflow paused");
+                    self.persist()?;
+                    let paused = WorkflowOutcome::Paused;
+                    self.frontend.report_workflow_completed(&paused);
+                    return Ok(IterationOutcome::Ended(paused));
+                }
+                // Dismiss / Continue-in-container / Finish are all meaningless
+                // on a dead container: re-present the board.
+                _ => continue,
+            }
+        }
+    }
+
+    /// Unattended recovery: a 60s yolo countdown (reported through the same
+    /// frontend hooks a stuck-step countdown uses) followed by exactly one
+    /// automatic retry of the failed step. A second failure of the same step
+    /// ends the workflow as `Failed`.
+    async fn handle_step_failure_unattended(
+        &mut self,
+        step_name: &str,
+        exit_code: i32,
+    ) -> Result<IterationOutcome, EngineError> {
+        if self.auto_retried_steps.contains(step_name) {
+            self.msg_error(format!(
+                "Step '{step_name}' failed again after its automatic retry (exit {exit_code}); \
+                 failing workflow",
+            ));
+            for s in &self.workflow.steps {
+                if !self.state.completed_steps.contains(&s.name) {
+                    self.state.set_status(&s.name, StepState::Cancelled);
+                }
+            }
+            self.state.set_status(
+                step_name,
+                StepState::Failed {
+                    exit_code,
+                    error_message: Some(format!(
+                        "failed twice (exit {exit_code}); automatic retry exhausted"
+                    )),
+                },
+            );
+            self.persist()?;
+            let failed = WorkflowOutcome::Failed {
+                last_step: step_name.to_string(),
+                exit_code,
+            };
+            self.frontend.report_workflow_completed(&failed);
+            return Ok(IterationOutcome::Ended(failed));
+        }
+
+        self.msg_warning(format!(
+            "Step '{step_name}' failed (exit {exit_code}); retrying once in {}s",
+            timing::YOLO_COUNTDOWN_DURATION.as_secs(),
+        ));
+        match self.run_failure_retry_countdown(step_name).await? {
+            YoloTickOutcome::Cancel => {
+                self.msg_warning(format!(
+                    "Retry countdown for step '{step_name}' cancelled; failing workflow",
+                ));
+                for s in &self.workflow.steps {
+                    if !self.state.completed_steps.contains(&s.name) {
+                        self.state.set_status(&s.name, StepState::Cancelled);
+                    }
+                }
+                self.state.set_status(
+                    step_name,
+                    StepState::Failed {
+                        exit_code,
+                        error_message: Some("retry countdown cancelled".into()),
+                    },
+                );
+                self.persist()?;
+                let failed = WorkflowOutcome::Failed {
+                    last_step: step_name.to_string(),
+                    exit_code,
+                };
+                self.frontend.report_workflow_completed(&failed);
+                Ok(IterationOutcome::Ended(failed))
+            }
+            _ => {
+                self.auto_retried_steps.insert(step_name.to_string());
+                self.msg_info(format!(
+                    "Retrying failed step '{step_name}' (attempt 2 of 2)"
+                ));
+                self.state.set_status(step_name, StepState::Pending);
+                self.persist()?;
+                Ok(IterationOutcome::Continue)
+            }
+        }
+    }
+
+    /// Tick the retry countdown for a failed step. Unlike the mid-step yolo
+    /// countdown there is no container left to recover, so the only outcomes
+    /// are "expired / advance now" (retry) and "cancelled" (fail).
+    async fn run_failure_retry_countdown(
+        &mut self,
+        step_name: &str,
+    ) -> Result<YoloTickOutcome, EngineError> {
+        let total = timing::YOLO_COUNTDOWN_DURATION;
+        let start = Instant::now();
+        self.frontend
+            .yolo_countdown_started(step_name, CountdownKind::FailureRetry);
+        let outcome = loop {
+            let elapsed = start.elapsed();
+            let remaining = total.saturating_sub(elapsed);
+            match self
+                .frontend
+                .yolo_countdown_tick(step_name, remaining, total)?
+            {
+                YoloTickOutcome::AdvanceNow => break YoloTickOutcome::AdvanceNow,
+                YoloTickOutcome::Cancel => break YoloTickOutcome::Cancel,
+                YoloTickOutcome::Continue => {}
+            }
+            if remaining.is_zero() {
+                break YoloTickOutcome::Continue;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        self.frontend.yolo_countdown_finished(step_name);
+        Ok(outcome)
+    }
+
+    /// Present the post-failure recovery board for a non-abort step failure
+    /// that surfaced after a parallel group drained.
+    async fn handle_group_step_failure(
+        &mut self,
+        step_name: &str,
+        exit_code: i32,
+    ) -> Result<IterationOutcome, EngineError> {
+        // Scope the board to the failed step: its peers have already exited,
+        // so the previous/next names must be computed relative to it.
+        self.current_step_name = Some(step_name.to_string());
+        self.handle_step_failure(step_name, exit_code).await
     }
 
     /// Advance exactly one step, reporting status through the frontend.
@@ -455,8 +1663,9 @@ impl WorkflowEngine {
         let step_name = self.launch_step().await?;
         let exit = {
             let exec = self
-                .current_execution
-                .as_mut()
+                .active_steps
+                .first_mut()
+                .and_then(|s| s.execution.as_mut())
                 .expect("launch_step stored execution");
             exec.wait().await?
         };
@@ -514,7 +1723,20 @@ impl WorkflowEngine {
         );
         self.persist()?;
 
-        self.current_execution = Some(execution);
+        let container_name = execution.handle().name.clone();
+        let output_tail = execution.output_tail();
+        self.active_steps = vec![ActiveParallelStep {
+            step_name: step.name.clone(),
+            execution: Some(execution),
+            cancel_handle: None,
+            container_name,
+            output_tail,
+            awman_killed: false,
+            stuck: false,
+            yolo_deadline: None,
+            agent: resolved_agent.clone(),
+            model: resolved_model.clone(),
+        }];
         self.current_step_name = Some(step.name.clone());
         self.current_step_agent = Some(resolved_agent);
         self.current_step_model = resolved_model;
@@ -527,6 +1749,13 @@ impl WorkflowEngine {
         exit: AgentExitInfo,
     ) -> Result<StepOutcome, EngineError> {
         self.last_exit_info = Some(exit.clone());
+        // The step's container has actually terminated (wait() resolved) —
+        // tell the frontend so it can tear down any live container UI.
+        self.frontend.report_container_exited(exit.exit_code);
+
+        // On a genuine (non-awman-kill) container failure, persist the buffered
+        // output tail so the user can debug what went wrong.
+        self.maybe_dump_step_failure(step_name, exit.exit_code);
 
         let (status, step_state) = if exit.exit_code == 0 {
             (WorkflowStepStatus::Succeeded, StepState::Succeeded)
@@ -564,22 +1793,18 @@ impl WorkflowEngine {
     async fn step_once_interruptible(&mut self) -> Result<InterruptibleStepResult, EngineError> {
         let step_name = self.launch_step().await?;
 
-        let cancel_handle = self
-            .current_execution
-            .as_ref()
-            .and_then(|e| e.cancel_handle());
+        let cancel_handle = self.focused_execution().and_then(|e| e.cancel_handle());
 
         // Subscribe to stuck/unstuck events from the container's io_bridge.
-        let mut stuck_rx = self.current_execution.as_ref().map(|e| e.subscribe_stuck());
+        let mut stuck_rx = self.focused_execution().map(|e| e.subscribe_stuck());
 
         // Publish the stuck sender to the frontend (TUI uses it for tab coloring).
-        if let Some(exec) = self.current_execution.as_ref() {
+        if let Some(exec) = self.focused_execution() {
             self.frontend.set_stuck_sender(exec.stuck_sender());
         }
 
         let mut exec = self
-            .current_execution
-            .take()
+            .take_focused_execution()
             .expect("launch_step stored execution");
         let (wait_tx, mut wait_rx) =
             tokio::sync::oneshot::channel::<(AgentExecution, Result<AgentExitInfo, EngineError>)>();
@@ -594,7 +1819,7 @@ impl WorkflowEngine {
                 result = &mut wait_rx => {
                     let (exec_back, exit_result) = result
                         .map_err(|_| EngineError::Other("step wait task dropped unexpectedly".into()))?;
-                    self.current_execution = Some(exec_back);
+                    self.set_focused_execution(exec_back);
                     return Ok(InterruptibleStepResult::StepCompleted(
                         self.finalize_step(&step_name, exit_result?)?
                     ));
@@ -621,7 +1846,9 @@ impl WorkflowEngine {
                             // window. The bridge already invoked the cancel
                             // callback to kill it; surface a warning and let
                             // wait_rx resolve naturally so finalize_step
-                            // records the failure.
+                            // records the failure. This is an awman-initiated
+                            // kill, so mark the slot to suppress a failure log.
+                            self.mark_focused_killed();
                             self.msg_warning(format!(
                                 "Step '{}' produced no output before its startup grace expired; killing container",
                                 step_name,
@@ -631,7 +1858,7 @@ impl WorkflowEngine {
                 }
                 Some(req) = Self::recv_engine(&mut self.engine_rx) => {
                     match req {
-                        EngineRequest::OpenControlBoard => {
+                        EngineRequest::OpenControlBoard { .. } => {
                             let mid = self.handle_mid_step_control_board(
                                 &step_name,
                                 &cancel_handle,
@@ -650,7 +1877,7 @@ impl WorkflowEngine {
                                 }
                             }
                         }
-                        EngineRequest::StepStuck => {
+                        EngineRequest::StepStuck { .. } => {
                             let result = self.handle_step_stuck(
                                 &step_name,
                                 &cancel_handle,
@@ -662,7 +1889,7 @@ impl WorkflowEngine {
                                 Some(r) => return Ok(r),
                             }
                         }
-                        EngineRequest::StepUnstuck => {
+                        EngineRequest::StepUnstuck { .. } => {
                             // Not inside a yolo countdown — nothing to cancel.
                         }
                     }
@@ -691,6 +1918,24 @@ impl WorkflowEngine {
         }
     }
 
+    /// Kill the current step's container and immediately tell the frontend
+    /// it is gone. Used by every engine-initiated kill (yolo auto-advance,
+    /// WCB advance/restart/back/pause/abort/finish). Steps whose container
+    /// exits on its own are reported via `finalize_step` instead.
+    fn kill_current_container(
+        &mut self,
+        cancel_handle: &Option<crate::engine::agent_runtime::execution::CancelHandle>,
+    ) {
+        // Mark before cancelling so that if the container's wait future later
+        // reaches finalize_step, the exit is treated as an expected kill and no
+        // failure log is written.
+        self.mark_focused_killed();
+        if let Some(ch) = cancel_handle {
+            let _ = ch.cancel();
+            self.frontend.report_container_exited(KILLED_EXIT_CODE);
+        }
+    }
+
     fn handle_mid_step_control_board(
         &mut self,
         step_name: &str,
@@ -709,7 +1954,7 @@ impl WorkflowEngine {
 
         let already_finished = match wait_rx.try_recv() {
             Ok((exec_back, exit_result)) => {
-                self.current_execution = Some(exec_back);
+                self.set_focused_execution(exec_back);
                 Some(exit_result)
             }
             Err(_) => None,
@@ -725,7 +1970,10 @@ impl WorkflowEngine {
                 Ok(MidStepOutcome::Continue)
             }
             NextAction::ContinueInCurrentContainer { prompt } => {
-                if let Some(exec) = self.current_execution.as_ref() {
+                // Direct field access keeps the borrow of `active_steps`
+                // disjoint from `agent_factory` (the helper would borrow all of
+                // `self`).
+                if let Some(exec) = self.active_steps.first().and_then(|s| s.execution.as_ref()) {
                     let _ = self.agent_factory.inject_prompt(exec, &prompt);
                 }
                 if let Some(exit_result) = already_finished {
@@ -737,9 +1985,7 @@ impl WorkflowEngine {
             }
             NextAction::Pause => {
                 if already_finished.is_none() {
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                 }
                 self.state.set_status(step_name, StepState::Pending);
                 self.persist()?;
@@ -749,9 +1995,7 @@ impl WorkflowEngine {
             }
             NextAction::Abort => {
                 if already_finished.is_none() {
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                 }
                 for s in &self.workflow.steps {
                     if !self.state.completed_steps.contains(&s.name) {
@@ -770,9 +2014,7 @@ impl WorkflowEngine {
                     ));
                 }
                 if already_finished.is_none() {
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                 }
                 for s in &self.workflow.steps {
                     if !self.state.completed_steps.contains(&s.name) {
@@ -786,9 +2028,7 @@ impl WorkflowEngine {
             }
             NextAction::LaunchNext => {
                 if already_finished.is_none() {
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                 }
                 self.state.set_status(step_name, StepState::Succeeded);
                 self.persist()?;
@@ -796,20 +2036,18 @@ impl WorkflowEngine {
             }
             NextAction::RestartCurrentStep => {
                 if already_finished.is_none() {
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                 }
+                self.reject_single_attempt_restart()?;
                 self.state.set_status(step_name, StepState::Pending);
                 self.persist()?;
                 Ok(MidStepOutcome::LoopContinue)
             }
             NextAction::CancelToPreviousStep => {
                 if already_finished.is_none() {
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                 }
+                self.reject_single_attempt_cancel_to_previous()?;
                 if let Some(prev) = self.previous_step_name() {
                     self.state.set_status(step_name, StepState::Cancelled);
                     self.state.set_status(&prev, StepState::Pending);
@@ -858,9 +2096,7 @@ impl WorkflowEngine {
                 MidStepYoloResult::Cancelled | MidStepYoloResult::Recovered => Ok(None),
                 MidStepYoloResult::Advanced => {
                     self.msg_info(format!("Yolo auto-advancing past step '{}'", step_name,));
-                    if let Some(ch) = cancel_handle {
-                        let _ = ch.cancel();
-                    }
+                    self.kill_current_container(cancel_handle);
                     self.state.set_status(step_name, StepState::Succeeded);
                     self.persist()?;
                     let step = self.find_step(step_name)?;
@@ -911,7 +2147,8 @@ impl WorkflowEngine {
             step_name,
             timing::YOLO_COUNTDOWN_DURATION.as_secs(),
         ));
-        self.frontend.yolo_countdown_started(step_name);
+        self.frontend
+            .yolo_countdown_started(step_name, CountdownKind::StuckStep);
         let total = timing::YOLO_COUNTDOWN_DURATION;
         let start = std::time::Instant::now();
 
@@ -985,7 +2222,7 @@ impl WorkflowEngine {
                 result = &mut *wait_rx => {
                     let (exec_back, exit_result) = result
                         .map_err(|_| EngineError::Other("step wait task dropped unexpectedly".into()))?;
-                    self.current_execution = Some(exec_back);
+                    self.set_focused_execution(exec_back);
                     self.frontend.yolo_countdown_finished(step_name);
                     return Ok(MidStepYoloResult::StepCompleted(
                         self.finalize_step(step_name, exit_result?)?
@@ -1021,11 +2258,11 @@ impl WorkflowEngine {
                 }
                 Some(req) = Self::recv_engine(&mut self.engine_rx) => {
                     match req {
-                        EngineRequest::OpenControlBoard => {
+                        EngineRequest::OpenControlBoard { .. } => {
                             self.frontend.yolo_countdown_finished(step_name);
                             return Ok(MidStepYoloResult::ShowControlBoard);
                         }
-                        EngineRequest::StepUnstuck => {
+                        EngineRequest::StepUnstuck { .. } => {
                             self.msg_info(format!(
                                 "Step '{}' recovered (engine request), cancelling countdown",
                                 step_name,
@@ -1033,7 +2270,7 @@ impl WorkflowEngine {
                             self.frontend.yolo_countdown_finished(step_name);
                             return Ok(MidStepYoloResult::Recovered);
                         }
-                        EngineRequest::StepStuck => {
+                        EngineRequest::StepStuck { .. } => {
                             // Already counting down; ignore duplicate.
                         }
                     }
@@ -1068,6 +2305,7 @@ impl WorkflowEngine {
                 Ok(InterruptibleStepResult::WorkflowEnded(wo))
             }
             NextAction::RestartCurrentStep => {
+                self.reject_single_attempt_restart()?;
                 if let Some(name) = self.current_step_name.clone() {
                     self.state.set_status(&name, StepState::Pending);
                     self.persist()?;
@@ -1083,6 +2321,25 @@ impl WorkflowEngine {
                 Ok(InterruptibleStepResult::LoopContinue)
             }
         }
+    }
+
+    fn reject_single_attempt_restart(&self) -> Result<(), EngineError> {
+        if self.retry_policy == WorkflowRetryPolicy::SingleAttempt {
+            return Err(EngineError::InvalidAdvanceAction(
+                "restart is unavailable because the startup gate is single-use".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reject_single_attempt_cancel_to_previous(&self) -> Result<(), EngineError> {
+        if self.retry_policy == WorkflowRetryPolicy::SingleAttempt {
+            return Err(EngineError::InvalidAdvanceAction(
+                "returning to a previous step is unavailable because the startup gate is single-use"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     fn handle_finish_workflow(&mut self) -> Result<WorkflowOutcome, EngineError> {
@@ -1156,6 +2413,7 @@ impl WorkflowEngine {
     }
 
     fn handle_cancel_to_previous(&mut self) -> Result<(), EngineError> {
+        self.reject_single_attempt_cancel_to_previous()?;
         let prev = self.previous_step_name();
         match prev {
             Some(prev) => {
@@ -1196,7 +2454,7 @@ impl WorkflowEngine {
                     .into(),
             ));
         }
-        match &self.current_execution {
+        match self.active_steps.first().and_then(|s| s.execution.as_ref()) {
             Some(exec) => match self.agent_factory.inject_prompt(exec, prompt)? {
                 Some(()) => {
                     self.state.set_status(&next_step.name, StepState::Succeeded);
@@ -1217,13 +2475,14 @@ impl WorkflowEngine {
     }
 
     pub fn compute_available_actions(&self) -> Result<AvailableActions, EngineError> {
+        let has_execution = self.focused_execution().is_some();
         let mut a = AvailableActions {
             can_launch_next: !self.state.is_complete(),
             can_restart_current_step: self.current_step_name.is_some(),
             can_pause: true,
             can_abort: true,
             can_finish_workflow: self.is_last_step(),
-            can_dismiss: self.current_execution.is_some() || self.current_step_name.is_some(),
+            can_dismiss: has_execution || self.current_step_name.is_some(),
             ..Default::default()
         };
         if let Some(next) = self.next_ready_step()? {
@@ -1233,7 +2492,7 @@ impl WorkflowEngine {
                 (Some(curr_a), curr_m) => *curr_a == next_agent && *curr_m == next_model,
                 _ => false,
             };
-            if ok && self.current_execution.is_some() {
+            if ok && has_execution {
                 a.can_continue_in_current_container = true;
                 a.continue_prompt = Some(next.prompt_template.clone());
             } else {
@@ -1252,6 +2511,37 @@ impl WorkflowEngine {
         if !a.can_finish_workflow {
             a.finish_workflow_unavailable_reason =
                 Some("FinishWorkflow is only valid on the last step".into());
+        }
+
+        // Workflow Control Board scoping for parallel groups (WI-0096 §10).
+        // The board's actions apply to the focused container; peers keep
+        // running. `active_steps` counts live containers; the focused step is
+        // the first entry, so peers = len - 1.
+        let peers_running = self.active_steps.len().saturating_sub(1);
+        a.parallel_peer_count = self.active_steps.len();
+        a.parallel_peers_running = peers_running;
+        if peers_running > 0 {
+            // Restart still targets only the focused container; surface the
+            // scoping note so frontends can explain it.
+            a.can_restart_current_step = false;
+            a.restart_unavailable_reason =
+                Some("Restart applies only to the focused container. Switch with Ctrl-S.".into());
+            a.can_cancel_to_previous_step = false;
+            a.cancel_to_previous_unavailable_reason =
+                Some("Cannot go back while other agents in this group are still running.".into());
+            a.can_finish_workflow = false;
+            a.finish_workflow_unavailable_reason =
+                Some("Cannot finish while other agents in this group are still running.".into());
+        }
+        if self.retry_policy == WorkflowRetryPolicy::SingleAttempt {
+            a.can_restart_current_step = false;
+            a.restart_unavailable_reason =
+                Some("Restart is unavailable because the startup gate is single-use".into());
+            a.can_cancel_to_previous_step = false;
+            a.cancel_to_previous_unavailable_reason = Some(
+                "Returning to a previous step is unavailable because the startup gate is single-use"
+                    .into(),
+            );
         }
         Ok(a)
     }
@@ -1325,8 +2615,10 @@ impl WorkflowEngine {
                     name: step.name.clone(),
                     agent,
                     model,
+                    has_step_override: step.agent.is_some() || step.model.is_some(),
                     status,
                     depends_on: step.depends_on.clone(),
+                    max_concurrent: self.max_concurrent,
                 }
             })
             .collect()
@@ -1562,15 +2854,22 @@ impl WorkflowEngine {
 
             self.frontend.on_teardown_step_started(&desc);
 
-            let step_failed = self.run_single_teardown_step(step, idx, &mut container_for_step);
+            let outcome = self.run_single_teardown_step(step, idx, &mut container_for_step);
 
-            let ultimately_failed = if step_failed {
+            let ultimately_failed = if outcome.failed {
                 let rem = on_failure_configs
                     .get(idx)
                     .and_then(|c| c.as_ref())
                     .cloned();
                 if let Some(rem_config) = rem {
-                    !self.run_teardown_remediation(&rem_config, step, idx, &mut container_for_step)
+                    !self.run_teardown_remediation(
+                        &rem_config,
+                        step,
+                        idx,
+                        &outcome.stdout,
+                        &outcome.stderr,
+                        &mut container_for_step,
+                    )
                 } else {
                     true
                 }
@@ -1600,7 +2899,10 @@ impl WorkflowEngine {
     }
 
     /// Execute a shell command in a container for a setup/teardown step.
-    /// Returns `true` if the step failed, `false` if succeeded.
+    /// Returns a [`PhaseStepOutcome`] carrying the failure flag and, on
+    /// failure, the full captured stdout/stderr. The captured output is only
+    /// used by the teardown remediation path (Feature B); the setup path
+    /// discards it via [`PhaseStepOutcome::failed`].
     fn run_shell_phase_step(
         &mut self,
         container: &dyn AgentExec,
@@ -1608,7 +2910,7 @@ impl WorkflowEngine {
         env: Option<&std::collections::HashMap<String, String>>,
         phase: &str,
         idx: usize,
-    ) -> bool {
+    ) -> PhaseStepOutcome {
         let is_setup = phase == "setup";
         let result = match container.exec_streaming(command, env, &mut |line| {
             if is_setup {
@@ -1621,16 +2923,18 @@ impl WorkflowEngine {
             Err(e) => {
                 let error = e.to_string();
                 self.set_phase_step_failed(is_setup, idx, &error);
-                return true;
+                // The runtime never produced an ExecOutput, so stdout is empty
+                // and stderr carries the launch error for the failure file.
+                return PhaseStepOutcome::failed(String::new(), error);
             }
         };
 
         if result.exit_code != 0 {
             self.set_phase_step_failed(is_setup, idx, &result.stderr);
-            return true;
+            return PhaseStepOutcome::failed(result.stdout, result.stderr);
         }
 
-        false
+        PhaseStepOutcome::succeeded()
     }
 
     /// Record a phase step as failed in the persisted state. Does NOT notify
@@ -1726,7 +3030,10 @@ impl WorkflowEngine {
 
         let (command, env) = setup_step_to_shell(step);
         match container_for_step(idx) {
-            Ok(c) => self.run_shell_phase_step(&*c, &command, env.as_ref(), "setup", idx),
+            Ok(c) => {
+                self.run_shell_phase_step(&*c, &command, env.as_ref(), "setup", idx)
+                    .failed
+            }
             Err(e) => {
                 self.set_phase_step_failed(true, idx, &e.to_string());
                 true
@@ -1734,13 +3041,15 @@ impl WorkflowEngine {
         }
     }
 
-    /// Execute a single teardown step. Returns `true` if failed.
+    /// Execute a single teardown step. Returns a [`PhaseStepOutcome`] carrying
+    /// the failure flag and, on failure, the captured stdout/stderr (threaded
+    /// to the remediation agent's failure file — Feature B).
     fn run_single_teardown_step<F>(
         &mut self,
         step: &crate::data::workflow_definition::TeardownStep,
         idx: usize,
         container_for_step: &mut F,
-    ) -> bool
+    ) -> PhaseStepOutcome
     where
         F: FnMut(usize) -> Result<Box<dyn AgentExec>, EngineError>,
     {
@@ -1752,20 +3061,28 @@ impl WorkflowEngine {
             max_retries,
         } = step
         {
-            return self.run_poll_ci_phase_step(
+            let failed = self.run_poll_ci_phase_step(
                 interval_secs.unwrap_or(30),
                 max_retries.unwrap_or(10),
                 false,
                 idx,
             );
+            // PollCi produces no command stdout/stderr; surface the recorded
+            // error string as the failure content so the file is still useful.
+            return if failed {
+                PhaseStepOutcome::failed(String::new(), self.phase_step_failed_error(false, idx))
+            } else {
+                PhaseStepOutcome::succeeded()
+            };
         }
 
         let (command, env) = teardown_step_to_shell(step);
         match container_for_step(idx) {
             Ok(c) => self.run_shell_phase_step(&*c, &command, env.as_ref(), "teardown", idx),
             Err(e) => {
-                self.set_phase_step_failed(false, idx, &e.to_string());
-                true
+                let error = e.to_string();
+                self.set_phase_step_failed(false, idx, &error);
+                PhaseStepOutcome::failed(String::new(), error)
             }
         }
     }
@@ -1798,7 +3115,7 @@ impl WorkflowEngine {
             self.frontend
                 .on_setup_step_fixing(&desc, attempt, config.max_attempts);
 
-            self.launch_on_failure_agent(config);
+            self.launch_on_failure_agent(config, None);
 
             self.state.setup_step_states[idx].status = PhaseStepStatus::Running;
             let _ = self.persist();
@@ -1823,11 +3140,18 @@ impl WorkflowEngine {
     }
 
     /// Run on_failure remediation for a teardown step. Returns `true` if remediation succeeded.
+    ///
+    /// `stdout` / `stderr` carry the output of the failure that triggered this
+    /// remediation. Each retry that fails again overwrites the failure file
+    /// with its own fresh output, so the agent always sees the most recent
+    /// failure (Feature B).
     fn run_teardown_remediation<F>(
         &mut self,
         config: &crate::data::workflow_definition::RemediationConfig,
         step: &crate::data::workflow_definition::TeardownStep,
         idx: usize,
+        stdout: &str,
+        stderr: &str,
         container_for_step: &mut F,
     ) -> bool
     where
@@ -1836,6 +3160,8 @@ impl WorkflowEngine {
         use crate::data::workflow_state::PhaseStepStatus;
 
         let desc = self.state.teardown_step_states[idx].description.clone();
+        let mut cur_stdout = stdout.to_string();
+        let mut cur_stderr = stderr.to_string();
         for attempt in 1..=config.max_attempts {
             self.msg_info(format!(
                 "Step failed — launching on_failure agent (attempt {attempt}/{})...",
@@ -1850,18 +3176,29 @@ impl WorkflowEngine {
             self.frontend
                 .on_teardown_step_fixing(&desc, attempt, config.max_attempts);
 
-            self.launch_on_failure_agent(config);
+            self.launch_on_failure_agent(
+                config,
+                Some(TeardownFailureContext {
+                    step_name: &desc,
+                    stdout: &cur_stdout,
+                    stderr: &cur_stderr,
+                }),
+            );
 
             self.state.teardown_step_states[idx].status = PhaseStepStatus::Running;
             let _ = self.persist();
 
-            let still_failed = self.run_single_teardown_step(step, idx, container_for_step);
-            if !still_failed {
+            let outcome = self.run_single_teardown_step(step, idx, container_for_step);
+            if !outcome.failed {
                 self.msg_info(format!(
                     "on_failure remediation succeeded on attempt {attempt}"
                 ));
                 return true;
             }
+            // Retain the freshest failure output so the next attempt's file
+            // reflects this retry, not the original failure.
+            cur_stdout = outcome.stdout;
+            cur_stderr = outcome.stderr;
 
             if attempt == config.max_attempts {
                 self.msg_warning(format!(
@@ -1877,15 +3214,24 @@ impl WorkflowEngine {
     /// Launch the on_failure agent container and wait for it to complete.
     /// The agent's own exit code is ignored — only the subsequent retry
     /// determines success.
+    ///
+    /// When `failure` is `Some` (teardown remediation), the failed command's
+    /// stdout/stderr are written to a file mounted into the agent's container
+    /// and a preamble pointing the agent at that file is prepended to the
+    /// remediation prompt (Feature B). Setup remediation passes `None`.
     fn launch_on_failure_agent(
         &mut self,
         config: &crate::data::workflow_definition::RemediationConfig,
+        failure: Option<TeardownFailureContext<'_>>,
     ) {
+        // Owned so it does not hold a borrow on `self.workflow` across the
+        // `&mut self` call to `prepare_teardown_failure_file` below.
         let agent_name_str = config
             .agent
             .as_deref()
             .or(self.workflow.agent.as_deref())
-            .unwrap_or("claude");
+            .unwrap_or("claude")
+            .to_string();
         let model = config
             .model
             .as_deref()
@@ -1893,7 +3239,7 @@ impl WorkflowEngine {
             .map(|s| s.to_string())
             .or_else(|| self.effective_config.model());
 
-        let agent_name = match crate::data::session::AgentName::new(agent_name_str) {
+        let agent_name = match crate::data::session::AgentName::new(&agent_name_str) {
             Ok(a) => a,
             Err(e) => {
                 self.msg_warning(format!("on_failure: invalid agent name: {e}"));
@@ -1901,24 +3247,50 @@ impl WorkflowEngine {
             }
         };
 
+        // Feature B: capture the failed command's output into a file the agent
+        // can read, and (when needed) an extra read-only mount. A write failure
+        // degrades gracefully — the agent still launches, just without the hint.
+        let artifacts = failure
+            .as_ref()
+            .and_then(|f| self.prepare_teardown_failure_file(f));
+
+        let prompt = match &artifacts {
+            Some(a) => a.prepend_preamble(&config.prompt),
+            None => config.prompt.clone(),
+        };
+        let extra_overlays = artifacts
+            .as_ref()
+            .and_then(|a| a.extra_overlay.clone())
+            .map(|o| vec![o]);
+
         let synthetic_step = WorkflowStep {
             name: "__on_failure__".to_string(),
             depends_on: Vec::new(),
-            prompt_template: config.prompt.clone(),
-            agent: Some(agent_name_str.to_string()),
+            prompt_template: prompt,
+            agent: Some(agent_name_str.clone()),
             model: model.clone(),
-            overlays: None,
+            overlays: extra_overlays,
             abort_on_failure: false,
         };
 
         let runtime = WorkflowRuntimeContext {
             step_agent: agent_name,
-            step_model: model,
+            step_model: model.clone(),
             git_root: self.session.git_root().to_path_buf(),
             session_id: self.session.id(),
             workflow_invocation_id: self.state.invocation_id,
             workflow_step_info: None,
         };
+
+        // Same pre-launch notification main steps get (mod.rs `launch_step`).
+        // Frontends rely on it to prepare per-container state — the TUI
+        // recreates its AgentIo channels here; skipping it would make the
+        // factory's `take_io` find no channels and fail.
+        self.frontend.report_step_interactive_launch(
+            &synthetic_step,
+            &agent_name_str,
+            model.as_deref(),
+        );
 
         let execution =
             match self
@@ -1947,6 +3319,116 @@ impl WorkflowEngine {
         }
     }
 
+    /// Whether this workflow declares a writable `context(workflow)` overlay.
+    ///
+    /// When true, `~/.awman/context/workflows/{invocation}/` is already mounted
+    /// read-write at `/awman/context/workflow` in every agent container, so the
+    /// teardown-failure file can be written there directly. A read-only
+    /// (`context(workflow:ro)`) declaration returns `false` so the ephemeral
+    /// read-only remediation mount is used instead (Feature B edge case).
+    ///
+    /// The command layer overrides this after merging config/env/CLI/workflow
+    /// overlays, so this reflects the active context overlay set.
+    fn workflow_context_overlay_writable(&self) -> bool {
+        matches!(
+            self.workflow_context_permission,
+            Some(OverlayPermission::ReadWrite)
+        )
+    }
+
+    /// Write the teardown-failure output file and resolve its mount, returning
+    /// the artifacts needed to point the remediation agent at it. Returns
+    /// `None` on any failure (directory or file write) after logging a
+    /// warning — remediation then proceeds without the file hint, never
+    /// aborting (Feature B edge cases).
+    fn prepare_teardown_failure_file(
+        &mut self,
+        failure: &TeardownFailureContext<'_>,
+    ) -> Option<TeardownFailureArtifacts> {
+        use crate::data::fs::context_dirs::{validate_context_path, ContextDirResolver};
+
+        let resolver = match ContextDirResolver::from_process_env() {
+            Ok(r) => r,
+            Err(e) => {
+                self.msg_warning(format!(
+                    "on_failure: could not resolve context directory, launching agent without \
+                     failure output: {e}"
+                ));
+                return None;
+            }
+        };
+
+        // The host directory is deterministic for this invocation whether or
+        // not context(workflow) is declared — always the workflow context dir.
+        let host_dir = resolver.workflow_dir(self.state.invocation_id);
+
+        // Decide the container-visible location. When context(workflow) is
+        // active and writable the directory is already mounted read-write at
+        // /awman/context/workflow; otherwise mount the (ephemeral) directory
+        // read-only at /awman/remediation.
+        let use_writable_workflow_overlay = self.workflow_context_overlay_writable();
+        let container_path: &'static str = if use_writable_workflow_overlay {
+            TEARDOWN_FAILURE_OVERLAY_CONTAINER_PATH
+        } else {
+            TEARDOWN_FAILURE_EPHEMERAL_CONTAINER_PATH
+        };
+
+        // Create the directory (idempotent when the overlay already exists).
+        if let Err(e) = std::fs::create_dir_all(&host_dir) {
+            self.msg_warning(format!(
+                "on_failure: could not create directory {}, launching agent without failure \
+                 output: {e}",
+                host_dir.display()
+            ));
+            return None;
+        }
+
+        // Security: the resolved path must stay under ~/.awman/context/.
+        if let Err(e) = validate_context_path(resolver.awman_home(), &host_dir) {
+            self.msg_warning(format!(
+                "on_failure: refusing to write failure output outside the context root: {e}"
+            ));
+            return None;
+        }
+
+        let sanitized = sanitize_step_name_for_filename(failure.step_name);
+        let filename = format!("teardown-failure-{sanitized}.txt");
+        let file_path = host_dir.join(&filename);
+        let contents =
+            format_teardown_failure_file(failure.step_name, failure.stdout, failure.stderr);
+        if let Err(e) = std::fs::write(&file_path, contents) {
+            self.msg_warning(format!(
+                "on_failure: could not write failure output to {}, launching agent without it: {e}",
+                file_path.display()
+            ));
+            return None;
+        }
+
+        let extra_overlay = if use_writable_workflow_overlay {
+            None
+        } else if self.workflow_context_permission == Some(OverlayPermission::ReadOnly) {
+            Some(format!(
+                "{}:{}/{}:ro",
+                file_path.display(),
+                TEARDOWN_FAILURE_EPHEMERAL_CONTAINER_PATH,
+                filename
+            ))
+        } else {
+            Some(format!(
+                "{}:{}:ro",
+                host_dir.display(),
+                TEARDOWN_FAILURE_EPHEMERAL_CONTAINER_PATH
+            ))
+        };
+
+        Some(TeardownFailureArtifacts {
+            container_path,
+            filename,
+            step_name: failure.step_name.to_string(),
+            extra_overlay,
+        })
+    }
+
     /// Mark the workflow as fully finished. Called by the orchestrator after
     /// the main phase completes when no teardown phase will run (so the state
     /// reflects completion rather than lingering in `Main`).
@@ -1956,6 +3438,176 @@ impl WorkflowEngine {
         self.persist()?;
         Ok(())
     }
+}
+
+/// Container path where the failure file is visible when a writable
+/// `context(workflow)` overlay is active (already mounted read-write).
+const TEARDOWN_FAILURE_OVERLAY_CONTAINER_PATH: &str = "/awman/context/workflow";
+/// Container path for the one-off read-only remediation mount used when no
+/// writable `context(workflow)` overlay is active.
+const TEARDOWN_FAILURE_EPHEMERAL_CONTAINER_PATH: &str = "/awman/remediation";
+/// Per-stream truncation cap (~100 KB). Only the tail is retained since the
+/// most recent output is the most relevant to a failure.
+const TEARDOWN_STREAM_TRUNCATE_BYTES: usize = 100 * 1024;
+
+/// Outcome of a setup/teardown shell step: whether it failed, plus the
+/// captured stdout/stderr (populated on failure, used only by the teardown
+/// remediation failure file — Feature B). Kept deliberately narrow rather
+/// than storing a full `ExecOutput` in `PhaseStepStatus`.
+struct PhaseStepOutcome {
+    failed: bool,
+    stdout: String,
+    stderr: String,
+}
+
+impl PhaseStepOutcome {
+    fn succeeded() -> Self {
+        Self {
+            failed: false,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    fn failed(stdout: String, stderr: String) -> Self {
+        Self {
+            failed: true,
+            stdout,
+            stderr,
+        }
+    }
+}
+
+/// The captured output of a failed teardown command, passed into
+/// `launch_on_failure_agent` so it can materialize the remediation failure
+/// file (Feature B).
+struct TeardownFailureContext<'a> {
+    step_name: &'a str,
+    stdout: &'a str,
+    stderr: &'a str,
+}
+
+/// Resolved artifacts after successfully writing the teardown-failure file.
+struct TeardownFailureArtifacts {
+    /// Container path of the directory holding the file.
+    container_path: &'static str,
+    /// The written file's name (`teardown-failure-<sanitized>.txt`).
+    filename: String,
+    /// The original (unsanitized) step name, for the prompt preamble.
+    step_name: String,
+    /// A one-off `host:container:ro` overlay to add to the synthetic step, or
+    /// `None` when the writable `context(workflow)` overlay already mounts it.
+    extra_overlay: Option<String>,
+}
+
+impl TeardownFailureArtifacts {
+    /// Prepend the fixed system-prompt preamble pointing the agent at the
+    /// failure file to the user's remediation prompt.
+    fn prepend_preamble(&self, user_prompt: &str) -> String {
+        format!(
+            "The full output (stdout and stderr) of the failed teardown step \"{step}\" has been\n\
+             written to {path}/{file}.\n\
+             Read that file first to understand the failure before attempting a fix.\n\
+             \n\
+             ---\n\
+             \n\
+             {user_prompt}",
+            step = self.step_name,
+            path = self.container_path,
+            file = self.filename,
+        )
+    }
+}
+
+fn workflow_context_permission_from_overlay_strings(
+    overlays: Option<&[String]>,
+) -> Option<OverlayPermission> {
+    let overlays = overlays?;
+    for entry in overlays {
+        for token in entry.split(',') {
+            let token = token.trim();
+            let Some(inner) = token
+                .strip_prefix("context(")
+                .and_then(|s| s.strip_suffix(')'))
+            else {
+                continue;
+            };
+            let mut parts = inner.splitn(2, ':');
+            let scope = parts.next().unwrap_or("").trim();
+            if scope != "workflow" {
+                continue;
+            }
+            return match parts.next().map(str::trim).unwrap_or("rw") {
+                "ro" => Some(OverlayPermission::ReadOnly),
+                _ => Some(OverlayPermission::ReadWrite),
+            };
+        }
+    }
+    None
+}
+
+/// Sanitize a step name into a safe filename component: non-alphanumeric
+/// characters (including `/`, `\`, `..`, spaces, and shell metacharacters)
+/// become `-`, and the result is truncated to 64 characters.
+fn sanitize_step_name_for_filename(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    out.truncate(64);
+    if out.is_empty() {
+        out.push_str("step");
+    }
+    out
+}
+
+/// Retain the last [`TEARDOWN_STREAM_TRUNCATE_BYTES`] of a stream, prefixing a
+/// truncation notice when content was dropped. Truncation respects UTF-8
+/// character boundaries.
+fn truncate_stream(content: &str) -> String {
+    if content.len() <= TEARDOWN_STREAM_TRUNCATE_BYTES {
+        return content.to_string();
+    }
+    let start = content.len() - TEARDOWN_STREAM_TRUNCATE_BYTES;
+    // Advance to the next char boundary so we never slice mid-codepoint.
+    let start = (start..content.len())
+        .find(|&i| content.is_char_boundary(i))
+        .unwrap_or(content.len());
+    format!(
+        "[... output truncated, showing last {} KB ...]\n{}",
+        TEARDOWN_STREAM_TRUNCATE_BYTES / 1024,
+        &content[start..]
+    )
+}
+
+/// Format the teardown-failure file body in the fixed Feature B layout,
+/// substituting `(empty)` for blank streams and truncating oversized output.
+fn format_teardown_failure_file(step_name: &str, stdout: &str, stderr: &str) -> String {
+    let render = |s: &str| -> String {
+        if s.is_empty() {
+            "(empty)".to_string()
+        } else {
+            truncate_stream(s)
+        }
+    };
+    format!(
+        "=== FAILED COMMAND: {step_name} ===\n\
+         \n\
+         --- STDOUT ---\n\
+         {stdout}\n\
+         \n\
+         --- STDERR ---\n\
+         {stderr}\n",
+        step_name = step_name,
+        stdout = render(stdout),
+        stderr = render(stderr),
+    )
 }
 
 /// Hash a workflow's steps + title to detect drift.
@@ -1988,7 +3640,6 @@ mod tests {
     use crate::data::workflow_definition::{Workflow, WorkflowStep};
     use crate::data::workflow_state_store::WorkflowStateStore;
     use crate::engine::agent_runtime::execution::{AgentExecution, AgentExitInfo};
-    use crate::engine::overlay::OverlayEngine;
 
     // ── Fake implementations ─────────────────────────────────────────────────
 
@@ -1997,7 +3648,17 @@ mod tests {
         step_statuses: Mutex<Vec<(String, WorkflowStepStatus)>>,
         completed: Mutex<Option<WorkflowOutcome>>,
         confirm_resume_response: bool,
-        failure_choice: StepFailureChoice,
+        /// What `supports_interactive_recovery` reports. `true` (the default)
+        /// drives a step failure through the `actions` queue; `false` puts the
+        /// engine on the unattended countdown-and-retry path.
+        interactive: bool,
+        /// What `yolo_countdown_tick` returns. `AdvanceNow` collapses the 60s
+        /// retry countdown to a single tick so unattended tests stay fast;
+        /// `Cancel` (the default) is the pre-existing safe answer.
+        yolo_tick: YoloTickOutcome,
+        /// Every board the engine raised, shared so a test can read them back
+        /// after the engine has taken ownership of the frontend.
+        boards: Arc<Mutex<Vec<AvailableActions>>>,
     }
 
     impl FakeWorkflowFrontend {
@@ -2007,21 +3668,30 @@ mod tests {
                 step_statuses: Mutex::new(Vec::new()),
                 completed: Mutex::new(None),
                 confirm_resume_response: true,
-                failure_choice: StepFailureChoice::Abort,
+                interactive: true,
+                yolo_tick: YoloTickOutcome::Cancel,
+                boards: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// Handle on the boards this frontend will be shown.
+        fn boards(&self) -> Arc<Mutex<Vec<AvailableActions>>> {
+            self.boards.clone()
+        }
+
+        fn unattended(mut self) -> Self {
+            self.interactive = false;
+            self
+        }
+
+        fn with_yolo_tick(mut self, tick: YoloTickOutcome) -> Self {
+            self.yolo_tick = tick;
+            self
         }
 
         fn with_confirm_resume(mut self, response: bool) -> Self {
             self.confirm_resume_response = response;
             self
-        }
-
-        fn step_statuses(&self) -> Vec<(String, WorkflowStepStatus)> {
-            self.step_statuses.lock().unwrap().clone()
-        }
-
-        fn completed_outcome(&self) -> Option<WorkflowOutcome> {
-            self.completed.lock().unwrap().clone()
         }
     }
 
@@ -2034,8 +3704,9 @@ mod tests {
         fn show_workflow_control_board(
             &mut self,
             _state: &WorkflowState,
-            _available: &AvailableActions,
+            available: &AvailableActions,
         ) -> Result<NextAction, EngineError> {
+            self.boards.lock().unwrap().push(available.clone());
             let action = self
                 .actions
                 .lock()
@@ -2045,16 +3716,12 @@ mod tests {
             Ok(action)
         }
 
-        fn confirm_resume(&mut self, _mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
-            Ok(self.confirm_resume_response)
+        fn supports_interactive_recovery(&self) -> bool {
+            self.interactive
         }
 
-        fn user_choose_after_step_failure(
-            &mut self,
-            _step: &WorkflowStep,
-            _exit: &AgentExitInfo,
-        ) -> Result<StepFailureChoice, EngineError> {
-            Ok(self.failure_choice.clone())
+        fn confirm_resume(&mut self, _mismatch: &ResumeMismatch) -> Result<bool, EngineError> {
+            Ok(self.confirm_resume_response)
         }
 
         fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
@@ -2070,7 +3737,7 @@ mod tests {
             _remaining: Duration,
             _total: Duration,
         ) -> Result<YoloTickOutcome, EngineError> {
-            Ok(YoloTickOutcome::Cancel)
+            Ok(self.yolo_tick.clone())
         }
 
         fn report_workflow_completed(&mut self, outcome: &WorkflowOutcome) {
@@ -2080,20 +3747,27 @@ mod tests {
 
     struct FakeAgentExecutionFactory {
         exit_codes: Mutex<VecDeque<i32>>,
-        pub execution_call_count: AtomicUsize,
+        pub execution_call_count: Arc<AtomicUsize>,
         pub inject_call_count: AtomicUsize,
         pub recorded_contexts: Mutex<Vec<WorkflowRuntimeContext>>,
         inject_result: Option<()>,
+        /// When set, each produced execution carries an output tail pre-filled
+        /// with these lines (exercises the container failure-log path).
+        tail_lines: Option<Vec<String>>,
+        /// Container name stamped on each produced execution's handle.
+        container_name: String,
     }
 
     impl FakeAgentExecutionFactory {
         fn new(exit_codes: impl IntoIterator<Item = i32>) -> Self {
             Self {
                 exit_codes: Mutex::new(exit_codes.into_iter().collect()),
-                execution_call_count: AtomicUsize::new(0),
+                execution_call_count: Arc::new(AtomicUsize::new(0)),
                 inject_call_count: AtomicUsize::new(0),
                 recorded_contexts: Mutex::new(Vec::new()),
                 inject_result: None,
+                tail_lines: None,
+                container_name: "fake-container".to_string(),
             }
         }
 
@@ -2101,9 +3775,20 @@ mod tests {
             Self::new(std::iter::repeat_n(0, 100))
         }
 
-        fn with_inject_support(exit_codes: impl IntoIterator<Item = i32>) -> Self {
+        fn execution_call_counter(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.execution_call_count)
+        }
+
+        /// Produce executions whose output tail is pre-filled with `lines` and
+        /// whose container handle is named `container_name`.
+        fn with_output_tail(
+            exit_codes: impl IntoIterator<Item = i32>,
+            container_name: &str,
+            lines: impl IntoIterator<Item = &'static str>,
+        ) -> Self {
             Self {
-                inject_result: Some(()),
+                tail_lines: Some(lines.into_iter().map(|s| s.to_string()).collect()),
+                container_name: container_name.to_string(),
                 ..Self::new(exit_codes)
             }
         }
@@ -2129,10 +3814,24 @@ mod tests {
             let handle = AgentHandle {
                 id: format!("fake-{}", self.execution_call_count.load(Ordering::Relaxed)),
                 image_tag: "fake-image:latest".into(),
-                name: "fake-container".into(),
+                name: self.container_name.clone(),
                 started_at: now,
             };
-            Ok(AgentExecution::finished(handle, info))
+            match &self.tail_lines {
+                Some(lines) => {
+                    let tail = OutputTail::with_default_capacity();
+                    for line in lines {
+                        tail.push_bytes(line.as_bytes());
+                        tail.push_bytes(b"\n");
+                    }
+                    Ok(AgentExecution::finished_with_tail(
+                        handle,
+                        info,
+                        Some(Arc::new(tail)),
+                    ))
+                }
+                None => Ok(AgentExecution::finished(handle, info)),
+            }
         }
 
         fn inject_prompt(
@@ -2153,6 +3852,26 @@ mod tests {
             tmp.path().to_path_buf(),
             &resolver,
             SessionOpenOptions::default(),
+        )
+        .unwrap()
+    }
+
+    /// Session whose env snapshot pins `AWMAN_CONFIG_HOME` to `home`, so the
+    /// engine resolves `~/.awman/logs/` under a temp dir instead of the real
+    /// home — no process-global env mutation, no cross-test races.
+    fn make_session_with_home(tmp: &tempfile::TempDir, home: &std::path::Path) -> Session {
+        use crate::data::config::env::{EnvSnapshot, AWMAN_CONFIG_HOME};
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        Session::open(
+            tmp.path().to_path_buf(),
+            &resolver,
+            SessionOpenOptions {
+                env: Some(EnvSnapshot::with_overrides([(
+                    AWMAN_CONFIG_HOME,
+                    home.to_str().unwrap(),
+                )])),
+                ..Default::default()
+            },
         )
         .unwrap()
     }
@@ -2206,17 +3925,30 @@ mod tests {
         factory: FakeAgentExecutionFactory,
         frontend: FakeWorkflowFrontend,
     ) -> WorkflowEngine {
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         WorkflowEngine::new(
             session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
+        )
+        .unwrap()
+    }
+
+    fn make_engine_with_frontend_and_retry_policy(
+        session: &Session,
+        workflow: Workflow,
+        factory: FakeAgentExecutionFactory,
+        frontend: FakeWorkflowFrontend,
+        retry_policy: WorkflowRetryPolicy,
+    ) -> WorkflowEngine {
+        WorkflowEngine::new_with_retry_policy(
+            session,
+            workflow,
+            None,
+            Box::new(frontend),
+            Box::new(factory),
+            retry_policy,
         )
         .unwrap()
     }
@@ -2265,17 +3997,12 @@ mod tests {
         );
         let factory = FakeAgentExecutionFactory::always_success();
         let frontend = FakeWorkflowFrontend::new([NextAction::LaunchNext]);
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
 
@@ -2358,6 +4085,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failing_container_writes_output_log_and_error_message() {
+        use crate::data::message::MessageLevel;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let session = make_session_with_home(&tmp, home.path());
+        let workflow = make_workflow(
+            Some("wf-log"),
+            Some("claude"),
+            vec![make_step("build", &[], None)],
+        );
+        let factory = FakeAgentExecutionFactory::with_output_tail(
+            [1],
+            "awman-build-xyz",
+            ["compiling project", "error: it exploded"],
+        );
+        let (frontend, messages) = MessageCapturingFrontend::new();
+        let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+        let invocation_id = engine.state().invocation_id;
+        let outcome = engine.step_once().await.unwrap();
+        assert!(matches!(
+            outcome.status,
+            WorkflowStepStatus::Failed { exit_code: 1 }
+        ));
+
+        // The buffered output must be persisted to the per-container log file.
+        let paths = crate::data::fs::WorkflowLogPaths::at_home(home.path());
+        let log_path = paths.container_log_path(invocation_id, "build", "awman-build-xyz");
+        assert!(
+            log_path.exists(),
+            "failure log must be written at {}",
+            log_path.display()
+        );
+        let body = std::fs::read_to_string(&log_path).unwrap();
+        assert!(body.contains("compiling project"), "log body: {body:?}");
+        assert!(body.contains("error: it exploded"), "log body: {body:?}");
+
+        // An Error-level message must point the user at the log file.
+        let messages = messages.lock().unwrap();
+        let err = messages
+            .iter()
+            .find(|m| m.level == MessageLevel::Error)
+            .expect("an Error message must be emitted on container failure");
+        assert!(
+            err.text.contains(&log_path.display().to_string()),
+            "error message must name the log path: {}",
+            err.text
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_container_writes_no_failure_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let session = make_session_with_home(&tmp, home.path());
+        let workflow = make_workflow(
+            Some("wf-ok"),
+            Some("claude"),
+            vec![make_step("build", &[], None)],
+        );
+        let factory =
+            FakeAgentExecutionFactory::with_output_tail([0], "awman-build-ok", ["all good"]);
+        let mut engine = make_engine(&session, workflow, factory, []);
+
+        engine.step_once().await.unwrap();
+
+        let paths = crate::data::fs::WorkflowLogPaths::at_home(home.path());
+        assert!(
+            !paths.logs_dir().exists(),
+            "a clean (exit 0) container must not create the logs directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn awman_killed_container_writes_no_failure_log() {
+        // A non-zero exit on a container awman itself killed is expected and
+        // must NOT produce a failure log.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let session = make_session_with_home(&tmp, home.path());
+        let workflow = make_workflow(
+            Some("wf-killed"),
+            Some("claude"),
+            vec![make_step("build", &[], None)],
+        );
+        let factory = FakeAgentExecutionFactory::always_success();
+        let mut engine = make_engine(&session, workflow, factory, []);
+
+        // Simulate a live slot that awman killed, carrying buffered output.
+        let tail = OutputTail::with_default_capacity();
+        tail.push_bytes(b"some output before the kill\n");
+        engine.active_steps.push(ActiveParallelStep {
+            step_name: "build".to_string(),
+            execution: None,
+            cancel_handle: None,
+            container_name: "awman-build-killed".to_string(),
+            output_tail: Some(Arc::new(tail)),
+            awman_killed: true,
+            stuck: false,
+            yolo_deadline: None,
+            agent: AgentName::new("claude").unwrap(),
+            model: None,
+        });
+
+        engine.maybe_dump_step_failure("build", KILLED_EXIT_CODE);
+
+        let paths = crate::data::fs::WorkflowLogPaths::at_home(home.path());
+        assert!(
+            !paths.logs_dir().exists(),
+            "an awman-killed container must not produce a failure log"
+        );
+    }
+
+    // ── WI-0115 §1: interactive step-failure recovery board ──────────────
+
+    #[tokio::test]
     async fn step_failure_abort_returns_aborted() {
         let tmp = tempfile::tempdir().unwrap();
         let session = make_session(&tmp);
@@ -2367,7 +4211,7 @@ mod tests {
             vec![make_step("a", &[], None)],
         );
         let factory = FakeAgentExecutionFactory::new([2]);
-        let frontend = FakeWorkflowFrontend::new([]);
+        let frontend = FakeWorkflowFrontend::new([NextAction::Abort]);
         let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
 
         let result = engine.run_to_completion().await.unwrap();
@@ -2375,7 +4219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn step_failure_retry_reruns_step() {
+    async fn step_failure_restart_reruns_step() {
         let tmp = tempfile::tempdir().unwrap();
         let session = make_session(&tmp);
         let workflow = make_workflow(
@@ -2384,8 +4228,9 @@ mod tests {
             vec![make_step("a", &[], None)],
         );
         let factory = FakeAgentExecutionFactory::new([1, 0]);
-        let mut frontend = FakeWorkflowFrontend::new([]);
-        frontend.failure_choice = StepFailureChoice::Retry;
+        // Restart the failed step, then finish the (now last, succeeded) step.
+        let frontend =
+            FakeWorkflowFrontend::new([NextAction::RestartCurrentStep, NextAction::FinishWorkflow]);
         let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
 
         let result = engine.run_to_completion().await.unwrap();
@@ -2402,12 +4247,341 @@ mod tests {
             vec![make_step("a", &[], None)],
         );
         let factory = FakeAgentExecutionFactory::new([1]);
-        let mut frontend = FakeWorkflowFrontend::new([]);
-        frontend.failure_choice = StepFailureChoice::Pause;
+        let frontend = FakeWorkflowFrontend::new([NextAction::Pause]);
         let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
 
         let result = engine.run_to_completion().await.unwrap();
         assert!(matches!(result, WorkflowOutcome::Paused));
+    }
+
+    #[tokio::test]
+    async fn step_failure_launch_next_skips_failed_step_and_runs_the_next_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-fail-skip"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        // 'a' fails, 'b' succeeds.
+        let factory = FakeAgentExecutionFactory::new([1, 0]);
+        let frontend =
+            FakeWorkflowFrontend::new([NextAction::LaunchNext, NextAction::FinishWorkflow]);
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert!(matches!(result, WorkflowOutcome::Completed));
+        assert!(
+            matches!(engine.state().status_of("a"), Some(StepState::Skipped)),
+            "the failed step must be skipped so its dependents become ready"
+        );
+        assert!(matches!(
+            engine.state().status_of("b"),
+            Some(StepState::Succeeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn step_failure_cancel_to_previous_reruns_both_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-fail-back"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        // a ok → b fails → back to a → a ok → b ok.
+        let factory = FakeAgentExecutionFactory::new([0, 1, 0, 0]);
+        let frontend = FakeWorkflowFrontend::new([
+            // After 'a' succeeds the first time.
+            NextAction::LaunchNext,
+            // 'b' failed: go back to 'a'.
+            NextAction::CancelToPreviousStep,
+            // 'a' succeeded again.
+            NextAction::LaunchNext,
+            // 'b' succeeded.
+            NextAction::FinishWorkflow,
+        ]);
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert!(matches!(result, WorkflowOutcome::Completed));
+        assert!(matches!(
+            engine.state().status_of("b"),
+            Some(StepState::Succeeded)
+        ));
+    }
+
+    #[test]
+    fn failure_actions_offer_recovery_and_never_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-fail-actions"),
+            Some("claude"),
+            vec![
+                make_step("a", &[], None),
+                make_step("b", &["a"], None),
+                make_step("c", &["b"], None),
+            ],
+        );
+        let factory = FakeAgentExecutionFactory::always_success();
+        let mut engine = make_engine(&session, workflow, factory, []);
+        engine.state.set_status("a", StepState::Succeeded);
+        engine.current_step_name = Some("b".to_string());
+
+        let available = engine.compute_failure_actions("b", 42).unwrap();
+        assert!(available.can_restart_current_step);
+        assert!(available.can_cancel_to_previous_step);
+        assert!(available.can_launch_next);
+        assert!(available.can_abort);
+        assert!(
+            !available.can_finish_workflow,
+            "a failure board must not offer Finish"
+        );
+        assert!(
+            !available.can_dismiss,
+            "the failed step's container is already dead"
+        );
+        let failure = available.step_failure.expect("failure context");
+        assert_eq!(failure.step_name, "b");
+        assert_eq!(failure.exit_code, 42);
+        assert_eq!(failure.previous_step.as_deref(), Some("a"));
+        assert_eq!(failure.next_step.as_deref(), Some("c"));
+        assert!(failure
+            .detail_lines
+            .iter()
+            .any(|l| l.contains("Exit code: 42")));
+    }
+
+    #[test]
+    fn failure_actions_on_the_last_step_offer_no_next() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-fail-last"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        let factory = FakeAgentExecutionFactory::always_success();
+        let mut engine = make_engine(&session, workflow, factory, []);
+        engine.current_step_name = Some("a".to_string());
+
+        let available = engine.compute_failure_actions("a", 1).unwrap();
+        assert!(!available.can_launch_next);
+        assert!(!available.can_cancel_to_previous_step);
+        assert!(available.can_restart_current_step);
+    }
+
+    /// WI-0115 §1: a step left `Failed` is not in `completed_steps`, so the DAG
+    /// still reports it ready. Recovering only the first failure of a drained
+    /// parallel group would let its peers be relaunched silently — no board, no
+    /// retry accounting, no way for the user to know a second step even failed.
+    #[tokio::test]
+    async fn every_failure_in_a_parallel_group_gets_its_own_board() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_max_concurrent(&tmp, Some(2));
+        let workflow = make_workflow(
+            Some("wf-two-failures"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &[], None)],
+        );
+        // Both members of the group fail.
+        let factory = FakeAgentExecutionFactory::new([1, 1]);
+        // One decision per failure; the second ends the run so the test does
+        // not depend on what a re-run of the skipped steps would do.
+        let frontend =
+            FakeWorkflowFrontend::new([NextAction::RestartCurrentStep, NextAction::Abort]);
+        let boards = frontend.boards();
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let outcome = engine.run_to_completion().await.unwrap();
+        assert_eq!(outcome, WorkflowOutcome::Aborted);
+
+        let boards = boards.lock().unwrap();
+        let failed_on: Vec<&str> = boards
+            .iter()
+            .filter_map(|b| b.step_failure.as_ref())
+            .map(|f| f.step_name.as_str())
+            .collect();
+        assert_eq!(
+            failed_on.len(),
+            2,
+            "one board per failed step, got boards for {failed_on:?}"
+        );
+        let mut named = failed_on.clone();
+        named.sort_unstable();
+        assert_eq!(
+            named,
+            vec!["a", "b"],
+            "each board must name its own failure, not repeat the first"
+        );
+    }
+
+    // ── WI-0115 §3: unattended countdown-and-retry ───────────────────────
+
+    #[tokio::test]
+    async fn single_attempt_policy_launches_once_and_fails_before_automatic_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-startup-gated-single-attempt"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        // A second success is deliberately available: consuming it would prove
+        // the normal unattended retry path ran despite the single-use gate.
+        let factory = FakeAgentExecutionFactory::new([17, 0]);
+        let starts = factory.execution_call_counter();
+        let frontend = FakeWorkflowFrontend::new([])
+            .unattended()
+            .with_yolo_tick(YoloTickOutcome::AdvanceNow);
+        let mut engine = make_engine_with_frontend_and_retry_policy(
+            &session,
+            workflow,
+            factory,
+            frontend,
+            WorkflowRetryPolicy::SingleAttempt,
+        );
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(
+            result,
+            WorkflowOutcome::Failed {
+                last_step: "a".to_string(),
+                exit_code: 17,
+            }
+        );
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            1,
+            "the initial gated launch must occur exactly once"
+        );
+        assert!(matches!(
+            engine.state().status_of("a"),
+            Some(StepState::Failed { exit_code: 17, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_constructor_still_retries_once_without_waiting_for_real_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-legacy-retry-policy"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        let factory = FakeAgentExecutionFactory::new([17, 0]);
+        let starts = factory.execution_call_counter();
+        let frontend = FakeWorkflowFrontend::new([])
+            .unattended()
+            .with_yolo_tick(YoloTickOutcome::AdvanceNow);
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            2,
+            "the legacy constructor must preserve its one automatic retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn unattended_step_failure_retries_once_then_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-unattended-retry"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        let factory = FakeAgentExecutionFactory::new([1, 0]);
+        let frontend = FakeWorkflowFrontend::new([])
+            .unattended()
+            .with_yolo_tick(YoloTickOutcome::AdvanceNow);
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+    }
+
+    #[tokio::test]
+    async fn unattended_step_failing_twice_fails_the_workflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-unattended-fail"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let factory = FakeAgentExecutionFactory::new([7, 7]);
+        let frontend = FakeWorkflowFrontend::new([])
+            .unattended()
+            .with_yolo_tick(YoloTickOutcome::AdvanceNow);
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(
+            result,
+            WorkflowOutcome::Failed {
+                last_step: "a".to_string(),
+                exit_code: 7,
+            }
+        );
+        assert!(
+            matches!(engine.state().status_of("b"), Some(StepState::Cancelled)),
+            "remaining steps must be cancelled once the workflow fails"
+        );
+    }
+
+    /// `abort_on_failure` is checked before the recovery path is chosen, so an
+    /// unattended run aborts on the first failure rather than spending its one
+    /// automatic retry (WI-0115 §3).
+    #[tokio::test]
+    async fn unattended_abort_on_failure_step_aborts_without_retrying() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let mut step = make_step("a", &[], None);
+        step.abort_on_failure = true;
+        let workflow = make_workflow(Some("wf-unattended-abort"), Some("claude"), vec![step]);
+        // A single exit code: a retry would launch a second container and panic
+        // the fake factory, so reaching `Aborted` proves no retry happened.
+        let factory = FakeAgentExecutionFactory::new([9]);
+        let frontend = FakeWorkflowFrontend::new([])
+            .unattended()
+            .with_yolo_tick(YoloTickOutcome::AdvanceNow);
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(result, WorkflowOutcome::Aborted);
+        assert!(engine.abort_on_failure_triggered());
+    }
+
+    #[tokio::test]
+    async fn unattended_cancelled_retry_countdown_fails_immediately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-unattended-cancel"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        // Only one exit code: a second launch would panic the fake factory,
+        // proving no retry happened.
+        let factory = FakeAgentExecutionFactory::new([3]);
+        let frontend = FakeWorkflowFrontend::new([]).unattended();
+        let mut engine = make_engine_with_frontend(&session, workflow, factory, frontend);
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(
+            result,
+            WorkflowOutcome::Failed {
+                last_step: "a".to_string(),
+                exit_code: 3,
+            }
+        );
     }
 
     #[tokio::test]
@@ -2447,23 +4621,176 @@ mod tests {
         }
 
         let factory2 = FakeAgentExecutionFactory::always_success();
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let frontend = FakeWorkflowFrontend::new([]);
+        let mut engine =
+            WorkflowEngine::resume(&session, wf, None, Box::new(frontend), Box::new(factory2))
+                .await
+                .unwrap();
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+    }
+
+    /// WI-0115 §2: an aborted run saves a state in which *every* step is
+    /// terminal (the failed one plus every step it cancelled). `is_complete()`
+    /// reads that as finished, so without a load-time reset the resumed run
+    /// would report instant success and execute nothing. This is the engine's
+    /// own guard — it holds for dynamic and non-dynamic workflows alike, and
+    /// whether or not the command layer rewound the state first.
+    #[tokio::test]
+    async fn resuming_an_aborted_run_reruns_its_unfinished_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let wf = make_workflow(
+            Some("wf-aborted"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+
+        // First run: 'a' succeeds, 'b' fails, the user aborts.
+        {
+            let factory = FakeAgentExecutionFactory::new([0, 1]);
+            let frontend = FakeWorkflowFrontend::new([NextAction::LaunchNext, NextAction::Abort]);
+            let mut engine = make_engine_with_frontend(&session, wf.clone(), factory, frontend);
+            let outcome = engine.run_to_completion().await.unwrap();
+            assert_eq!(outcome, WorkflowOutcome::Aborted);
+        }
+
+        let saved = WorkflowStateStore::at_git_root(tmp.path())
+            .load(None, "wf-aborted")
+            .unwrap()
+            .unwrap();
+        assert!(
+            saved.is_complete(),
+            "precondition: an aborted state has no non-terminal steps left"
+        );
+
+        // Resuming must re-run 'b' rather than declare instant success.
+        let factory2 = FakeAgentExecutionFactory::new([0]);
         let mut engine = WorkflowEngine::resume(
             &session,
             wf,
             None,
-            Box::new(frontend),
+            Box::new(FakeWorkflowFrontend::new([NextAction::FinishWorkflow])),
             Box::new(factory2),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .await
         .unwrap();
+        assert!(
+            matches!(engine.state().status_of("b"), Some(StepState::Pending)),
+            "the cancelled step must be reset at load"
+        );
+        assert!(
+            matches!(engine.state().status_of("a"), Some(StepState::Succeeded)),
+            "a step that genuinely succeeded must be left alone"
+        );
+
         let result = engine.run_to_completion().await.unwrap();
         assert_eq!(result, WorkflowOutcome::Completed);
+        assert!(matches!(
+            engine.state().status_of("b"),
+            Some(StepState::Succeeded)
+        ));
+    }
+
+    /// WI-0115 §2: a saved state outlives edits to its workflow file. A step
+    /// dropped from the file since the state was written can never run — the
+    /// DAG decides what runs — but it still counts towards `is_complete()`,
+    /// which the load-time reset would have just put back to `Pending`. Left
+    /// in, it strands the run on "no ready steps remaining"; pruned, the run
+    /// finishes.
+    #[tokio::test]
+    async fn resuming_a_state_whose_workflow_dropped_a_step_still_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+
+        // The workflow as it was: a → b → publish, aborted partway.
+        let before = make_workflow(
+            Some("wf-drift"),
+            Some("claude"),
+            vec![
+                make_step("a", &[], None),
+                make_step("b", &["a"], None),
+                make_step("publish", &["b"], None),
+            ],
+        );
+        {
+            let factory = FakeAgentExecutionFactory::new([0, 1]);
+            let frontend = FakeWorkflowFrontend::new([NextAction::LaunchNext, NextAction::Abort]);
+            let mut engine = make_engine_with_frontend(&session, before, factory, frontend);
+            assert_eq!(
+                engine.run_to_completion().await.unwrap(),
+                WorkflowOutcome::Aborted
+            );
+        }
+
+        // The workflow as it is now: 'publish' has been deleted. Same title,
+        // so the saved state is still found; the hash differs, and the fake
+        // frontend confirms the drift prompt.
+        let after = make_workflow(
+            Some("wf-drift"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let mut engine = WorkflowEngine::resume(
+            &session,
+            after,
+            None,
+            Box::new(FakeWorkflowFrontend::new([NextAction::FinishWorkflow])),
+            Box::new(FakeAgentExecutionFactory::new([0])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            engine.state().status_of("publish"),
+            None,
+            "a step the workflow no longer defines must be dropped, not reset"
+        );
+
+        assert_eq!(
+            engine.run_to_completion().await.unwrap(),
+            WorkflowOutcome::Completed,
+        );
+    }
+
+    /// WI 0106 §6a: a squad task bound to its durable workspace has no
+    /// worktree to absorb awman's own bookkeeping, and that directory must
+    /// survive every run untouched. `resume_with_state_root` therefore keeps
+    /// the state file — which the engine creates, rewrites and (on a fresh
+    /// run) deletes — entirely outside the session's root.
+    #[tokio::test]
+    async fn a_state_root_override_keeps_the_state_file_out_of_the_session_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let run_dir = tempfile::tempdir().unwrap();
+        let wf = make_workflow(
+            Some("wf-state-root"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+
+        let mut engine = WorkflowEngine::resume_with_state_root(
+            &session,
+            wf,
+            None,
+            Box::new(FakeWorkflowFrontend::new([NextAction::Pause])),
+            Box::new(FakeAgentExecutionFactory::always_success()),
+            Some(run_dir.path().to_path_buf()),
+        )
+        .await
+        .unwrap();
+        engine.run_to_completion().await.unwrap();
+
+        assert!(
+            WorkflowStateStore::at_git_root(run_dir.path())
+                .load(None, "wf-state-root")
+                .unwrap()
+                .is_some(),
+            "state must be persisted under the override root"
+        );
+        assert!(
+            !tmp.path().join(".awman").join("workflows").exists(),
+            "the session root must be left untouched by the engine's bookkeeping"
+        );
     }
 
     #[tokio::test]
@@ -2487,9 +4814,6 @@ mod tests {
             Some("claude"),
             vec![make_step("a", &[], None), make_step("b", &["a"], None)],
         );
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let frontend = FakeWorkflowFrontend::new([]).with_confirm_resume(false);
         let result = WorkflowEngine::resume(
             &session,
@@ -2497,8 +4821,6 @@ mod tests {
             None,
             Box::new(frontend),
             Box::new(FakeAgentExecutionFactory::always_success()),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .await;
 
@@ -2539,17 +4861,12 @@ mod tests {
             }
         }
 
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
             None,
             Box::new(FakeWorkflowFrontend::new([])),
             Box::new(RecordingFactory(factory_arc.clone())),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
 
@@ -2672,6 +4989,21 @@ mod tests {
         cvar.notify_all();
     }
 
+    /// Wait until `count` reaches `expected` launches, then assert it.
+    ///
+    /// Launch is asynchronous: the engine task must be scheduled and each
+    /// slot spawned before the factory increments the counter. A fixed
+    /// sleep raced that on loaded CI runners (observed: 1 launch after
+    /// 150 ms), so poll with a generous deadline instead. The assertion is
+    /// unchanged; only the wait is bounded rather than fixed.
+    async fn wait_for_execution_count(count: &AtomicUsize, expected: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while count.load(Ordering::Relaxed) < expected && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(count.load(Ordering::Relaxed), expected);
+    }
+
     struct BlockingFactory {
         execution_count: Arc<AtomicUsize>,
         inject_count: Arc<AtomicUsize>,
@@ -2716,6 +5048,7 @@ mod tests {
                     handle,
                     backend,
                     std::sync::Arc::new(stuck_tx),
+                    None,
                 ))
             } else {
                 let now = Utc::now();
@@ -2751,6 +5084,9 @@ mod tests {
         completed: Mutex<Option<WorkflowOutcome>>,
         available_log: Mutex<Vec<AvailableActions>>,
         engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
+        /// Exit codes passed to `report_container_exited`, shared so tests
+        /// can assert on them after the engine consumes the frontend.
+        container_exits: Arc<Mutex<Vec<i32>>>,
     }
 
     impl CapturingFrontend {
@@ -2764,6 +5100,7 @@ mod tests {
                 completed: Mutex::new(None),
                 available_log: Mutex::new(Vec::new()),
                 engine_tx,
+                container_exits: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -2793,14 +5130,6 @@ mod tests {
             Ok(true)
         }
 
-        fn user_choose_after_step_failure(
-            &mut self,
-            _step: &WorkflowStep,
-            _exit: &AgentExitInfo,
-        ) -> Result<StepFailureChoice, EngineError> {
-            Ok(StepFailureChoice::Abort)
-        }
-
         fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
             self.step_statuses
                 .lock()
@@ -2821,6 +5150,10 @@ mod tests {
             *self.completed.lock().unwrap() = Some(outcome.clone());
         }
 
+        fn report_container_exited(&mut self, exit_code: i32) {
+            self.container_exits.lock().unwrap().push(exit_code);
+        }
+
         fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
             *self.engine_tx.lock().unwrap() = Some(tx);
         }
@@ -2832,21 +5165,18 @@ mod tests {
         factory: BlockingFactory,
         actions: impl IntoIterator<Item = NextAction>,
         engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
-    ) -> WorkflowEngine {
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
+    ) -> (WorkflowEngine, Arc<Mutex<Vec<i32>>>) {
         let frontend = CapturingFrontend::new(actions, engine_tx);
-        WorkflowEngine::new(
+        let container_exits = frontend.container_exits.clone();
+        let engine = WorkflowEngine::new(
             session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(crate::engine::git::GitEngine::new()),
-            Arc::new(overlay),
         )
-        .unwrap()
+        .unwrap();
+        (engine, container_exits)
     }
 
     // ── Mid-step control board tests ─────────────────────────────────────────
@@ -2866,7 +5196,7 @@ mod tests {
             Arc::new(Mutex::new(None));
 
         let factory = BlockingFactory::new([(cancel_flag.clone(), completion1.clone())]);
-        let mut engine = make_capturing_engine(
+        let (mut engine, container_exits) = make_capturing_engine(
             &session,
             workflow,
             factory,
@@ -2883,18 +5213,29 @@ mod tests {
         let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
         tokio::time::sleep(Duration::from_millis(150)).await;
-        tx.send(EngineRequest::OpenControlBoard).unwrap();
+        tx.send(EngineRequest::OpenControlBoard {
+            step_name: String::new(),
+        })
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         assert!(
             !cancel_flag.load(Ordering::Relaxed),
             "cancel must not be called when user picks Dismiss"
         );
+        assert!(
+            container_exits.lock().unwrap().is_empty(),
+            "no container exit may be reported while the container still runs"
+        );
 
         signal_completion(&completion1, 0);
 
         let result = engine_task.await.unwrap().unwrap();
         assert_eq!(result, WorkflowOutcome::Completed);
+        assert!(
+            container_exits.lock().unwrap().contains(&0),
+            "the step's natural completion must be reported with its exit code"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2910,7 +5251,7 @@ mod tests {
         let (cancel_flag, completion) = make_blocking_entry();
         let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
         let factory = BlockingFactory::new([(cancel_flag.clone(), completion.clone())]);
-        let mut engine = make_capturing_engine(
+        let (mut engine, _container_exits) = make_capturing_engine(
             &session,
             workflow,
             factory,
@@ -2922,7 +5263,10 @@ mod tests {
         let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
         tokio::time::sleep(Duration::from_millis(150)).await;
-        tx.send(EngineRequest::OpenControlBoard).unwrap();
+        tx.send(EngineRequest::OpenControlBoard {
+            step_name: String::new(),
+        })
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         assert!(!cancel_flag.load(Ordering::Relaxed));
@@ -2946,7 +5290,7 @@ mod tests {
         let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
         let factory = BlockingFactory::new([(cancel_flag.clone(), completion1)]);
         let execution_count = factory.execution_count.clone();
-        let mut engine = make_capturing_engine(
+        let (mut engine, _container_exits) = make_capturing_engine(
             &session,
             workflow,
             factory,
@@ -2958,7 +5302,10 @@ mod tests {
         let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
         tokio::time::sleep(Duration::from_millis(150)).await;
-        tx.send(EngineRequest::OpenControlBoard).unwrap();
+        tx.send(EngineRequest::OpenControlBoard {
+            step_name: String::new(),
+        })
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         assert!(cancel_flag.load(Ordering::Relaxed));
@@ -2982,7 +5329,7 @@ mod tests {
         let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
         let factory = BlockingFactory::new([(cancel_flag.clone(), completion1)]);
         let execution_count = factory.execution_count.clone();
-        let mut engine = make_capturing_engine(
+        let (mut engine, container_exits) = make_capturing_engine(
             &session,
             workflow,
             factory,
@@ -2994,10 +5341,18 @@ mod tests {
         let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
         tokio::time::sleep(Duration::from_millis(150)).await;
-        tx.send(EngineRequest::OpenControlBoard).unwrap();
+        tx.send(EngineRequest::OpenControlBoard {
+            step_name: String::new(),
+        })
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         assert!(cancel_flag.load(Ordering::Relaxed));
+        assert_eq!(
+            container_exits.lock().unwrap().first(),
+            Some(&KILLED_EXIT_CODE),
+            "an engine kill must be reported to the frontend immediately"
+        );
 
         let result = engine_task.await.unwrap().unwrap();
         assert_eq!(result, WorkflowOutcome::Completed);
@@ -3056,7 +5411,7 @@ mod tests {
                 // Cancel immediately to keep the test fast.
                 Ok(YoloTickOutcome::Cancel)
             }
-            fn yolo_countdown_started(&mut self, _: &str) {
+            fn yolo_countdown_started(&mut self, _: &str, _: CountdownKind) {
                 self.yolo_started.store(true, Ordering::Relaxed);
             }
             fn yolo_countdown_finished(&mut self, _: &str) {
@@ -3064,13 +5419,6 @@ mod tests {
             }
             fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
                 Ok(true)
-            }
-            fn user_choose_after_step_failure(
-                &mut self,
-                _: &WorkflowStep,
-                _: &AgentExitInfo,
-            ) -> Result<StepFailureChoice, EngineError> {
-                Ok(StepFailureChoice::Abort)
             }
             fn report_step_status(&mut self, _: &WorkflowStep, _: WorkflowStepStatus) {}
             fn report_workflow_completed(&mut self, _: &WorkflowOutcome) {}
@@ -3091,17 +5439,12 @@ mod tests {
             (cancel_flag_a.clone(), completion_a.clone()),
             (_cancel_flag_b.clone(), completion_b.clone()),
         ]);
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
         engine.set_yolo(true);
@@ -3111,7 +5454,10 @@ mod tests {
         let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
         tokio::time::sleep(Duration::from_millis(150)).await;
-        tx.send(EngineRequest::StepStuck).unwrap();
+        tx.send(EngineRequest::StepStuck {
+            step_name: String::new(),
+        })
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Countdown was cancelled by the frontend (YoloTickOutcome::Cancel),
@@ -3140,7 +5486,7 @@ mod tests {
         let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
         let factory = BlockingFactory::new([(cancel_flag.clone(), completion.clone())]);
         // When WCB opens due to stuck: Dismiss, then later LaunchNext between steps.
-        let mut engine = make_capturing_engine(
+        let (mut engine, _container_exits) = make_capturing_engine(
             &session,
             workflow,
             factory,
@@ -3154,7 +5500,10 @@ mod tests {
         let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
 
         tokio::time::sleep(Duration::from_millis(150)).await;
-        tx.send(EngineRequest::StepStuck).unwrap();
+        tx.send(EngineRequest::StepStuck {
+            step_name: String::new(),
+        })
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         // Step still running (Dismiss was chosen).
@@ -3219,13 +5568,6 @@ mod tests {
             fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
                 Ok(true)
             }
-            fn user_choose_after_step_failure(
-                &mut self,
-                _: &WorkflowStep,
-                _: &AgentExitInfo,
-            ) -> Result<StepFailureChoice, EngineError> {
-                Ok(StepFailureChoice::Abort)
-            }
             fn report_step_status(&mut self, step: &WorkflowStep, status: WorkflowStepStatus) {
                 self.step_statuses
                     .lock()
@@ -3247,17 +5589,12 @@ mod tests {
             (cancel_flag_a.clone(), completion_a.clone()),
             (_cancel_flag_b.clone(), completion_b.clone()),
         ]);
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         let mut engine = WorkflowEngine::new(
             &session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap();
         engine.set_yolo(true);
@@ -3269,11 +5606,17 @@ mod tests {
         // Let the step launch.
         tokio::time::sleep(Duration::from_millis(150)).await;
         // Kick off the yolo countdown.
-        tx.send(EngineRequest::StepStuck).unwrap();
+        tx.send(EngineRequest::StepStuck {
+            step_name: String::new(),
+        })
+        .unwrap();
         // Let the countdown run a tick or two without expiring.
         tokio::time::sleep(Duration::from_millis(200)).await;
         // Container produced output again — recovery signal.
-        tx.send(EngineRequest::StepUnstuck).unwrap();
+        tx.send(EngineRequest::StepUnstuck {
+            step_name: String::new(),
+        })
+        .unwrap();
         // Wait long enough that, if the engine were mistakenly advancing the
         // step on Unstuck, step "b" would have launched. Cancel-flag-a must
         // still be false (step "a" still running, NOT cancelled by Advanced).
@@ -3306,7 +5649,7 @@ mod tests {
         let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
         let factory =
             BlockingFactory::new([(Arc::new(AtomicBool::new(false)), completion.clone())]);
-        let mut engine = make_capturing_engine(
+        let (mut engine, _container_exits) = make_capturing_engine(
             &session,
             workflow,
             factory,
@@ -3320,7 +5663,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         // Send StepUnstuck when there's no countdown — should be harmlessly ignored.
-        tx.send(EngineRequest::StepUnstuck).unwrap();
+        tx.send(EngineRequest::StepUnstuck {
+            step_name: String::new(),
+        })
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         signal_completion(&completion, 0);
@@ -3437,6 +5783,7 @@ mod tests {
                 url: "https://example.com/repo".into(),
                 branch: None,
                 into: None,
+                conflict_mode: Default::default(),
             },
             SetupStep::PullBranch {
                 remote: None,
@@ -3907,9 +6254,11 @@ mod tests {
     // explicitly permitted, while the multi-thread runtime handles the future.
 
     /// Frontend that records every `write_message` call so tests can assert on
-    /// the on_failure status messages emitted by the engine.
+    /// the on_failure status messages emitted by the engine. Also records the
+    /// step name of every `report_step_interactive_launch` call.
     struct MessageCapturingFrontend {
         messages: Arc<Mutex<Vec<crate::data::message::UserMessage>>>,
+        interactive_launches: Arc<Mutex<Vec<String>>>,
     }
 
     impl MessageCapturingFrontend {
@@ -3918,9 +6267,16 @@ mod tests {
             (
                 Self {
                     messages: Arc::clone(&store),
+                    interactive_launches: Arc::new(Mutex::new(Vec::new())),
                 },
                 store,
             )
+        }
+
+        /// Handle to the recorded `report_step_interactive_launch` step names.
+        /// Grab before moving the frontend into the engine.
+        fn launches_handle(&self) -> Arc<Mutex<Vec<String>>> {
+            Arc::clone(&self.interactive_launches)
         }
     }
 
@@ -3942,14 +6298,18 @@ mod tests {
         fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
             Ok(true)
         }
-        fn user_choose_after_step_failure(
-            &mut self,
-            _step: &WorkflowStep,
-            _exit: &AgentExitInfo,
-        ) -> Result<StepFailureChoice, EngineError> {
-            Ok(StepFailureChoice::Abort)
-        }
         fn report_step_status(&mut self, _step: &WorkflowStep, _status: WorkflowStepStatus) {}
+        fn report_step_interactive_launch(
+            &mut self,
+            step: &WorkflowStep,
+            _agent: &str,
+            _model: Option<&str>,
+        ) {
+            self.interactive_launches
+                .lock()
+                .unwrap()
+                .push(step.name.clone());
+        }
         fn yolo_countdown_tick(
             &mut self,
             _step_name: &str,
@@ -3967,17 +6327,12 @@ mod tests {
         factory: FakeAgentExecutionFactory,
         frontend: MessageCapturingFrontend,
     ) -> WorkflowEngine {
-        let overlay = OverlayEngine::with_auth_resolver(
-            crate::data::fs::auth_paths::AuthPathResolver::at_home(session.git_root()),
-        );
         WorkflowEngine::new(
             session,
             workflow,
             None,
             Box::new(frontend),
             Box::new(factory),
-            Arc::new(GitEngine::new()),
-            Arc::new(overlay),
         )
         .unwrap()
     }
@@ -4313,6 +6668,7 @@ mod tests {
             let factory = FakeAgentExecutionFactory::always_success();
             let frontend = MessageCapturingFrontend {
                 messages: Arc::clone(&msg_store_clone),
+                interactive_launches: Arc::new(Mutex::new(Vec::new())),
             };
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -4373,6 +6729,7 @@ mod tests {
             let factory = FakeAgentExecutionFactory::always_success();
             let frontend = MessageCapturingFrontend {
                 messages: Arc::clone(&msg_store_clone),
+                interactive_launches: Arc::new(Mutex::new(Vec::new())),
             };
             let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
 
@@ -4451,6 +6808,57 @@ mod tests {
             let states = &engine.state().teardown_step_states;
             assert_eq!(states[0].status, PhaseStepStatus::Succeeded);
             assert_eq!(states[1].status, PhaseStepStatus::Succeeded);
+        })
+        .await
+        .unwrap();
+    }
+
+    // The remediation agent launch must announce itself through
+    // report_step_interactive_launch, like main steps do. Frontends prepare
+    // per-container state there — the TUI recreates its AgentIo channels, so
+    // skipping the call would leave the factory's take_io with no channels
+    // and kill the whole command task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn on_failure_agent_launch_reports_interactive_launch() {
+        use crate::data::workflow_definition::TeardownStep;
+
+        tokio::task::spawn_blocking(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let workflow =
+                make_workflow(Some("wf"), Some("claude"), vec![make_step("a", &[], None)]);
+            let factory = FakeAgentExecutionFactory::always_success();
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let launches = frontend.launches_handle();
+            let mut engine = make_engine_capturing(&session, workflow, factory, frontend);
+
+            let steps = vec![TeardownStep::RunShell {
+                command: "tests".into(),
+                env: None,
+            }];
+            // Step fails, retry fails again → exactly one remediation attempt.
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("".into(), "err".into(), 1),
+                ("".into(), "err".into(), 1),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1))];
+
+            engine
+                .run_teardown(
+                    &steps,
+                    &[false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
+                .unwrap();
+
+            assert_eq!(
+                launches.lock().unwrap().as_slice(),
+                ["__on_failure__".to_string()],
+                "remediation agent launch must fire report_step_interactive_launch"
+            );
         })
         .await
         .unwrap();
@@ -4567,5 +6975,1753 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    // ── Feature B (WI-0099): teardown failure output capture — unit tests ───
+
+    #[test]
+    fn sanitize_step_name_replaces_path_separators_and_dots() {
+        let out = sanitize_step_name_for_filename("run_shell: ../../etc/passwd");
+        assert!(
+            !out.contains('/'),
+            "must not contain path separators: {out}"
+        );
+        assert!(!out.contains(".."), "must not contain '..': {out}");
+        assert!(
+            out.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "must only contain safe filename characters: {out}"
+        );
+    }
+
+    #[test]
+    fn sanitize_step_name_replaces_spaces_and_shell_metacharacters() {
+        let out = sanitize_step_name_for_filename("rm -rf $(whoami); echo `id` && true");
+        assert!(
+            out.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "must only contain safe filename characters: {out}"
+        );
+        assert!(!out.contains(' '));
+        assert!(!out.contains('$'));
+        assert!(!out.contains('('));
+        assert!(!out.contains(';'));
+        assert!(!out.contains('`'));
+    }
+
+    #[test]
+    fn sanitize_step_name_replaces_backslashes_and_colons() {
+        let out = sanitize_step_name_for_filename(r"C:\Users\evil\payload");
+        assert!(!out.contains('\\'));
+        assert!(!out.contains(':'));
+    }
+
+    #[test]
+    fn sanitize_step_name_truncates_to_64_chars() {
+        let long_name = "a".repeat(100);
+        let out = sanitize_step_name_for_filename(&long_name);
+        assert_eq!(out.len(), 64, "must be truncated to the 64-char cap: {out}");
+        assert!(out.chars().all(|c| c == 'a'));
+    }
+
+    #[test]
+    fn sanitize_step_name_empty_falls_back_to_step() {
+        assert_eq!(sanitize_step_name_for_filename(""), "step");
+    }
+
+    #[test]
+    fn sanitize_step_name_preserves_already_safe_names() {
+        assert_eq!(
+            sanitize_step_name_for_filename("build-frontend_v2"),
+            "build-frontend_v2"
+        );
+    }
+
+    #[test]
+    fn sanitize_step_name_handles_unicode_without_panicking() {
+        let out = sanitize_step_name_for_filename("café/日本語 build");
+        assert!(
+            out.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "must only contain safe filename characters: {out}"
+        );
+        assert!(out.starts_with("caf"));
+    }
+
+    #[test]
+    fn truncate_stream_leaves_short_content_untouched() {
+        let content = "short output\nwith a few lines";
+        assert_eq!(truncate_stream(content), content);
+    }
+
+    #[test]
+    fn truncate_stream_exactly_at_cap_is_untouched() {
+        let content = "z".repeat(TEARDOWN_STREAM_TRUNCATE_BYTES);
+        assert_eq!(truncate_stream(&content), content);
+    }
+
+    #[test]
+    fn truncate_stream_keeps_last_bytes_with_notice() {
+        let filler = "x".repeat(TEARDOWN_STREAM_TRUNCATE_BYTES + 500);
+        let content = format!("HEAD-MARKER{filler}TAIL-MARKER");
+        let out = truncate_stream(&content);
+        assert!(
+            out.starts_with("[... output truncated, showing last"),
+            "must prefix a truncation notice: {out}"
+        );
+        assert!(
+            !out.contains("HEAD-MARKER"),
+            "the dropped head must not appear: {out}"
+        );
+        assert!(out.ends_with("TAIL-MARKER"));
+    }
+
+    #[test]
+    fn truncate_stream_respects_utf8_char_boundaries() {
+        // '€' is 3 bytes; repeating it so the cut point would otherwise land
+        // mid-codepoint must not panic and must yield valid UTF-8.
+        let filler = "€".repeat(TEARDOWN_STREAM_TRUNCATE_BYTES / 3 + 10);
+        let content = format!("{filler}END");
+        let out = truncate_stream(&content);
+        assert!(out.ends_with("END"));
+    }
+
+    #[test]
+    fn format_teardown_failure_file_basic_content() {
+        let out =
+            format_teardown_failure_file("run_shell: cargo test", "out content", "err content");
+        assert_eq!(
+            out,
+            "=== FAILED COMMAND: run_shell: cargo test ===\n\n\
+             --- STDOUT ---\nout content\n\n\
+             --- STDERR ---\nerr content\n"
+        );
+    }
+
+    #[test]
+    fn format_teardown_failure_file_empty_stdout_uses_placeholder() {
+        let out = format_teardown_failure_file("step", "", "some stderr");
+        assert!(out.contains("--- STDOUT ---\n(empty)\n"));
+        assert!(out.contains("some stderr"));
+    }
+
+    #[test]
+    fn format_teardown_failure_file_empty_stderr_uses_placeholder() {
+        let out = format_teardown_failure_file("step", "some stdout", "");
+        assert!(out.contains("some stdout"));
+        assert!(out.contains("--- STDERR ---\n(empty)\n"));
+    }
+
+    #[test]
+    fn format_teardown_failure_file_both_empty_uses_placeholders_for_both() {
+        let out = format_teardown_failure_file("step", "", "");
+        assert!(out.contains("--- STDOUT ---\n(empty)\n"));
+        assert!(out.contains("--- STDERR ---\n(empty)\n"));
+    }
+
+    #[test]
+    fn format_teardown_failure_file_truncates_oversized_stream() {
+        let big = "y".repeat(TEARDOWN_STREAM_TRUNCATE_BYTES + 1000);
+        let out = format_teardown_failure_file("step", &big, "");
+        assert!(out.contains("output truncated"));
+        assert!(
+            !out.contains(&big),
+            "raw oversized content must not appear verbatim in the file"
+        );
+    }
+
+    #[test]
+    fn prepend_preamble_overlay_path_references_correct_file_and_user_prompt() {
+        let artifacts = TeardownFailureArtifacts {
+            container_path: TEARDOWN_FAILURE_OVERLAY_CONTAINER_PATH,
+            filename: "teardown-failure-run-shell--cargo-test.txt".to_string(),
+            step_name: "run_shell: cargo test".to_string(),
+            extra_overlay: None,
+        };
+        let out = artifacts.prepend_preamble("Fix the bug.");
+        assert!(out.contains("failed teardown step \"run_shell: cargo test\""));
+        assert!(out.contains("/awman/context/workflow/teardown-failure-run-shell--cargo-test.txt"));
+        assert!(out.contains("Read that file first"));
+        assert!(
+            out.contains("---\n\nFix the bug."),
+            "user prompt must follow the '---' separator: {out}"
+        );
+    }
+
+    #[test]
+    fn prepend_preamble_ephemeral_path_references_remediation_mount() {
+        let artifacts = TeardownFailureArtifacts {
+            container_path: TEARDOWN_FAILURE_EPHEMERAL_CONTAINER_PATH,
+            filename: "teardown-failure-step.txt".to_string(),
+            step_name: "step".to_string(),
+            extra_overlay: Some("/host/dir:/awman/remediation:ro".to_string()),
+        };
+        let out = artifacts.prepend_preamble("Custom prompt");
+        assert!(out.contains("/awman/remediation/teardown-failure-step.txt"));
+        assert!(out.trim_end().ends_with("Custom prompt"));
+    }
+
+    fn make_engine_with_workflow_overlays(
+        tmp: &tempfile::TempDir,
+        overlays: Option<Vec<String>>,
+    ) -> WorkflowEngine {
+        let session = make_session(tmp);
+        let mut workflow = make_workflow(
+            Some("wf-overlay"),
+            Some("claude"),
+            vec![make_step("a", &[], None)],
+        );
+        workflow.overlays = overlays;
+        make_engine(
+            &session,
+            workflow,
+            FakeAgentExecutionFactory::always_success(),
+            [],
+        )
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_false_when_no_overlays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_engine_with_workflow_overlays(&tmp, None);
+        assert!(!engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_true_for_default_rw_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine =
+            make_engine_with_workflow_overlays(&tmp, Some(vec!["context(workflow)".to_string()]));
+        assert!(engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_true_for_explicit_rw_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_engine_with_workflow_overlays(
+            &tmp,
+            Some(vec!["context(workflow:rw)".to_string()]),
+        );
+        assert!(engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_false_for_readonly_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_engine_with_workflow_overlays(
+            &tmp,
+            Some(vec!["context(workflow:ro)".to_string()]),
+        );
+        assert!(!engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_false_for_unrelated_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine =
+            make_engine_with_workflow_overlays(&tmp, Some(vec!["context(repo)".to_string()]));
+        assert!(!engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_true_within_comma_separated_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_engine_with_workflow_overlays(
+            &tmp,
+            Some(vec!["context(repo), context(workflow)".to_string()]),
+        );
+        assert!(engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_false_when_only_readonly_across_multiple_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = make_engine_with_workflow_overlays(
+            &tmp,
+            Some(vec![
+                "context(repo)".to_string(),
+                "context(workflow:ro)".to_string(),
+            ]),
+        );
+        assert!(!engine.workflow_context_overlay_writable());
+    }
+
+    #[test]
+    fn workflow_context_overlay_writable_uses_active_permission_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut engine = make_engine_with_workflow_overlays(&tmp, None);
+        assert!(!engine.workflow_context_overlay_writable());
+
+        engine.set_workflow_context_permission(Some(OverlayPermission::ReadWrite));
+        assert!(
+            engine.workflow_context_overlay_writable(),
+            "a workflow context overlay supplied by config/env/CLI must be treated as active"
+        );
+
+        engine.set_workflow_context_permission(Some(OverlayPermission::ReadOnly));
+        assert!(
+            !engine.workflow_context_overlay_writable(),
+            "read-only workflow context must not be treated as writable"
+        );
+    }
+
+    // ── Feature B (WI-0099): teardown failure output capture — integration ──
+    //
+    // `prepare_teardown_failure_file` resolves the host directory via
+    // `ContextDirResolver::from_process_env()`, which reads the *real* process
+    // environment (there is no test-injectable `EnvSnapshot` seam on that call
+    // path). These tests therefore pin `AWMAN_CONFIG_HOME` to a temp dir for
+    // their duration. `ENV_LOCK` serializes that mutation across test threads
+    // and `EnvVarGuard` restores the previous value on drop (even on panic) —
+    // mirrors the pattern already used in `command::commands::clean::tests`.
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// `(step name, resolved prompt, overlays)` recorded per `execution_for_step` call.
+    type RecordedStepCall = (String, String, Option<Vec<String>>);
+
+    /// Records every synthetic step handed to `execution_for_step` — name,
+    /// resolved prompt, and overlays — so tests can assert on the
+    /// `launch_on_failure_agent` prompt hint and mount decision without a
+    /// live container runtime.
+    struct StepRecordingFactory {
+        inner: Arc<FakeAgentExecutionFactory>,
+        step_calls: Arc<Mutex<Vec<RecordedStepCall>>>,
+    }
+
+    impl StepRecordingFactory {
+        fn new(inner: Arc<FakeAgentExecutionFactory>) -> (Self, Arc<Mutex<Vec<RecordedStepCall>>>) {
+            let step_calls = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    inner,
+                    step_calls: Arc::clone(&step_calls),
+                },
+                step_calls,
+            )
+        }
+    }
+
+    impl AgentExecutionFactory for StepRecordingFactory {
+        fn execution_for_step(
+            &self,
+            step: &WorkflowStep,
+            session: &Session,
+            runtime: &WorkflowRuntimeContext,
+        ) -> Result<AgentExecution, EngineError> {
+            self.step_calls.lock().unwrap().push((
+                step.name.clone(),
+                step.prompt_template.clone(),
+                step.overlays.clone(),
+            ));
+            self.inner.execution_for_step(step, session, runtime)
+        }
+
+        fn inject_prompt(
+            &self,
+            execution: &AgentExecution,
+            prompt: &str,
+        ) -> Result<Option<()>, EngineError> {
+            self.inner.inject_prompt(execution, prompt)
+        }
+    }
+
+    // Teardown failure WITH an active, writable `context(workflow)` overlay:
+    // the file must land in the overlay's existing host path and the prompt
+    // hint must reference the already-mounted `/awman/context/workflow/...`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_failure_with_active_context_workflow_overlay_writes_into_it() {
+        use crate::data::fs::context_dirs::ContextDirResolver;
+        use crate::data::workflow_definition::TeardownStep;
+
+        // `awman_home` stays alive in this outer frame for the whole test
+        // (including across the `.await` below) so the directory exists for
+        // the blocking closure's whole execution. The `ENV_LOCK` guard and
+        // `AWMAN_CONFIG_HOME` mutation live entirely *inside* the closure so
+        // no `MutexGuard` is held across an await point.
+        let awman_home = tempfile::tempdir().unwrap();
+        let awman_home_path = awman_home.path().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let _env_lock = ENV_LOCK.lock().unwrap();
+            let _env_guard = EnvVarGuard::set("AWMAN_CONFIG_HOME", &awman_home_path);
+
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let mut workflow = make_workflow(
+                Some("wf-overlay-active"),
+                Some("claude"),
+                vec![make_step("a", &[], None)],
+            );
+            workflow.overlays = Some(vec!["context(workflow)".to_string()]);
+
+            let recording = Arc::new(FakeAgentExecutionFactory::always_success());
+            let (step_factory, step_calls_handle) =
+                StepRecordingFactory::new(Arc::clone(&recording));
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = WorkflowEngine::new(
+                &session,
+                workflow,
+                None,
+                Box::new(frontend),
+                Box::new(step_factory),
+            )
+            .unwrap();
+            let invocation_id = engine.state().invocation_id;
+
+            let steps = vec![TeardownStep::RunShell {
+                command: "cargo test".into(),
+                env: None,
+            }];
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("stdout content".into(), "stderr content".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1))];
+
+            engine
+                .run_teardown(
+                    &steps,
+                    &[false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
+                .unwrap();
+
+            let resolver = ContextDirResolver::at_home(&awman_home_path);
+            let host_dir = resolver.workflow_dir(invocation_id);
+            let sanitized = sanitize_step_name_for_filename("run_shell: cargo test");
+            let file_path = host_dir.join(format!("teardown-failure-{sanitized}.txt"));
+            let content = std::fs::read_to_string(&file_path).unwrap_or_else(|e| {
+                panic!("expected failure file at {}: {e}", file_path.display())
+            });
+            assert!(content.contains("=== FAILED COMMAND: run_shell: cargo test ==="));
+            assert!(content.contains("stdout content"));
+            assert!(content.contains("stderr content"));
+
+            let calls = step_calls_handle.lock().unwrap().clone();
+            let on_failure_call = calls
+                .iter()
+                .find(|(name, _, _)| name == "__on_failure__")
+                .expect("remediation agent must have been launched");
+            let expected_hint = format!("/awman/context/workflow/teardown-failure-{sanitized}.txt");
+            assert!(
+                on_failure_call.1.contains(expected_hint.as_str()),
+                "prompt must reference the overlay path: {}",
+                on_failure_call.1
+            );
+            assert!(
+                on_failure_call.2.is_none(),
+                "context(workflow) overlay is already mounted; no extra overlay expected"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // A read-only `context(workflow:ro)` overlay must not be treated as the
+    // writable destination. The failure file is still written host-side under
+    // the workflow context directory, but the remediation hint uses
+    // `/awman/remediation/...`; the extra mount targets the file itself so the
+    // existing read-only context directory mount is not deduplicated away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_failure_with_readonly_context_workflow_overlay_uses_remediation_mount() {
+        use crate::data::fs::context_dirs::ContextDirResolver;
+        use crate::data::workflow_definition::TeardownStep;
+
+        let awman_home = tempfile::tempdir().unwrap();
+        let awman_home_path = awman_home.path().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let _env_lock = ENV_LOCK.lock().unwrap();
+            let _env_guard = EnvVarGuard::set("AWMAN_CONFIG_HOME", &awman_home_path);
+
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let mut workflow = make_workflow(
+                Some("wf-overlay-readonly"),
+                Some("claude"),
+                vec![make_step("a", &[], None)],
+            );
+            workflow.overlays = Some(vec!["context(workflow:ro)".to_string()]);
+
+            let recording = Arc::new(FakeAgentExecutionFactory::always_success());
+            let (step_factory, step_calls_handle) =
+                StepRecordingFactory::new(Arc::clone(&recording));
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = WorkflowEngine::new(
+                &session,
+                workflow,
+                None,
+                Box::new(frontend),
+                Box::new(step_factory),
+            )
+            .unwrap();
+            let invocation_id = engine.state().invocation_id;
+
+            let steps = vec![TeardownStep::RunShell {
+                command: "cargo test".into(),
+                env: None,
+            }];
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("ro out".into(), "ro err".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1))];
+
+            engine
+                .run_teardown(
+                    &steps,
+                    &[false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
+                .unwrap();
+
+            let resolver = ContextDirResolver::at_home(&awman_home_path);
+            let host_dir = resolver.workflow_dir(invocation_id);
+            let sanitized = sanitize_step_name_for_filename("run_shell: cargo test");
+            let filename = format!("teardown-failure-{sanitized}.txt");
+            let file_path = host_dir.join(&filename);
+            let content = std::fs::read_to_string(&file_path).unwrap_or_else(|e| {
+                panic!("expected failure file at {}: {e}", file_path.display())
+            });
+            assert!(content.contains("ro out"));
+            assert!(content.contains("ro err"));
+
+            let calls = step_calls_handle.lock().unwrap().clone();
+            let on_failure_call = calls
+                .iter()
+                .find(|(name, _, _)| name == "__on_failure__")
+                .expect("remediation agent must have been launched");
+            let expected_hint = format!("/awman/remediation/{filename}");
+            assert!(
+                on_failure_call.1.contains(expected_hint.as_str()),
+                "prompt must reference the remediation path: {}",
+                on_failure_call.1
+            );
+            let expected_overlay =
+                format!("{}:/awman/remediation/{filename}:ro", file_path.display());
+            assert_eq!(
+                on_failure_call.2,
+                Some(vec![expected_overlay]),
+                "read-only context fallback must mount the failure file at /awman/remediation"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // Teardown failure WITHOUT a `context(workflow)` overlay: an ephemeral
+    // directory is used, mounted read-only at /awman/remediation, and the
+    // prompt hint references that mount.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_failure_without_context_workflow_overlay_uses_ephemeral_mount() {
+        use crate::data::fs::context_dirs::ContextDirResolver;
+        use crate::data::workflow_definition::TeardownStep;
+
+        // `awman_home` stays alive in this outer frame for the whole test
+        // (including across the `.await` below) so the directory exists for
+        // the blocking closure's whole execution. The `ENV_LOCK` guard and
+        // `AWMAN_CONFIG_HOME` mutation live entirely *inside* the closure so
+        // no `MutexGuard` is held across an await point.
+        let awman_home = tempfile::tempdir().unwrap();
+        let awman_home_path = awman_home.path().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let _env_lock = ENV_LOCK.lock().unwrap();
+            let _env_guard = EnvVarGuard::set("AWMAN_CONFIG_HOME", &awman_home_path);
+
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            // No `context(workflow)` declared.
+            let workflow = make_workflow(
+                Some("wf-overlay-absent"),
+                Some("claude"),
+                vec![make_step("a", &[], None)],
+            );
+
+            let recording = Arc::new(FakeAgentExecutionFactory::always_success());
+            let (step_factory, step_calls_handle) =
+                StepRecordingFactory::new(Arc::clone(&recording));
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = WorkflowEngine::new(
+                &session,
+                workflow,
+                None,
+                Box::new(frontend),
+                Box::new(step_factory),
+            )
+            .unwrap();
+            let invocation_id = engine.state().invocation_id;
+
+            let steps = vec![TeardownStep::RunShell {
+                command: "deploy".into(),
+                env: None,
+            }];
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("out".into(), "err".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1))];
+
+            engine
+                .run_teardown(
+                    &steps,
+                    &[false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
+                .unwrap();
+
+            let resolver = ContextDirResolver::at_home(&awman_home_path);
+            let host_dir = resolver.workflow_dir(invocation_id);
+            assert!(
+                host_dir.starts_with(awman_home_path.join("context").join("workflows")),
+                "ephemeral dir must live under ~/.awman/context/workflows/: {}",
+                host_dir.display()
+            );
+            let sanitized = sanitize_step_name_for_filename("run_shell: deploy");
+            let file_path = host_dir.join(format!("teardown-failure-{sanitized}.txt"));
+            assert!(
+                file_path.exists(),
+                "failure file must be written to the ephemeral dir: {}",
+                file_path.display()
+            );
+
+            let calls = step_calls_handle.lock().unwrap().clone();
+            let on_failure_call = calls
+                .iter()
+                .find(|(name, _, _)| name == "__on_failure__")
+                .expect("remediation agent must have been launched");
+            let expected_hint = format!("/awman/remediation/teardown-failure-{sanitized}.txt");
+            assert!(
+                on_failure_call.1.contains(expected_hint.as_str()),
+                "prompt must reference the ephemeral mount path: {}",
+                on_failure_call.1
+            );
+            let expected_overlay = format!("{}:/awman/remediation:ro", host_dir.display());
+            assert_eq!(
+                on_failure_call.2,
+                Some(vec![expected_overlay]),
+                "a one-off read-only overlay must be attached when context(workflow) is absent"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // A second (and third) teardown failure during multi-attempt remediation
+    // must overwrite the failure file with the latest output, not the first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_failure_retry_overwrites_file_with_latest_output() {
+        use crate::data::fs::context_dirs::ContextDirResolver;
+        use crate::data::workflow_definition::TeardownStep;
+
+        // `awman_home` stays alive in this outer frame for the whole test
+        // (including across the `.await` below) so the directory exists for
+        // the blocking closure's whole execution. The `ENV_LOCK` guard and
+        // `AWMAN_CONFIG_HOME` mutation live entirely *inside* the closure so
+        // no `MutexGuard` is held across an await point.
+        let awman_home = tempfile::tempdir().unwrap();
+        let awman_home_path = awman_home.path().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let _env_lock = ENV_LOCK.lock().unwrap();
+            let _env_guard = EnvVarGuard::set("AWMAN_CONFIG_HOME", &awman_home_path);
+
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let mut workflow = make_workflow(
+                Some("wf-retry-overwrite"),
+                Some("claude"),
+                vec![make_step("a", &[], None)],
+            );
+            workflow.overlays = Some(vec!["context(workflow)".to_string()]);
+
+            let recording = Arc::new(FakeAgentExecutionFactory::always_success());
+            let (step_factory, _step_calls) = StepRecordingFactory::new(Arc::clone(&recording));
+            let (frontend, _msgs) = MessageCapturingFrontend::new();
+            let mut engine = WorkflowEngine::new(
+                &session,
+                workflow,
+                None,
+                Box::new(frontend),
+                Box::new(step_factory),
+            )
+            .unwrap();
+            let invocation_id = engine.state().invocation_id;
+
+            let steps = vec![TeardownStep::RunShell {
+                command: "flaky".into(),
+                env: None,
+            }];
+            // Initial failure, first retry fails again with different output,
+            // second retry succeeds.
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("first-out".into(), "first-err".into(), 1),
+                ("second-out".into(), "second-err".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(2))];
+
+            let (_aborted, any_failed) = engine
+                .run_teardown(
+                    &steps,
+                    &[false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
+                .unwrap();
+            assert!(
+                !any_failed,
+                "the second retry succeeds so the step must not remain failed"
+            );
+
+            let resolver = ContextDirResolver::at_home(&awman_home_path);
+            let host_dir = resolver.workflow_dir(invocation_id);
+            let sanitized = sanitize_step_name_for_filename("run_shell: flaky");
+            let file_path = host_dir.join(format!("teardown-failure-{sanitized}.txt"));
+            let content = std::fs::read_to_string(&file_path).unwrap();
+
+            assert!(
+                content.contains("second-out") && content.contains("second-err"),
+                "file must reflect the latest failure: {content}"
+            );
+            assert!(
+                !content.contains("first-out") && !content.contains("first-err"),
+                "stale output from the first failure must be overwritten: {content}"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // A write failure (e.g. disk full, permission error) must degrade
+    // gracefully: the remediation agent still launches, using the
+    // unmodified `on_failure.prompt` with no dangling file reference.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn teardown_failure_write_error_degrades_gracefully() {
+        use crate::data::fs::context_dirs::ContextDirResolver;
+        use crate::data::workflow_definition::TeardownStep;
+
+        // `awman_home` stays alive in this outer frame for the whole test
+        // (including across the `.await` below) so the directory exists for
+        // the blocking closure's whole execution. The `ENV_LOCK` guard and
+        // `AWMAN_CONFIG_HOME` mutation live entirely *inside* the closure so
+        // no `MutexGuard` is held across an await point.
+        let awman_home = tempfile::tempdir().unwrap();
+        let awman_home_path = awman_home.path().to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let _env_lock = ENV_LOCK.lock().unwrap();
+            let _env_guard = EnvVarGuard::set("AWMAN_CONFIG_HOME", &awman_home_path);
+
+            let tmp = tempfile::tempdir().unwrap();
+            let session = make_session(&tmp);
+            let mut workflow = make_workflow(
+                Some("wf-write-failure"),
+                Some("claude"),
+                vec![make_step("a", &[], None)],
+            );
+            workflow.overlays = Some(vec!["context(workflow)".to_string()]);
+
+            let recording = Arc::new(FakeAgentExecutionFactory::always_success());
+            let (step_factory, step_calls_handle) =
+                StepRecordingFactory::new(Arc::clone(&recording));
+            let (frontend, msgs) = MessageCapturingFrontend::new();
+            let mut engine = WorkflowEngine::new(
+                &session,
+                workflow,
+                None,
+                Box::new(frontend),
+                Box::new(step_factory),
+            )
+            .unwrap();
+            let invocation_id = engine.state().invocation_id;
+
+            // Pre-create the target file path AS A DIRECTORY so the production
+            // `std::fs::write` call fails deterministically (EISDIR) without
+            // relying on permission bits, which don't block root in CI/dev
+            // containers.
+            let resolver = ContextDirResolver::at_home(&awman_home_path);
+            let host_dir = resolver.workflow_dir(invocation_id);
+            let sanitized = sanitize_step_name_for_filename("run_shell: flaky");
+            let conflicting_path = host_dir.join(format!("teardown-failure-{sanitized}.txt"));
+            std::fs::create_dir_all(&conflicting_path).unwrap();
+
+            let steps = vec![TeardownStep::RunShell {
+                command: "flaky".into(),
+                env: None,
+            }];
+            let mock = Arc::new(MockBackgroundContainer::with_results([
+                ("out".into(), "err".into(), 1),
+                ("".into(), "".into(), 0),
+            ]));
+            let on_failure_configs = vec![Some(remediation_config(1))];
+
+            engine
+                .run_teardown(
+                    &steps,
+                    &[false],
+                    &on_failure_configs,
+                    true,
+                    false,
+                    mock.factory(),
+                )
+                .unwrap();
+
+            let calls = step_calls_handle.lock().unwrap().clone();
+            let on_failure_call = calls
+                .iter()
+                .find(|(name, _, _)| name == "__on_failure__")
+                .expect("remediation agent must still launch despite the write failure");
+            assert_eq!(
+                on_failure_call.1, "Fix the broken step.",
+                "prompt must be the unmodified config prompt with no file hint: {}",
+                on_failure_call.1
+            );
+            assert!(
+                !on_failure_call.1.contains("teardown-failure"),
+                "prompt must not reference a file that failed to write"
+            );
+            assert!(
+                on_failure_call.2.is_none(),
+                "no overlay should be attached when the file write failed"
+            );
+
+            let warnings = msgs.lock().unwrap().clone();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|m| m.level == crate::data::message::MessageLevel::Warning
+                        && m.text.contains("could not write failure output")),
+                "must warn about the write failure: {warnings:?}"
+            );
+        })
+        .await
+        .unwrap();
+    }
+
+    // ── WI-0096 parallel-group engine tests ──────────────────────────────────
+
+    use crate::data::config::flags::FlagConfig;
+
+    /// Open a session whose effective `max_concurrent_agents` is `max`
+    /// (via a flag override, the highest-precedence source).
+    fn make_session_with_max_concurrent(tmp: &tempfile::TempDir, max: Option<usize>) -> Session {
+        let resolver = StaticGitRootResolver::new(tmp.path());
+        let opts = SessionOpenOptions {
+            flags: FlagConfig {
+                max_concurrent_agents: max,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        Session::open(tmp.path().to_path_buf(), &resolver, opts).unwrap()
+    }
+
+    /// Records every parallel-group callback so tests can assert on the
+    /// engine's scheduling decisions after it is moved into a spawned task.
+    #[derive(Default)]
+    struct ParallelRecord {
+        launched: Vec<String>,
+        exited: Vec<(String, i32)>,
+        stuck: Vec<String>,
+        unstuck: Vec<String>,
+        group_finished: bool,
+        available: Vec<AvailableActions>,
+    }
+
+    struct ParallelTestFrontend {
+        actions: Mutex<VecDeque<NextAction>>,
+        engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
+        record: Arc<Mutex<ParallelRecord>>,
+        /// Return value for every per-step parallel yolo tick.
+        yolo_tick: YoloTickOutcome,
+    }
+
+    impl ParallelTestFrontend {
+        fn new(
+            actions: impl IntoIterator<Item = NextAction>,
+            engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>>,
+            yolo_tick: YoloTickOutcome,
+        ) -> (Self, Arc<Mutex<ParallelRecord>>) {
+            let record = Arc::new(Mutex::new(ParallelRecord::default()));
+            (
+                Self {
+                    actions: Mutex::new(actions.into_iter().collect()),
+                    engine_tx,
+                    record: record.clone(),
+                    yolo_tick,
+                },
+                record,
+            )
+        }
+    }
+
+    impl crate::data::message::UserMessageSink for ParallelTestFrontend {
+        fn write_message(&mut self, _msg: crate::data::message::UserMessage) {}
+        fn replay_queued(&mut self) {}
+    }
+
+    impl WorkflowFrontend for ParallelTestFrontend {
+        fn show_workflow_control_board(
+            &mut self,
+            _state: &WorkflowState,
+            available: &AvailableActions,
+        ) -> Result<NextAction, EngineError> {
+            self.record
+                .lock()
+                .unwrap()
+                .available
+                .push(available.clone());
+            Ok(self
+                .actions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(NextAction::Pause))
+        }
+        fn confirm_resume(&mut self, _: &ResumeMismatch) -> Result<bool, EngineError> {
+            Ok(true)
+        }
+        fn report_step_status(&mut self, _: &WorkflowStep, _: WorkflowStepStatus) {}
+        fn yolo_countdown_tick(
+            &mut self,
+            _: &str,
+            _: Duration,
+            _: Duration,
+        ) -> Result<YoloTickOutcome, EngineError> {
+            Ok(YoloTickOutcome::Cancel)
+        }
+        fn report_workflow_completed(&mut self, _: &WorkflowOutcome) {}
+        fn set_engine_sender(&mut self, tx: tokio::sync::mpsc::UnboundedSender<EngineRequest>) {
+            *self.engine_tx.lock().unwrap() = Some(tx);
+        }
+        fn report_parallel_step_launched(&mut self, step_name: &str, _: &str, _: Option<&str>) {
+            self.record
+                .lock()
+                .unwrap()
+                .launched
+                .push(step_name.to_string());
+        }
+        fn report_parallel_step_dequeued(&mut self, step_name: &str, _: &str, _: Option<&str>) {
+            self.record
+                .lock()
+                .unwrap()
+                .launched
+                .push(step_name.to_string());
+        }
+        fn report_parallel_step_exited(&mut self, step_name: &str, exit_code: i32) {
+            self.record
+                .lock()
+                .unwrap()
+                .exited
+                .push((step_name.to_string(), exit_code));
+        }
+        fn report_parallel_step_stuck(&mut self, step_name: &str) {
+            self.record
+                .lock()
+                .unwrap()
+                .stuck
+                .push(step_name.to_string());
+        }
+        fn report_parallel_step_unstuck(&mut self, step_name: &str) {
+            self.record
+                .lock()
+                .unwrap()
+                .unstuck
+                .push(step_name.to_string());
+        }
+        fn report_parallel_group_finished(&mut self) {
+            self.record.lock().unwrap().group_finished = true;
+        }
+        fn parallel_step_yolo_countdown_tick(
+            &mut self,
+            _: &str,
+            _: Duration,
+            _: Duration,
+        ) -> Result<YoloTickOutcome, EngineError> {
+            Ok(self.yolo_tick.clone())
+        }
+    }
+
+    fn build_parallel_engine(
+        session: &Session,
+        workflow: Workflow,
+        factory: BlockingFactory,
+        frontend: ParallelTestFrontend,
+    ) -> WorkflowEngine {
+        WorkflowEngine::new(
+            session,
+            workflow,
+            None,
+            Box::new(frontend),
+            Box::new(factory),
+        )
+        .unwrap()
+    }
+
+    /// Full 4-step, fully-parallel workflow with `max_concurrent = 2` runs to
+    /// completion and launches exactly one container per step.
+    #[tokio::test]
+    async fn run_to_completion_full_parallel_group_max_concurrent_2() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_max_concurrent(&tmp, Some(2));
+        assert_eq!(
+            session.effective_config().effective_max_concurrent_agents(),
+            Some(2)
+        );
+        let workflow = make_workflow(
+            Some("wf-full-parallel"),
+            Some("claude"),
+            vec![
+                make_step("a", &[], None),
+                make_step("b", &[], None),
+                make_step("c", &[], None),
+                make_step("d", &[], None),
+            ],
+        );
+        let factory = FakeAgentExecutionFactory::always_success();
+        let mut engine = make_engine(&session, workflow, factory, []);
+        assert_eq!(engine.max_concurrent(), Some(2));
+
+        let result = engine.run_to_completion().await.unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+        for s in ["a", "b", "c", "d"] {
+            assert!(
+                matches!(engine.state().status_of(s), Some(StepState::Succeeded)),
+                "step {s} must have succeeded"
+            );
+        }
+    }
+
+    /// Scheduling: with 4 concurrently-ready steps and `max_concurrent = 2`,
+    /// exactly 2 start initially; the 3rd starts only when the 1st finishes and
+    /// the 4th only when the 2nd finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_group_launches_respect_max_concurrent_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_max_concurrent(&tmp, Some(2));
+        let workflow = make_workflow(
+            Some("wf-staged"),
+            Some("claude"),
+            vec![
+                make_step("a", &[], None),
+                make_step("b", &[], None),
+                make_step("c", &[], None),
+                make_step("d", &[], None),
+            ],
+        );
+
+        let entries: Vec<_> = (0..4).map(|_| make_blocking_entry()).collect();
+        let factory = BlockingFactory::new(entries.iter().cloned());
+        let execution_count = factory.execution_count.clone();
+        let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+        let (frontend, record) =
+            ParallelTestFrontend::new([], engine_tx.clone(), YoloTickOutcome::Continue);
+        let mut engine = build_parallel_engine(&session, workflow, factory, frontend);
+
+        let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+
+        // Only 2 of the 4 steps start initially.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            execution_count.load(Ordering::Relaxed),
+            2,
+            "max_concurrent=2 must cap the initial launch at 2"
+        );
+        assert_eq!(record.lock().unwrap().launched, vec!["a", "b"]);
+
+        // Finishing the 1st frees a slot; the 3rd (c) launches.
+        signal_completion(&entries[0].1, 0);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(execution_count.load(Ordering::Relaxed), 3);
+        assert_eq!(record.lock().unwrap().launched, vec!["a", "b", "c"]);
+
+        // Finishing the 2nd frees the last slot; the 4th (d) launches.
+        signal_completion(&entries[1].1, 0);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(execution_count.load(Ordering::Relaxed), 4);
+        assert_eq!(record.lock().unwrap().launched, vec!["a", "b", "c", "d"]);
+
+        // Drain the rest and confirm completion.
+        signal_completion(&entries[2].1, 0);
+        signal_completion(&entries[3].1, 0);
+        let result = engine_task.await.unwrap().unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+    }
+
+    /// `abort_on_failure` on one running step kills the other running peer and
+    /// aborts the whole workflow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_group_abort_on_failure_kills_peer_and_aborts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_max_concurrent(&tmp, Some(2));
+        let mut step_a = make_step("a", &[], None);
+        step_a.abort_on_failure = true;
+        let workflow = make_workflow(
+            Some("wf-abort-parallel"),
+            Some("claude"),
+            vec![step_a, make_step("b", &[], None)],
+        );
+
+        let (cancel_a, completion_a) = make_blocking_entry();
+        let (cancel_b, _completion_b) = make_blocking_entry();
+        let factory = BlockingFactory::new([
+            (cancel_a.clone(), completion_a.clone()),
+            (cancel_b.clone(), _completion_b),
+        ]);
+        let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+        let (frontend, _record) =
+            ParallelTestFrontend::new([], engine_tx.clone(), YoloTickOutcome::Continue);
+        let mut engine = build_parallel_engine(&session, workflow, factory, frontend);
+
+        let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+
+        // Both launch; then step "a" fails.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!cancel_b.load(Ordering::Relaxed));
+        signal_completion(&completion_a, 1);
+
+        let result = engine_task.await.unwrap().unwrap();
+        assert_eq!(result, WorkflowOutcome::Aborted);
+        assert!(
+            cancel_b.load(Ordering::Relaxed),
+            "abort_on_failure must kill the still-running peer 'b'"
+        );
+    }
+
+    /// Yolo countdown expiry on slot 0 kills that container, launches the
+    /// queued step into the freed slot, and leaves the other slot running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_group_yolo_expiry_launches_queued_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_max_concurrent(&tmp, Some(2));
+        let workflow = make_workflow(
+            Some("wf-yolo-queue"),
+            Some("claude"),
+            vec![
+                make_step("a", &[], None),
+                make_step("b", &[], None),
+                make_step("c", &[], None),
+            ],
+        );
+
+        let (cancel_a, _c_a) = make_blocking_entry();
+        let (cancel_b, completion_b) = make_blocking_entry();
+        let (cancel_c, completion_c) = make_blocking_entry();
+        let factory = BlockingFactory::new([
+            (cancel_a.clone(), _c_a),
+            (cancel_b.clone(), completion_b.clone()),
+            (cancel_c.clone(), completion_c.clone()),
+        ]);
+        let execution_count = factory.execution_count.clone();
+        let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+        let (frontend, _record) =
+            ParallelTestFrontend::new([], engine_tx.clone(), YoloTickOutcome::AdvanceNow);
+        let mut engine = build_parallel_engine(&session, workflow, factory, frontend);
+        engine.set_yolo(true);
+        let tx = {
+            // set_engine_sender fires during construction.
+            engine_tx.lock().unwrap().clone().unwrap()
+        };
+
+        let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+
+        // a + b launched (2), c queued.
+        wait_for_execution_count(&execution_count, 2).await;
+
+        // Mark slot "a" stuck → yolo countdown → the AdvanceNow tick expires it.
+        tx.send(EngineRequest::StepStuck {
+            step_name: "a".to_string(),
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            cancel_a.load(Ordering::Relaxed),
+            "yolo expiry must kill slot 'a'"
+        );
+        assert_eq!(
+            execution_count.load(Ordering::Relaxed),
+            3,
+            "the queued step 'c' must launch into the freed slot"
+        );
+        assert!(
+            !cancel_b.load(Ordering::Relaxed),
+            "slot 'b' must keep running"
+        );
+
+        // Complete the survivors.
+        signal_completion(&completion_b, 0);
+        signal_completion(&completion_c, 0);
+        let result = engine_task.await.unwrap().unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+    }
+
+    /// Yolo expiry with no queued step: the group drains — no new launch, the
+    /// other slot continues, and the group finishes when it exits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_group_yolo_expiry_draining_no_new_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_max_concurrent(&tmp, Some(2));
+        let workflow = make_workflow(
+            Some("wf-yolo-drain"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &[], None)],
+        );
+
+        let (cancel_a, _c_a) = make_blocking_entry();
+        let (cancel_b, completion_b) = make_blocking_entry();
+        let factory = BlockingFactory::new([
+            (cancel_a.clone(), _c_a),
+            (cancel_b.clone(), completion_b.clone()),
+        ]);
+        let execution_count = factory.execution_count.clone();
+        let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+        let (frontend, _record) =
+            ParallelTestFrontend::new([], engine_tx.clone(), YoloTickOutcome::AdvanceNow);
+        let mut engine = build_parallel_engine(&session, workflow, factory, frontend);
+        engine.set_yolo(true);
+        let tx = engine_tx.lock().unwrap().clone().unwrap();
+
+        let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+
+        wait_for_execution_count(&execution_count, 2).await;
+
+        tx.send(EngineRequest::StepStuck {
+            step_name: "a".to_string(),
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(
+            cancel_a.load(Ordering::Relaxed),
+            "yolo expiry must kill slot 'a'"
+        );
+        assert_eq!(
+            execution_count.load(Ordering::Relaxed),
+            2,
+            "no queued step means nothing new launches (draining)"
+        );
+        assert!(
+            !cancel_b.load(Ordering::Relaxed),
+            "the surviving slot keeps running"
+        );
+
+        signal_completion(&completion_b, 0);
+        let result = engine_task.await.unwrap().unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+    }
+
+    /// `StepStuck { step_name }` (yolo off) marks only the named slot stuck;
+    /// the other slot is unaffected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parallel_step_stuck_routes_to_named_slot_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_max_concurrent(&tmp, Some(2));
+        let workflow = make_workflow(
+            Some("wf-stuck-route"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &[], None)],
+        );
+
+        let (_ca, completion_a) = make_blocking_entry();
+        let (_cb, completion_b) = make_blocking_entry();
+        let factory = BlockingFactory::new([
+            (Arc::new(AtomicBool::new(false)), completion_a.clone()),
+            (Arc::new(AtomicBool::new(false)), completion_b.clone()),
+        ]);
+        let engine_tx: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(None));
+        let (frontend, record) =
+            ParallelTestFrontend::new([], engine_tx.clone(), YoloTickOutcome::Continue);
+        let mut engine = build_parallel_engine(&session, workflow, factory, frontend);
+        // Not yolo mode.
+        let tx = engine_tx.lock().unwrap().clone().unwrap();
+
+        let engine_task = tokio::spawn(async move { engine.run_to_completion().await });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        tx.send(EngineRequest::StepStuck {
+            step_name: "b".to_string(),
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        {
+            let rec = record.lock().unwrap();
+            assert_eq!(rec.stuck, vec!["b"], "only 'b' must be reported stuck");
+            assert!(
+                !rec.stuck.contains(&"a".to_string()),
+                "'a' must not be reported stuck"
+            );
+        }
+
+        signal_completion(&completion_a, 0);
+        signal_completion(&completion_b, 0);
+        let result = engine_task.await.unwrap().unwrap();
+        assert_eq!(result, WorkflowOutcome::Completed);
+    }
+
+    /// WCB scoping (§10): when the focused step has running parallel peers,
+    /// `can_cancel_to_previous_step` and `can_finish_workflow` are forced false
+    /// and `restart_unavailable_reason` is set.
+    #[tokio::test]
+    async fn compute_available_actions_scopes_wcb_with_parallel_peers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session_with_max_concurrent(&tmp, Some(2));
+        let workflow = make_workflow(
+            Some("wf-wcb-peers"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &[], None)],
+        );
+        let factory = FakeAgentExecutionFactory::always_success();
+        let mut engine = make_engine(&session, workflow, factory, []);
+
+        let dummy = |name: &str| ActiveParallelStep {
+            step_name: name.to_string(),
+            execution: None,
+            cancel_handle: None,
+            container_name: format!("container-{name}"),
+            output_tail: None,
+            awman_killed: false,
+            stuck: false,
+            yolo_deadline: None,
+            agent: AgentName::new("claude").unwrap(),
+            model: None,
+        };
+
+        // Two live slots, "a" focused → one running peer.
+        engine.active_steps.push(dummy("a"));
+        engine.active_steps.push(dummy("b"));
+        engine.current_step_name = Some("a".to_string());
+        engine.current_step_agent = Some(AgentName::new("claude").unwrap());
+
+        let a = engine.compute_available_actions().unwrap();
+        assert_eq!(a.parallel_peer_count, 2);
+        assert_eq!(a.parallel_peers_running, 1);
+        assert!(!a.can_cancel_to_previous_step);
+        assert!(a.cancel_to_previous_unavailable_reason.is_some());
+        assert!(!a.can_finish_workflow);
+        assert!(a.finish_workflow_unavailable_reason.is_some());
+        assert!(a.restart_unavailable_reason.is_some());
+
+        // Drop to a single live slot → no peers, no forced scoping.
+        engine.active_steps.pop();
+        let b = engine.compute_available_actions().unwrap();
+        assert_eq!(b.parallel_peers_running, 0);
+        assert!(b.restart_unavailable_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn single_attempt_policy_hides_restart_after_a_successful_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-actions"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let factory = FakeAgentExecutionFactory::new([0]);
+        let mut engine = make_engine_with_frontend_and_retry_policy(
+            &session,
+            workflow,
+            factory,
+            FakeWorkflowFrontend::new([]),
+            WorkflowRetryPolicy::SingleAttempt,
+        );
+
+        let outcome = engine.step_once().await.expect("initial launch succeeds");
+        assert_eq!(outcome.step_name, "a");
+        let available = engine
+            .compute_available_actions()
+            .expect("available actions");
+        assert!(
+            !available.can_restart_current_step,
+            "a single-use startup gate cannot offer a fresh-container restart"
+        );
+        assert!(
+            available.restart_unavailable_reason.is_some(),
+            "the frontend needs an explicit reason for the disabled action"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_attempt_policy_rejects_injected_restart_without_second_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-injected-restart"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let factory = FakeAgentExecutionFactory::new([0, 0]);
+        let starts = factory.execution_call_counter();
+        let frontend = FakeWorkflowFrontend::new([NextAction::RestartCurrentStep]);
+        let mut engine = make_engine_with_frontend_and_retry_policy(
+            &session,
+            workflow,
+            factory,
+            frontend,
+            WorkflowRetryPolicy::SingleAttempt,
+        );
+
+        let error = engine
+            .run_to_completion()
+            .await
+            .expect_err("a frontend cannot inject a gated restart");
+        assert!(
+            matches!(error, EngineError::InvalidAdvanceAction(_)),
+            "unexpected restart rejection: {error:?}"
+        );
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            1,
+            "the injected restart must be rejected before a second launch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_attempt_policy_rejects_mid_step_restart_and_cleans_up_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-mid-step-restart"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let (cancel_flag, completion) = make_blocking_entry();
+        let engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>> =
+            Arc::new(Mutex::new(None));
+        let factory = BlockingFactory::new([(cancel_flag.clone(), completion.clone())]);
+        let starts = factory.execution_count.clone();
+        let frontend = CapturingFrontend::new([NextAction::RestartCurrentStep], engine_tx.clone());
+        let mut engine = WorkflowEngine::new_with_retry_policy(
+            &session,
+            workflow,
+            None,
+            Box::new(frontend),
+            Box::new(factory),
+            WorkflowRetryPolicy::SingleAttempt,
+        )
+        .expect("engine");
+        let tx = engine_tx.clone();
+        let mut task = tokio::spawn(async move { engine.run_to_completion().await });
+
+        let sender = match tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(sender) = tx.lock().unwrap().clone() {
+                    break sender;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        {
+            Ok(sender) => sender,
+            Err(_) => {
+                signal_completion(&completion, 1);
+                task.abort();
+                let _ = task.await;
+                panic!("engine sender must be installed");
+            }
+        };
+        if sender
+            .send(EngineRequest::OpenControlBoard {
+                step_name: "a".to_string(),
+            })
+            .is_err()
+        {
+            signal_completion(&completion, 1);
+            task.abort();
+            let _ = task.await;
+            panic!("open control board");
+        }
+
+        let joined = match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                signal_completion(&completion, 1);
+                task.abort();
+                let _ = task.await;
+                panic!("single-attempt restart rejection did not finish");
+            }
+        };
+        let error = joined
+            .expect("workflow task")
+            .expect_err("a frontend cannot inject a mid-step gated restart");
+        assert!(
+            matches!(error, EngineError::InvalidAdvanceAction(_)),
+            "unexpected mid-step restart rejection: {error:?}"
+        );
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            1,
+            "the invalid action must not consume the single-use gate twice"
+        );
+        assert!(
+            cancel_flag.load(Ordering::Relaxed),
+            "the owned first execution must still be stopped on rejection"
+        );
+    }
+
+    #[test]
+    fn single_attempt_policy_hides_cancel_to_previous_everywhere() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-cancel-actions"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let factory = FakeAgentExecutionFactory::always_success();
+        let mut engine = make_engine_with_frontend_and_retry_policy(
+            &session,
+            workflow,
+            factory,
+            FakeWorkflowFrontend::new([]),
+            WorkflowRetryPolicy::SingleAttempt,
+        );
+        engine.state.set_status("a", StepState::Succeeded);
+        engine.current_step_name = Some("b".to_string());
+
+        let ordinary = engine
+            .compute_available_actions()
+            .expect("ordinary available actions");
+        assert!(
+            !ordinary.can_cancel_to_previous_step,
+            "returning to a previous step would consume the single-use gate again"
+        );
+        assert!(ordinary.cancel_to_previous_unavailable_reason.is_some());
+
+        let failure = engine
+            .compute_failure_actions("b", 17)
+            .expect("failure available actions");
+        assert!(
+            !failure.can_cancel_to_previous_step,
+            "failure recovery cannot offer a previous-step relaunch"
+        );
+        assert!(failure.cancel_to_previous_unavailable_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn single_attempt_policy_rejects_injected_cancel_to_previous_without_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-injected-cancel-previous"),
+            Some("claude"),
+            vec![
+                make_step("a", &[], None),
+                make_step("b", &["a"], None),
+                make_step("c", &["b"], None),
+            ],
+        );
+        let factory = FakeAgentExecutionFactory::new([0, 0, 0]);
+        let starts = factory.execution_call_counter();
+        let frontend =
+            FakeWorkflowFrontend::new([NextAction::LaunchNext, NextAction::CancelToPreviousStep]);
+        let mut engine = make_engine_with_frontend_and_retry_policy(
+            &session,
+            workflow,
+            factory,
+            frontend,
+            WorkflowRetryPolicy::SingleAttempt,
+        );
+
+        let result = engine.run_to_completion().await;
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            2,
+            "only the original launches of a and b may occur"
+        );
+        assert!(matches!(
+            engine.state().status_of("a"),
+            Some(StepState::Succeeded)
+        ));
+        assert!(matches!(
+            engine.state().status_of("b"),
+            Some(StepState::Succeeded)
+        ));
+        let error = result.expect_err("an injected previous-step relaunch must be rejected");
+        assert!(matches!(error, EngineError::InvalidAdvanceAction(_)));
+    }
+
+    #[tokio::test]
+    async fn single_attempt_failure_board_rejects_cancel_to_previous_without_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-failure-cancel-previous"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let factory = FakeAgentExecutionFactory::new([0, 17]);
+        let starts = factory.execution_call_counter();
+        let frontend = FakeWorkflowFrontend::new([NextAction::CancelToPreviousStep]);
+        let boards = frontend.boards();
+        let mut engine = make_engine_with_frontend_and_retry_policy(
+            &session,
+            workflow,
+            factory,
+            frontend,
+            WorkflowRetryPolicy::SingleAttempt,
+        );
+
+        let first = engine.step_once().await.expect("launch a");
+        assert!(matches!(first.status, WorkflowStepStatus::Succeeded));
+        let second = engine.step_once().await.expect("launch b");
+        assert!(matches!(
+            second.status,
+            WorkflowStepStatus::Failed { exit_code: 17 }
+        ));
+        // SingleAttempt intentionally terminates a public run immediately on
+        // failure. Exercise the private failure-board injection boundary here
+        // without claiming that the public path displays this board.
+        let result = engine.handle_step_failure_interactive("b", 17);
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            2,
+            "failure recovery must not launch a again"
+        );
+        assert!(matches!(
+            engine.state().status_of("a"),
+            Some(StepState::Succeeded)
+        ));
+        assert!(matches!(
+            engine.state().status_of("b"),
+            Some(StepState::Failed { exit_code: 17, .. })
+        ));
+        let shown = boards.lock().unwrap();
+        let failure_board = shown.last().expect("failure board");
+        assert!(!failure_board.can_cancel_to_previous_step);
+        assert!(failure_board
+            .cancel_to_previous_unavailable_reason
+            .is_some());
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("failure recovery accepted a previous-step relaunch"),
+        };
+        assert!(matches!(error, EngineError::InvalidAdvanceAction(_)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_attempt_mid_step_cancel_to_previous_cleans_up_without_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = make_session(&tmp);
+        let workflow = make_workflow(
+            Some("wf-gated-mid-cancel-previous"),
+            Some("claude"),
+            vec![make_step("a", &[], None), make_step("b", &["a"], None)],
+        );
+        let (cancel_flag, completion) = make_blocking_entry();
+        let engine_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineRequest>>>> =
+            Arc::new(Mutex::new(None));
+        let factory = BlockingFactory::new([(cancel_flag.clone(), completion.clone())]);
+        let starts = factory.execution_count.clone();
+        let frontend =
+            CapturingFrontend::new([NextAction::CancelToPreviousStep], engine_tx.clone());
+        let mut engine = WorkflowEngine::new_with_retry_policy(
+            &session,
+            workflow,
+            None,
+            Box::new(frontend),
+            Box::new(factory),
+            WorkflowRetryPolicy::SingleAttempt,
+        )
+        .expect("engine");
+        engine.state.set_status("a", StepState::Succeeded);
+        engine.persist().expect("persist initial completed step");
+        let tx = engine_tx.clone();
+        let mut task = tokio::spawn(async move { engine.run_to_completion().await });
+
+        let sender = match tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(sender) = tx.lock().unwrap().clone() {
+                    break sender;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        {
+            Ok(sender) => sender,
+            Err(_) => {
+                signal_completion(&completion, 1);
+                task.abort();
+                let _ = task.await;
+                panic!("engine sender must be installed");
+            }
+        };
+        if sender
+            .send(EngineRequest::OpenControlBoard {
+                step_name: "b".to_string(),
+            })
+            .is_err()
+        {
+            signal_completion(&completion, 1);
+            task.abort();
+            let _ = task.await;
+            panic!("open control board");
+        }
+
+        let joined = match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                signal_completion(&completion, 1);
+                task.abort();
+                let _ = task.await;
+                panic!("single-attempt previous-step rejection did not finish");
+            }
+        };
+        let result = joined.expect("workflow task");
+        assert_eq!(
+            starts.load(Ordering::Relaxed),
+            1,
+            "the live b execution is the only launch in this invocation"
+        );
+        assert!(
+            cancel_flag.load(Ordering::Relaxed),
+            "the owned b execution must be stopped before rejection returns"
+        );
+        let saved = WorkflowStateStore::at_git_root(tmp.path())
+            .load(None, "wf-gated-mid-cancel-previous")
+            .expect("load persisted state")
+            .expect("persisted workflow state");
+        assert!(matches!(saved.status_of("a"), Some(StepState::Succeeded)));
+        let error = result.expect_err("mid-step previous-step relaunch must be rejected");
+        assert!(matches!(error, EngineError::InvalidAdvanceAction(_)));
     }
 }

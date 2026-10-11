@@ -41,6 +41,8 @@ pub enum FlagKind {
     OptionalPath,
     /// `--foo N` u16 number.
     U16,
+    /// `--foo N` usize number, must be >= 1.
+    UsizeAtLeastOne,
 }
 
 /// Default value for a flag.
@@ -76,6 +78,20 @@ impl FlagSpec {
     }
 }
 
+/// Spec for a flag that once existed but has since been removed. Frontends
+/// scan raw argv for these *before* clap parses, so a user who passes a
+/// retired flag sees a migration hint instead of clap's generic
+/// "unexpected argument" error. Keeping the retired-flag knowledge here — next
+/// to the live [`FlagSpec`]s — means future removals never touch `main.rs`.
+#[derive(Debug, Clone, Copy)]
+pub struct RemovedFlagSpec {
+    /// The retired long flag, leading dashes included (e.g. `--mount-ssh`).
+    /// Matches both the bare form and the `--flag=value` form.
+    pub name: &'static str,
+    /// Migration guidance appended after "`<name>` has been removed.".
+    pub hint: &'static str,
+}
+
 /// The kind of an argument (positional value).
 #[derive(Debug, Clone, Copy)]
 pub enum ArgumentKind {
@@ -104,6 +120,24 @@ pub enum FrontendKind {
     Api,
 }
 
+/// Whether a command needs a squad daemon gateway before it can be built,
+/// and how hard dispatch should try to get one.
+///
+/// This is the catalogue's answer to a question two frontends used to answer
+/// for themselves with hard-coded name lists (WI 0113 F-04). Dispatch reads
+/// it; no frontend does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayNeed {
+    /// The command never speaks to a squad daemon.
+    None,
+    /// The command cannot run without one: start a daemon if none is running,
+    /// and refuse when this process holds no key for it.
+    Running,
+    /// The command reports on a daemon if one is running and answers "not
+    /// running" otherwise. Starts nothing and mints no key.
+    IfRunning,
+}
+
 /// Spec for one command (or subcommand) in the catalogue.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandSpec {
@@ -116,8 +150,32 @@ pub struct CommandSpec {
     pub flags: &'static [FlagSpec],
     pub subcommands: &'static [&'static CommandSpec],
     /// Whether this command can be invoked via the API frontend.
-    /// Only `exec workflow` and `exec prompt` have this set to `true`.
+    ///
+    /// Interactive/PTY commands are deliberately excluded as long-term
+    /// policy: an HTTP request cannot safely own their terminal lifecycle.
+    /// `squad attach` is therefore `false` even though its non-presentation
+    /// flow is implemented in Layer 2 and shared by CLI and TUI.
     pub api_allowed: bool,
+
+    /// How `Dispatch` constructs this command (WI 0113 F-10).
+    ///
+    /// The catalogue owns the constructor the same way it owns the flags and
+    /// their defaults: `Dispatch::build_command` resolves the flags, looks the
+    /// spec up and calls this. A spec that is not itself runnable — the root,
+    /// a grouping parent such as `exec`, or a command still awaiting its
+    /// Layer 2 implementation — registers
+    /// [`build::unsupported`](crate::command::dispatch::build::unsupported).
+    pub build: crate::command::dispatch::build::CommandBuilder,
+
+    /// Whether dispatch must hold a squad gateway before this command is
+    /// built. `None` for everything outside the squad subtree.
+    pub gateway_need: GatewayNeed,
+    /// Whether this command needs a container-class agent runtime. The squad
+    /// subtree does: a sandbox-tier runtime cannot mount task directories or
+    /// run workflow setup/teardown steps, so every squad entry point must
+    /// fail fast with the shared refusal rather than start work it cannot
+    /// finish.
+    pub requires_container_tier: bool,
 }
 
 impl CommandSpec {
@@ -204,6 +262,28 @@ impl CommandCatalogue {
     /// the runtime.
     pub fn requires_runtime(&self, path: &[&str]) -> bool {
         !matches!(path.first(), Some(&"config"))
+    }
+
+    /// Scan a raw argv for any [removed flag](RemovedFlagSpec). Returns the
+    /// composed migration message ("`<flag>` has been removed. <hint>") for the
+    /// first removed flag found, or `None` when argv contains none. Frontends
+    /// call this before clap parsing so a retired flag surfaces the hint
+    /// instead of clap's generic "unexpected argument" error. Both the bare
+    /// `--flag` and the `--flag=value` forms are matched.
+    pub fn removed_flag_hint<I, S>(&self, args: I) -> Option<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for arg in args {
+            let arg = arg.as_ref();
+            for spec in REMOVED_FLAGS {
+                if arg == spec.name || arg.starts_with(&format!("{}=", spec.name)) {
+                    return Some(format!("{} has been removed. {}", spec.name, spec.hint));
+                }
+            }
+        }
+        None
     }
 
     /// Validate that a command path is reachable by the given frontend,
@@ -294,6 +374,9 @@ const ROOT: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::unsupported,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     flags: &[
         FlagSpec {
             long: "build",
@@ -338,12 +421,67 @@ const ROOT: CommandSpec = CommandSpec {
         &CONFIG,
         &EXEC,
         &API_SERVER,
+        &SQUAD,
         &REMOTE,
         &NEW,
+        &CLEAN,
     ],
 };
 
 const PATH_ALIASES: &[(&[&str], &[&str])] = &[];
+
+/// Flags that have been removed. Scanned by [`CommandCatalogue::removed_flag_hint`]
+/// before clap parsing so retired flags yield a migration hint. Add an entry
+/// here when a flag is dropped; `main.rs` needs no changes.
+const REMOVED_FLAGS: &[RemovedFlagSpec] = &[
+    // WI-0082: `--mount-ssh` was removed in favour of `--overlay ssh()`.
+    RemovedFlagSpec {
+        name: "--mount-ssh",
+        hint: "Pass `--overlay ssh()` instead (or set `overlays = [\"ssh()\"]` \
+               in a per-step workflow entry). See `docs/08-overlays.md`.",
+    },
+];
+
+// ── clean ─────────────────────────────────────────────────────────────────────
+
+const CLEAN: CommandSpec = CommandSpec {
+    name: "clean",
+    aliases: &[],
+    help: "Remove stopped awman containers, completed workflow data, and dangling images.",
+    long_help: None,
+    arguments: &[],
+    flags: &[
+        FlagSpec {
+            long: "yes",
+            short: Some('y'),
+            help: "Skip the confirmation prompt (for scripting).",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "dry-run",
+            short: None,
+            help: "List what would be removed without deleting anything.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+    ],
+    // Blocked at the catalogue layer for the API frontend; never reaches
+    // command dispatch via the API.
+    api_allowed: false,
+    build: crate::command::dispatch::build::clean,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
+    subcommands: &[],
+};
 
 // ── init ─────────────────────────────────────────────────────────────────────
 
@@ -356,6 +494,7 @@ const AGENT_VALUES: &[&str] = &[
     "copilot",
     "crush",
     "cline",
+    "agy",
     "antigravity",
 ];
 
@@ -390,6 +529,9 @@ const INIT: CommandSpec = CommandSpec {
         },
     ],
     api_allowed: false,
+    build: crate::command::dispatch::build::init,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -470,6 +612,9 @@ const READY: CommandSpec = CommandSpec {
         },
     ],
     api_allowed: false,
+    build: crate::command::dispatch::build::ready,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -483,6 +628,9 @@ const CHAT: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &AGENT_RUN_FLAGS_NO_WORKTREE,
     api_allowed: false,
+    build: crate::command::dispatch::build::chat,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -496,6 +644,9 @@ const SPECS: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::unsupported,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[&SPECS_AMEND],
 };
 
@@ -535,6 +686,9 @@ const SPECS_AMEND: CommandSpec = CommandSpec {
         },
     ],
     api_allowed: false,
+    build: crate::command::dispatch::build::specs,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -558,6 +712,9 @@ const STATUS: CommandSpec = CommandSpec {
         optional: true,
     }],
     api_allowed: false,
+    build: crate::command::dispatch::build::status,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -571,6 +728,9 @@ const CONFIG: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::unsupported,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[&CONFIG_SHOW, &CONFIG_GET, &CONFIG_SET],
 };
 
@@ -582,6 +742,9 @@ const CONFIG_SHOW: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::config,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -598,6 +761,9 @@ const CONFIG_GET: CommandSpec = CommandSpec {
     }],
     flags: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::config,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -632,6 +798,9 @@ const CONFIG_SET: CommandSpec = CommandSpec {
         optional: true,
     }],
     api_allowed: false,
+    build: crate::command::dispatch::build::config,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -645,6 +814,9 @@ const EXEC: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::unsupported,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[&EXEC_PROMPT, &EXEC_WORKFLOW],
 };
 
@@ -655,12 +827,19 @@ const EXEC_PROMPT: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[ArgumentSpec {
         name: "prompt",
+        // Greedy trailing positional: every remaining token joins into one
+        // prompt string. Declaring it here keeps the "join positionals with
+        // spaces" behavior spec-driven across all frontends instead of a
+        // per-frontend special case (work item 0097, Finding A).
         help: "The prompt text to send to the agent.",
-        kind: ArgumentKind::String,
+        kind: ArgumentKind::TrailingVarArgs,
         optional: true,
     }],
     flags: &EXEC_PROMPT_FLAGS,
     api_allowed: true,
+    build: crate::command::dispatch::build::exec_prompt,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -671,12 +850,17 @@ const EXEC_WORKFLOW: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[ArgumentSpec {
         name: "workflow",
-        help: "Path to the workflow file.",
+        // Optional at the catalogue level so `--dynamic` can omit it; the
+        // command layer still requires it for every non-dynamic invocation.
+        help: "Path to the workflow file (omit with --dynamic).",
         kind: ArgumentKind::Path,
-        optional: false,
+        optional: true,
     }],
     flags: &EXEC_WORKFLOW_FLAGS,
     api_allowed: true,
+    build: crate::command::dispatch::build::exec_workflow,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -690,6 +874,9 @@ const API_SERVER: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::unsupported,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[
         &API_SERVER_START,
         &API_SERVER_KILL,
@@ -773,6 +960,9 @@ const API_SERVER_START: CommandSpec = CommandSpec {
         },
     ],
     api_allowed: false,
+    build: crate::command::dispatch::build::api_server,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -784,6 +974,9 @@ const API_SERVER_KILL: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::api_server,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -795,6 +988,9 @@ const API_SERVER_LOGS: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::api_server,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -806,6 +1002,716 @@ const API_SERVER_STATUS: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::api_server,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
+    subcommands: &[],
+};
+
+// ── squad ────────────────────────────────────────────────────────────────────
+
+const SQUAD: CommandSpec = CommandSpec {
+    name: "squad",
+    aliases: &[],
+    help: "Manage the squad task daemon and scheduled tasks.",
+    long_help: None,
+    arguments: &[],
+    flags: &[
+        FlagSpec {
+            long: "non-interactive",
+            short: Some('n'),
+            help: "Print the squad status summary instead of opening the TUI.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliAndTui,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "json",
+            short: None,
+            help: "Emit JSON output.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &["non-interactive"],
+            optional: true,
+        },
+    ],
+    api_allowed: false,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::IfRunning,
+    requires_container_tier: true,
+    subcommands: &[
+        &SQUAD_START,
+        &SQUAD_STOP,
+        &SQUAD_STATUS,
+        &SQUAD_LOGS,
+        &SQUAD_ADD,
+        &SQUAD_EDIT,
+        &SQUAD_LIST,
+        &SQUAD_SHOW,
+        &SQUAD_REMOVE,
+        &SQUAD_PAUSE,
+        &SQUAD_RESUME,
+        &SQUAD_TRIGGER,
+        &SQUAD_CANCEL,
+        &SQUAD_ATTACH,
+        &SQUAD_ENV,
+    ],
+};
+
+const SQUAD_START: CommandSpec = CommandSpec {
+    name: "start",
+    aliases: &[],
+    help: "Start the squad daemon.",
+    long_help: None,
+    arguments: &[],
+    flags: &[
+        FlagSpec {
+            long: "port",
+            short: None,
+            help: "Port to listen on (0 selects an OS-assigned port).",
+            kind: FlagKind::U16,
+            default: FlagDefault::U16(0),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "background",
+            short: None,
+            help: "Daemonize via the OS process manager.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "refresh-key",
+            short: None,
+            help: "Regenerate the squad key and print its AWMAN_SQUAD_KEY export snippet.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "dangerously-skip-auth",
+            short: None,
+            help: "Skip key creation and authentication for this run (loopback-only).",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+    ],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+
+const SQUAD_STOP: CommandSpec = CommandSpec {
+    name: "stop",
+    aliases: &["kill"],
+    help: "Stop the squad daemon.",
+    long_help: None,
+    arguments: &[],
+    flags: &[],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+
+const SQUAD_STATUS: CommandSpec = CommandSpec {
+    name: "status",
+    aliases: &[],
+    help: "Show squad daemon status.",
+    long_help: None,
+    arguments: &[],
+    flags: &[FlagSpec {
+        long: "json",
+        short: None,
+        help: "Emit JSON output.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    }],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::IfRunning,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+
+const SQUAD_LOGS: CommandSpec = CommandSpec {
+    name: "logs",
+    aliases: &[],
+    help: "Show the squad daemon log.",
+    long_help: None,
+    arguments: &[],
+    flags: &[FlagSpec {
+        long: "follow",
+        short: Some('f'),
+        help: "Follow the log as it grows.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    }],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+
+/// The task-scoped agent pool, shared verbatim by `squad add` and
+/// `squad edit` so both write the same `config.json` block (WI 0110).
+const SQUAD_AGENT_MODELS_FLAG: FlagSpec = FlagSpec {
+    long: "agent-models",
+    short: None,
+    help: "Agents and models this task may use: <agent>=<model>[,<model>...]. Repeatable.",
+    kind: FlagKind::VecString,
+    default: FlagDefault::EmptyVec,
+    frontends: FrontendVisibility::All,
+    conflicts_with: &[],
+    implies: &[],
+    optional: true,
+};
+
+const SQUAD_ADD: CommandSpec = CommandSpec {
+    name: "add",
+    aliases: &[],
+    help: "Create a squad task.",
+    long_help: None,
+    arguments: &[],
+    flags: &[
+        FlagSpec {
+            long: "name",
+            short: None,
+            help: "Task slug.",
+            kind: FlagKind::String,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: false,
+        },
+        FlagSpec {
+            long: "description",
+            short: None,
+            help: "Task description.",
+            kind: FlagKind::String,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: false,
+        },
+        FlagSpec {
+            long: "repo",
+            short: None,
+            help: "Legacy synonym for `--workspace <path>`; ignored when `--workspace` is given.",
+            kind: FlagKind::Path,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "interval",
+            short: None,
+            help: "Evaluation interval (for example 6h).",
+            kind: FlagKind::String,
+            default: FlagDefault::Str("6h"),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "agent",
+            short: None,
+            help: "Task-specific leader agent.",
+            kind: FlagKind::String,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "model",
+            short: None,
+            help: "Task-specific leader model.",
+            kind: FlagKind::String,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "workspace",
+            short: None,
+            help: "Task workspace: `default` for the durable per-task workspace, or a folder/repo path. Defaults to `default`.",
+            kind: FlagKind::String,
+            // Deliberately no catalogue default: Dispatch must be able to tell
+            // "not given" from "given as default", because an absent
+            // `--workspace` falls back to the legacy `--repo` before settling
+            // on the durable workspace.
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "overlay",
+            short: None,
+            help: "Overlay the task's containers get: dir()/ssh()/env()/skill(). Repeatable.",
+            kind: FlagKind::VecString,
+            default: FlagDefault::EmptyVec,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "mount-scope",
+            short: None,
+            help: "Repository scope mounted for scheduled runs (custom git-repo workspaces only).",
+            kind: FlagKind::Enum(&["cwd", "gitroot"]),
+            default: FlagDefault::Str("gitroot"),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        SQUAD_AGENT_MODELS_FLAG,
+        FlagSpec {
+            long: "interview",
+            short: None,
+            help: "Collect task fields interactively.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliAndTui,
+            conflicts_with: &["non-interactive"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "non-interactive",
+            short: Some('n'),
+            help: "Never prompt: refuse anything needing a confirmation instead of asking.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliAndTui,
+            conflicts_with: &["interview"],
+            implies: &[],
+            optional: true,
+        },
+    ],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::Running,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+
+const SQUAD_LIST: CommandSpec = CommandSpec {
+    name: "list",
+    aliases: &[],
+    help: "List squad tasks.",
+    long_help: None,
+    arguments: &[],
+    flags: &[FlagSpec {
+        long: "json",
+        short: None,
+        help: "Emit JSON output.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    }],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::Running,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+
+const SQUAD_NAME_ARGUMENT: ArgumentSpec = ArgumentSpec {
+    name: "name",
+    help: "Task name.",
+    kind: ArgumentKind::String,
+    optional: false,
+};
+
+const SQUAD_SHOW: CommandSpec = CommandSpec {
+    name: "show",
+    aliases: &[],
+    help: "Show a squad task.",
+    long_help: None,
+    arguments: &[SQUAD_NAME_ARGUMENT],
+    flags: &[FlagSpec {
+        long: "json",
+        short: None,
+        help: "Emit JSON output.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    }],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::Running,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+/// `squad edit` carries every field a task may change after creation. `name`,
+/// `workspace` and `mount-scope` are absent on purpose: they are captured once
+/// at creation and define the task's identity and isolation (WI 0110).
+const SQUAD_EDIT: CommandSpec = CommandSpec {
+    name: "edit",
+    aliases: &[],
+    help: "Edit an existing squad task.",
+    long_help: Some(
+        "Change a task's description, schedule, leader agent/model, overlays, or agent pool. \
+         A task's name, workspace and mount scope are fixed at creation and cannot be edited; \
+         changing those means creating a new task. Every flag is optional, but at least one \
+         must be given unless --interview is used.",
+    ),
+    arguments: &[SQUAD_NAME_ARGUMENT],
+    flags: &[
+        FlagSpec {
+            long: "description",
+            short: None,
+            help: "Replace the task description.",
+            kind: FlagKind::String,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "interval",
+            short: None,
+            help: "Replace the evaluation interval (for example 6h).",
+            kind: FlagKind::String,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "agent",
+            short: None,
+            help: "Replace the task-specific leader agent.",
+            kind: FlagKind::String,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["clear-agent"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "clear-agent",
+            short: None,
+            help: "Drop the task's own leader agent, falling back to the squad default.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["agent"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "model",
+            short: None,
+            help: "Replace the task-specific leader model.",
+            kind: FlagKind::String,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["clear-model"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "clear-model",
+            short: None,
+            help: "Drop the task's own leader model, falling back to the squad default.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["model"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "overlay",
+            short: None,
+            help: "Replace the task's overlays: dir()/ssh()/env()/skill(). Repeatable.",
+            kind: FlagKind::VecString,
+            default: FlagDefault::EmptyVec,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["clear-overlays"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "clear-overlays",
+            short: None,
+            help: "Remove every overlay from the task.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["overlay"],
+            implies: &[],
+            optional: true,
+        },
+        SQUAD_AGENT_MODELS_FLAG,
+        FlagSpec {
+            long: "clear-agent-models",
+            short: None,
+            help: "Remove the task's own agent pool, inheriting the global squad settings.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["agent-models"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "interview",
+            short: None,
+            help: "Collect the edited fields interactively, prefilled with the current values.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliAndTui,
+            conflicts_with: &["non-interactive"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "non-interactive",
+            short: Some('n'),
+            help: "Never prompt: refuse anything needing a confirmation instead of asking.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::CliAndTui,
+            conflicts_with: &["interview"],
+            implies: &[],
+            optional: true,
+        },
+    ],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::Running,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+
+const SQUAD_REMOVE: CommandSpec = CommandSpec {
+    name: "remove",
+    aliases: &[],
+    help: "Remove a squad task.",
+    long_help: None,
+    arguments: &[SQUAD_NAME_ARGUMENT],
+    flags: &[FlagSpec {
+        long: "yes",
+        short: Some('y'),
+        help: "Do not prompt for confirmation.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::CliAndTui,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    }],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::Running,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+const SQUAD_PAUSE: CommandSpec = CommandSpec {
+    name: "pause",
+    aliases: &[],
+    help: "Pause a squad task.",
+    long_help: None,
+    arguments: &[SQUAD_NAME_ARGUMENT],
+    flags: &[],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::Running,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+const SQUAD_RESUME: CommandSpec = CommandSpec {
+    name: "resume",
+    aliases: &[],
+    help: "Resume a squad task.",
+    long_help: None,
+    arguments: &[SQUAD_NAME_ARGUMENT],
+    flags: &[],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::Running,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+const SQUAD_TRIGGER: CommandSpec = CommandSpec {
+    name: "trigger",
+    aliases: &[],
+    help: "Evaluate a squad task now, ignoring its schedule.",
+    long_help: Some(
+        "Ask the squad daemon to evaluate a task on its next scheduler tick, whatever \
+         its interval says and whatever backoff is outstanding. The task's interval is \
+         not changed: the trigger fires exactly one evaluation, after which the task \
+         returns to its normal schedule. A paused task is refused — resume it first.",
+    ),
+    arguments: &[SQUAD_NAME_ARGUMENT],
+    flags: &[],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::Running,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+const SQUAD_CANCEL: CommandSpec = CommandSpec {
+    name: "cancel",
+    aliases: &[],
+    help: "Cancel a squad task's in-progress run.",
+    long_help: Some(
+        "Stop the run a squad task is executing right now: its evaluation is abandoned, \
+         every agent container it started is stopped, and the run is recorded as \
+         canceled in the task's history. The task keeps its schedule and is evaluated \
+         again when next due. Fails when the task has no run in progress.",
+    ),
+    arguments: &[SQUAD_NAME_ARGUMENT],
+    flags: &[],
+    api_allowed: true,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::Running,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+const SQUAD_ATTACH: CommandSpec = CommandSpec {
+    name: "attach",
+    aliases: &[],
+    help: "Attach to a running squad task container.",
+    long_help: None,
+    arguments: &[SQUAD_NAME_ARGUMENT],
+    flags: &[FlagSpec {
+        long: "container",
+        short: None,
+        help: "Running container ID when multiple are active.",
+        kind: FlagKind::String,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliAndTui,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    }],
+    api_allowed: false,
+    build: crate::command::dispatch::build::squad_attach,
+    gateway_need: GatewayNeed::Running,
+    requires_container_tier: true,
+    subcommands: &[],
+};
+
+/// `squad env` — the one home for the daemon's env coverage (WI 0116 §6d).
+///
+/// `api_allowed: false` is deliberate and is a security property, not an
+/// oversight: an API-allowed leaf can be driven through the `/v1/commands`
+/// `{subcommand, args}` envelope, where CLI-arg-shaped strings drift into
+/// tracing spans and error text. Payload values must never travel that way, so
+/// the whole leaf stays off the API front door. The daemon's own typed
+/// `/v1/daemon/env` route is the only way env data crosses the socket.
+const SQUAD_ENV: CommandSpec = CommandSpec {
+    name: "env",
+    aliases: &[],
+    help: "Show which env() values the squad daemon has, and where they came from.",
+    long_help: Some(
+        "Report every environment variable the squad daemon needs — the union of every \
+         env(NAME) overlay across the task store, the daemon's own config and \
+         AWMAN_OVERLAYS — with whether the daemon currently holds a value, where that \
+         value came from (this shell, a previous push, or the OS keychain at startup), \
+         and how long any missing one has been missing.\n\n\
+         Values are never printed: this command reports only whether one is present. \
+         Running it with no flag also performs the ordinary coverage check, which sends \
+         a value only when it actually differs from what the daemon holds. --push \
+         re-sends every value this shell has regardless, which is what to reach for \
+         after rotating a token. --clear removes the daemon's persisted keychain item; \
+         the running daemon keeps the values it already holds.",
+    ),
+    arguments: &[],
+    flags: &[
+        FlagSpec {
+            long: "push",
+            short: None,
+            help: "Push every required value this shell has, whether or not it differs.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "clear",
+            short: None,
+            help: "Remove the daemon's persisted keychain item.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "json",
+            short: None,
+            help: "Emit JSON output.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &[],
+            implies: &[],
+            optional: true,
+        },
+    ],
+    api_allowed: false,
+    build: crate::command::dispatch::build::squad,
+    gateway_need: GatewayNeed::Running,
+    requires_container_tier: true,
     subcommands: &[],
 };
 
@@ -819,6 +1725,9 @@ const REMOTE: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::unsupported,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[&REMOTE_SESSION, &REMOTE_EXEC],
 };
 
@@ -832,6 +1741,9 @@ const REMOTE_EXEC: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::unsupported,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[&REMOTE_EXEC_WORKFLOW, &REMOTE_EXEC_PROMPT],
 };
 
@@ -848,6 +1760,9 @@ const REMOTE_EXEC_WORKFLOW: CommandSpec = CommandSpec {
     }],
     flags: &REMOTE_EXEC_WORKFLOW_FLAGS,
     api_allowed: false,
+    build: crate::command::dispatch::build::remote,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -858,12 +1773,17 @@ const REMOTE_EXEC_PROMPT: CommandSpec = CommandSpec {
     long_help: None,
     arguments: &[ArgumentSpec {
         name: "prompt",
+        // Greedy trailing positional (see EXEC_PROMPT): joins remaining tokens
+        // into one prompt string, spec-driven for every frontend.
         help: "The prompt text to send to the agent.",
-        kind: ArgumentKind::String,
+        kind: ArgumentKind::TrailingVarArgs,
         optional: false,
     }],
     flags: &REMOTE_EXEC_PROMPT_FLAGS,
     api_allowed: false,
+    build: crate::command::dispatch::build::remote,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -871,8 +1791,8 @@ const REMOTE_EXEC_PROMPT: CommandSpec = CommandSpec {
 //
 // Per the work item: `remote exec workflow` accepts the same flags as the
 // local `exec workflow`, minus flags that make no sense remotely (`--workdir`
-// is implicit, `--worktree` is a server-side concern). Plus remote-transport
-// flags (--remote-addr, --session, --api-key, --follow).
+// is implicit and `--worktree` is a server-side concern). Plus remote-transport
+// flags (`--remote-addr`, `--session`, `--api-key`, `--follow`).
 //
 // The flag list is built at compile time by const fn so that any future
 // addition to AGENT_RUN_FLAGS_NO_WORKTREE / EXEC_WORKFLOW_FLAGS is picked up
@@ -1016,6 +1936,9 @@ const REMOTE_SESSION: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::unsupported,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[&REMOTE_SESSION_START, &REMOTE_SESSION_KILL],
 };
 
@@ -1027,6 +1950,9 @@ const REMOTE_SESSION_START: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &REMOTE_SESSION_START_FLAGS,
     api_allowed: false,
+    build: crate::command::dispatch::build::remote,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -1112,6 +2038,9 @@ const REMOTE_SESSION_KILL: CommandSpec = CommandSpec {
     }],
     flags: &REMOTE_SESSION_KILL_FLAGS,
     api_allowed: false,
+    build: crate::command::dispatch::build::remote,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -1150,6 +2079,9 @@ const NEW: CommandSpec = CommandSpec {
     arguments: &[],
     flags: &[],
     api_allowed: false,
+    build: crate::command::dispatch::build::unsupported,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[&NEW_SPEC, &NEW_WORKFLOW, &NEW_SKILL],
 };
 
@@ -1195,6 +2127,9 @@ const NEW_SPEC: CommandSpec = CommandSpec {
         },
     ],
     api_allowed: false,
+    build: crate::command::dispatch::build::new,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -1253,6 +2188,9 @@ const NEW_WORKFLOW: CommandSpec = CommandSpec {
         },
     ],
     api_allowed: false,
+    build: crate::command::dispatch::build::new,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -1296,8 +2234,44 @@ const NEW_SKILL: CommandSpec = CommandSpec {
             implies: &[],
             optional: true,
         },
+        FlagSpec {
+            long: "pull",
+            short: None,
+            help: "Pull (or refresh) a published skills library from GitHub, e.g. github.com/obra/superpowers.",
+            kind: FlagKind::OptionalString,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["pull-all", "interview", "global"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "pull-all",
+            short: None,
+            help: "Refresh every previously-pulled skills library.",
+            kind: FlagKind::Bool,
+            default: FlagDefault::Bool(false),
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["pull", "subdir", "interview", "global"],
+            implies: &[],
+            optional: true,
+        },
+        FlagSpec {
+            long: "subdir",
+            short: None,
+            help: "Subdirectory inside the pulled repo containing skills (default: skills).",
+            kind: FlagKind::OptionalString,
+            default: FlagDefault::None,
+            frontends: FrontendVisibility::All,
+            conflicts_with: &["pull-all"],
+            implies: &[],
+            optional: true,
+        },
     ],
     api_allowed: false,
+    build: crate::command::dispatch::build::new,
+    gateway_need: GatewayNeed::None,
+    requires_container_tier: false,
     subcommands: &[],
 };
 
@@ -1306,7 +2280,7 @@ const NEW_SKILL: CommandSpec = CommandSpec {
 /// Agent-run flag set used by `chat` and `exec prompt` (no worktree, no
 /// workflow). All optional. Mode flags `yolo` / `auto` / `plan` are mutually
 /// exclusive.
-const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 8] = [
+const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 11] = [
     FlagSpec {
         long: "non-interactive",
         short: Some('n'),
@@ -1335,6 +2309,17 @@ const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 8] = [
         help: "Mount the host Docker daemon socket into the agent container.",
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &["startup-gate-control"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "launch-mode",
+        short: None,
+        help: "Launch the agent over stdio or ACP.",
+        kind: FlagKind::Enum(&["stdio", "acp"]),
+        default: FlagDefault::None,
         frontends: FrontendVisibility::All,
         conflicts_with: &[],
         implies: &[],
@@ -1395,11 +2380,33 @@ const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 8] = [
         implies: &[],
         optional: true,
     },
+    FlagSpec {
+        long: "startup-gate-control",
+        short: None,
+        help: "Gate agent startup using the request and release files in DIR.",
+        kind: FlagKind::OptionalPath,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &["allow-docker"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "startup-gate-timeout",
+        short: None,
+        help: "Seconds to wait for startup-gate release (default 120, range 1..=3600).",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
 ];
 
 /// Agent-run flags for `exec prompt` — extends `AGENT_RUN_FLAGS_NO_WORKTREE`
 /// with `--issue`. Scoped to `exec prompt` only; `chat` retains the base set.
-const EXEC_PROMPT_FLAGS: [FlagSpec; 9] = [
+const EXEC_PROMPT_FLAGS: [FlagSpec; 12] = [
     FlagSpec {
         long: "non-interactive",
         short: Some('n'),
@@ -1428,6 +2435,17 @@ const EXEC_PROMPT_FLAGS: [FlagSpec; 9] = [
         help: "Mount the host Docker daemon socket into the agent container.",
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &["startup-gate-control"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "launch-mode",
+        short: None,
+        help: "Launch the agent over stdio or ACP.",
+        kind: FlagKind::Enum(&["stdio", "acp"]),
+        default: FlagDefault::None,
         frontends: FrontendVisibility::All,
         conflicts_with: &[],
         implies: &[],
@@ -1499,9 +2517,31 @@ const EXEC_PROMPT_FLAGS: [FlagSpec; 9] = [
         implies: &[],
         optional: true,
     },
+    FlagSpec {
+        long: "startup-gate-control",
+        short: None,
+        help: "Gate agent startup using the request and release files in DIR.",
+        kind: FlagKind::OptionalPath,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &["allow-docker"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "startup-gate-timeout",
+        short: None,
+        help: "Seconds to wait for startup-gate release (default 120, range 1..=3600).",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
 ];
 
-const EXEC_WORKFLOW_FLAGS: [FlagSpec; 11] = [
+const EXEC_WORKFLOW_FLAGS: [FlagSpec; 17] = [
     FlagSpec {
         long: "work-item",
         short: None,
@@ -1541,6 +2581,17 @@ const EXEC_WORKFLOW_FLAGS: [FlagSpec; 11] = [
         help: "Mount the host Docker daemon socket into the agent container.",
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &["startup-gate-control"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "launch-mode",
+        short: None,
+        help: "Launch the agent over stdio or ACP.",
+        kind: FlagKind::Enum(&["stdio", "acp"]),
+        default: FlagDefault::None,
         frontends: FrontendVisibility::All,
         conflicts_with: &[],
         implies: &[],
@@ -1623,17 +2674,159 @@ const EXEC_WORKFLOW_FLAGS: [FlagSpec; 11] = [
         implies: &[],
         optional: true,
     },
+    FlagSpec {
+        long: "dynamic",
+        short: None,
+        help: "Have a leader agent design and run a workflow for --work-item. \
+               Implies --yolo, --worktree, and context(workflow); the positional \
+               workflow path must be omitted.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        // Mutual exclusions (positional path, --plan) and the --work-item
+        // requirement are enforced in the command layer because --yolo may be
+        // implied rather than explicitly supplied (WI-0092 §3).
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "leader",
+        short: None,
+        help: "Agent and model for the dynamic leader, as agent::model \
+               (e.g. claude::claude-opus-4-8). Only valid with --dynamic.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "max-concurrent",
+        short: None,
+        help: "Cap on concurrently-running workflow steps (must be >= 1).",
+        kind: FlagKind::UsizeAtLeastOne,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "startup-gate-control",
+        short: None,
+        help: "Gate agent startup using the request and release files in DIR.",
+        kind: FlagKind::OptionalPath,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &["allow-docker"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "startup-gate-timeout",
+        short: None,
+        help: "Seconds to wait for startup-gate release (default 120, range 1..=3600).",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
 ];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Walk every spec in the catalogue, root included, with its path.
+    fn all_specs() -> Vec<(Vec<&'static str>, &'static CommandSpec)> {
+        fn walk(
+            spec: &'static CommandSpec,
+            path: Vec<&'static str>,
+            out: &mut Vec<(Vec<&'static str>, &'static CommandSpec)>,
+        ) {
+            out.push((path.clone(), spec));
+            for sub in spec.subcommands {
+                let mut child = path.clone();
+                child.push(sub.name);
+                walk(sub, child, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(CommandCatalogue::get().root(), Vec::new(), &mut out);
+        out
+    }
+
+    /// A `FlagDefault` of the wrong shape for its `FlagKind` would be silently
+    /// dropped when the flag is resolved (`dispatch::resolved::apply_default`
+    /// leaves the read value alone), so the mismatch is caught here instead.
+    #[test]
+    fn every_flag_default_matches_its_kind() {
+        for (path, spec) in all_specs() {
+            for flag in spec.flags {
+                let ok = matches!(
+                    (flag.kind, flag.default),
+                    (_, FlagDefault::None)
+                        | (FlagKind::Bool, FlagDefault::Bool(_))
+                        | (
+                            FlagKind::String | FlagKind::OptionalString | FlagKind::Enum(_),
+                            FlagDefault::Str(_)
+                        )
+                        | (FlagKind::U16, FlagDefault::U16(_))
+                        | (FlagKind::VecString, FlagDefault::EmptyVec)
+                );
+                assert!(
+                    ok,
+                    "{} --{}: default {:?} does not match kind {:?}",
+                    path.join(" "),
+                    flag.long,
+                    flag.default,
+                    flag.kind
+                );
+            }
+            // An enum default must name one of the enum's own values.
+            for flag in spec.flags {
+                if let (FlagKind::Enum(values), FlagDefault::Str(default)) =
+                    (flag.kind, flag.default)
+                {
+                    assert!(
+                        values.contains(&default),
+                        "{} --{}: default {default:?} is not one of {values:?}",
+                        path.join(" "),
+                        flag.long
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn lookup_top_level_returns_spec() {
         let cat = CommandCatalogue::get();
         let spec = cat.lookup(&["init"]).expect("init must be present");
         assert_eq!(spec.name, "init");
+    }
+
+    #[test]
+    fn init_agent_catalogue_exposes_agy_and_accepts_the_legacy_input_alias() {
+        let init = CommandCatalogue::get()
+            .lookup(&["init"])
+            .expect("init must be present");
+        let agent = init.find_flag("agent").expect("init must expose --agent");
+        let FlagKind::Enum(values) = agent.kind else {
+            panic!("init --agent must remain an enum")
+        };
+        assert!(
+            values.contains(&"agy"),
+            "canonical agy value missing: {values:?}"
+        );
+        assert!(
+            values.contains(&"antigravity"),
+            "migration alias must remain accepted as input: {values:?}"
+        );
     }
 
     #[test]
@@ -1718,7 +2911,11 @@ mod tests {
         let prompt = cat.lookup(&["remote", "exec", "prompt"]).unwrap();
         assert_eq!(prompt.arguments.len(), 1);
         assert_eq!(prompt.arguments[0].name, "prompt");
-        assert!(matches!(prompt.arguments[0].kind, ArgumentKind::String));
+        // Greedy trailing positional so multi-word prompts join spec-driven.
+        assert!(matches!(
+            prompt.arguments[0].kind,
+            ArgumentKind::TrailingVarArgs
+        ));
     }
 
     // ─── Data-table tests ─────────────────────────────────────────────────────
@@ -2140,5 +3337,183 @@ mod tests {
         assert_eq!(set.arguments.len(), 2);
         let names: Vec<&str> = set.arguments.iter().map(|a| a.name).collect();
         assert!(names.contains(&"field") && names.contains(&"value"));
+    }
+
+    // ── WI-0098 Finding B: removed-flag migration hints ───────────────────────
+
+    #[test]
+    fn removed_flag_hint_returns_hint_for_mount_ssh() {
+        let cat = CommandCatalogue::get();
+        let hint = cat
+            .removed_flag_hint(["chat", "--mount-ssh"])
+            .expect("--mount-ssh must yield a migration hint");
+        assert!(
+            hint.starts_with("--mount-ssh has been removed."),
+            "hint must name the removed flag; got: {hint}"
+        );
+        assert!(
+            hint.contains("ssh()") || hint.contains("--overlay"),
+            "hint must point at the `--overlay ssh()` replacement; got: {hint}"
+        );
+    }
+
+    #[test]
+    fn removed_flag_hint_matches_value_form() {
+        let cat = CommandCatalogue::get();
+        // `--mount-ssh=x` (the `=`-bearing form) must be intercepted too.
+        let hint = cat
+            .removed_flag_hint(["chat", "--mount-ssh=x"])
+            .expect("--mount-ssh=x must yield the same migration hint");
+        assert!(hint.starts_with("--mount-ssh has been removed."));
+    }
+
+    #[test]
+    fn removed_flag_hint_none_for_live_flags() {
+        let cat = CommandCatalogue::get();
+        // Live flags and near-misses must not trigger a removed-flag hint.
+        assert!(cat
+            .removed_flag_hint(["chat", "--overlay", "ssh()"])
+            .is_none());
+        assert!(cat
+            .removed_flag_hint(["chat", "--non-interactive"])
+            .is_none());
+        // A flag that merely contains the removed name as a substring must not match.
+        assert!(cat
+            .removed_flag_hint(["chat", "--mount-ssh-extra"])
+            .is_none());
+        assert!(cat.removed_flag_hint(Vec::<String>::new()).is_none());
+    }
+
+    #[test]
+    fn launch_mode_rejects_unknown_enum_value() {
+        let cat = CommandCatalogue::get();
+        let err = cat
+            .parse_raw_args(
+                &["exec", "prompt"],
+                &["--launch-mode".to_string(), "bogus".to_string()],
+            )
+            .expect_err("an unrecognized launch mode must be rejected");
+
+        match err {
+            crate::command::error::CommandError::InvalidFlagValue {
+                command,
+                flag,
+                reason,
+            } => {
+                assert_eq!(command, vec!["exec".to_string(), "prompt".to_string()]);
+                assert_eq!(flag, "launch-mode");
+                assert_eq!(reason, "'bogus' is not one of [\"stdio\", \"acp\"]");
+            }
+            other => panic!("expected InvalidFlagValue, got {other:?}"),
+        }
+    }
+
+    /// Every squad subcommand that talks to the daemon declares the need, and
+    /// the three lifecycle commands declare none.
+    ///
+    /// This is the guard on the root cause of F-04: two frontends each carried
+    /// a hand-written list of these names, and the lists had already drifted
+    /// apart from each other and from the catalogue. `start`, `stop`, and
+    /// `logs` are the exceptions on purpose — `start` *is* the daemon, while
+    /// `stop` and `logs` act on the process and its file. `attach` now uses a
+    /// running gateway through Dispatch (WI 0113 Step 10).
+    #[test]
+    fn every_squad_subcommand_declares_whether_it_needs_a_gateway() {
+        const NO_GATEWAY: &[&str] = &["start", "stop", "logs"];
+        let squad = CommandCatalogue::get()
+            .lookup(&["squad"])
+            .expect("squad must exist");
+        assert!(
+            !squad.subcommands.is_empty(),
+            "the squad subtree must not be empty, or this test proves nothing"
+        );
+        for sub in squad.subcommands {
+            if NO_GATEWAY.contains(&sub.name) {
+                assert_eq!(
+                    sub.gateway_need,
+                    GatewayNeed::None,
+                    "`squad {}` must never try to acquire a gateway",
+                    sub.name
+                );
+            } else {
+                assert_ne!(
+                    sub.gateway_need,
+                    GatewayNeed::None,
+                    "`squad {}` reaches the daemon and must declare a gateway need",
+                    sub.name
+                );
+            }
+        }
+    }
+
+    /// `squad status` reports on a daemon rather than requiring one, so it must
+    /// never start one: with nothing running it still succeeds with a "not
+    /// running" summary.
+    #[test]
+    fn squad_status_asks_for_a_gateway_only_if_one_is_already_running() {
+        let catalogue = CommandCatalogue::get();
+        let status = catalogue
+            .lookup(&["squad", "status"])
+            .expect("squad status must exist");
+        assert_eq!(status.gateway_need, GatewayNeed::IfRunning);
+        let bare = catalogue.lookup(&["squad"]).expect("squad must exist");
+        assert_eq!(bare.gateway_need, GatewayNeed::IfRunning);
+    }
+
+    #[test]
+    fn squad_attach_requires_a_running_gateway_and_is_excluded_from_the_api() {
+        let attach = CommandCatalogue::get()
+            .lookup(&["squad", "attach"])
+            .expect("squad attach must exist");
+        assert_eq!(attach.gateway_need, GatewayNeed::Running);
+        assert!(attach.requires_container_tier);
+        assert!(!attach.api_allowed);
+    }
+
+    /// The runtime-tier guard is catalogue-driven, and squad is the only
+    /// subtree that carries it: a sandbox-class runtime cannot mount task
+    /// directories or run workflow setup/teardown steps.
+    #[test]
+    fn the_container_tier_requirement_is_the_squad_subtree_and_nothing_else() {
+        fn walk(spec: &'static CommandSpec, path: Vec<&'static str>, out: &mut Vec<Vec<&str>>) {
+            if spec.requires_container_tier {
+                out.push(path.clone());
+            }
+            for sub in spec.subcommands {
+                let mut child = path.clone();
+                child.push(sub.name);
+                walk(sub, child, out);
+            }
+        }
+        let mut tiered = Vec::new();
+        walk(CommandCatalogue::get().root(), Vec::new(), &mut tiered);
+        assert!(
+            !tiered.is_empty(),
+            "the squad subtree must carry the requirement"
+        );
+        for path in &tiered {
+            assert_eq!(
+                path.first(),
+                Some(&"squad"),
+                "only squad requires a container tier; found {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_mode_is_registered_on_each_local_agent_command() {
+        let cat = CommandCatalogue::get();
+        let paths: &[&[&str]] = &[&["chat"], &["exec", "prompt"], &["exec", "workflow"]];
+        for path in paths {
+            let command = cat.lookup(path).expect("agent command must exist");
+            let flag = command
+                .find_flag("launch-mode")
+                .expect("agent command must expose --launch-mode");
+            assert!(flag.optional);
+            match flag.kind {
+                FlagKind::Enum(values) => assert_eq!(values, &["stdio", "acp"]),
+                other => panic!("expected enum flag, got {other:?}"),
+            }
+        }
     }
 }

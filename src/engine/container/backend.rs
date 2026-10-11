@@ -8,6 +8,7 @@ use std::path::Path;
 use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::background::ExecOutput;
 use crate::engine::agent_runtime::execution::{AgentInstance, AgentStats};
+use crate::engine::container::gated_launch::LaunchRetentionRegistry;
 use crate::engine::container::options::{OverlaySpec, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
 
@@ -22,6 +23,24 @@ pub(super) trait ContainerBackend: Send + Sync {
         options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError>;
 
+    fn build_with_launch_retention(
+        &self,
+        options: ResolvedContainerOptions,
+        launch_retention: Option<std::sync::Arc<LaunchRetentionRegistry>>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        if options
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some())
+        {
+            return Err(EngineError::Config(
+                "orchestrated launch retention is unavailable".into(),
+            ));
+        }
+        let _ = launch_retention;
+        self.build(options)
+    }
+
     fn list_running(&self, session: &Session) -> Result<Vec<AgentHandle>, EngineError>;
 
     /// List all running awman containers without requiring a session.
@@ -32,17 +51,56 @@ pub(super) trait ContainerBackend: Send + Sync {
 
     fn stats(&self, handle: &AgentHandle) -> Result<AgentStats, EngineError>;
 
-    fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError>;
+    /// Stop and remove a container this process owns. Every CLI-shaped backend
+    /// spells this the same way, so the default is the implementation; a backend
+    /// whose CLI diverges overrides it.
+    fn stop(&self, handle: &AgentHandle) -> Result<(), EngineError> {
+        super::process::stop_and_remove(self.cli_binary(), &handle.name);
+        Ok(())
+    }
+
+    /// List stopped (exited/dead) awman containers. Backends that cannot
+    /// enumerate stopped containers fall back to an empty list.
+    fn list_stopped(&self) -> Result<Vec<AgentHandle>, EngineError> {
+        Ok(Vec::new())
+    }
+
+    /// List dangling awman images eligible for cleanup. Default: empty.
+    fn list_dangling_images(
+        &self,
+    ) -> Result<Vec<crate::engine::container::runtime::ContainerImageInfo>, EngineError> {
+        Ok(Vec::new())
+    }
 
     /// Build the CLI arguments for `docker exec -it` (or equivalent) into a
-    /// running container. Used by TUI re-attach.
+    /// running container. Used by TUI re-attach. Docker and Apple accept the
+    /// identical argv, so the default is the implementation.
     fn exec_args(
         &self,
         container_id: &str,
         working_dir: &str,
         entrypoint: &[&str],
         env_vars: &[(&str, &str)],
-    ) -> Vec<String>;
+    ) -> Vec<String> {
+        let mut args = vec!["exec".to_string(), "-it".to_string()];
+        args.extend(["-w".to_string(), working_dir.to_string()]);
+        for (k, v) in env_vars {
+            args.push("-e".to_string());
+            args.push(format!("{k}={v}"));
+        }
+        args.push(container_id.to_string());
+        args.extend(entrypoint.iter().map(|s| s.to_string()));
+        args
+    }
+
+    /// Attach to an already-running container this process did not start,
+    /// via `<cli> exec` (argv from `exec_args`). The returned instance's
+    /// execution never issues `stop`/`rm` on grace-expiry — the container
+    /// belongs to another process.
+    fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError>;
+
+    /// List running awman containers whose name starts with `prefix`.
+    fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError>;
 
     /// Static name used by `ContainerRuntime::runtime_name`.
     fn name(&self) -> &'static str;

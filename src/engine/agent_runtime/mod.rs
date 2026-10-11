@@ -24,6 +24,7 @@ pub mod background;
 pub mod capabilities;
 pub mod execution;
 pub mod frontend;
+pub mod output_tail;
 
 pub use background::{AgentExec, ExecOutput};
 pub use capabilities::{Capabilities, DindSupport};
@@ -32,6 +33,7 @@ pub use execution::{
     CancelHandle, StuckEvent,
 };
 pub use frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
+pub use output_tail::{OutputTail, DEFAULT_OUTPUT_TAIL_LINES};
 
 /// Common option carrier between Layer 2 and the runtime tier. Layer 2
 /// constructs whichever variant matches the runtime paradigm it's targeting
@@ -119,6 +121,22 @@ pub trait AgentRuntimeEngine: Send + Sync {
         entrypoint: &[&str],
         env_vars: &[(&str, &str)],
     ) -> Vec<String>;
+
+    /// Attach to an already-running agent this process did not start.
+    ///
+    /// Returns a `Box<dyn AgentInstance>` so the result flows into the same
+    /// `run_with_frontend(Box<dyn AgentFrontend>) -> AgentExecution` path a
+    /// freshly-built instance uses — `CliFrontend` and `TuiContainerProxy`
+    /// both drive an attach session unchanged. The instance opens an
+    /// `exec`/`sbx exec` session (argv from `exec_args`); its execution never
+    /// stops the target on grace-expiry, because this process does not own it.
+    fn attach(&self, handle: &AgentHandle) -> Result<Box<dyn AgentInstance>, EngineError>;
+
+    /// Enumerate running agents whose container/sandbox name starts with
+    /// `prefix`. Every tier can honour this: Docker `ps --filter name=`,
+    /// Apple's client-side prefix predicate, sandbox `sbx ls` name filter.
+    /// The name prefix is the one identity channel all three tiers share.
+    fn list_running_with_name_prefix(&self, prefix: &str) -> Result<Vec<AgentHandle>, EngineError>;
 
     /// Name of the CLI binary this runtime drives ("docker", "container", "sbx").
     fn cli_binary(&self) -> &'static str;

@@ -10,10 +10,10 @@ pub mod repo;
 pub use effective::EffectiveConfig;
 pub use env::{Env, EnvSnapshot};
 pub use flags::FlagConfig;
-pub use global::GlobalConfig;
+pub use global::{GlobalConfig, LaunchModeFallback};
 pub use repo::{
-    AgentAuthMode, ApiConfig, RemoteConfig, RepoConfig, WorkItemsConfig, REPO_CONFIG_FILENAME,
-    REPO_CONFIG_SUBDIR,
+    AgentAuthMode, ApiConfig, AuthRefreshConfig, DynamicWorkflowsConfig, LaunchMode, RemoteConfig,
+    RepoConfig, SquadConfig, WorkItemsConfig, REPO_CONFIG_FILENAME, REPO_CONFIG_SUBDIR,
 };
 
 /// Built-in default number of scrollback lines for the container terminal emulator.

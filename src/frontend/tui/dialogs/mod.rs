@@ -9,6 +9,11 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::frontend::tui::text_edit::TextEdit;
 
+/// Title of the `Ctrl-T` New Tab dialog. The key handler's `Ctrl-S` intercept
+/// and the renderer's `[Ctrl+S] open squad` hint are both keyed off this one
+/// string, so the shortcut and its advertisement can never disagree.
+pub(crate) const NEW_TAB_DIALOG_TITLE: &str = "New Tab";
+
 /// A dialog request sent from the command thread to the event loop.
 #[derive(Debug)]
 pub enum DialogRequest {
@@ -28,6 +33,10 @@ pub enum DialogRequest {
     MultilineInput {
         title: String,
         prompt: String,
+        /// Text the editor opens holding (WI 0110). `None` opens empty. Used
+        /// by edit interviews, where an untouched box must mean "keep what
+        /// is there" rather than "erase it".
+        default_text: Option<String>,
     },
     ListPicker {
         title: String,
@@ -38,7 +47,6 @@ pub enum DialogRequest {
         options: Vec<(String, String)>,
     },
     WorkflowControlBoard(WorkflowControlBoardState),
-    WorkflowStepError(WorkflowStepErrorState),
     WorkflowYoloCountdown(WorkflowYoloCountdownState),
     WorkflowStepConfirm(WorkflowStepConfirmState),
     AgentSetup(AgentSetupState),
@@ -52,6 +60,13 @@ pub enum DialogRequest {
     WorkflowCancelConfirm,
     ConfigShow {
         rows: Vec<ConfigShowRow>,
+        /// Initially selected row, so the dialog can reopen on the field the
+        /// user just edited instead of jumping back to the top.
+        selected: usize,
+        /// The previous edit, when it was rejected (invalid value or failed
+        /// write). The dialog reopens in edit mode with the input preserved
+        /// and the reason displayed.
+        rejected: Option<ConfigShowRejectedEdit>,
     },
     Loading {
         title: String,
@@ -60,6 +75,15 @@ pub enum DialogRequest {
         title: String,
         body: String,
         keys: Vec<(char, String)>,
+    },
+    /// The one-shot squad key disclosure, raised as a [`Dialog::Notice`].
+    /// Sent, never awaited: a notice has no answer to give back, and the
+    /// command thread must not block on the user dismissing it.
+    KeySetupNotice {
+        title: String,
+        body: String,
+        copy_key: String,
+        copy_zshrc_snippet: String,
     },
 }
 
@@ -105,7 +129,6 @@ pub enum Dialog {
         options: Vec<(String, String)>,
     },
     WorkflowControlBoard(WorkflowControlBoardState),
-    WorkflowStepError(WorkflowStepErrorState),
     WorkflowYoloCountdown(WorkflowYoloCountdownState),
     WorkflowStepConfirm(WorkflowStepConfirmState),
     AgentSetup(AgentSetupState),
@@ -115,6 +138,37 @@ pub enum Dialog {
     CloseTabConfirm,
     WorkflowCancelConfirm,
     ConfigShow(ConfigShowState),
+    /// Task detail for the squad tab (WI 0102). Kept live by
+    /// `App::tick_all_tabs` from the active squad tab's snapshot. Run history
+    /// lives in its own modal (`SquadTaskHistory`), reached with `h`.
+    SquadTaskDetail(SquadDetailState),
+    /// Run history for one squad task, in a modal of its own so a long task
+    /// description can never push the history off the bottom of the detail
+    /// modal. Opened with `h` from the card grid or from the detail modal.
+    SquadTaskHistory(SquadHistoryState),
+    /// Confirmation before removing a squad task (WI 0102). `y` dispatches
+    /// `squad remove <name>`; `n`/`Esc` dismisses.
+    SquadRemoveConfirm {
+        name: String,
+    },
+    /// Confirmation before triggering, cancelling or pausing a squad task
+    /// from the card grid or the detail modal. `y` dispatches the action's
+    /// `squad <subcommand> <name>`; `n`/`Esc` dismisses.
+    SquadActionConfirm {
+        action: SquadConfirmAction,
+        name: String,
+    },
+    /// Confirmation before starting a squad daemon that is not already running
+    /// (WI 0110). Opening the squad tab starts a long-lived background
+    /// process; `y` builds the tab (and with it the daemon), `n`/`Esc` opens
+    /// no tab at all. Never raised when a daemon is already up.
+    SquadStartConfirm,
+    /// The squad daemon requires a bearer key this process does not hold: a
+    /// hash exists on disk, `AWMAN_SQUAD_KEY` is unset here, and the plaintext
+    /// key is unrecoverable. `y` mints a new key and restarts the daemon onto
+    /// it; `n`/`Esc` opens no squad tab, because one that 401s on every poll
+    /// would show nothing but that.
+    SquadKeyMissing,
     Loading {
         title: String,
     },
@@ -129,6 +183,21 @@ pub enum Dialog {
     FatalError {
         title: String,
         body: String,
+    },
+    /// One-shot informational modal with no command thread behind it: Enter and
+    /// Esc simply dismiss it. Used for the squad key-setup snippet, which must
+    /// be readable long enough to copy and must not scroll away in a status bar.
+    Notice {
+        title: String,
+        body: String,
+        /// The raw squad bearer key, when this notice is the key-setup
+        /// snippet — `[c]` copies it to the clipboard. `None` for notices
+        /// unrelated to a key (e.g. "daemon did not start"), which shows no
+        /// copy hint.
+        copy_key: Option<String>,
+        /// The bare shell export line alone, so `[z]` can copy just what
+        /// belongs in the rc file, without the banner and notes around it.
+        copy_zshrc_snippet: Option<String>,
     },
 }
 
@@ -147,16 +216,33 @@ pub struct WorkflowControlBoardState {
     pub continue_unavailable_reason: Option<String>,
     pub cancel_to_previous_unavailable_reason: Option<String>,
     pub finish_workflow_unavailable_reason: Option<String>,
+    /// Reason "Restart current step" is unavailable — set in a parallel group
+    /// where restart applies only to the focused container (WI-0096 §10).
+    /// Rendered in DarkGray under the dimmed Restart line.
+    pub restart_unavailable_reason: Option<String>,
     /// True when a container is currently running (mid-step). The engine
     /// computes this from `can_dismiss` in `AvailableActions`.
     /// Changes rendering: Esc = dismiss (step keeps running), [p] = pause.
     pub can_dismiss: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct WorkflowStepErrorState {
-    pub step_name: String,
-    pub error_lines: Vec<String>,
+    /// Custom label for the right-arrow (launch-next) action, copied from
+    /// `AvailableActions.launch_next_label`. `None` renders the default
+    /// "Next: new container". The dynamic leader step sets this to
+    /// "Start dynamic workflow".
+    pub launch_next_label: Option<String>,
+    /// The step this Workflow Control Board's actions apply to (WI-0096 §10).
+    /// In a parallel group this is the currently-focused container. Defaults to
+    /// `step_name` for single-step workflows.
+    pub focused_step_name: String,
+    /// Number of steps in the focused step's parallel group. `0` means the
+    /// focused step is not part of a multi-step parallel batch.
+    pub parallel_peer_count: usize,
+    /// Live peers still running in the focused step's parallel group (excludes
+    /// the focused step). Non-zero disables back/finish in the WCB.
+    pub parallel_peers_running: usize,
+    /// Detail lines for the failure that opened this board (exit code, signal,
+    /// run duration), copied from `AvailableActions::step_failure`. Empty on an
+    /// ordinary between-steps board (WI-0115 §1).
+    pub failure_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -191,12 +277,112 @@ pub struct AgentAuthState {
     pub env_vars: Vec<String>,
 }
 
+/// State for the squad task-detail modal (WI 0102). `name` is the identity
+/// used by `tick_all_tabs` to refresh `task` from the tab snapshot each tick.
+/// Run history is not part of this modal — see `SquadHistoryState`.
+#[derive(Debug, Clone)]
+pub struct SquadDetailState {
+    pub name: String,
+    pub task: crate::data::fs::task_store::Task,
+}
+
+/// A squad task action that asks for confirmation before it is dispatched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SquadConfirmAction {
+    Trigger,
+    Cancel,
+    Pause,
+}
+
+impl SquadConfirmAction {
+    /// The `squad` subcommand the action dispatches.
+    pub fn subcommand(self) -> &'static str {
+        match self {
+            Self::Trigger => "trigger",
+            Self::Cancel => "cancel",
+            Self::Pause => "pause",
+        }
+    }
+
+    /// The dialog title.
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Trigger => "Trigger task",
+            Self::Cancel => "Cancel run",
+            Self::Pause => "Pause task",
+        }
+    }
+
+    /// The question the dialog asks about task `name`.
+    pub fn question(self, name: &str) -> String {
+        match self {
+            Self::Trigger => format!("Evaluate task \"{name}\" on the next tick?"),
+            Self::Cancel => {
+                format!("Cancel the in-progress run of task \"{name}\" and stop its agents?")
+            }
+            Self::Pause => format!("Pause task \"{name}\"?"),
+        }
+    }
+
+    /// The label for the `y` key.
+    pub fn verb(self) -> &'static str {
+        match self {
+            Self::Trigger => "trigger",
+            Self::Cancel => "cancel run",
+            Self::Pause => "pause",
+        }
+    }
+}
+
+/// State for the squad run-history modal. `name` is the task whose runs are
+/// shown, and the identity `tick_all_tabs` refreshes `runs` against; `scroll`
+/// offsets the run table. `from_detail` records where the modal was opened
+/// from: Esc reopens the detail modal only when the user came from it, and
+/// simply closes when the modal was opened straight from the card grid.
+#[derive(Debug, Clone)]
+pub struct SquadHistoryState {
+    pub name: String,
+    pub runs: Vec<crate::data::fs::task_store::Run>,
+    pub scroll: usize,
+    pub from_detail: bool,
+}
+
 pub struct ConfigShowState {
     pub rows: Vec<ConfigShowRow>,
     pub selected: usize,
     pub editing: bool,
     pub edit_column: usize,
     pub editor: TextEdit,
+    /// In-progress Ctrl+N "add model mapping" flow, if any. While `Some`,
+    /// `editing` is also true so text input routes to `editor`.
+    pub new_entry: Option<NewMapEntryPhase>,
+    /// Why the last save attempt was rejected. Rendered in the dialog until
+    /// the user cancels the edit or starts a new one.
+    pub error: Option<String>,
+}
+
+/// A rejected config edit carried in `DialogRequest::ConfigShow`: the value
+/// the user typed plus the rejection reason, so the reopened dialog restores
+/// the edit instead of discarding the input.
+#[derive(Debug, Clone)]
+pub struct ConfigShowRejectedEdit {
+    pub field: String,
+    pub value: String,
+    pub global: bool,
+    pub reason: String,
+}
+
+/// Phase of a Ctrl+N add-entry flow in the config dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewMapEntryPhase {
+    /// Typing the agent name (the new `agentsToModels` map key).
+    Key,
+    /// Typing the comma-separated model list for the confirmed key.
+    Value { key: String },
+    /// Typing a new `dynamicWorkflows.guidance` entry (WI-0099). Single-phase:
+    /// only the instruction text is needed; its array index is assigned
+    /// automatically by appending.
+    GuidanceEntry,
 }
 
 #[derive(Debug)]
@@ -206,6 +392,12 @@ pub struct ConfigShowRow {
     pub repo: String,
     pub effective: String,
     pub read_only: bool,
+    /// Whether the value may be written to the global config scope.
+    pub global_writable: bool,
+    /// Whether the value may be written to the repo config scope.
+    pub repo_writable: bool,
+    /// Short format hint shown while editing (e.g. "true or false").
+    pub value_hint: Option<String>,
 }
 
 /// Compute a centered rect for a dialog.
@@ -281,7 +473,13 @@ pub fn render_yes_no(title: &str, body: &str, area: Rect, frame: &mut Frame) {
         })
         .sum();
     let body_h = wrapped_lines as u16;
-    let height = (body_h + 5).min(area.height.saturating_sub(2)).max(7);
+    // The dialog frame costs 4 rows (two borders + a row of padding each
+    // side), and the content is `body_h` rows plus a blank separator plus the
+    // key-hint row. Anything less than `body_h + 6` clips the hint off the
+    // bottom — which is exactly the row a user needs to know that `y`/`n`/Esc
+    // are the answers. `.max(8)` keeps a one-line body's dialog from looking
+    // cramped.
+    let height = (body_h + 6).min(area.height.saturating_sub(2)).max(8);
     let dialog_area = centered_fixed(width, height, area);
     let inner = render_dialog_frame(title, Color::Yellow, dialog_area, frame);
     let text = format!("{body}\n\n  [y] Yes   [n] No   [Esc] Cancel");
@@ -329,8 +527,7 @@ pub fn render_workflow_cancel_confirm(area: Rect, frame: &mut Frame) {
         dialog_area,
         frame,
     );
-    let text =
-        "  Cancel workflow execution?\n\n  The running container will be killed and the\n  current step returned to Pending for resumption.\n\n  [y] cancel execution   [n / Esc] keep running";
+    let text = "  Cancel workflow execution?\n\n  The running container will be killed and the\n  current step returned to Pending for resumption.\n\n  [y] cancel execution   [n / Esc] keep running";
     frame.render_widget(
         Paragraph::new(text).wrap(ratatui::widgets::Wrap { trim: false }),
         inner,

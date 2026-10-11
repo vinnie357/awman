@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crate::data::config::env::EnvSnapshot;
 use crate::data::config::flags::FlagConfig;
-use crate::data::config::global::GlobalConfig;
-use crate::data::config::repo::{AgentAuthMode, RepoConfig};
+use crate::data::config::global::{GlobalConfig, LaunchModeFallback};
+use crate::data::config::repo::{AgentAuthMode, LaunchMode, RepoConfig};
 use crate::data::config::{DEFAULT_AGENT_STUCK_TIMEOUT_SECS, DEFAULT_SCROLLBACK_LINES};
 
 /// Merged view of every configuration source, in precedence order.
@@ -22,6 +22,15 @@ pub struct EffectiveConfig {
     env: EnvSnapshot,
     repo: RepoConfig,
     global: GlobalConfig,
+}
+
+/// Resolved live credential-refresh settings. Repository fields override the
+/// corresponding global fields; absent values use the built-in defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthRefreshSettings {
+    pub enabled: bool,
+    pub threshold: Duration,
+    pub tick: Duration,
 }
 
 impl Default for EffectiveConfig {
@@ -199,12 +208,49 @@ impl EffectiveConfig {
         self.global.runtime.clone()
     }
 
+    /// Effective agent launch mode (flag > env > repo > built-in `stdio`).
+    ///
+    /// Launch mode is intentionally not inherited from global configuration;
+    /// it is scoped to an invocation or repository. The repository setting is
+    /// agent-independent, so no agent name is needed here (the agent-support
+    /// check happens separately, in the command layer and `build_options`).
+    pub fn launch_mode(&self) -> LaunchMode {
+        if let Some(mode) = self.flags.launch_mode {
+            return mode;
+        }
+        if let Some(mode) = self.env.launch_mode() {
+            return mode;
+        }
+        self.repo.launch_mode.unwrap_or_default()
+    }
+
+    /// Effective ACP fallback policy. This is global-only; flags, environment
+    /// and repository configuration do not override it.
+    pub fn launch_mode_fallback(&self) -> LaunchModeFallback {
+        self.global.launch_mode_fallback.unwrap_or_default()
+    }
+
     /// Effective base image tag for setup/teardown containers (repo > global > None).
     pub fn base_image(&self) -> Option<String> {
         if let Some(v) = self.repo.base_image.as_deref() {
             return Some(v.to_string());
         }
         self.global.base_image.clone()
+    }
+
+    /// Effective cap on concurrently-running workflow steps
+    /// (flags > env > repo > global > `None` = unlimited).
+    pub fn effective_max_concurrent_agents(&self) -> Option<usize> {
+        if let Some(n) = self.flags.max_concurrent_agents {
+            return Some(n);
+        }
+        if let Some(n) = self.env.max_concurrent_agents() {
+            return Some(n);
+        }
+        if let Some(n) = self.repo.max_concurrent_agents {
+            return Some(n);
+        }
+        self.global.max_concurrent_agents
     }
 
     /// Effective credential injection mode (repo > built-in default `keychain`).
@@ -220,6 +266,31 @@ impl EffectiveConfig {
     pub fn auth_mode(&self) -> AgentAuthMode {
         self.repo.auth.unwrap_or_default()
     }
+
+    /// Effective live credential-refresh configuration (repo > global >
+    /// built-in). `enabled: false` is the escape hatch that restores legacy
+    /// env-variable credential delivery.
+    pub fn auth_refresh(&self) -> AuthRefreshSettings {
+        let repo = self.repo.auth_refresh.as_ref();
+        let global = self.global.auth_refresh.as_ref();
+        AuthRefreshSettings {
+            enabled: repo
+                .and_then(|c| c.enabled)
+                .or_else(|| global.and_then(|c| c.enabled))
+                .unwrap_or(true),
+            threshold: Duration::from_secs(
+                repo.and_then(|c| c.threshold_minutes)
+                    .or_else(|| global.and_then(|c| c.threshold_minutes))
+                    .unwrap_or(20)
+                    .saturating_mul(60),
+            ),
+            tick: Duration::from_secs(
+                repo.and_then(|c| c.tick_seconds)
+                    .or_else(|| global.and_then(|c| c.tick_seconds))
+                    .unwrap_or(60),
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -228,7 +299,7 @@ mod tests {
     use crate::data::config::env::{
         EnvSnapshot, AWMAN_API_KEY, AWMAN_REMOTE_ADDR, AWMAN_REMOTE_SESSION,
     };
-    use crate::data::config::repo::{AgentAuthMode, ApiConfig, RemoteConfig};
+    use crate::data::config::repo::{AgentAuthMode, ApiConfig, AuthRefreshConfig, RemoteConfig};
     use std::time::Duration;
 
     fn make_effective(
@@ -818,6 +889,89 @@ mod tests {
         assert_eq!(ec4.scrollback_lines(), DEFAULT_SCROLLBACK_LINES);
     }
 
+    // ─── effective_max_concurrent_agents (WI-0096) ──────────────────────────
+
+    fn env_with_max_concurrent(n: &str) -> EnvSnapshot {
+        EnvSnapshot::with_overrides([(crate::data::config::env::AWMAN_MAX_CONCURRENT_AGENTS, n)])
+    }
+
+    #[test]
+    fn max_concurrent_flag_beats_env_repo_and_global() {
+        let flags = FlagConfig {
+            max_concurrent_agents: Some(1),
+            ..Default::default()
+        };
+        let repo = RepoConfig {
+            max_concurrent_agents: Some(3),
+            ..Default::default()
+        };
+        let global = GlobalConfig {
+            max_concurrent_agents: Some(4),
+            ..Default::default()
+        };
+        let ec = make_effective(flags, env_with_max_concurrent("2"), repo, global);
+        assert_eq!(ec.effective_max_concurrent_agents(), Some(1));
+    }
+
+    #[test]
+    fn max_concurrent_env_beats_repo_and_global() {
+        let repo = RepoConfig {
+            max_concurrent_agents: Some(3),
+            ..Default::default()
+        };
+        let global = GlobalConfig {
+            max_concurrent_agents: Some(4),
+            ..Default::default()
+        };
+        let ec = make_effective(
+            FlagConfig::default(),
+            env_with_max_concurrent("2"),
+            repo,
+            global,
+        );
+        assert_eq!(ec.effective_max_concurrent_agents(), Some(2));
+    }
+
+    #[test]
+    fn max_concurrent_repo_beats_global() {
+        let repo = RepoConfig {
+            max_concurrent_agents: Some(3),
+            ..Default::default()
+        };
+        let global = GlobalConfig {
+            max_concurrent_agents: Some(4),
+            ..Default::default()
+        };
+        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
+        assert_eq!(ec.effective_max_concurrent_agents(), Some(3));
+    }
+
+    #[test]
+    fn max_concurrent_global_used_when_repo_env_flag_unset() {
+        let global = GlobalConfig {
+            max_concurrent_agents: Some(4),
+            ..Default::default()
+        };
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            global,
+        );
+        assert_eq!(ec.effective_max_concurrent_agents(), Some(4));
+    }
+
+    #[test]
+    fn max_concurrent_none_when_all_unset_means_unlimited() {
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            GlobalConfig::default(),
+        );
+        assert_eq!(ec.effective_max_concurrent_agents(), None);
+    }
+
     // ── Part B: auth_mode ─────────────────────────────────────────────────────
 
     #[test]
@@ -886,5 +1040,200 @@ mod tests {
             GlobalConfig::default(),
         );
         assert_eq!(ec.auth_mode(), AgentAuthMode::Keychain);
+    }
+
+    // ── launch_mode ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn launch_mode_defaults_to_stdio_and_ignores_global_config() {
+        let global = GlobalConfig {
+            launch_mode_fallback: Some(LaunchModeFallback::Stdio),
+            ..Default::default()
+        };
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            global,
+        );
+        assert_eq!(ec.launch_mode(), LaunchMode::Stdio);
+    }
+
+    #[test]
+    fn launch_mode_uses_repo_when_flag_and_env_are_unset() {
+        let repo = RepoConfig {
+            launch_mode: Some(LaunchMode::Acp),
+            ..Default::default()
+        };
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            repo,
+            GlobalConfig::default(),
+        );
+        assert_eq!(ec.launch_mode(), LaunchMode::Acp);
+    }
+
+    #[test]
+    fn launch_mode_env_beats_repo() {
+        let env =
+            EnvSnapshot::with_overrides([(crate::data::config::env::AWMAN_LAUNCH_MODE, "stdio")]);
+        let repo = RepoConfig {
+            launch_mode: Some(LaunchMode::Acp),
+            ..Default::default()
+        };
+        let ec = make_effective(FlagConfig::default(), env, repo, GlobalConfig::default());
+        assert_eq!(ec.launch_mode(), LaunchMode::Stdio);
+    }
+
+    #[test]
+    fn launch_mode_flag_beats_env_and_repo() {
+        let flags = FlagConfig {
+            launch_mode: Some(LaunchMode::Acp),
+            ..Default::default()
+        };
+        let env =
+            EnvSnapshot::with_overrides([(crate::data::config::env::AWMAN_LAUNCH_MODE, "stdio")]);
+        let repo = RepoConfig {
+            launch_mode: Some(LaunchMode::Stdio),
+            ..Default::default()
+        };
+        let ec = make_effective(flags, env, repo, GlobalConfig::default());
+        assert_eq!(ec.launch_mode(), LaunchMode::Acp);
+    }
+
+    // ── launch_mode_fallback ─────────────────────────────────────────────────
+
+    #[test]
+    fn launch_mode_fallback_defaults_to_error() {
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            GlobalConfig::default(),
+        );
+        assert_eq!(ec.launch_mode_fallback(), LaunchModeFallback::Error);
+    }
+
+    #[test]
+    fn launch_mode_fallback_uses_global_config_only() {
+        let global = GlobalConfig {
+            launch_mode_fallback: Some(LaunchModeFallback::Stdio),
+            ..Default::default()
+        };
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            global,
+        );
+        assert_eq!(ec.launch_mode_fallback(), LaunchModeFallback::Stdio);
+    }
+
+    // ── auth_refresh (WI-0107 §6) ────────────────────────────────────────────
+
+    #[test]
+    fn auth_refresh_defaults_when_unset_anywhere() {
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            GlobalConfig::default(),
+        );
+        assert_eq!(
+            ec.auth_refresh(),
+            AuthRefreshSettings {
+                enabled: true,
+                threshold: Duration::from_secs(20 * 60),
+                tick: Duration::from_secs(60),
+            }
+        );
+    }
+
+    #[test]
+    fn auth_refresh_repo_overrides_global_per_field() {
+        let repo = RepoConfig {
+            auth_refresh: Some(AuthRefreshConfig {
+                enabled: None,
+                threshold_minutes: Some(5),
+                tick_seconds: None,
+            }),
+            ..Default::default()
+        };
+        let global = GlobalConfig {
+            auth_refresh: Some(AuthRefreshConfig {
+                enabled: Some(false),
+                threshold_minutes: Some(30),
+                tick_seconds: Some(15),
+            }),
+            ..Default::default()
+        };
+        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
+        let settings = ec.auth_refresh();
+        // repo sets threshold_minutes explicitly, so it wins over global's.
+        assert_eq!(
+            settings.threshold,
+            Duration::from_secs(5 * 60),
+            "repo threshold_minutes must override global"
+        );
+        // repo leaves `enabled` and `tick_seconds` unset, so each falls
+        // through to global independently (per-field precedence, not
+        // per-object).
+        assert!(
+            !settings.enabled,
+            "repo left `enabled` unset; must inherit global's false"
+        );
+        assert_eq!(
+            settings.tick,
+            Duration::from_secs(15),
+            "repo left tick_seconds unset; must inherit global's value"
+        );
+    }
+
+    #[test]
+    fn auth_refresh_repo_kill_switch_overrides_global_enabled_true() {
+        let repo = RepoConfig {
+            auth_refresh: Some(AuthRefreshConfig {
+                enabled: Some(false),
+                threshold_minutes: None,
+                tick_seconds: None,
+            }),
+            ..Default::default()
+        };
+        let global = GlobalConfig {
+            auth_refresh: Some(AuthRefreshConfig {
+                enabled: Some(true),
+                threshold_minutes: None,
+                tick_seconds: None,
+            }),
+            ..Default::default()
+        };
+        let ec = make_effective(FlagConfig::default(), EnvSnapshot::empty(), repo, global);
+        assert!(
+            !ec.auth_refresh().enabled,
+            "repo-level kill switch (enabled: false) must win over an enabled global default"
+        );
+    }
+
+    #[test]
+    fn auth_refresh_global_only_is_used_when_repo_unset() {
+        let global = GlobalConfig {
+            auth_refresh: Some(AuthRefreshConfig {
+                enabled: Some(true),
+                threshold_minutes: Some(45),
+                tick_seconds: Some(90),
+            }),
+            ..Default::default()
+        };
+        let ec = make_effective(
+            FlagConfig::default(),
+            EnvSnapshot::empty(),
+            RepoConfig::default(),
+            global,
+        );
+        let settings = ec.auth_refresh();
+        assert!(settings.enabled);
+        assert_eq!(settings.threshold, Duration::from_secs(45 * 60));
+        assert_eq!(settings.tick, Duration::from_secs(90));
     }
 }

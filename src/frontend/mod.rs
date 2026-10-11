@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod cli;
+pub mod squad;
 pub mod tui;
 
 use std::io::IsTerminal;

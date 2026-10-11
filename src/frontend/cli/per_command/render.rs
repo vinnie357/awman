@@ -38,7 +38,7 @@ use crate::command::CommandOutcome;
 /// Format a [`CommandOutcome`] into the success-path stdout text. Returns
 /// `None` when no extra output is needed (engines that stream their progress
 /// to stderr already and produce no additional summary on stdout).
-pub fn render(outcome: &CommandOutcome) -> Option<String> {
+pub fn render(outcome: &CommandOutcome, json: bool) -> Option<String> {
     match outcome {
         CommandOutcome::Empty => None,
         CommandOutcome::Status(o) => Some(render_status(o)),
@@ -54,7 +54,20 @@ pub fn render(outcome: &CommandOutcome) -> Option<String> {
         CommandOutcome::Specs(o) => render_specs(o),
         CommandOutcome::Auth(o) => render_auth(o),
         CommandOutcome::Download(o) => render_download(o),
+        CommandOutcome::Clean(o) => render_clean(o),
+        CommandOutcome::Squad(o) => super::squad::render_squad(o, json),
+        CommandOutcome::SquadAttach(_) => None,
     }
+}
+
+// ─── clean ─────────────────────────────────────────────────────────────────────
+//
+// `awman clean` streams its itemized summary, confirmation, and result
+// messages through the frontend during the run (CLI: stdout + message queue).
+// The success outcome adds nothing further on stdout.
+
+fn render_clean(_o: &crate::command::commands::clean::CleanOutcome) -> Option<String> {
+    None
 }
 
 // ─── status ──────────────────────────────────────────────────────────────────
@@ -68,7 +81,16 @@ pub fn render_status(o: &StatusOutcome) -> String {
         out.push_str("  No code agents running.\n");
         out.push_str("  To start one: awman exec workflow <file>  or  awman chat\n");
     } else {
-        let headers = ["●", "Container", "ID", "Image", "CPU%", "Mem MB", "Started"];
+        let headers = [
+            "●",
+            "Container",
+            "ID",
+            "Image",
+            "CPU%",
+            "Mem MB",
+            "Started",
+            "Source",
+        ];
         let rows: Vec<Vec<String>> = o.containers.iter().map(render_container_row).collect();
         out.push_str(&format_table(&headers, &rows));
     }
@@ -95,10 +117,11 @@ fn render_container_row(c: &StatusContainerRow) -> Vec<String> {
         cpu,
         mem,
         c.started_at.clone(),
+        c.source_label().unwrap_or_else(|| "session".to_string()),
     ]
 }
 
-fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
+pub(crate) fn format_table(headers: &[&str], rows: &[Vec<String>]) -> String {
     let ncols = headers.len();
     let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     for row in rows {
@@ -364,7 +387,7 @@ fn render_new(o: &NewOutcome) -> Option<String> {
     match o {
         NewOutcome::Spec(s) => Some(render_new_spec(s)),
         NewOutcome::Workflow(w) => Some(render_new_workflow(w)),
-        NewOutcome::Skill(s) => Some(render_new_skill(s)),
+        NewOutcome::Skill(s) => render_new_skill(s),
     }
 }
 
@@ -383,12 +406,19 @@ fn render_new_workflow(o: &NewWorkflowOutcome) -> String {
     }
 }
 
-fn render_new_skill(o: &NewSkillOutcome) -> String {
+fn render_new_skill(o: &NewSkillOutcome) -> Option<String> {
+    // `--pull` / `--pull-all` create nothing and are not repo-scoped: they
+    // clone or refresh a managed library under the global skills store, and
+    // already reported each library through the message sink. Rendering a
+    // "Created skill (repo)" summary here would contradict both.
+    if o.pull {
+        return None;
+    }
     let scope = if o.global { "global" } else { "repo" };
-    match &o.path {
+    Some(match &o.path {
         Some(p) => format!("Created skill ({scope}): {p}"),
         None => format!("Skill created ({scope})."),
-    }
+    })
 }
 
 // ─── specs / auth / download ─────────────────────────────────────────────────
@@ -429,12 +459,12 @@ fn render_download(o: &DownloadOutcome) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::commands::status::{ContainerKind, StatusOutcome};
+    use crate::command::commands::status::{ContainerKind, ContainerSource, StatusOutcome};
     use crate::engine::step_status::StepStatus;
 
     #[test]
     fn render_empty_returns_none() {
-        assert!(render(&CommandOutcome::Empty).is_none());
+        assert!(render(&CommandOutcome::Empty, false).is_none());
     }
 
     #[test]
@@ -459,6 +489,7 @@ mod tests {
                 image: "awman/dev:latest".into(),
                 started_at: "2025-01-01T00:00:00Z".into(),
                 kind: ContainerKind::Agent,
+                source: ContainerSource::Session,
                 tab_number: None,
                 stuck: false,
                 command_label: None,
@@ -471,6 +502,45 @@ mod tests {
         let s = render_status(&o);
         assert!(s.contains("CODE AGENTS"), "{s}");
         assert!(s.contains("awman-1"), "{s}");
+    }
+
+    #[test]
+    fn render_status_marks_squad_container_and_leaves_session_row_plain() {
+        let o = StatusOutcome {
+            containers: vec![
+                StatusContainerRow {
+                    id: "abc1234567890".into(),
+                    name: "awman-1-2".into(),
+                    image: "awman/dev:latest".into(),
+                    started_at: "2025-01-01T00:00:00Z".into(),
+                    kind: ContainerKind::Agent,
+                    source: ContainerSource::Session,
+                    tab_number: None,
+                    stuck: false,
+                    command_label: None,
+                    cpu_percent: None,
+                    memory_mb: None,
+                },
+                StatusContainerRow {
+                    id: "def1234567890".into(),
+                    name: "awman-squad-issue-triage-12ab34cd".into(),
+                    image: "awman/dev:latest".into(),
+                    started_at: "2025-01-01T00:00:00Z".into(),
+                    kind: ContainerKind::Agent,
+                    source: ContainerSource::Squad("issue-triage".into()),
+                    tab_number: None,
+                    stuck: false,
+                    command_label: None,
+                    cpu_percent: None,
+                    memory_mb: None,
+                },
+            ],
+            watched: false,
+            tip: "test tip".into(),
+        };
+        let s = render_status(&o);
+        assert!(s.contains("squad:issue-triage"), "{s}");
+        assert!(s.contains("session"), "{s}");
     }
 
     #[test]
@@ -526,6 +596,7 @@ mod tests {
             local_agent: StepStatus::Done,
             audit: StepStatus::Skipped,
             image_rebuild: StepStatus::Skipped,
+            agent_credentials: Vec::new(),
             non_default_agent_images: Vec::new(),
             json_requested: false,
             refresh_requested: false,
@@ -630,6 +701,7 @@ mod tests {
             local_agent: StepStatus::Done,
             audit: StepStatus::Skipped,
             image_rebuild: StepStatus::Skipped,
+            agent_credentials: Vec::new(),
             non_default_agent_images: Vec::new(),
             json_requested: true,
             refresh_requested: false,
@@ -676,6 +748,7 @@ mod tests {
             local_agent: StepStatus::Pending,
             audit: StepStatus::Pending,
             image_rebuild: StepStatus::Pending,
+            agent_credentials: Vec::new(),
             non_default_agent_images: Vec::new(),
             json_requested: true,
             refresh_requested: true,
@@ -703,6 +776,9 @@ mod tests {
                     effective_value: Some("claude".into()),
                     kind: ConfigFieldKind::Enum,
                     read_only: false,
+                    global_writable: true,
+                    repo_writable: true,
+                    value_hint: None,
                 },
                 ConfigFieldRow {
                     field: "auto_agent_auth_accepted".into(),
@@ -711,6 +787,9 @@ mod tests {
                     effective_value: Some("true".into()),
                     kind: ConfigFieldKind::Bool,
                     read_only: true,
+                    global_writable: false,
+                    repo_writable: false,
+                    value_hint: None,
                 },
             ],
         };
@@ -729,6 +808,79 @@ mod tests {
     }
 
     #[test]
+    fn render_config_show_does_not_truncate_dynamic_workflows_values() {
+        use crate::command::commands::config::{ConfigFieldKind, ConfigFieldRow};
+        let long_models = "claude-opus-4-8, claude-sonnet-4-6, claude-haiku-4-5, \
+                            gemini-2.5-pro, codex-mini-latest";
+        let o = ConfigShowOutcome {
+            global: serde_json::json!({}),
+            repo: serde_json::json!({}),
+            rows: vec![
+                ConfigFieldRow {
+                    field: "dynamicWorkflows.defaultLeader".into(),
+                    global_value: None,
+                    repo_value: Some("claude::claude-opus-4-8".into()),
+                    effective_value: Some("claude::claude-opus-4-8".into()),
+                    kind: ConfigFieldKind::String,
+                    read_only: false,
+                    global_writable: false,
+                    repo_writable: true,
+                    value_hint: None,
+                },
+                ConfigFieldRow {
+                    field: "dynamicWorkflows.maxConcurrentSteps".into(),
+                    global_value: None,
+                    repo_value: Some("3".into()),
+                    effective_value: Some("3".into()),
+                    kind: ConfigFieldKind::Number,
+                    read_only: false,
+                    global_writable: false,
+                    repo_writable: true,
+                    value_hint: None,
+                },
+                ConfigFieldRow {
+                    field: "dynamicWorkflows.agentsToModels.claude".into(),
+                    global_value: None,
+                    repo_value: Some(long_models.into()),
+                    effective_value: Some(long_models.into()),
+                    kind: ConfigFieldKind::String,
+                    read_only: false,
+                    global_writable: false,
+                    repo_writable: true,
+                    value_hint: None,
+                },
+            ],
+        };
+        let s = render_config_show(&o);
+
+        assert!(
+            s.contains("dynamicWorkflows.defaultLeader"),
+            "defaultLeader field must appear: {s}"
+        );
+        assert!(
+            s.contains("dynamicWorkflows.maxConcurrentSteps"),
+            "maxConcurrentSteps field must appear: {s}"
+        );
+        assert!(
+            s.contains("dynamicWorkflows.agentsToModels.claude"),
+            "per-agent agentsToModels row must appear, got: {s}"
+        );
+        assert!(
+            !s.contains("dynamicWorkflows.agentsToModels.claude (read-only)"),
+            "per-agent agentsToModels rows are inline-editable and must not be marked \
+             read-only, got: {s}"
+        );
+        assert!(
+            s.contains(long_models),
+            "long agentsToModels value must appear untruncated in CLI text output, got: {s}"
+        );
+        assert!(
+            !s.contains('\u{2026}'),
+            "CLI config show output must never truncate values with an ellipsis, got: {s}"
+        );
+    }
+
+    #[test]
     fn render_config_set_formats_field_scope_and_value() {
         let o = ConfigSetOutcome {
             field: "agent".into(),
@@ -743,7 +895,9 @@ mod tests {
 
     // ── render_new ────────────────────────────────────────────────────────────
 
-    use crate::command::commands::new::{NewSkillOutcome, NewSpecOutcome, NewWorkflowOutcome};
+    use crate::command::commands::new::{
+        NewSkillOutcome, NewSpecOutcome, NewWorkflowOutcome, PullLibraryOutcome,
+    };
 
     #[test]
     fn render_new_spec_with_path_shows_created_path() {
@@ -798,10 +952,60 @@ mod tests {
             interview: false,
             global: true,
             path: Some("/home/user/.awman/skills/my-skill/SKILL.md".into()),
+            pull: false,
+            libraries: vec![],
         };
-        let s = render_new_skill(&o);
+        let s = render_new_skill(&o).expect("skill creation must render a summary line");
         assert!(s.contains("global"), "must mention global scope");
         assert!(s.contains("SKILL.md"), "path must appear");
+    }
+
+    /// A `--pull` run clones a managed library into the *global* store and
+    /// already reported it through the message sink. It must never render the
+    /// "Created skill (repo)" creation line (WI-0103 remediation).
+    #[test]
+    fn render_new_skill_pull_renders_no_creation_line() {
+        let o = NewSkillOutcome {
+            interview: false,
+            global: false,
+            path: Some("/home/user/.awman/skills/.library/superpowers".into()),
+            pull: true,
+            libraries: vec![PullLibraryOutcome {
+                slug: "superpowers".into(),
+                dir: "/home/user/.awman/skills/.library/superpowers".into(),
+                updated: false,
+                skills_found: vec!["brainstorming".into()],
+                error: None,
+            }],
+        };
+        assert_eq!(
+            render_new_skill(&o),
+            None,
+            "a pull must not render a skill-creation line"
+        );
+        assert_eq!(
+            render_new(&NewOutcome::Skill(o)),
+            None,
+            "the NewOutcome renderer must pass the pull's silence through"
+        );
+    }
+
+    /// `--pull-all` with nothing pulled yet has no libraries *and* no path;
+    /// it must still not be rendered as "Skill created (repo)."
+    #[test]
+    fn render_new_skill_empty_pull_all_renders_no_creation_line() {
+        let o = NewSkillOutcome {
+            interview: false,
+            global: false,
+            path: None,
+            pull: true,
+            libraries: vec![],
+        };
+        assert_eq!(
+            render_new_skill(&o),
+            None,
+            "an empty --pull-all must not claim a skill was created"
+        );
     }
 
     // ── render_specs ──────────────────────────────────────────────────────────

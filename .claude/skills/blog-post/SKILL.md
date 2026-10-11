@@ -84,6 +84,18 @@ Source and issues at [github.com/prettysmartdev/amux](https://github.com/prettys
 - Explain *why* the feature or change matters before explaining *what* it does.
 - Be direct. Use plain language. No hedging, no marketing copy.
 
+
+**Writing about squad**
+- squad is a *group of agents the reader owns*, not a daemon or a scheduler. Write
+  "your squad is a group of agents that…", "create a squad to automate your work",
+  "create a new task for your squad to tackle". Never "squad is a background
+  daemon" or "automate work with squad".
+- "squad daemon" is still the right word in lifecycle, auth, and API-conflict
+  material (`squad start`/`stop`/`logs`, `AWMAN_SQUAD_KEY`), because that is the
+  literal process and the literal text of the errors a reader will hit. Keep the
+  squad-as-a-group voice for everything that describes what squad *is* or *does*
+  for the reader.
+
 **What to avoid**
 - No buzzwords: "revolutionary", "game-changing", "seamless", "robust", "powerful", "exciting"
 - No fluff openers: "In this post I will...", "I'm excited to announce...", "Today we're launching..."
@@ -92,7 +104,12 @@ Source and issues at [github.com/prettysmartdev/amux](https://github.com/prettys
 
 **What to include**
 - Shell examples with `sh` code blocks for any commands a reader would run
-- Screenshot placeholders (e.g. `![TUI showing the new dialog](images/NNNN-slug-01.png)`) when a visual would help — do not attempt ASCII art
+- Screenshot placeholders when a visual would help — do not attempt ASCII art. Wrap them in an HTML comment so the docs link check does not flag an image that does not exist yet:
+  ```markdown
+  <!-- SCREENSHOT PLACEHOLDER: the TUI showing the new dialog.
+       Save it as docs/blog/images/NNNN-slug-01.png and replace this comment with:
+       ![TUI showing the new dialog](./images/NNNN-slug-01.png) -->
+  ```
 - The install snippet (`curl -s https://prettysmart.dev/install/amux.sh | sh`) in the first third of the post, inside a `---` fenced section
 - Concrete "before vs. after" framing when the post is about a fix or refactor
 

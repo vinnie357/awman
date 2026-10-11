@@ -7,15 +7,7 @@ use crate::engine::error::EngineError;
 /// Supported agent names — derived from the legacy `Agent` enum in
 /// `oldsrc/cli.rs`.
 pub const SUPPORTED_AGENTS: &[&str] = &[
-    "claude",
-    "codex",
-    "opencode",
-    "maki",
-    "gemini",
-    "copilot",
-    "crush",
-    "cline",
-    "antigravity",
+    "claude", "codex", "opencode", "maki", "gemini", "copilot", "crush", "cline", "agy",
 ];
 
 /// How awman injects the combined context system prompt into an agent.
@@ -61,6 +53,10 @@ pub struct AgentMatrix {
     pub allowed_tools_flag: Option<&'static str>,
     /// How model is delivered (`--model NAME` for most).
     pub model_flag: ModelFlagDelivery,
+    /// How a seeded prompt is delivered in interactive mode (positional for
+    /// most; a dedicated flag for agents whose bare positional means something
+    /// else — e.g. opencode `--prompt`).
+    pub interactive_seed_delivery: InteractiveSeedDelivery,
     /// Whether the agent supports mid-session prompt injection over its
     /// already-running container's stdin. Used by the workflow engine to
     /// decide between reusing a long-lived container (when `true`) and
@@ -71,6 +67,11 @@ pub struct AgentMatrix {
     /// stdin without losing state. The wiring on the Docker side keeps the
     /// spawned subprocess's stdin alive for re-injection.
     pub supports_stdin_injection: bool,
+    /// Whether this agent's CLI can run in ACP (Agent Client Protocol) mode.
+    pub supports_acp: bool,
+    /// Entrypoint used when launching in ACP mode. `None` when ACP is not
+    /// supported by this agent.
+    pub acp_entrypoint: Option<Vec<&'static str>>,
     /// How context system prompts are delivered to this agent.
     pub system_prompt_delivery: SystemPromptMode,
     /// CLI flag for system prompt delivery (e.g. `--append-system-prompt-file`).
@@ -89,6 +90,28 @@ pub enum ModelFlagDelivery {
     EqArg,
     /// Not supported.
     Unsupported,
+}
+
+/// How a seeded initial prompt is delivered when launching in *interactive*
+/// mode.
+///
+/// Most agents accept the prompt as a trailing positional argument to the bare
+/// interactive entrypoint (e.g. `claude "<prompt>"`). A few cannot: opencode's
+/// bare command treats a positional as a *project directory* (`opencode
+/// [project]`), so passing a prompt there makes opencode `open()` the prompt as
+/// a path — which fails with `ENAMETOOLONG` for any real prompt and crashes the
+/// container. Those agents declare a dedicated flag instead (opencode
+/// `--prompt <text>`).
+///
+/// This only governs interactive delivery. Non-interactive runs use the
+/// agent's `non_interactive_flag` entrypoint shape (e.g. `opencode run`) and
+/// receive the prompt over stdin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractiveSeedDelivery {
+    /// Append the prompt as the final positional argv argument.
+    Positional,
+    /// Deliver the prompt as a flag pair: `<flag> <text>`.
+    Flag(&'static str),
 }
 
 /// Which Docker Sandbox kit kind awman emits for this agent.
@@ -118,7 +141,11 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: Some("--disallowedTools"),
             allowed_tools_flag: Some("--allowedTools"),
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
+            // TODO(acp): verify and wire up if/when claude ships ACP support
+            supports_acp: false,
+            acp_entrypoint: None,
             system_prompt_delivery: SystemPromptMode::Append,
             system_prompt_flag: Some("--append-system-prompt-file"),
             sbx_kit_kind: SbxKitKind::Mixin,
@@ -137,7 +164,11 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
+            // TODO(acp): verify and wire up if/when codex ships ACP support
+            supports_acp: false,
+            acp_entrypoint: None,
             // codex takes the system prompt as `--config developer_instructions=<text>`.
             system_prompt_delivery: SystemPromptMode::AppendInline {
                 key: "developer_instructions",
@@ -155,7 +186,14 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            // opencode's bare command treats a positional as a project dir, so a
+            // seeded prompt must go through `--prompt <text>`; a positional
+            // prompt makes opencode `open()` the prompt as a path (ENAMETOOLONG).
+            interactive_seed_delivery: InteractiveSeedDelivery::Flag("--prompt"),
             supports_stdin_injection: false,
+            // TODO(acp): verify and wire up if/when opencode ships ACP support
+            supports_acp: false,
+            acp_entrypoint: None,
             system_prompt_delivery: SystemPromptMode::AgentsMd,
             system_prompt_flag: None,
             sbx_kit_kind: SbxKitKind::Mixin,
@@ -170,7 +208,11 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
+            // TODO(acp): verify and wire up if/when maki ships ACP support
+            supports_acp: false,
+            acp_entrypoint: None,
             system_prompt_delivery: SystemPromptMode::Unsupported,
             system_prompt_flag: None,
             sbx_kit_kind: SbxKitKind::Agent,
@@ -185,7 +227,11 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
+            // TODO(acp): verify and wire up if/when gemini ships ACP support
+            supports_acp: false,
+            acp_entrypoint: None,
             system_prompt_delivery: SystemPromptMode::EnvFile {
                 var: "GEMINI_SYSTEM_MD",
             },
@@ -202,7 +248,11 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
+            // TODO(acp): verify and wire up if/when copilot ships ACP support
+            supports_acp: false,
+            acp_entrypoint: None,
             system_prompt_delivery: SystemPromptMode::EnvFile {
                 var: "COPILOT_CUSTOM_INSTRUCTIONS_DIRS",
             },
@@ -219,7 +269,11 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
+            // TODO(acp): verify and wire up if/when crush ships ACP support
+            supports_acp: false,
+            acp_entrypoint: None,
             system_prompt_delivery: SystemPromptMode::Unsupported,
             system_prompt_flag: None,
             sbx_kit_kind: SbxKitKind::Agent,
@@ -234,12 +288,15 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
             model_flag: ModelFlagDelivery::SpaceArg,
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
+            supports_acp: true,
+            acp_entrypoint: Some(vec!["cline", "--acp"]),
             system_prompt_delivery: SystemPromptMode::Replace,
             system_prompt_flag: Some("--system"),
             sbx_kit_kind: SbxKitKind::Agent,
         },
-        "antigravity" => AgentMatrix {
+        "agy" | "antigravity" => AgentMatrix {
             // Verified against `agy --help` (v1.0.x). Flags actually accepted:
             //   --print / -p / --prompt           (non-interactive)
             //   --prompt-interactive / -i         (interactive seed)
@@ -254,7 +311,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             // Don't emit them; the binary just dumps `--help` and treats the
             // prompt as the agy executable name. Leaving plan/auto as `None`
             // keeps non-yolo modes a silent no-op (matches opencode/maki).
-            agent: "antigravity",
+            agent: "agy",
             interactive_entrypoint: vec!["agy"],
             non_interactive_flag: Some("--print"),
             plan_flag: None,
@@ -262,8 +319,15 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             auto_flag: None,
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
-            model_flag: ModelFlagDelivery::Unsupported,
+            model_flag: ModelFlagDelivery::SpaceArg,
+            // agy accepts `--prompt-interactive`/`-i` for an interactive seed,
+            // but awman has always seeded it positionally; keep that behavior
+            // until the flag form is verified end-to-end.
+            interactive_seed_delivery: InteractiveSeedDelivery::Positional,
             supports_stdin_injection: false,
+            // TODO(acp): verify and wire up if/when antigravity ships ACP support
+            supports_acp: false,
+            acp_entrypoint: None,
             system_prompt_delivery: SystemPromptMode::AddDir { flag: "--add-dir" },
             system_prompt_flag: None,
             sbx_kit_kind: SbxKitKind::Agent,
@@ -272,7 +336,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             return Err(EngineError::Other(format!(
                 "unknown agent '{other}'; supported: {}",
                 SUPPORTED_AGENTS.join(", ")
-            )))
+            )));
         }
     })
 }
@@ -296,6 +360,20 @@ pub fn entrypoint_for(matrix: &AgentMatrix, non_interactive: bool) -> Entrypoint
     Entrypoint(parts)
 }
 
+/// Build the entrypoint used for an ACP launch.
+pub fn entrypoint_for_acp(matrix: &AgentMatrix) -> Result<Entrypoint, EngineError> {
+    let parts = matrix
+        .acp_entrypoint
+        .as_ref()
+        .ok_or_else(|| EngineError::AcpUnsupported {
+            agent: matrix.agent.to_string(),
+        })?
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    Ok(Entrypoint(parts))
+}
+
 /// Translate a model name into the matrix-specific flag form.
 pub fn model_flag_for(matrix: &AgentMatrix, model: &str) -> Result<ModelFlagForm, EngineError> {
     match matrix.model_flag {
@@ -317,7 +395,39 @@ mod tests {
     #[test]
     fn matrix_supports_all_agents() {
         for a in SUPPORTED_AGENTS {
-            assert!(matrix_for(a).is_ok(), "matrix missing for {a}");
+            let matrix = matrix_for(a).expect("matrix missing for agent");
+            assert_eq!(
+                matrix.acp_entrypoint.is_some(),
+                matrix.supports_acp,
+                "ACP metadata invariant failed for {a}"
+            );
+        }
+    }
+
+    #[test]
+    fn cline_has_verified_acp_entrypoint() {
+        let matrix = matrix_for("cline").unwrap();
+        assert!(matrix.supports_acp);
+        assert_eq!(matrix.acp_entrypoint, Some(vec!["cline", "--acp"]));
+        assert_eq!(
+            entrypoint_for_acp(&matrix).unwrap(),
+            Entrypoint(vec!["cline".to_string(), "--acp".to_string()])
+        );
+    }
+
+    #[test]
+    fn unsupported_agents_have_no_acp_entrypoint() {
+        for agent in SUPPORTED_AGENTS {
+            if *agent == "cline" {
+                continue;
+            }
+            let matrix = matrix_for(agent).unwrap();
+            assert!(!matrix.supports_acp, "unexpected ACP support for {agent}");
+            assert!(matrix.acp_entrypoint.is_none());
+            assert!(matches!(
+                entrypoint_for_acp(&matrix),
+                Err(EngineError::AcpUnsupported { .. })
+            ));
         }
     }
 
@@ -327,9 +437,72 @@ mod tests {
     }
 
     #[test]
+    fn agy_is_the_canonical_matrix_identity_and_antigravity_is_an_input_alias() {
+        assert!(SUPPORTED_AGENTS.contains(&"agy"));
+        assert!(!SUPPORTED_AGENTS.contains(&"antigravity"));
+
+        for input in ["agy", "antigravity"] {
+            let matrix =
+                matrix_for(input).expect("canonical name and migration alias must resolve");
+            assert_eq!(matrix.agent, "agy", "input {input} must canonicalize");
+            assert_eq!(matrix.interactive_entrypoint, vec!["agy"]);
+            assert_eq!(matrix.non_interactive_flag, Some("--print"));
+            assert_eq!(
+                model_flag_for(&matrix, "gemini-3.5-pro").unwrap(),
+                ModelFlagForm::Argument("gemini-3.5-pro".to_string()),
+                "input {input} must deliver the explicit model as `--model MODEL`"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_agent_error_lists_only_the_canonical_agy_name() {
+        let message = matrix_for("actualagy").unwrap_err().to_string();
+        assert!(message.contains("unknown agent 'actualagy'"), "{message}");
+        let supported = message
+            .split_once("supported: ")
+            .expect("unknown-agent error must carry the supported catalogue")
+            .1;
+        assert!(supported.split(", ").any(|name| name == "agy"), "{message}");
+        assert!(
+            !supported.split(", ").any(|name| name == "antigravity"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn opencode_plan_unsupported() {
         let m = matrix_for("opencode").unwrap();
         assert!(m.plan_flag.is_none());
+    }
+
+    #[test]
+    fn opencode_interactive_seed_uses_prompt_flag() {
+        let m = matrix_for("opencode").unwrap();
+        assert_eq!(
+            m.interactive_seed_delivery,
+            InteractiveSeedDelivery::Flag("--prompt"),
+            "opencode must seed interactive prompts via `--prompt`; a bare \
+             positional is a project dir and opencode open()s it (ENAMETOOLONG)"
+        );
+    }
+
+    #[test]
+    fn only_opencode_uses_a_seed_flag_others_are_positional() {
+        for a in SUPPORTED_AGENTS {
+            let m = matrix_for(a).unwrap();
+            match a {
+                &"opencode" => assert!(matches!(
+                    m.interactive_seed_delivery,
+                    InteractiveSeedDelivery::Flag(_)
+                )),
+                _ => assert_eq!(
+                    m.interactive_seed_delivery,
+                    InteractiveSeedDelivery::Positional,
+                    "{a} must seed interactive prompts positionally"
+                ),
+            }
+        }
     }
 
     #[test]
@@ -374,21 +547,13 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_model_flag_unsupported_returns_err() {
+    fn legacy_antigravity_alias_delivers_model_as_space_argument() {
         let m = matrix_for("antigravity").unwrap();
-        let result = model_flag_for(&m, "gemini-3.5-flash");
-        assert!(
-            result.is_err(),
-            "model_flag_for antigravity must return Err (Unsupported); got {result:?}"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("antigravity"),
-            "error must name the agent; got: {msg}"
-        );
-        assert!(
-            msg.contains("does not support a model flag"),
-            "error must say 'does not support a model flag'; got: {msg}"
+        assert_eq!(m.agent, "agy");
+        assert_eq!(
+            model_flag_for(&m, "gemini-3.5-flash").unwrap(),
+            ModelFlagForm::Argument("gemini-3.5-flash".to_string()),
+            "the migration alias must retain an explicit model through canonical agy SpaceArg delivery"
         );
     }
 

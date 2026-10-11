@@ -77,7 +77,7 @@ fn make_app_state_with_workdirs(
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: auth,
         engines,
-        sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory()),
         event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         setup_buses: tokio::sync::Mutex::new(HashMap::new()),
     })
@@ -99,30 +99,35 @@ async fn spawn_router(
 // ─── Dispatch catalogue unit tests ────────────────────────────────────────────
 
 #[test]
-fn catalogue_api_allowed_commands_is_exactly_exec_workflow_and_exec_prompt() {
+fn catalogue_api_allowed_commands_includes_exec_and_squad_commands() {
     let cat = CommandCatalogue::get();
     let allowed = cat.api_allowed_commands();
 
+    let expected = [
+        ("exec", "prompt"),
+        ("exec", "workflow"),
+        ("squad", "start"),
+        ("squad", "stop"),
+        ("squad", "status"),
+        ("squad", "logs"),
+        ("squad", "add"),
+        // WI 0110: `squad edit` is API-allowed for the same reason `add` is —
+        // the daemon re-executes it from the remote gateway.
+        ("squad", "edit"),
+        ("squad", "list"),
+        ("squad", "show"),
+        ("squad", "remove"),
+        ("squad", "pause"),
+        ("squad", "resume"),
+        // `squad trigger` is API-allowed for the same reason `pause`/`resume`
+        // are: the remote gateway reaches the daemon by re-executing it.
+        ("squad", "trigger"),
+        ("squad", "cancel"),
+    ];
     assert_eq!(
-        allowed.len(),
-        2,
-        "expected exactly 2 API-allowed commands, got {}: {:?}",
-        allowed.len(),
-        allowed
-    );
-
-    let has_exec_workflow = allowed
-        .iter()
-        .any(|(p, s)| *p == "exec" && *s == "workflow");
-    let has_exec_prompt = allowed.iter().any(|(p, s)| *p == "exec" && *s == "prompt");
-
-    assert!(
-        has_exec_workflow,
-        "api_allowed_commands must include (\"exec\", \"workflow\"); got {allowed:?}"
-    );
-    assert!(
-        has_exec_prompt,
-        "api_allowed_commands must include (\"exec\", \"prompt\"); got {allowed:?}"
+        allowed.as_slice(),
+        expected,
+        "API-allowed command set changed unexpectedly: {allowed:?}"
     );
 }
 

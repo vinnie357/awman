@@ -11,24 +11,153 @@ pub mod agent_setup;
 pub mod api_server;
 pub mod auth;
 pub mod chat;
+pub mod clean;
 pub mod command_trait;
 pub mod config;
 pub mod download;
 pub mod exec_prompt;
 pub mod exec_workflow;
+pub(crate) mod http_core;
+pub mod squad;
+// HttpCore is the shared transport seam used by daemon-facing clients and
+// must be reachable by integration consumers without exposing its module's
+// implementation registry.
+pub use http_core::HttpCore;
+pub(crate) mod dynamic_repair;
+// The WI-0092 leader/repair budget is the one decision core `exec workflow
+// --dynamic` and the squad evaluator share; both callers — and the tests that
+// prove they behave identically — reach it through this re-export.
+pub use dynamic_repair::{RepairDecision, WorkflowRepairLoop};
 pub mod init;
 pub mod mount_scope;
 pub mod new;
 pub mod prompt_templates;
 pub mod ready;
 pub mod remote;
-pub(crate) mod remote_client;
+pub mod remote_client;
+pub mod skill_library;
 pub mod specs;
 pub mod status;
 pub mod status_tips;
 pub mod worktree_lifecycle;
 
 pub use command_trait::Command;
+
+pub(crate) fn preflight_startup_gate(
+    command: &'static str,
+    control: Option<&std::path::Path>,
+    timeout_seconds: u64,
+    allow_docker: bool,
+) -> Result<Option<crate::data::startup_gate::StartupGateSpec>, crate::command::error::CommandError>
+{
+    let Some(control) = control else {
+        return Ok(None);
+    };
+    if !(1..=3600).contains(&timeout_seconds) {
+        return Err(crate::command::error::CommandError::Other(format!(
+            "{command}: --startup-gate-timeout must be an integer in 1..=3600"
+        )));
+    }
+    if allow_docker {
+        return Err(crate::command::error::CommandError::Other(format!(
+            "{command}: --allow-docker is unsupported with --startup-gate-control"
+        )));
+    }
+    crate::data::startup_gate::load_startup_gate(
+        control,
+        std::time::Duration::from_secs(timeout_seconds),
+    )
+    .map(Some)
+    .map_err(|error| crate::command::error::CommandError::Other(format!("{command}: {error}")))
+}
+
+/// Result of resolving an ACP request for a concrete agent.
+///
+/// This is deliberately command-layer policy: the engine remains the final
+/// safety guard, while this decision determines whether a repository default
+/// may use the configured fallback before any setup, overlay, or runtime work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaunchModeDecision {
+    Stdio,
+    Acp,
+    StdioWithFallbackWarning,
+}
+
+#[cfg(test)]
+mod launch_mode_tests {
+    use super::*;
+    use crate::data::config::global::{GlobalConfig, LaunchModeFallback};
+    use crate::data::config::repo::LaunchMode;
+
+    fn config(fallback: LaunchModeFallback) -> crate::data::config::effective::EffectiveConfig {
+        crate::data::config::effective::EffectiveConfig::new(
+            crate::data::config::FlagConfig {
+                launch_mode: Some(LaunchMode::Acp),
+                ..Default::default()
+            },
+            Default::default(),
+            Default::default(),
+            GlobalConfig {
+                launch_mode_fallback: Some(fallback),
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn fallback_decision_matrix() {
+        let supported = crate::data::session::AgentName::new("cline").unwrap();
+        let unsupported = crate::data::session::AgentName::new("claude").unwrap();
+
+        assert_eq!(
+            resolve_launch_mode(&config(LaunchModeFallback::Error), &supported, false).unwrap(),
+            LaunchModeDecision::Acp
+        );
+        assert!(matches!(
+            resolve_launch_mode(&config(LaunchModeFallback::Error), &unsupported, false),
+            Err(crate::engine::error::EngineError::AcpUnsupported { .. })
+        ));
+        assert_eq!(
+            resolve_launch_mode(&config(LaunchModeFallback::Stdio), &unsupported, false).unwrap(),
+            LaunchModeDecision::StdioWithFallbackWarning
+        );
+        assert!(matches!(
+            resolve_launch_mode(&config(LaunchModeFallback::Stdio), &unsupported, true),
+            Err(crate::engine::error::EngineError::AcpUnsupported { .. })
+        ));
+    }
+}
+
+/// Apply the ACP support and fallback policy after normal agent resolution.
+/// Explicit single-agent ACP intent is never downgraded.
+pub(crate) fn resolve_launch_mode(
+    config: &crate::data::config::effective::EffectiveConfig,
+    agent: &crate::data::session::AgentName,
+    explicit_single_agent_acp: bool,
+) -> Result<LaunchModeDecision, crate::engine::error::EngineError> {
+    use crate::data::config::global::LaunchModeFallback;
+    use crate::data::config::repo::LaunchMode;
+
+    if config.launch_mode() == LaunchMode::Stdio {
+        return Ok(LaunchModeDecision::Stdio);
+    }
+    if crate::engine::agent::agent_matrix::matrix_for(agent.as_str())?.supports_acp {
+        return Ok(LaunchModeDecision::Acp);
+    }
+    if explicit_single_agent_acp || config.launch_mode_fallback() == LaunchModeFallback::Error {
+        return Err(crate::engine::error::EngineError::AcpUnsupported {
+            agent: agent.as_str().to_string(),
+        });
+    }
+    Ok(LaunchModeDecision::StdioWithFallbackWarning)
+}
+
+pub(crate) fn acp_fallback_warning(agent: &crate::data::session::AgentName) -> String {
+    format!(
+        "agent '{}' does not support ACP; falling back to stdio for this session — see launchModeFallback",
+        agent.as_str()
+    )
+}
 
 /// Resolve the agent name to use for a command, in precedence order:
 ///   1. explicit CLI flag (`flag`)
@@ -108,7 +237,7 @@ pub enum TypedOverlay {
 }
 
 /// Aggregated overlay information after collecting from all sources.
-#[derive(Debug)]
+#[derive(Debug, Clone, Default)]
 pub struct CollectedOverlays {
     pub directories: Vec<crate::engine::overlay::DirectorySpec>,
     pub include_all_skills: bool,
@@ -233,6 +362,23 @@ fn parse_single_typed_overlay(expr: &str) -> Result<TypedOverlay, String> {
             if args == "*" {
                 Ok(TypedOverlay::Skill(SkillSpec::All))
             } else {
+                if args.matches('/').count() > 1 {
+                    return Err(format!(
+                        "skill(name) supports at most one '/' (library/skill); got '{args}'"
+                    ));
+                }
+                // Each segment must be a single, contained path component:
+                // an empty, '.' or '..' segment is joined onto a host skills
+                // path at mount time and would resolve somewhere the reference
+                // never named (e.g. `skill(lib/..)` = the whole clone).
+                if args
+                    .split('/')
+                    .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+                {
+                    return Err(format!(
+                        "skill(name) segments must not be empty, '.' or '..'; got '{args}'"
+                    ));
+                }
                 Ok(TypedOverlay::Skill(SkillSpec::Named(args.to_string())))
             }
         }
@@ -258,7 +404,25 @@ fn parse_single_typed_overlay(expr: &str) -> Result<TypedOverlay, String> {
             if args.contains(',') {
                 return Err("env() takes one argument; use separate env() calls for multiple vars".to_string());
             }
-            Ok(TypedOverlay::Env(args.to_string()))
+            // The argument becomes an environment variable *name*: it is emitted
+            // as `-e NAME` and, for a squad daemon, set on the spawned container
+            // CLI's own environment via `Command::env`. A name containing `=`
+            // would produce a malformed entry there rather than a passthrough,
+            // and one containing a NUL would fail the spawn. Refusing it at the
+            // front door means a bad task is rejected when it is created rather
+            // than discovered at its first scheduled run, hours later.
+            let name = args;
+            let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if !valid {
+                return Err(format!(
+                    "env() argument {name:?} is not a valid environment variable name \
+                     (letters, digits and underscore, not starting with a digit)"
+                ));
+            }
+            Ok(TypedOverlay::Env(name.to_string()))
         }
         "context" => {
             if args.is_empty() {
@@ -645,6 +809,60 @@ pub fn warn_legacy_config(
 }
 
 #[cfg(test)]
+mod env_overlay_parser_tests {
+    use super::*;
+
+    #[test]
+    fn env_accepts_an_ordinary_environment_variable_name() {
+        for name in ["GITHUB_TOKEN", "_private", "AWS_PROFILE2", "X"] {
+            assert_eq!(
+                parse_overlay_list(&format!("env({name})")).unwrap(),
+                vec![TypedOverlay::Env(name.to_string())],
+                "{name} is a perfectly ordinary variable name"
+            );
+        }
+    }
+
+    /// Remediation of review-security F11. The argument becomes an environment
+    /// variable *name*: `-e NAME` in argv and, for a squad daemon, a
+    /// `Command::env` key on the spawned container CLI. A `=` there makes a
+    /// malformed entry instead of a passthrough and a NUL fails the spawn, so a
+    /// bad name is refused when the task is created rather than discovered at
+    /// its first scheduled run.
+    #[test]
+    fn env_rejects_a_name_that_is_not_an_environment_variable_name() {
+        for bad in [
+            "FOO=bar",
+            "2FOO",
+            "FOO BAR",
+            "FOO-BAR",
+            "FOO\u{0}BAR",
+            "FOO.BAR",
+        ] {
+            let err = parse_overlay_list(&format!("env({bad})")).unwrap_err_or_else_name(bad);
+            assert!(
+                err.contains("not a valid environment variable name"),
+                "env({bad}) must be refused by name, not by accident; got: {err}"
+            );
+        }
+    }
+
+    /// A helper that reports the offending input when the parse unexpectedly
+    /// succeeds, since a silent `unwrap_err` panic names nothing.
+    trait UnwrapErrNamed {
+        fn unwrap_err_or_else_name(self, input: &str) -> String;
+    }
+    impl UnwrapErrNamed for Result<Vec<TypedOverlay>, String> {
+        fn unwrap_err_or_else_name(self, input: &str) -> String {
+            match self {
+                Ok(parsed) => panic!("env({input}) must not parse; got {parsed:?}"),
+                Err(e) => e,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod skill_parser_tests {
     use super::*;
 
@@ -670,6 +888,77 @@ mod skill_parser_tests {
             result,
             vec![TypedOverlay::Skill(SkillSpec::Named("myskill".to_string()))]
         );
+    }
+
+    #[test]
+    fn skill_library_slash_skill_parses_to_named() {
+        // `skill(library/skill)` (exactly one slash) is a valid single-skill
+        // reference into a pulled library — it parses as a Named spec.
+        let result = parse_overlay_list("skill(superpowers/brainstorming)").unwrap();
+        assert_eq!(
+            result,
+            vec![TypedOverlay::Skill(SkillSpec::Named(
+                "superpowers/brainstorming".to_string()
+            ))]
+        );
+    }
+
+    #[test]
+    fn skill_with_two_slashes_is_rejected() {
+        // More than one slash is ambiguous (`library/skill` is the deepest
+        // form) and must be rejected at parse time with a descriptive error.
+        let err = parse_overlay_list("skill(a/b/c)").unwrap_err();
+        assert!(
+            err.contains("at most one '/'") && err.contains("a/b/c"),
+            "error must explain the one-slash limit and echo the bad value; got: {err}"
+        );
+    }
+
+    /// Segments are joined onto host skills paths at mount time, so a `.`,
+    /// `..` or empty segment would resolve somewhere the reference never named
+    /// — `skill(superpowers/..)` would mount the whole managed clone, `.git/`
+    /// included (WI-0103 remediation).
+    #[test]
+    fn skill_with_traversal_or_empty_segments_is_rejected() {
+        for bad in [
+            "superpowers/..",
+            "superpowers/.",
+            "../superpowers",
+            "./superpowers",
+            "superpowers/",
+            "/superpowers",
+            "..",
+            ".",
+        ] {
+            let expr = format!("skill({bad})");
+            let err = parse_overlay_list(&expr)
+                .err()
+                .unwrap_or_else(|| panic!("'{expr}' must be rejected at parse time"));
+            assert!(
+                err.contains("must not be empty, '.' or '..'"),
+                "'{expr}' must be rejected with the segment rule; got: {err}"
+            );
+        }
+    }
+
+    /// The new segment rule must not narrow what already parsed.
+    #[test]
+    fn skill_ordinary_names_still_parse_after_segment_validation() {
+        for good in [
+            "lint",
+            "superpowers",
+            "superpowers/brainstorming",
+            "my.skill",
+        ] {
+            let expr = format!("skill({good})");
+            let parsed = parse_overlay_list(&expr)
+                .unwrap_or_else(|e| panic!("'{expr}' must still parse; got error: {e}"));
+            assert_eq!(
+                parsed,
+                vec![TypedOverlay::Skill(SkillSpec::Named(good.to_string()))],
+                "'{expr}' must parse to the same named skill as before"
+            );
+        }
     }
 
     #[test]

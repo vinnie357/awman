@@ -8,7 +8,7 @@ use crate::command::commands::agent_setup::AgentSetupFrontend;
 use crate::command::commands::mount_scope::MountScopeFrontend;
 use crate::command::commands::prompt_templates::{render_amend_prompt, render_interview_prompt};
 use crate::command::commands::{resolve_agent, Command};
-use crate::command::dispatch::Engines;
+use crate::command::dispatch::{BuildContext, Engines};
 use crate::command::error::CommandError;
 use crate::data::message::{MessageLevel, UserMessage, UserMessageSink};
 use crate::engine::agent::AgentRunOptions;
@@ -164,6 +164,21 @@ impl SpecsCommand {
         }
     }
 
+    /// Construct from the catalogue-resolved input (WI 0113 F-10). `specs`
+    /// has one leaf today; the subcommand is still selected from the caller's
+    /// canonical path so a second one needs no new entry point.
+    pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        let sub = match ctx.caller.leaf() {
+            "amend" => SpecsSubcommand::Amend(SpecsAmendFlags {
+                work_item: ctx.args.require("work_item")?,
+                non_interactive: ctx.flags.bool("non-interactive"),
+                allow_docker: ctx.flags.bool("allow-docker"),
+            }),
+            _ => return Err(CommandError::unknown_command(&ctx.path())),
+        };
+        Ok(Self::new(sub, ctx.engines.clone(), ctx.session.clone()))
+    }
+
     pub fn subcommand(&self) -> &SpecsSubcommand {
         &self.sub
     }
@@ -309,7 +324,7 @@ pub(crate) async fn create_new_spec(
     session: crate::data::session::Session,
     interview: bool,
     non_interactive: bool,
-    issue_flags: crate::data::issue::IssueSourceFlags,
+    issue_flags: crate::engine::issue::IssueSourceFlags,
     frontend: &mut dyn SpecsCommandFrontend,
 ) -> Result<NewSpecOutcome, CommandError> {
     let git_root = session.git_root().to_path_buf();
@@ -357,7 +372,10 @@ pub(crate) async fn create_new_spec(
         slug: String,
     }
     let fetched_issue: Option<FetchedIssue> = if let Some(ref issue_ref) = issue_flags.issue {
-        let router = crate::data::issue::router::IssueSourceRouter::default();
+        let router = crate::engine::issue::router::IssueSourceRouter::new(
+            std::sync::Arc::clone(&engines.git_engine),
+            session.env(),
+        );
         match router.fetch_issue_with_progress(issue_ref, &git_root, frontend) {
             Ok((issue, source)) => {
                 let markdown = source.format_as_markdown(&issue);
@@ -495,10 +513,12 @@ pub(crate) async fn create_new_spec(
         engines
             .require_container_runtime()
             .map_err(CommandError::from)?;
-        let mut options = match engines
-            .agent_engine
-            .build_options(&session, &agent, &run_opts)
-        {
+        let mut options = match engines.agent_engine.build_options_with_credentials(
+            &session,
+            &agent,
+            &run_opts,
+            &credentials,
+        ) {
             Ok(o) => o,
             Err(e) => {
                 frontend.write_message(UserMessage {
@@ -508,7 +528,12 @@ pub(crate) async fn create_new_spec(
                 return Err(CommandError::from(e));
             }
         };
-        if !credentials.env_vars.is_empty() {
+        if !credentials.env_vars.is_empty()
+            && matches!(
+                credentials.delivery,
+                crate::engine::auth::CredentialDelivery::Env
+            )
+        {
             options.push(ContainerOption::AgentCredentials {
                 env_vars: credentials.env_vars,
             });
@@ -725,35 +750,7 @@ mod tests {
     }
 
     fn make_engines_with_root(root: &std::path::Path) -> crate::command::dispatch::Engines {
-        use crate::data::fs::api_paths::ApiPaths;
-        use crate::data::fs::auth_paths::AuthPathResolver;
-        use crate::engine::container::ContainerRuntime;
-        use crate::engine::overlay::OverlayEngine;
-        use std::sync::Arc;
-        let overlay = Arc::new(OverlayEngine::with_auth_resolver(
-            AuthPathResolver::at_home(root),
-        ));
-        let runtime = Arc::new(ContainerRuntime::docker());
-        let agent_engine = Arc::new(crate::engine::agent::AgentEngine::new(
-            overlay.clone(),
-            runtime.clone(),
-        ));
-        let auth_engine = Arc::new(crate::engine::auth::AuthEngine::with_paths(
-            AuthPathResolver::at_home(root),
-            ApiPaths::at_root(root),
-        ));
-        crate::command::dispatch::Engines {
-            runtime: runtime.clone(),
-            container_runtime: Some(runtime),
-            sandbox_runtime: None,
-            git_engine: Arc::new(crate::engine::git::GitEngine::new()),
-            overlay_engine: overlay,
-            auth_engine,
-            agent_engine,
-            workflow_state_store: Arc::new(crate::data::EngineWorkflowStateStore::at_git_root(
-                root,
-            )),
-        }
+        crate::command::dispatch::Engines::for_tests(root)
     }
 
     fn make_session(root: &std::path::Path) -> crate::data::session::Session {

@@ -11,3 +11,4 @@ mod helpers;
 
 mod catalogue_completeness;
 mod json_outputs;
+mod squad_catalogue;

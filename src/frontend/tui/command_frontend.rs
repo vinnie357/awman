@@ -6,6 +6,7 @@
 //! the parsed input's typed maps. Interactive Q&A methods open modal dialogs
 //! via the dialog channel and block until the user responds.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -17,9 +18,9 @@ use crate::data::message::{UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::frontend::tui::dialogs::{DialogRequest, DialogResponse};
 use crate::frontend::tui::tabs::{
-    SharedActiveWorktreePath, SharedContainerName, SharedEngineTx, SharedPtyResetFlag,
-    SharedResizeTx, SharedStatusDashboard, SharedStdinTx, SharedStuckSender, SharedTuiContext,
-    SharedWorkflowViewState, SharedYoloCancelFlag, SharedYoloState,
+    SharedActiveWorktreePath, SharedContainerExitCode, SharedContainerName, SharedEngineTx,
+    SharedPtyResetFlag, SharedResizeTx, SharedStatusDashboard, SharedStdinTx, SharedStuckSender,
+    SharedTuiContext, SharedWorkflowViewState, SharedYoloCancelFlag, SharedYoloState,
 };
 use crate::frontend::tui::user_message::{SharedStatusLog, TuiUserMessageSink};
 
@@ -47,6 +48,10 @@ pub struct TuiCommandFrontend {
     pub(crate) yolo_cancel_flag: SharedYoloCancelFlag,
     pub(crate) pty_reset_flag: SharedPtyResetFlag,
     pub(crate) container_name_shared: SharedContainerName,
+    /// Shared exit-code slot: written when the engine reports a workflow
+    /// container actually terminated; the TUI event loop takes it and closes
+    /// the container window.
+    pub(crate) container_exit_shared: SharedContainerExitCode,
     /// Persistent stdout sender — kept alive across workflow steps so each
     /// new `AgentIo` can send output to the same TUI event loop receiver.
     pub(crate) stdout_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
@@ -77,9 +82,37 @@ pub struct TuiCommandFrontend {
     /// Live TUI context shared with the event loop. The event loop refreshes
     /// this on every tick; the status command reads it on each watch iteration.
     pub(crate) tui_context_shared: SharedTuiContext,
+    /// Shared queue of parallel-slot lifecycle events (WI-0096). The parallel
+    /// workflow callbacks push here; the TUI event loop drains it to maintain
+    /// `Tab::container_slots`.
+    pub(crate) container_slot_events: crate::frontend::tui::tabs::SharedContainerSlotEvents,
+    pub(crate) squad_attach_session:
+        Option<std::sync::Arc<crate::frontend::tui::squad_attach::SquadAttachSession>>,
+    pub(crate) squad_attach_reachable: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub(crate) squad_attach_metadata: HashMap<String, (String, Option<String>)>,
+    pub(crate) parallel_group_active: bool,
+    pub(crate) pending_step_slot_io: HashMap<String, crate::frontend::tui::tabs::ContainerSlotIo>,
+    /// Per-step cancel flags for in-flight parallel yolo countdowns, keyed by
+    /// step name. Created in `parallel_step_yolo_countdown_started`, shared
+    /// with the slot via `ContainerSlotEvent::YoloStarted` so the TUI event
+    /// loop can request cancellation (Esc on the per-slot countdown modal);
+    /// checked and removed in `parallel_step_yolo_countdown_tick` /
+    /// `_finished`.
+    pub(crate) pending_parallel_yolo_cancel: HashMap<String, SharedYoloCancelFlag>,
+    /// Field name of the most recent config-dialog edit, so the re-presented
+    /// table reopens with that row selected (the `config show` edit loop
+    /// presents the dialog again after every save).
+    pub(crate) last_config_edit_field: Option<String>,
 }
 
+// `SquadCommandFrontend` for `TuiCommandFrontend` (interview dialogs) lives in
+// `per_command::squad`, alongside the other per-command TUI frontend impls.
+
 impl TuiCommandFrontend {
+    pub(crate) fn squad_attach_has_explicit_target(&self) -> bool {
+        self.parsed.flags.contains_key("container")
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         parsed: ParsedCommandBoxInput,
@@ -92,6 +125,7 @@ impl TuiCommandFrontend {
         yolo_cancel_flag: SharedYoloCancelFlag,
         pty_reset_flag: SharedPtyResetFlag,
         container_name_shared: SharedContainerName,
+        container_exit_shared: SharedContainerExitCode,
         stdin_tx_shared: SharedStdinTx,
         resize_tx_shared: SharedResizeTx,
         engine_tx_shared: SharedEngineTx,
@@ -99,6 +133,7 @@ impl TuiCommandFrontend {
         active_worktree_path: SharedActiveWorktreePath,
         status_dashboard: SharedStatusDashboard,
         tui_context_shared: SharedTuiContext,
+        container_slot_events: crate::frontend::tui::tabs::SharedContainerSlotEvents,
     ) -> Self {
         let stdout_tx = container_io.stdout.clone();
         Self {
@@ -114,6 +149,7 @@ impl TuiCommandFrontend {
             yolo_cancel_flag,
             pty_reset_flag,
             container_name_shared,
+            container_exit_shared,
             stdout_tx,
             stdin_tx_shared,
             resize_tx_shared,
@@ -122,6 +158,14 @@ impl TuiCommandFrontend {
             active_worktree_path,
             status_dashboard,
             tui_context_shared,
+            container_slot_events,
+            squad_attach_session: None,
+            squad_attach_reachable: None,
+            squad_attach_metadata: HashMap::new(),
+            parallel_group_active: false,
+            pending_step_slot_io: HashMap::new(),
+            pending_parallel_yolo_cancel: HashMap::new(),
+            last_config_edit_field: None,
         }
     }
 
@@ -135,7 +179,9 @@ impl TuiCommandFrontend {
         let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
 
         let initial_size = match crossterm::terminal::size() {
-            Ok((cols, rows)) => crate::frontend::tui::compute_container_inner_size(cols, rows),
+            Ok((cols, rows)) => {
+                crate::frontend::tui::event_loop::compute_container_inner_size(cols, rows)
+            }
             Err(_) => (80u16, 24u16),
         };
 
@@ -155,6 +201,48 @@ impl TuiCommandFrontend {
             resize: Some(resize_rx),
             initial_size: Some(initial_size),
         });
+    }
+
+    pub(crate) fn recreate_parallel_container_io(&mut self, step_name: &str) {
+        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let stdin_tx_for_engine = stdin_tx.clone();
+        let (resize_tx, resize_rx) = tokio::sync::mpsc::unbounded_channel::<(u16, u16)>();
+
+        let initial_size = match crossterm::terminal::size() {
+            Ok((cols, rows)) => {
+                crate::frontend::tui::event_loop::compute_container_inner_size(cols, rows)
+            }
+            Err(_) => (80u16, 24u16),
+        };
+
+        self.container_io = Some(AgentIo {
+            stdout: stdout_tx.clone(),
+            stderr: stdout_tx,
+            stdin_tx: stdin_tx_for_engine,
+            stdin_rx,
+            resize: Some(resize_rx),
+            initial_size: Some(initial_size),
+        });
+        self.pending_step_slot_io.insert(
+            step_name.to_string(),
+            crate::frontend::tui::tabs::ContainerSlotIo {
+                stdout_rx,
+                stdin_tx,
+                resize_tx,
+            },
+        );
+    }
+
+    /// Push a parallel-slot lifecycle event into the shared queue for the
+    /// TUI event loop to drain (WI-0096).
+    pub(crate) fn push_container_slot_event(
+        &self,
+        event: crate::frontend::tui::tabs::ContainerSlotEvent,
+    ) {
+        if let Ok(mut q) = self.container_slot_events.lock() {
+            q.push_back(event);
+        }
     }
 
     /// Send a dialog request and block waiting for the response.
@@ -269,6 +357,31 @@ impl CommandFrontend for TuiCommandFrontend {
                         flag: flag.to_string(),
                         reason: format!("'{v}' is not a valid u16"),
                     })
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn flag_usize(
+        &self,
+        _command_path: &[&str],
+        flag: &str,
+    ) -> Result<Option<usize>, CommandError> {
+        match self.parsed.flags.get(flag) {
+            Some(FlagValue::String(v)) => {
+                let n: usize = v.parse().map_err(|_| CommandError::InvalidFlagValue {
+                    command: self.parsed.path.clone(),
+                    flag: flag.to_string(),
+                    reason: format!("'{v}' is not a valid number"),
+                })?;
+                if n < 1 {
+                    return Err(CommandError::InvalidFlagValue {
+                        command: self.parsed.path.clone(),
+                        flag: flag.to_string(),
+                        reason: format!("'{v}' must be >= 1"),
+                    });
+                }
+                Ok(Some(n))
             }
             _ => Ok(None),
         }

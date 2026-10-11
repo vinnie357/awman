@@ -4,16 +4,19 @@
 //! The frontend is a pure I/O layer — it renders what the engine tells it
 //! and collects user input when the engine asks for it.
 
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::broadcast;
 
 use crate::data::message::UserMessageSink;
 use crate::data::workflow_definition::WorkflowStep;
 use crate::data::workflow_state::WorkflowState;
-use crate::engine::agent_runtime::execution::AgentExitInfo;
 use crate::engine::agent_runtime::execution::StuckEvent;
+use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::error::EngineError;
 use crate::engine::workflow::actions::{
-    AvailableActions, NextAction, ResumeMismatch, StepFailureChoice, StepOutput, WorkflowOutcome,
+    AvailableActions, CountdownKind, NextAction, ResumeMismatch, StepOutput, WorkflowOutcome,
     WorkflowStepProgressInfo, WorkflowStepStatus, YoloTickOutcome,
 };
 use crate::engine::workflow::EngineRequest;
@@ -47,7 +50,12 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     /// Engine tells frontend: yolo countdown just started for this step.
     /// Frontend should show the countdown dialog (active tab) or flash
     /// the tab header yellow/purple (background tab).
-    fn yolo_countdown_started(&mut self, _step_name: &str) {}
+    ///
+    /// `kind` says what expiry will do — advance past a stuck container, or
+    /// retry a step that failed (WI-0115 §3) — so a frontend that narrates the
+    /// countdown in words can narrate the right ones. Frontends that only show
+    /// a clock can ignore it.
+    fn yolo_countdown_started(&mut self, _step_name: &str, _kind: CountdownKind) {}
 
     /// Engine tells frontend: yolo countdown finished (expired, cancelled,
     /// or step recovered). Frontend dismisses dialog / resets tab style.
@@ -75,16 +83,38 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     ) {
     }
 
+    /// Called by the engine the moment the current container has actually
+    /// terminated — either it exited on its own (agent quit, crash, startup
+    /// grace kill) or the engine killed it (yolo advance, WCB action).
+    ///
+    /// Contract: this fires ONLY on real container death. It is never called
+    /// for a stuck-but-alive container or while a yolo countdown is still
+    /// running. `exit_code` is the container's exit code when known, or
+    /// [`KILLED_EXIT_CODE`](crate::engine::agent_runtime::execution::KILLED_EXIT_CODE)
+    /// when the engine killed it without waiting for the real code.
+    fn report_container_exited(&mut self, _exit_code: i32) {}
+
+    // === Capabilities ===
+
+    /// Whether a human is on the other side of this frontend and can be asked
+    /// what to do when a step fails.
+    ///
+    /// `true` puts the engine on the interactive recovery path: it opens the
+    /// Workflow Control Board with the failure attached and waits for a
+    /// restart / back / next / abort decision. `false` — the squad daemon, the
+    /// API server, a `--non-interactive` CLI run — puts it on the unattended
+    /// path: one yolo countdown, one automatic retry, then the workflow fails
+    /// (WI-0115 §3).
+    ///
+    /// Defaults to `false`: a frontend that has not opted in must never be
+    /// blocked on a question nobody can answer.
+    fn supports_interactive_recovery(&self) -> bool {
+        false
+    }
+
     // === User decisions (blocking) ===
 
     fn confirm_resume(&mut self, mismatch: &ResumeMismatch) -> Result<bool, EngineError>;
-
-    /// Called after a step transitions to Failed.
-    fn user_choose_after_step_failure(
-        &mut self,
-        step: &WorkflowStep,
-        exit: &AgentExitInfo,
-    ) -> Result<StepFailureChoice, EngineError>;
 
     // === Channel setup ===
 
@@ -118,4 +148,74 @@ pub trait WorkflowFrontend: UserMessageSink + Send {
     fn on_teardown_step_completed(&mut self, _description: &str) {}
     fn on_teardown_step_failed(&mut self, _description: &str, _exit_code: i32, _stderr: &str) {}
     fn on_teardown_step_fixing(&mut self, _description: &str, _attempt: u32, _of: u32) {}
+
+    // === Parallel-group commands (WI-0096) ===
+    //
+    // All default no-ops. The single-step path never calls these; frontends
+    // that don't render multi-container UX simply ignore them. The engine owns
+    // every scheduling/concurrency decision — these callbacks are pure
+    // presentation notifications.
+
+    /// Engine is launching multiple parallel containers for this group.
+    /// `step_names` is the ordered list of all steps in this parallel batch
+    /// (including queued ones that are not yet running).
+    fn report_parallel_group_started(&mut self, _step_names: &[String]) {}
+
+    /// One container in a parallel group has started running.
+    fn report_parallel_step_launched(
+        &mut self,
+        _step_name: &str,
+        _agent: &str,
+        _model: Option<&str>,
+    ) {
+    }
+
+    /// The engine learned a parallel step's actual container name (right
+    /// after the container launched). Frontends use it for per-container
+    /// stats polling and status-bar display.
+    fn report_parallel_step_container(&mut self, _step_name: &str, _container_name: &str) {}
+
+    /// One container in a parallel group has exited.
+    /// `evict` — the frontend should remove the status bar for this step
+    /// entirely (not replace it with a grey summary bar).
+    fn report_parallel_step_exited(&mut self, _step_name: &str, _exit_code: i32) {}
+
+    /// A queued step in this parallel group has started (because a slot freed up).
+    fn report_parallel_step_dequeued(
+        &mut self,
+        _step_name: &str,
+        _agent: &str,
+        _model: Option<&str>,
+    ) {
+    }
+
+    /// The parallel group has fully drained; all steps completed.
+    fn report_parallel_group_finished(&mut self) {}
+
+    /// Per-step stuck notification for a parallel container.
+    fn report_parallel_step_stuck(&mut self, _step_name: &str) {}
+    fn report_parallel_step_unstuck(&mut self, _step_name: &str) {}
+
+    /// Per-step yolo countdown updates.
+    fn parallel_step_yolo_countdown_started(&mut self, _step_name: &str) {}
+    fn parallel_step_yolo_countdown_tick(
+        &mut self,
+        _step_name: &str,
+        _remaining: Duration,
+        _total: Duration,
+    ) -> Result<YoloTickOutcome, EngineError> {
+        Ok(YoloTickOutcome::Continue)
+    }
+    fn parallel_step_yolo_countdown_finished(&mut self, _step_name: &str) {}
+
+    /// Set per-step I/O channels. Called once per parallel step launch.
+    fn set_parallel_step_io(&mut self, _step_name: &str, _io: AgentIo) {}
+
+    /// Set per-step stuck sender (one per active parallel container).
+    fn set_parallel_step_stuck_sender(
+        &mut self,
+        _step_name: &str,
+        _sender: Arc<broadcast::Sender<StuckEvent>>,
+    ) {
+    }
 }

@@ -59,7 +59,11 @@ fn awman_api_root_env_var_constant_uses_awman_prefix() {
     );
 }
 
-/// `AWMAN_API_ROOT` override is honoured and the resolved root is free of legacy names.
+/// `AWMAN_API_ROOT` override is honoured for the API root. As of WI 0101
+/// Part 1.1 the shared database no longer lives under the API root — it moved
+/// to `<data_home>/data/awman.db` (resolved by `DataPaths`), which does not
+/// track `AWMAN_API_ROOT`. The API root override still governs everything else
+/// under `~/.awman/api/`.
 #[test]
 fn api_paths_honours_awman_api_root_override() {
     let env = EnvSnapshot::with_overrides([(AWMAN_API_ROOT, "/custom/awman/api")]);
@@ -69,10 +73,15 @@ fn api_paths_honours_awman_api_root_override() {
         std::path::Path::new("/custom/awman/api"),
         "ApiPaths must respect AWMAN_API_ROOT override"
     );
+    // The database relocated out of the API root; it is no longer under it.
     let db = paths.db_path();
     assert!(
-        db.starts_with("/custom/awman/api"),
-        "db path must be under the overridden root; got {db:?}"
+        !db.starts_with("/custom/awman/api"),
+        "db path must NOT be under the API root after the WI 0101 relocation; got {db:?}"
+    );
+    assert!(
+        db.ends_with("data/awman.db"),
+        "db path must live under <data_home>/data/awman.db; got {db:?}"
     );
 }
 
@@ -124,21 +133,20 @@ fn api_serve_config_type_uses_api_naming() {
 /// constant, so changes to the log message string are caught directly.
 #[test]
 fn api_startup_log_message_contains_awman_and_api_mode() {
-    let src = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/frontend/api/mod.rs",
-    ))
-    .expect("read src/frontend/api/mod.rs");
+    // Keep the source scan independent of the runtime checkout. Some test
+    // runners execute the compiled test binary after the source workspace has
+    // been torn down; `include_str!` makes Cargo track this file as an input
+    // while preserving the assertion against the actual source.
+    let src = include_str!("../../src/frontend/api/mod.rs");
 
-    // Collect every `tracing::info!` literal that mentions "starting",
-    // "listening", or "stopped" — those are the lifecycle log lines.
+    // Collect every string literal that mentions "starting", "listening", or
+    // "stopped" — those are the lifecycle log lines. Scanned as quoted
+    // segments per line (not "the whole trimmed line must be one literal")
+    // so a `tracing::info!(field = value, "message")` call with keyed fields
+    // ahead of the message literal is still caught.
     let lifecycle_msgs: Vec<&str> = src
         .lines()
-        .filter_map(|l| {
-            l.trim()
-                .strip_prefix('"')
-                .and_then(|s| s.strip_suffix("\""))
-        })
+        .flat_map(|l| l.split('"').skip(1).step_by(2))
         .filter(|l| {
             let lower = l.to_lowercase();
             lower.contains("starting") || lower.contains("listening") || lower.contains("stopped")
@@ -226,7 +234,7 @@ async fn real_network_api_frontend_status_endpoint_reachable_after_rename() {
         task_handles: tokio::sync::Mutex::new(Vec::new()),
         auth_mode: AuthMode::Disabled,
         engines,
-        sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        sessions: Arc::new(awman::data::session_manager::SessionManager::in_memory()),
         event_buses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         setup_buses: tokio::sync::Mutex::new(HashMap::new()),
     });
