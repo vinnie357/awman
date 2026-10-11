@@ -458,14 +458,6 @@ impl ResolvedContainerOptions {
         for opt in options {
             r.ingest(opt)?;
         }
-        if r.startup_gate
-            .as_ref()
-            .is_some_and(|gate| gate.control.orchestrated_parts().is_some())
-        {
-            return Err(ResolveError::Conflict(
-                "orchestrated startup gates are not enabled for container launch".into(),
-            ));
-        }
         // Part A: drop agent_credentials that duplicate a service already covered
         // by a harness-declared env var.  Applies to ALL container runtimes.
         // Production callers pass the real host-env lookup; tests inject a
@@ -502,7 +494,11 @@ impl ResolvedContainerOptions {
             ContainerOption::Auto(v) => self.auto = v,
             ContainerOption::Plan(v) => self.plan = v,
             ContainerOption::WorkingDir(v) => self.working_dir = Some(v),
-            ContainerOption::Name(v) => self.name = Some(v),
+            ContainerOption::Name(v) => {
+                if self.name.replace(v).is_some() {
+                    return Err(ResolveError::Conflict("duplicate container name".into()));
+                }
+            }
             ContainerOption::Cpu(v) => self.cpu = Some(v),
             ContainerOption::Memory(v) => self.memory = Some(v),
             ContainerOption::AgentSettingsPassthrough(v) => self.agent_settings = Some(v),
@@ -566,6 +562,35 @@ impl ResolvedContainerOptions {
             ));
         }
         if let Some(gate) = &self.startup_gate {
+            if let Some((_, identity)) = gate.control.orchestrated_parts() {
+                if self.name.as_ref() != Some(&identity.container_name) {
+                    return Err(ResolveError::Conflict(
+                        "orchestrated startup gate requires its validated container name".into(),
+                    ));
+                }
+                let expected_digest: String = identity
+                    .token_digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                let reserved_labels = self
+                    .labels
+                    .iter()
+                    .filter(|(key, _)| key == "dev.awman.orchestrator-launch")
+                    .collect::<Vec<_>>();
+                if reserved_labels.len() != 1
+                    || reserved_labels[0].1.as_str() != expected_digest.as_str()
+                {
+                    return Err(ResolveError::Conflict(
+                        "orchestrated startup gate requires its validated launch label".into(),
+                    ));
+                }
+                if self.remove_on_exit {
+                    return Err(ResolveError::Conflict(
+                        "orchestrated startup gate requires retained container ownership".into(),
+                    ));
+                }
+            }
             if self.acp {
                 return Err(ResolveError::Conflict(
                     "startup gate does not support ACP".into(),

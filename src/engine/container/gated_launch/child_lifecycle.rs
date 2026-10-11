@@ -209,6 +209,36 @@ impl ExecutionResourceLoan {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
+
+    pub(in crate::engine::container) fn release_and_wait_until(
+        &mut self,
+        deadline: Instant,
+    ) -> bool {
+        self.release();
+        let mut changed = self
+            .custody
+            .changed_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while self.custody.resources_present.load(Ordering::Acquire) {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            if remaining.is_zero() {
+                return false;
+            }
+            let (next, timeout) = self
+                .custody
+                .changed
+                .wait_timeout(changed, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            changed = next;
+            if timeout.timed_out() && self.custody.resources_present.load(Ordering::Acquire) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl fmt::Debug for ChildLifecycleAuthority {

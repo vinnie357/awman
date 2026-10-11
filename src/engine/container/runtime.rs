@@ -56,6 +56,8 @@ static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
 pub struct ContainerRuntime {
     backend: Arc<dyn ContainerBackend>,
     launch_retention: Result<Arc<LaunchRetentionRegistry>, LaunchRetentionInitError>,
+    #[cfg(test)]
+    test_boundary: Option<Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -150,12 +152,21 @@ fn parse_gate_image_config(runtime: &str, raw: &[u8]) -> Result<GateImageConfig,
     })
 }
 
+fn valid_orchestrated_runtime_user(value: &str) -> bool {
+    let Some((user, group)) = value.split_once(':') else {
+        return false;
+    };
+    user.parse::<u32>().is_ok_and(|uid| uid != 0) && group.parse::<u32>().is_ok_and(|gid| gid != 0)
+}
+
 impl ContainerRuntime {
     /// Construct with the Docker backend.
     pub fn docker() -> Self {
         Self {
             backend: Arc::new(DockerBackend),
             launch_retention: LaunchRetentionRegistry::try_new(),
+            #[cfg(test)]
+            test_boundary: None,
         }
     }
 
@@ -164,8 +175,26 @@ impl ContainerRuntime {
     /// non-mac host yields a runtime whose probes simply fail.
     pub fn apple() -> Self {
         Self {
-            backend: Arc::new(AppleBackend),
+            backend: Arc::new(AppleBackend::default()),
             launch_retention: LaunchRetentionRegistry::try_new(),
+            #[cfg(test)]
+            test_boundary: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apple_with_test_boundary(
+        boundary: Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
+    ) -> Self {
+        let launch_retention = if boundary.retention_available() {
+            LaunchRetentionRegistry::try_new()
+        } else {
+            Err(LaunchRetentionInitError::SupervisorThreadUnavailable)
+        };
+        Self {
+            backend: Arc::new(AppleBackend::with_test_boundary(Arc::clone(&boundary))),
+            launch_retention,
+            test_boundary: Some(boundary),
         }
     }
 
@@ -231,12 +260,27 @@ impl ContainerRuntime {
             options.startup_gate_runtime_user =
                 (!inspected.user.is_empty() && inspected.user != "0" && inspected.user != "root")
                     .then_some(inspected.user);
+            if orchestrated
+                && !options
+                    .startup_gate_runtime_user
+                    .as_deref()
+                    .is_some_and(valid_orchestrated_runtime_user)
+            {
+                return Err(EngineError::Config(
+                    "orchestrated Apple launch requires an inspected numeric user and group".into(),
+                ));
+            }
         }
         self.backend
             .build_with_launch_retention(options, launch_retention)
     }
 
     fn inspect_gate_image(&self, image: &str) -> Result<GateImageConfig, EngineError> {
+        #[cfg(test)]
+        if let Some(boundary) = &self.test_boundary {
+            let raw = boundary.image_inspection()?;
+            return parse_gate_image_config(self.backend.name(), &raw);
+        }
         use std::process::{Command, Stdio};
         let output = match self.backend.name() {
             "apple-containers" => Command::new("container")

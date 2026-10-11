@@ -30,6 +30,7 @@ pub mod instance;
 pub mod io_bridge;
 pub mod naming;
 pub mod options;
+pub(crate) mod orchestrated_apple;
 mod process;
 pub mod runtime;
 pub mod startup_gate;

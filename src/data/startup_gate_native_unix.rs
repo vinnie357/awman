@@ -27,6 +27,7 @@ const MAX_INTENT: usize = 512;
 const GUEST_CONTROL: &str = "guest-control";
 const INTENT_FILE: &str = "launch-intent.json";
 const PLAN_FILE: &str = "launch-plan.json";
+const RECEIPT_FILE: &str = "launch.json";
 
 const RESERVED_GATE_NAMES: &[&str] = &[
     "bootstrap.py",
@@ -170,6 +171,45 @@ pub(crate) struct OrchestratedControlAuthority {
 impl OrchestratedControlAuthority {
     pub(crate) fn validated_manifests(&self) -> &BTreeMap<String, Vec<u8>> {
         self.validated_manifests.as_ref()
+    }
+
+    pub(crate) fn read_guest_record(
+        &self,
+        name: &'static str,
+        maximum: u64,
+    ) -> Result<Option<Vec<u8>>, StartupGateError> {
+        revalidate_mount_source(self)?;
+        let file = match openat_readonly(&self.guest_control.dir.dir, name, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io(error)),
+        };
+        validate_regular_metadata(
+            &file.metadata().map_err(io)?,
+            0o600,
+            maximum,
+            self.guest_control.dir.identity.owner_uid,
+        )?;
+        let bytes = read_bounded(file, maximum)?;
+        revalidate_mount_source(self)?;
+        Ok(Some(bytes))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_guest_record(
+        &self,
+        target: &'static str,
+        prefix: &'static str,
+        bytes: &[u8],
+    ) -> Result<PinnedRegularFile, PlanFileError> {
+        revalidate_mount_source(self).map_err(|_| PlanFileError::ExistingOrUnsafe)?;
+        match openat_readonly(&self.guest_control.dir.dir, target, false) {
+            Ok(_) => return Err(PlanFileError::ExistingOrUnsafe),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(PlanFileError::ExistingOrUnsafe),
+        }
+        let guest = PinnedControlDir(Arc::clone(&self.guest_control.dir));
+        guest.publish_record(target, prefix, bytes)
     }
 }
 
@@ -1044,7 +1084,31 @@ impl PinnedControlDir {
         if self.existing_launch_plan()?.is_some() {
             return Err(PlanFileError::ExistingOrUnsafe);
         }
-        let temp_name = format!(".launch-plan.{}.tmp", uuid::Uuid::new_v4().simple());
+        self.publish_record(PLAN_FILE, ".launch-plan", bytes)
+    }
+
+    pub(crate) fn publish_launch_receipt(
+        &self,
+        bytes: &[u8],
+    ) -> Result<PinnedRegularFile, PlanFileError> {
+        match openat_readonly(&self.0.dir, RECEIPT_FILE, false) {
+            Ok(_) => return Err(PlanFileError::ExistingOrUnsafe),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(PlanFileError::ExistingOrUnsafe),
+        }
+        self.publish_record(RECEIPT_FILE, ".launch", bytes)
+    }
+
+    fn publish_record(
+        &self,
+        target: &'static str,
+        prefix: &'static str,
+        bytes: &[u8],
+    ) -> Result<PinnedRegularFile, PlanFileError> {
+        if bytes.len() as u64 > MAX_REQUEST {
+            return Err(PlanFileError::PublicationFailed);
+        }
+        let temp_name = format!("{prefix}.{}.tmp", uuid::Uuid::new_v4().simple());
         let fd = nix::fcntl::openat(
             &self.0.dir,
             temp_name.as_str(),
@@ -1071,7 +1135,7 @@ impl PinnedControlDir {
                 .map_err(|_| PlanFileError::PublicationFailed)?;
             file.sync_all()
                 .map_err(|_| PlanFileError::PublicationFailed)?;
-            rename_noreplace(&self.0.dir, temp_name.as_str(), PLAN_FILE)?;
+            rename_noreplace(&self.0.dir, temp_name.as_str(), target)?;
             self.0
                 .dir
                 .sync_all()
@@ -1099,6 +1163,24 @@ impl PinnedControlDir {
 
     pub(crate) fn verify_launch_plan(&self, expected: &PinnedRegularFile) -> bool {
         matches!(self.existing_launch_plan(), Ok(Some(actual)) if actual == *expected)
+    }
+
+    pub(crate) fn verify_launch_receipt(&self, expected: &PinnedRegularFile) -> bool {
+        let Ok(file) = openat_readonly(&self.0.dir, RECEIPT_FILE, false) else {
+            return false;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return false;
+        };
+        let Ok(identity) =
+            validate_regular_metadata(&metadata, 0o600, MAX_REQUEST, self.0.identity.owner_uid)
+        else {
+            return false;
+        };
+        PinnedRegularFile(Arc::new(PinnedRegularFileInner {
+            _file: file,
+            identity,
+        })) == *expected
     }
 }
 

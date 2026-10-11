@@ -33,6 +33,7 @@
 //! genuinely differ.
 
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -43,11 +44,13 @@ use crate::engine::agent_runtime::execution::{
 use crate::engine::agent_runtime::frontend::AgentIo;
 use crate::engine::container::attach_socket::AttachSocketGuard;
 use crate::engine::container::gated_launch::LaunchRetentionRegistry;
+#[cfg(test)]
+use crate::engine::container::gated_launch::NotCreatedProof;
 use crate::engine::container::gated_launch::{
-    retain_detached_after_error, validate_immediate_pre_spawn, ChildLifecycleAuthority,
-    ChildLifecycleSlot, DurableLaunchPlan, ExecutionResourceLoan, GatedProviderAdapter,
-    LaunchRetentionReason, RetainedAgentLaunch, RetainedExecution, SpawnStageError,
-    SpawnedCreateCli,
+    retain_detached_after_error, validate_immediate_pre_spawn, ActiveGateMonitor,
+    ActiveGatedCustody, ChildLifecycleAuthority, ChildLifecycleSlot, DurableLaunchPlan,
+    ExecutionResourceLoan, GatedProviderAdapter, LaunchRetentionReason, RetainedAgentLaunch,
+    RetainedExecution, SpawnStageError, SpawnedCreateCli,
 };
 use crate::engine::container::instance::{handle_now, ContainerId};
 use crate::engine::container::io_bridge::{BridgeConfig, CancelFn};
@@ -70,6 +73,23 @@ pub(super) type PostWaitHook = fn();
 /// The no-op [`PostWaitHook`] — used by every backend that leaves the process's
 /// stdio the way it found it.
 pub(super) fn no_post_wait() {}
+
+#[cfg(test)]
+fn observe_not_created(
+    boundary: Option<&dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
+    proof: NotCreatedProof,
+) {
+    let Some(boundary) = boundary else { return };
+    match proof {
+        NotCreatedProof::CliNeverStarted => boundary.observe_custody(
+            super::orchestrated_apple::TestOwnershipObservation {
+                quiescence_proven: true,
+                ..Default::default()
+            },
+            false,
+        ),
+    }
+}
 
 /// Everything the shared spawn path needs to know about a container CLI.
 ///
@@ -115,6 +135,11 @@ impl ContainerCli {
         start_delay: crate::engine::container::timing::APPLE_CONTAINER_START_DELAY,
         post_wait: no_post_wait,
     };
+
+    #[cfg(test)]
+    pub(super) fn with_bin(self, bin: &'static str) -> Self {
+        Self { bin, ..self }
+    }
 }
 
 // ─── The attach hook (Apple's attach rendezvous) ────────────────────────────
@@ -146,6 +171,8 @@ pub(super) struct GatedSpawnContext {
     pub plan: DurableLaunchPlan,
     pub adapter: Arc<dyn GatedProviderAdapter>,
     pub enclosing: Instant,
+    #[cfg(test)]
+    pub tuple_validation_only: bool,
 }
 
 struct SpawnRetentionState {
@@ -250,6 +277,9 @@ pub(super) struct ContainerInstance {
     pub post_bridge: Option<AttachHook>,
     pub gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
     pub launch_retention: Option<Arc<LaunchRetentionRegistry>>,
+    pub gated_provider: Option<Arc<dyn GatedProviderAdapter>>,
+    #[cfg(test)]
+    pub test_boundary: Option<Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>>,
 }
 
 impl ContainerInstance {
@@ -275,6 +305,30 @@ impl ContainerInstance {
         post_bridge: Option<AttachHook>,
         launch_retention: Option<Arc<LaunchRetentionRegistry>>,
     ) -> Self {
+        Self::new_with_orchestrated_launch(
+            cli,
+            image,
+            name,
+            options,
+            leases,
+            post_bridge,
+            (launch_retention, None),
+        )
+    }
+
+    pub(super) fn new_with_orchestrated_launch(
+        cli: ContainerCli,
+        image: ImageRef,
+        name: ContainerName,
+        options: ResolvedContainerOptions,
+        leases: Vec<CredentialLease>,
+        post_bridge: Option<AttachHook>,
+        launch_services: (
+            Option<Arc<LaunchRetentionRegistry>>,
+            Option<Arc<dyn GatedProviderAdapter>>,
+        ),
+    ) -> Self {
+        let (launch_retention, gated_provider) = launch_services;
         Self {
             cli,
             id: ContainerId::new(name.0.clone()),
@@ -285,7 +339,18 @@ impl ContainerInstance {
             post_bridge,
             gate_cleanup: None,
             launch_retention,
+            gated_provider,
+            #[cfg(test)]
+            test_boundary: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_test_boundary(
+        &mut self,
+        boundary: Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
+    ) {
+        self.test_boundary = Some(boundary);
     }
 }
 
@@ -304,8 +369,19 @@ impl AgentInstance for ContainerInstance {
     ) -> Result<AgentExecution, EngineError> {
         let cli = self.cli;
         let post_bridge = self.post_bridge;
+        let mut gated = None;
         if let Some(spec) = self.options.startup_gate.clone() {
-            let mut staged = super::startup_gate::stage_startup_gate(&spec)?;
+            let mut staged = match super::startup_gate::stage_startup_gate(&spec) {
+                Ok(staged) => staged,
+                Err(error) => {
+                    #[cfg(test)]
+                    observe_not_created(
+                        self.test_boundary.as_deref(),
+                        NotCreatedProof::CliNeverStarted,
+                    );
+                    return Err(error);
+                }
+            };
             staged
                 .wrapper_argv
                 .extend(["--container-name".into(), self.name.0.clone()]);
@@ -344,6 +420,36 @@ impl AgentInstance for ContainerInstance {
                 .0
                 .clone();
             let wrapped = super::startup_gate::wrap_entrypoint(&staged, &original)?;
+            if let Some((controls, identity)) = spec.control.orchestrated_parts() {
+                if self.name != identity.container_name {
+                    return Err(EngineError::Config(
+                        "orchestrated container identity changed before launch".into(),
+                    ));
+                }
+                let adapter = self.gated_provider.clone().ok_or_else(|| {
+                    EngineError::Config("orchestrated Apple provider is unavailable".into())
+                })?;
+                let enclosing = Instant::now() + spec.timeout;
+                let plan = super::gated_launch::prepare_orchestrated_launch(
+                    adapter.as_ref(),
+                    &self.image,
+                    identity,
+                    Arc::clone(controls),
+                    enclosing,
+                )
+                .map_err(|error| EngineError::Container(error.to_string()))?;
+                let mount = staged.orchestrated_mount.take().ok_or_else(|| {
+                    EngineError::Config("orchestrated guest control mount is unavailable".into())
+                })?;
+                staged.overlays.push(mount.revalidated_overlay()?);
+                gated = Some(GatedSpawnContext {
+                    plan,
+                    adapter,
+                    enclosing,
+                    #[cfg(test)]
+                    tuple_validation_only: false,
+                });
+            }
             self.options.overlays.extend(staged.overlays.clone());
             self.options.entrypoint = Some(crate::engine::container::options::Entrypoint(wrapped));
             self.gate_cleanup = Some(staged.cleanup);
@@ -368,7 +474,8 @@ impl AgentInstance for ContainerInstance {
 
         let prepared = ChildLifecycleAuthority::prepare()?;
         let slot = Arc::new(ChildLifecycleSlot::new());
-        let retention = SpawnRetentionContext::new(None);
+        let retention =
+            SpawnRetentionContext::new(gated.as_ref().map(|context| context.plan.clone()));
         let bridge_cfg = bridge_config_for(cli, &self.name, grace_timeout, stuck_timeout);
         let req = SpawnRequest {
             io,
@@ -379,8 +486,10 @@ impl AgentInstance for ContainerInstance {
             bridge_cfg,
             prepared: Some(prepared),
             slot: Some(slot),
-            gated: None,
+            gated,
             retention: Arc::clone(&retention),
+            #[cfg(test)]
+            test_boundary: self.test_boundary.clone(),
             #[cfg(test)]
             fault: None,
         };
@@ -438,6 +547,8 @@ pub(super) struct SpawnRequest {
     pub slot: Option<Arc<ChildLifecycleSlot>>,
     pub gated: Option<GatedSpawnContext>,
     pub retention: Arc<SpawnRetentionContext>,
+    #[cfg(test)]
+    pub test_boundary: Option<Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>>,
     #[cfg(test)]
     pub fault: Option<SpawnFault>,
 }
@@ -765,28 +876,183 @@ fn spawn_child(cli: ContainerCli, cmd: &mut Command) -> Result<std::process::Chi
     })
 }
 
-type PreparedSpawnGate = (
-    Option<DurableLaunchPlan>,
-    Option<Arc<dyn GatedProviderAdapter>>,
-    Option<Instant>,
-);
+enum PreparedSpawnGate {
+    Legacy,
+    Orchestrated {
+        plan: DurableLaunchPlan,
+        adapter: Arc<dyn GatedProviderAdapter>,
+        enclosing: Instant,
+        registry: Arc<LaunchRetentionRegistry>,
+        #[cfg(test)]
+        tuple_validation_only: bool,
+    },
+}
+
+impl PreparedSpawnGate {
+    fn plan(&self) -> Option<&DurableLaunchPlan> {
+        match self {
+            Self::Legacy => None,
+            Self::Orchestrated { plan, .. } => Some(plan),
+        }
+    }
+
+    fn adapter(&self) -> Option<&Arc<dyn GatedProviderAdapter>> {
+        match self {
+            Self::Legacy => None,
+            Self::Orchestrated { adapter, .. } => Some(adapter),
+        }
+    }
+
+    fn enclosing(&self) -> Option<Instant> {
+        match self {
+            Self::Legacy => None,
+            Self::Orchestrated { enclosing, .. } => Some(*enclosing),
+        }
+    }
+
+    fn is_orchestrated(&self) -> bool {
+        matches!(self, Self::Orchestrated { .. })
+    }
+
+    #[cfg(test)]
+    fn tuple_validation_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Orchestrated {
+                tuple_validation_only: true,
+                ..
+            }
+        )
+    }
+
+    fn complete(
+        self,
+        lifecycle: ChildLifecycleAuthority,
+        resource_loan: ExecutionResourceLoan,
+        gate_monitor: Option<ActiveGateMonitor>,
+        #[cfg(test)] boundary: Option<
+            Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
+        >,
+    ) -> (
+        Option<OrchestratedExecutionOwner>,
+        Option<ExecutionResourceLoan>,
+    ) {
+        #[cfg(test)]
+        if self.tuple_validation_only() {
+            return (None, Some(resource_loan));
+        }
+
+        match self {
+            Self::Legacy => (None, Some(resource_loan)),
+            Self::Orchestrated {
+                plan,
+                adapter,
+                registry,
+                ..
+            } => (
+                Some(OrchestratedExecutionOwner {
+                    registry,
+                    custody: Some(ActiveGatedCustody::new(
+                        plan,
+                        lifecycle,
+                        resource_loan,
+                        adapter,
+                        gate_monitor,
+                        #[cfg(test)]
+                        boundary,
+                    )),
+                }),
+                None,
+            ),
+        }
+    }
+}
 
 type PreparedChild = (
     super::gated_launch::PreparedChildLifecycle,
     Arc<ChildLifecycleSlot>,
 );
 
-fn prepare_spawn_gate(gated: Option<GatedSpawnContext>) -> Result<PreparedSpawnGate, EngineError> {
+fn prepare_spawn_gate(
+    gated: Option<GatedSpawnContext>,
+    registry: Option<&Arc<LaunchRetentionRegistry>>,
+) -> Result<PreparedSpawnGate, EngineError> {
     let Some(gated) = gated else {
-        return Ok((None, None, None));
+        return Ok(PreparedSpawnGate::Legacy);
     };
+    #[cfg(test)]
+    let tuple_validation_only = gated.tuple_validation_only;
+    let registry = registry
+        .cloned()
+        .ok_or_else(|| EngineError::Container("launch retention registry unavailable".into()))?;
     let barrier =
         validate_immediate_pre_spawn(&gated.plan, gated.adapter.as_ref(), gated.enclosing)
             .map_err(|error| EngineError::Container(error.to_string()))?;
     let plan = barrier
         .consume_for_spawn(gated.plan)
         .map_err(|error| EngineError::Container(error.to_string()))?;
-    Ok((Some(plan), Some(gated.adapter), Some(gated.enclosing)))
+    Ok(PreparedSpawnGate::Orchestrated {
+        plan,
+        adapter: gated.adapter,
+        enclosing: gated.enclosing,
+        registry,
+        #[cfg(test)]
+        tuple_validation_only,
+    })
+}
+
+#[cfg(test)]
+fn observe_test_spawn(
+    boundary: Option<&dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
+    instance: &ContainerInstance,
+    argv: &[String],
+    plan: Option<&DurableLaunchPlan>,
+) {
+    let Some(boundary) = boundary else { return };
+    let writable_mounts = instance
+        .options
+        .overlays
+        .iter()
+        .filter(|overlay| {
+            overlay.permission == crate::engine::container::options::OverlayPermission::ReadWrite
+                && overlay.container_path == std::path::Path::new("/.awman/startup-gate/control")
+        })
+        .map(|overlay| (overlay.container_path.display().to_string(), plan.is_some()))
+        .collect();
+    let labels = instance
+        .options
+        .labels
+        .iter()
+        .filter(|(key, _)| key == "dev.awman.orchestrator-launch")
+        .map(|(_, value)| value.clone())
+        .collect();
+    let (request, manifests) = instance
+        .options
+        .startup_gate
+        .as_ref()
+        .map(|gate| {
+            if let Some((controls, _)) = gate.control.orchestrated_parts() {
+                (
+                    controls.request.request_bytes().to_vec(),
+                    controls.validated_manifests().clone(),
+                )
+            } else {
+                (
+                    serde_json::to_vec(&gate.request).unwrap_or_default(),
+                    gate.validated_manifests.clone(),
+                )
+            }
+        })
+        .unwrap_or_default();
+    boundary.observe_spawn(
+        argv.to_vec(),
+        instance.name.0.clone(),
+        labels,
+        writable_mounts,
+        plan.is_some() && instance.launch_retention.is_some(),
+        request,
+        manifests,
+    );
 }
 
 fn before_cli_start(error: EngineError) -> SpawnStageError {
@@ -816,7 +1082,7 @@ fn after_cli_start(
 }
 
 fn validate_after_spawn(
-    plan: &Option<DurableLaunchPlan>,
+    plan: Option<&DurableLaunchPlan>,
     _adapter: Option<&dyn GatedProviderAdapter>,
     _enclosing: Option<Instant>,
 ) -> Result<(), EngineError> {
@@ -874,6 +1140,8 @@ pub(super) fn spawn_pty_bridged(
         gated,
         retention,
         #[cfg(test)]
+        test_boundary,
+        #[cfg(test)]
         fault,
     } = req;
 
@@ -927,7 +1195,15 @@ pub(super) fn spawn_pty_bridged(
         cmd.env(k, v);
     }
 
-    let (plan, adapter, enclosing) = prepare_spawn_gate(gated).map_err(before_cli_start)?;
+    let prepared_gate =
+        prepare_spawn_gate(gated, instance.launch_retention.as_ref()).map_err(before_cli_start)?;
+    #[cfg(test)]
+    observe_test_spawn(
+        test_boundary.as_deref(),
+        &instance,
+        &argv,
+        prepared_gate.plan(),
+    );
 
     let spawn_custody = custody.spawn().ok_or_else(|| {
         before_cli_start(EngineError::Container(
@@ -978,9 +1254,14 @@ pub(super) fn spawn_pty_bridged(
         Arc::clone(&slot),
         cli,
         instance.name.0.clone(),
-        plan.is_some(),
+        prepared_gate.is_orchestrated(),
     );
-    validate_after_spawn(&plan, adapter.as_deref(), enclosing).map_err(|source| {
+    validate_after_spawn(
+        prepared_gate.plan(),
+        prepared_gate.adapter().map(|adapter| adapter.as_ref()),
+        prepared_gate.enclosing(),
+    )
+    .map_err(|source| {
         after_cli_start(
             &retention,
             source,
@@ -1150,17 +1431,26 @@ pub(super) fn spawn_pty_bridged(
         }
     }
 
+    let gate_cancelled = Arc::new(AtomicBool::new(false));
+    let orchestrated = prepared_gate.is_orchestrated();
+    let (orchestrated_owner, resource_loan) = prepared_gate.complete(
+        lifecycle.clone(),
+        resource_loan,
+        None,
+        #[cfg(test)]
+        test_boundary.clone(),
+    );
     let backend = ContainerExecution {
         cli,
         lifecycle: lifecycle.clone(),
         slot,
-        orchestrated: plan.is_some(),
-        gated_plan: plan,
-        gated_adapter: adapter,
-        gated_enclosing: enclosing,
-        launch_retention: instance.launch_retention.as_ref().map(Arc::downgrade),
+        orchestrated,
+        orchestrated_owner,
         container_name: instance.name.0.clone(),
-        resource_loan: Some(resource_loan),
+        resource_loan,
+        gate_cancelled,
+        #[cfg(test)]
+        test_boundary,
     };
     Ok(AgentExecution::new(
         handle,
@@ -1190,6 +1480,8 @@ pub(super) fn spawn_piped(
         gated,
         retention,
         #[cfg(test)]
+        test_boundary,
+        #[cfg(test)]
         fault,
     } = req;
 
@@ -1218,7 +1510,15 @@ pub(super) fn spawn_piped(
         custody_witness: test_support::take_custody_witness(),
     }));
 
-    let (plan, adapter, enclosing) = prepare_spawn_gate(gated).map_err(before_cli_start)?;
+    let prepared_gate =
+        prepare_spawn_gate(gated, instance.launch_retention.as_ref()).map_err(before_cli_start)?;
+    #[cfg(test)]
+    observe_test_spawn(
+        test_boundary.as_deref(),
+        &instance,
+        &argv,
+        prepared_gate.plan(),
+    );
     let pipes = match custody
         .spawn_mut()
         .and_then(|resources| resources.io.as_mut())
@@ -1231,6 +1531,10 @@ pub(super) fn spawn_piped(
         }
     };
     let mut child = spawn_child(cli, &mut cmd).map_err(before_cli_start)?;
+    #[cfg(test)]
+    if let Some(boundary) = &test_boundary {
+        boundary.observe_child_start();
+    }
     pipes.take_from(&mut child);
     let lifecycle = prepared
         .bind_started_child_with_resources(SpawnedCreateCli::Piped(child), started_at, custody)
@@ -1258,9 +1562,14 @@ pub(super) fn spawn_piped(
         Arc::clone(&slot),
         cli,
         instance.name.0.clone(),
-        plan.is_some(),
+        prepared_gate.is_orchestrated(),
     );
-    validate_after_spawn(&plan, adapter.as_deref(), enclosing).map_err(|source| {
+    validate_after_spawn(
+        prepared_gate.plan(),
+        prepared_gate.adapter().map(|adapter| adapter.as_ref()),
+        prepared_gate.enclosing(),
+    )
+    .map_err(|source| {
         after_cli_start(
             &retention,
             source,
@@ -1310,17 +1619,47 @@ pub(super) fn spawn_piped(
     // `try_inject_stdin` falls back to launching a fresh container — which
     // is the correct behaviour for a non-interactive run that has already
     // consumed its single prompt.
+    let gate_cancelled = Arc::new(AtomicBool::new(false));
+    let orchestrated = prepared_gate.is_orchestrated();
+    #[cfg(not(test))]
+    let gate_monitor = start_gate_monitor(
+        prepared_gate.plan(),
+        prepared_gate.adapter(),
+        prepared_gate.enclosing(),
+        Arc::clone(&gate_cancelled),
+        #[cfg(test)]
+        test_boundary.clone(),
+    );
+    #[cfg(test)]
+    let gate_monitor = if prepared_gate.tuple_validation_only() {
+        None
+    } else {
+        start_gate_monitor(
+            prepared_gate.plan(),
+            prepared_gate.adapter(),
+            prepared_gate.enclosing(),
+            Arc::clone(&gate_cancelled),
+            test_boundary.clone(),
+        )
+    };
+    let (orchestrated_owner, resource_loan) = prepared_gate.complete(
+        lifecycle.clone(),
+        resource_loan,
+        gate_monitor,
+        #[cfg(test)]
+        test_boundary.clone(),
+    );
     let backend = ContainerExecution {
         cli,
         lifecycle: lifecycle.clone(),
         slot,
-        orchestrated: plan.is_some(),
-        gated_plan: plan,
-        gated_adapter: adapter,
-        gated_enclosing: enclosing,
-        launch_retention: instance.launch_retention.as_ref().map(Arc::downgrade),
+        orchestrated,
+        orchestrated_owner,
         container_name: instance.name.0.clone(),
-        resource_loan: Some(resource_loan),
+        resource_loan,
+        gate_cancelled,
+        #[cfg(test)]
+        test_boundary,
     };
     Ok(AgentExecution::new(
         handle,
@@ -1370,6 +1709,8 @@ pub(super) fn spawn_piped_interactive(
         gated,
         retention,
         #[cfg(test)]
+        test_boundary,
+        #[cfg(test)]
         fault,
     } = req;
 
@@ -1398,7 +1739,8 @@ pub(super) fn spawn_piped_interactive(
         custody_witness: test_support::take_custody_witness(),
     }));
 
-    let (plan, adapter, enclosing) = prepare_spawn_gate(gated).map_err(before_cli_start)?;
+    let prepared_gate =
+        prepare_spawn_gate(gated, instance.launch_retention.as_ref()).map_err(before_cli_start)?;
     let pipes = match custody
         .spawn_mut()
         .and_then(|resources| resources.io.as_mut())
@@ -1442,9 +1784,14 @@ pub(super) fn spawn_piped_interactive(
         Arc::clone(&slot),
         cli,
         instance.name.0.clone(),
-        plan.is_some(),
+        prepared_gate.is_orchestrated(),
     );
-    validate_after_spawn(&plan, adapter.as_deref(), enclosing).map_err(|source| {
+    validate_after_spawn(
+        prepared_gate.plan(),
+        prepared_gate.adapter().map(|adapter| adapter.as_ref()),
+        prepared_gate.enclosing(),
+    )
+    .map_err(|source| {
         after_cli_start(
             &retention,
             source,
@@ -1485,17 +1832,26 @@ pub(super) fn spawn_piped_interactive(
     // it, unlike `spawn_piped`). Retaining the sender both enables
     // `try_inject_stdin` and prevents the writer task from ever seeing EOF, so
     // the container's stdin pipe stays open for the whole JSON-RPC session.
+    let gate_cancelled = Arc::new(AtomicBool::new(false));
+    let orchestrated = prepared_gate.is_orchestrated();
+    let (orchestrated_owner, resource_loan) = prepared_gate.complete(
+        lifecycle.clone(),
+        resource_loan,
+        None,
+        #[cfg(test)]
+        test_boundary.clone(),
+    );
     let backend = ContainerExecution {
         cli,
         lifecycle: lifecycle.clone(),
         slot,
-        orchestrated: plan.is_some(),
-        gated_plan: plan,
-        gated_adapter: adapter,
-        gated_enclosing: enclosing,
-        launch_retention: instance.launch_retention.as_ref().map(Arc::downgrade),
+        orchestrated,
+        orchestrated_owner,
         container_name: instance.name.0.clone(),
-        resource_loan: Some(resource_loan),
+        resource_loan,
+        gate_cancelled,
+        #[cfg(test)]
+        test_boundary,
     };
     Ok(AgentExecution::new(
         handle,
@@ -1535,29 +1891,189 @@ pub(super) struct ContainerExecution {
     lifecycle: ChildLifecycleAuthority,
     slot: Arc<ChildLifecycleSlot>,
     orchestrated: bool,
-    #[allow(dead_code)]
-    gated_plan: Option<DurableLaunchPlan>,
-    #[allow(dead_code)]
-    gated_adapter: Option<Arc<dyn GatedProviderAdapter>>,
-    #[allow(dead_code)]
-    gated_enclosing: Option<Instant>,
+    orchestrated_owner: Option<OrchestratedExecutionOwner>,
     container_name: String,
-    #[allow(dead_code)]
-    launch_retention: Option<Weak<LaunchRetentionRegistry>>,
     resource_loan: Option<ExecutionResourceLoan>,
+    gate_cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_boundary: Option<Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>>,
+}
+
+struct OrchestratedExecutionOwner {
+    registry: Arc<LaunchRetentionRegistry>,
+    custody: Option<ActiveGatedCustody>,
+}
+
+impl OrchestratedExecutionOwner {
+    fn retain(
+        &mut self,
+        reason: LaunchRetentionReason,
+        last_inspection: Option<super::gated_launch::ProviderLaunchInspection>,
+    ) -> Option<super::gated_launch::LaunchRetentionTicket> {
+        let mut custody = self.custody.take()?;
+        custody.reason = reason;
+        if last_inspection.is_some() {
+            custody.last_inspection = last_inspection;
+        }
+        Some(self.registry.retain_active_gated(custody))
+    }
+}
+
+fn start_gate_monitor(
+    plan: Option<&DurableLaunchPlan>,
+    adapter: Option<&Arc<dyn GatedProviderAdapter>>,
+    enclosing: Option<Instant>,
+    cancelled: Arc<AtomicBool>,
+    #[cfg(test)] boundary: Option<
+        Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
+    >,
+) -> Option<ActiveGateMonitor> {
+    let plan = plan?.clone();
+    let adapter = Arc::clone(adapter?);
+    let enclosing = enclosing?;
+    let monitor_cancelled = Arc::clone(&cancelled);
+    let worker = std::thread::Builder::new()
+        .name("awman-orchestrated-apple-gate".into())
+        .spawn(move || {
+            super::orchestrated_apple::await_protected_release(
+                &plan,
+                adapter.as_ref(),
+                &cancelled,
+                enclosing,
+                #[cfg(test)]
+                boundary.as_deref(),
+            )
+            .map(|_| ())
+        })
+        .ok();
+    Some(ActiveGateMonitor::new(monitor_cancelled, worker))
 }
 
 impl Drop for ContainerExecution {
     fn drop(&mut self) {
+        if let Some(owner) = self.orchestrated_owner.as_mut() {
+            self.gate_cancelled.store(true, Ordering::Release);
+            let _ticket = owner.retain(LaunchRetentionReason::ChildStateUnknown, None);
+            return;
+        }
+        self.gate_cancelled.store(true, Ordering::Release);
         drop(self.resource_loan.take());
+    }
+}
+
+impl ContainerExecution {
+    fn retain_uncertain(
+        &mut self,
+        reason: LaunchRetentionReason,
+        last_inspection: Option<super::gated_launch::ProviderLaunchInspection>,
+    ) -> Result<(), EngineError> {
+        let owner = self.orchestrated_owner.as_mut().ok_or_else(|| {
+            EngineError::Container("orchestrated execution custody unavailable".into())
+        })?;
+        let _ticket = owner.retain(reason, last_inspection).ok_or_else(|| {
+            EngineError::Container("orchestrated execution custody unavailable".into())
+        })?;
+        #[cfg(test)]
+        if let Some(boundary) = &self.test_boundary {
+            boundary.observe_custody(
+                super::orchestrated_apple::TestOwnershipObservation {
+                    exact_plan: true,
+                    child: true,
+                    container: true,
+                    controls: true,
+                    staged_files: true,
+                    registry_ticket: true,
+                    quiescence_proven: false,
+                },
+                false,
+            );
+        }
+        Ok(())
     }
 }
 
 impl ExecutionBackend for ContainerExecution {
     fn wait_blocking(mut self: Box<Self>) -> Result<AgentExitInfo, EngineError> {
-        let info = self.lifecycle.wait_actual()?;
+        let gate_result = match self
+            .orchestrated_owner
+            .as_mut()
+            .and_then(|owner| owner.custody.as_mut())
+            .and_then(|custody| custody.gate_monitor.as_mut())
+        {
+            Some(monitor) => match monitor.wait() {
+                Some(result) => {
+                    if let Some(custody) = self
+                        .orchestrated_owner
+                        .as_mut()
+                        .and_then(|owner| owner.custody.as_mut())
+                    {
+                        custody.gate_monitor = None;
+                    }
+                    Some(result)
+                }
+                None => Some(Err(LaunchRetentionReason::ChildStateUnknown)),
+            },
+            None => None,
+        };
+        if let Some(Err(reason)) = gate_result {
+            self.retain_uncertain(reason, None)?;
+            return Err(EngineError::Container(
+                "orchestrated launch retained for recovery".into(),
+            ));
+        }
+        let info = match self.lifecycle.wait_actual() {
+            Ok(info) => info,
+            Err(error) if self.orchestrated_owner.is_some() => {
+                self.retain_uncertain(LaunchRetentionReason::ChildStateUnknown, None)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        if self.orchestrated_owner.is_some() {
+            let custody = self
+                .orchestrated_owner
+                .as_mut()
+                .and_then(|owner| owner.custody.as_mut())
+                .ok_or_else(|| {
+                    EngineError::Container("orchestrated execution custody unavailable".into())
+                })?;
+            let enclosing = Instant::now() + Duration::from_secs(10);
+            if let Err(error) = super::orchestrated_apple::cleanup_exact_launch(
+                &custody.plan,
+                custody.adapter.as_ref(),
+                &custody.lifecycle,
+                &mut custody.cleanup_phase,
+                enclosing,
+                #[cfg(test)]
+                custody.boundary.as_deref(),
+            ) {
+                let (reason, last_inspection) = *error;
+                self.retain_uncertain(reason, last_inspection)?;
+                return Err(EngineError::Container(
+                    "orchestrated cleanup retained for recovery".into(),
+                ));
+            }
+            let resource_loan = custody.resource_loan.take().ok_or_else(|| {
+                EngineError::Container("orchestrated execution resource loan unavailable".into())
+            })?;
+            resource_loan.release_and_wait();
+            self.orchestrated_owner = None;
+        }
         if let Some(resource_loan) = self.resource_loan.take() {
             resource_loan.release_and_wait();
+        }
+        #[cfg(test)]
+        if let Some(boundary) = &self.test_boundary {
+            if !self.orchestrated {
+                boundary.observe_provider_entry(false);
+            }
+            boundary.observe_custody(
+                super::orchestrated_apple::TestOwnershipObservation {
+                    quiescence_proven: true,
+                    ..Default::default()
+                },
+                false,
+            );
         }
         Ok(info)
     }
@@ -1579,6 +2095,7 @@ impl ExecutionBackend for ContainerExecution {
     }
 
     fn cancel(&self) -> Result<(), EngineError> {
+        self.gate_cancelled.store(true, Ordering::Release);
         let authority = self
             .slot
             .authority()
@@ -1596,8 +2113,10 @@ impl ExecutionBackend for ContainerExecution {
         let name = self.container_name.clone();
         let slot = Arc::clone(&self.slot);
         let orchestrated = self.orchestrated;
+        let gate_cancelled = Arc::clone(&self.gate_cancelled);
         Some(crate::engine::agent_runtime::execution::CancelHandle::new(
             move || {
+                gate_cancelled.store(true, Ordering::Release);
                 let authority = slot
                     .authority()
                     .ok_or_else(|| EngineError::Container("create CLI state unknown".into()))?;
@@ -1668,6 +2187,12 @@ pub(crate) mod test_support {
         Pty { cols: u16, rows: u16 },
         Piped,
         PersistentPiped,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FixtureGateMode {
+        FullOwner,
+        TupleValidationOnly,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1820,6 +2345,21 @@ pub(crate) mod test_support {
         spec: FixtureSpawnSpec,
         registry: Arc<LaunchRetentionRegistry>,
     ) -> FixtureSpawnResult {
+        spawn_fixture_with_gate_mode(spec, registry, FixtureGateMode::FullOwner)
+    }
+
+    pub(crate) fn spawn_tuple_validation_fixture(
+        spec: FixtureSpawnSpec,
+        registry: Arc<LaunchRetentionRegistry>,
+    ) -> FixtureSpawnResult {
+        spawn_fixture_with_gate_mode(spec, registry, FixtureGateMode::TupleValidationOnly)
+    }
+
+    fn spawn_fixture_with_gate_mode(
+        spec: FixtureSpawnSpec,
+        registry: Arc<LaunchRetentionRegistry>,
+        gate_mode: FixtureGateMode,
+    ) -> FixtureSpawnResult {
         let prepared_override = PREPARED_OVERRIDE.with(|prepared| prepared.borrow_mut().take());
         let slot = prepared_override
             .as_ref()
@@ -1905,6 +2445,7 @@ pub(crate) mod test_support {
             plan: gate.plan,
             adapter: gate.adapter,
             enclosing: gate.enclosing,
+            tuple_validation_only: gate_mode == FixtureGateMode::TupleValidationOnly,
         });
         let request = SpawnRequest {
             io,
@@ -1917,6 +2458,7 @@ pub(crate) mod test_support {
             slot: Some(Arc::clone(&slot)),
             gated,
             retention: Arc::clone(&retention),
+            test_boundary: None,
             fault: (spec.fault == Some(FixtureSpawnFault::AfterBindBeforeBridge))
                 .then_some(SpawnFault::AfterBindBeforeBridge),
         };
@@ -2053,6 +2595,7 @@ mod tests {
                 gated: None,
                 fault: None,
                 retention: SpawnRetentionContext::new(None),
+                test_boundary: None,
             },
             handle,
         )

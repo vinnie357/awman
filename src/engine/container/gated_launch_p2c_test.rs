@@ -28,8 +28,8 @@ use super::gated_launch::{
 };
 use super::options::{ContainerName, ImageRef, ResolvedContainerOptions};
 use super::process::test_support::{
-    spawn_fixture, FixtureIoMode, FixtureSpawnFault, FixtureSpawnGate, FixtureSpawnResult,
-    FixtureSpawnSpec,
+    spawn_tuple_validation_fixture, FixtureIoMode, FixtureSpawnFault, FixtureSpawnGate,
+    FixtureSpawnResult, FixtureSpawnSpec,
 };
 use crate::data::session::{AgentHandle, Session};
 use crate::data::startup_gate::load_startup_gate;
@@ -387,7 +387,7 @@ fn invoke(options: InvokeOptions) -> Result<Invocation, Box<dyn Error>> {
     let registry = LaunchRetentionRegistry::try_new()
         .map_err(|_| "launch retention registry failed to start")?;
     let gate_adapter: Arc<dyn GatedProviderAdapter> = adapter.clone();
-    let spawned = spawn_fixture(
+    let spawned = spawn_tuple_validation_fixture(
         FixtureSpawnSpec {
             mode: options.mode,
             executable: options.executable,

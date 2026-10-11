@@ -26,6 +26,11 @@ pub mod agent_matrix;
 pub mod download;
 pub mod frontend;
 
+#[cfg(all(test, unix))]
+mod orchestrated_apple_command_acceptance_test;
+#[cfg(all(test, unix))]
+mod orchestrated_apple_command_test_boundary;
+
 pub use frontend::AgentFrontend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -211,14 +216,28 @@ impl AgentEngine {
         run: &AgentRunOptions,
         credentials: &AgentCredentials,
     ) -> Result<Vec<ContainerOption>, EngineError> {
-        if run
+        let orchestrated_identity = run
             .startup_gate
             .as_ref()
-            .is_some_and(|gate| gate.control.orchestrated_parts().is_some())
-        {
-            return Err(EngineError::Config(
-                "orchestrated startup gates are not enabled for container launch".into(),
-            ));
+            .and_then(|gate| gate.control.orchestrated_parts())
+            .map(|(_, identity)| identity);
+        if orchestrated_identity.is_some() {
+            if self.container_runtime.runtime_name() != "apple-containers" {
+                return Err(EngineError::OptionNotSupportedByBackend {
+                    option: "orchestrated startup gate".into(),
+                    backend: self.container_runtime.runtime_name().into(),
+                });
+            }
+            if !matches!(run.launch_mode, LaunchMode::Stdio) {
+                return Err(EngineError::ConflictingOptions(
+                    "orchestrated startup gate requires stdio launch mode".into(),
+                ));
+            }
+            if run.allow_docker {
+                return Err(EngineError::ConflictingOptions(
+                    "orchestrated startup gate does not support --allow-docker".into(),
+                ));
+            }
         }
         let matrix = agent_matrix::matrix_for(agent.as_str())?;
 
@@ -275,6 +294,21 @@ impl AgentEngine {
                 value: session.id().to_string(),
             },
         ];
+        if let Some(identity) = orchestrated_identity {
+            let token_digest = identity
+                .token_digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            options.extend([
+                ContainerOption::Name(identity.container_name.clone()),
+                ContainerOption::Label {
+                    key: "dev.awman.orchestrator-launch".into(),
+                    value: token_digest,
+                },
+                ContainerOption::KeepContainer,
+            ]);
+        }
         if let Some(gate) = &run.startup_gate {
             options.push(ContainerOption::StartupGateTrustedTemplate);
             options.push(ContainerOption::StartupGate(gate.clone()));
@@ -489,6 +523,17 @@ impl AgentEngine {
         credentials: &AgentCredentials,
         runtime: &dyn AgentRuntimeEngine,
     ) -> Result<ResolvedAgentOptions, EngineError> {
+        if run
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some())
+            && runtime.runtime_name() != "apple-containers"
+        {
+            return Err(EngineError::OptionNotSupportedByBackend {
+                option: "orchestrated startup gate".into(),
+                backend: runtime.runtime_name().into(),
+            });
+        }
         if runtime.capabilities().kit_declarative {
             if run.startup_gate.is_some() {
                 return Err(EngineError::OptionNotSupportedByBackend {

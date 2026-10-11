@@ -6,15 +6,17 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::child_lifecycle::{
-    ChildLifecycleState, RawCustodyCapability, RawCustodyOutcome, RetainedExecution,
-    TerminateRequestOutcome,
+    ChildLifecycleAuthority, ChildLifecycleState, ExecutionResourceLoan, RawCustodyCapability,
+    RawCustodyOutcome, RetainedExecution, TerminateRequestOutcome,
 };
-use super::{DurableLaunchPlan, ProviderLaunchInspection};
+use super::{DurableLaunchPlan, GatedProviderAdapter, ProviderLaunchInspection};
 #[cfg(test)]
+use crate::engine::container::orchestrated_apple::OrchestratedAppleTestBoundary;
 use crate::engine::error::EngineError;
 
 pub(crate) const REGISTRY_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const SUPERVISOR_ACTIVE_RETRY_BOUND: Duration = Duration::from_secs(2);
 const RETAINED_LOCAL_CLI_TERMINATE_BOUND: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +27,52 @@ pub(crate) enum LaunchRetentionReason {
     InspectionUnavailable,
     PostSpawnControlChanged,
     BridgeSetupFailed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ActiveGatedRetryOutcome {
+    Resolved,
+    Retained,
+}
+
+pub(crate) struct ActiveGateMonitor {
+    cancelled: Arc<AtomicBool>,
+    worker: Option<std::thread::JoinHandle<Result<(), LaunchRetentionReason>>>,
+}
+
+impl ActiveGateMonitor {
+    pub(crate) fn new(
+        cancelled: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<Result<(), LaunchRetentionReason>>>,
+    ) -> Self {
+        Self { cancelled, worker }
+    }
+
+    pub(crate) fn wait(&mut self) -> Option<Result<(), LaunchRetentionReason>> {
+        self.worker.take().map(|worker| {
+            worker
+                .join()
+                .unwrap_or(Err(LaunchRetentionReason::ChildStateUnknown))
+        })
+    }
+
+    fn cancel_and_wait_until(&mut self, deadline: Instant) -> bool {
+        self.cancelled.store(true, Ordering::Release);
+        let Some(worker) = self.worker.as_ref() else {
+            return false;
+        };
+        while !worker.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !worker.is_finished() {
+            return false;
+        }
+        let Some(worker) = self.worker.take() else {
+            return false;
+        };
+        let _ = worker.join();
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,7 +101,47 @@ impl fmt::Debug for RetainedAgentLaunch {
 
 enum RetainedRegistryEnvelope {
     Gated(Box<RetainedAgentLaunch>),
+    ActiveGated(Box<ActiveGatedCustody>),
     Legacy(Option<RetainedExecution>),
+}
+
+pub(crate) struct ActiveGatedCustody {
+    pub(in crate::engine::container) plan: DurableLaunchPlan,
+    pub(in crate::engine::container) lifecycle: ChildLifecycleAuthority,
+    pub(in crate::engine::container) resource_loan: Option<ExecutionResourceLoan>,
+    pub(in crate::engine::container) adapter: Arc<dyn GatedProviderAdapter>,
+    pub(in crate::engine::container) last_inspection: Option<ProviderLaunchInspection>,
+    pub(in crate::engine::container) reason: LaunchRetentionReason,
+    pub(in crate::engine::container) gate_monitor: Option<ActiveGateMonitor>,
+    pub(in crate::engine::container) cleanup_phase:
+        crate::engine::container::orchestrated_apple::ExactCleanupPhase,
+    #[cfg(test)]
+    pub(in crate::engine::container) boundary: Option<Arc<dyn OrchestratedAppleTestBoundary>>,
+}
+
+impl ActiveGatedCustody {
+    pub(in crate::engine::container) fn new(
+        plan: DurableLaunchPlan,
+        lifecycle: ChildLifecycleAuthority,
+        resource_loan: ExecutionResourceLoan,
+        adapter: Arc<dyn GatedProviderAdapter>,
+        gate_monitor: Option<ActiveGateMonitor>,
+        #[cfg(test)] boundary: Option<Arc<dyn OrchestratedAppleTestBoundary>>,
+    ) -> Self {
+        Self {
+            plan,
+            lifecycle,
+            resource_loan: Some(resource_loan),
+            adapter,
+            last_inspection: None,
+            reason: LaunchRetentionReason::ChildStateUnknown,
+            gate_monitor,
+            cleanup_phase:
+                crate::engine::container::orchestrated_apple::ExactCleanupPhase::NeedsCleanup,
+            #[cfg(test)]
+            boundary,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -76,6 +164,10 @@ struct Shared {
     worker_detached: AtomicBool,
     worker_finished: AtomicBool,
     next_ticket: AtomicU64,
+    #[cfg(test)]
+    resource_loan_releases: Mutex<BTreeMap<LaunchRetentionTicket, usize>>,
+    #[cfg(test)]
+    supervisor_active_claims_blocked: AtomicBool,
     #[cfg(test)]
     drop_on_worker: Mutex<Option<Arc<LaunchRetentionRegistry>>>,
 }
@@ -151,6 +243,10 @@ impl LaunchRetentionRegistry {
             worker_finished: AtomicBool::new(false),
             next_ticket: AtomicU64::new(1),
             #[cfg(test)]
+            resource_loan_releases: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            supervisor_active_claims_blocked: AtomicBool::new(false),
+            #[cfg(test)]
             drop_on_worker: Mutex::new(None),
         });
         let worker_shared = Arc::clone(&shared);
@@ -173,6 +269,51 @@ impl LaunchRetentionRegistry {
         execution: RetainedExecution,
     ) -> LaunchRetentionTicket {
         self.retain_envelope(RetainedRegistryEnvelope::Legacy(Some(execution)))
+    }
+
+    pub(in crate::engine::container) fn retain_active_gated(
+        &self,
+        custody: ActiveGatedCustody,
+    ) -> LaunchRetentionTicket {
+        let ticket = self.retain_envelope(RetainedRegistryEnvelope::ActiveGated(Box::new(custody)));
+        #[cfg(test)]
+        self.shared
+            .resource_loan_releases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(ticket)
+            .or_insert(0);
+        ticket
+    }
+
+    // Exact-ticket callers share the same operation now used by the production supervisor.
+    #[allow(dead_code)]
+    pub(crate) fn retry_active_gated(
+        &self,
+        ticket: LaunchRetentionTicket,
+        deadline: Instant,
+    ) -> Result<ActiveGatedRetryOutcome, EngineError> {
+        let mut entry = match claim_outstanding_entry(&self.shared, ticket, deadline)? {
+            OutstandingEntryClaim::Claimed(entry) => *entry,
+            OutstandingEntryClaim::Resolved => return Ok(ActiveGatedRetryOutcome::Resolved),
+            OutstandingEntryClaim::RetainedInFlight => {
+                return Ok(ActiveGatedRetryOutcome::Retained);
+            }
+        };
+        match retry_claimed_active_gated(&self.shared, ticket, &mut entry, deadline) {
+            Ok(ActiveGatedRetryOutcome::Resolved) => {
+                publish_resolved_entry(&self.shared, ticket);
+                Ok(ActiveGatedRetryOutcome::Resolved)
+            }
+            Ok(ActiveGatedRetryOutcome::Retained) => {
+                publish_retained_entry(&self.shared, ticket, entry);
+                Ok(ActiveGatedRetryOutcome::Retained)
+            }
+            Err(error) => {
+                publish_retained_entry(&self.shared, ticket, entry);
+                Err(error)
+            }
+        }
     }
 
     fn retain_envelope(&self, launch: RetainedRegistryEnvelope) -> LaunchRetentionTicket {
@@ -218,6 +359,162 @@ impl LaunchRetentionRegistry {
     }
 }
 
+enum OutstandingEntryClaim {
+    Claimed(Box<RetainedEntry>),
+    Resolved,
+    RetainedInFlight,
+}
+
+fn claim_outstanding_entry(
+    shared: &Shared,
+    ticket: LaunchRetentionTicket,
+    deadline: Instant,
+) -> Result<OutstandingEntryClaim, EngineError> {
+    let mut entries = shared.entries.lock().unwrap_or_else(|poisoned| {
+        shared.supervisor_failed.store(true, Ordering::Release);
+        poisoned.into_inner()
+    });
+    let mut observed_outstanding = false;
+    loop {
+        if let Some(entry) = entries.remove(&ticket) {
+            return Ok(OutstandingEntryClaim::Claimed(Box::new(entry)));
+        }
+        let ticket_present = shared
+            .tickets
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&ticket);
+        if !ticket_present {
+            return if observed_outstanding {
+                Ok(OutstandingEntryClaim::Resolved)
+            } else {
+                Err(EngineError::Container(
+                    "retained launch ticket unavailable".into(),
+                ))
+            };
+        }
+        observed_outstanding = true;
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(OutstandingEntryClaim::RetainedInFlight);
+        };
+        let (next, _) = shared
+            .changed
+            .wait_timeout(entries, remaining)
+            .unwrap_or_else(|p| p.into_inner());
+        entries = next;
+    }
+}
+
+fn retry_claimed_active_gated(
+    shared: &Shared,
+    _ticket: LaunchRetentionTicket,
+    entry: &mut RetainedEntry,
+    deadline: Instant,
+) -> Result<ActiveGatedRetryOutcome, EngineError> {
+    let RetainedRegistryEnvelope::ActiveGated(custody) = &mut entry.launch else {
+        return Err(EngineError::Container(
+            "retained launch ticket is not an active gated launch".into(),
+        ));
+    };
+
+    if let Some(monitor) = custody.gate_monitor.as_mut() {
+        if !monitor.cancel_and_wait_until(deadline) {
+            return Ok(ActiveGatedRetryOutcome::Retained);
+        }
+        custody.gate_monitor = None;
+    }
+
+    if custody.cleanup_phase
+        != crate::engine::container::orchestrated_apple::ExactCleanupPhase::Complete
+    {
+        let cleanup = crate::engine::container::orchestrated_apple::cleanup_exact_launch(
+            &custody.plan,
+            custody.adapter.as_ref(),
+            &custody.lifecycle,
+            &mut custody.cleanup_phase,
+            deadline,
+            #[cfg(test)]
+            custody.boundary.as_deref(),
+        );
+        if let Err(error) = cleanup {
+            let (reason, last_inspection) = *error;
+            custody.reason = reason;
+            if last_inspection.is_some() {
+                custody.last_inspection = last_inspection;
+            }
+            let child_reaped = custody.lifecycle.retained_child_is_actually_reaped();
+            record_poll_disposition(
+                shared,
+                entry,
+                RetainedEntryPoll {
+                    child_reaped,
+                    resolved: false,
+                },
+            );
+            return Ok(ActiveGatedRetryOutcome::Retained);
+        }
+    }
+
+    let loan_released = custody
+        .resource_loan
+        .as_mut()
+        .is_some_and(|resource_loan| resource_loan.release_and_wait_until(deadline));
+    if !loan_released {
+        return Ok(ActiveGatedRetryOutcome::Retained);
+    }
+
+    let Some(_released_resource_loan) = custody.resource_loan.take() else {
+        return Err(EngineError::Container(
+            "retained execution resource loan unavailable".into(),
+        ));
+    };
+    #[cfg(test)]
+    {
+        let mut releases = shared
+            .resource_loan_releases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let count = releases.entry(_ticket).or_default();
+        *count = count.saturating_add(1);
+    }
+
+    record_poll_disposition(
+        shared,
+        entry,
+        RetainedEntryPoll {
+            child_reaped: true,
+            resolved: true,
+        },
+    );
+    Ok(ActiveGatedRetryOutcome::Resolved)
+}
+
+fn publish_retained_entry(shared: &Shared, ticket: LaunchRetentionTicket, entry: RetainedEntry) {
+    shared
+        .entries
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            shared.supervisor_failed.store(true, Ordering::Release);
+            poisoned.into_inner()
+        })
+        .insert(ticket, entry);
+    shared.changed.notify_all();
+}
+
+fn publish_resolved_entry(shared: &Shared, ticket: LaunchRetentionTicket) {
+    let entries = shared.entries.lock().unwrap_or_else(|poisoned| {
+        shared.supervisor_failed.store(true, Ordering::Release);
+        poisoned.into_inner()
+    });
+    shared
+        .tickets
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&ticket);
+    drop(entries);
+    shared.changed.notify_all();
+}
+
 impl Drop for LaunchRetentionRegistry {
     fn drop(&mut self) {
         self.shared.accepting.store(false, Ordering::Release);
@@ -258,18 +555,38 @@ fn supervisor_loop(shared: Arc<Shared>) {
         }
         let shutdown = shared.shutdown_requested.load(Ordering::Acquire);
         let mut local = Vec::new();
-        {
+        let active = {
             let mut entries = shared.entries.lock().unwrap_or_else(|poisoned| {
                 shared.supervisor_failed.store(true, Ordering::Release);
                 poisoned.into_inner()
             });
-            let tickets: Vec<_> = entries.keys().copied().collect();
+            let active_ticket = entries.iter().find_map(|(ticket, entry)| {
+                #[cfg(test)]
+                if shared
+                    .supervisor_active_claims_blocked
+                    .load(Ordering::Acquire)
+                    && matches!(&entry.launch, RetainedRegistryEnvelope::ActiveGated(_))
+                {
+                    return None;
+                }
+                matches!(&entry.launch, RetainedRegistryEnvelope::ActiveGated(_)).then_some(*ticket)
+            });
+            let active = active_ticket
+                .and_then(|ticket| entries.remove(&ticket).map(|entry| (ticket, entry)));
+            let tickets: Vec<_> = entries
+                .iter()
+                .filter_map(|(ticket, entry)| {
+                    (!matches!(&entry.launch, RetainedRegistryEnvelope::ActiveGated(_)))
+                        .then_some(*ticket)
+                })
+                .collect();
             for ticket in tickets {
                 if let Some(entry) = entries.remove(&ticket) {
                     local.push((ticket, entry));
                 }
             }
-        }
+            active
+        };
         let mut keep = Vec::new();
         for (ticket, mut entry) in local {
             let disposition = poll_retained_entry(&shared, &mut entry, shutdown);
@@ -277,11 +594,7 @@ fn supervisor_loop(shared: Arc<Shared>) {
             if !disposition.resolved {
                 keep.push((ticket, entry));
             } else {
-                shared
-                    .tickets
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&ticket);
+                publish_resolved_entry(&shared, ticket);
             }
         }
         if !keep.is_empty() {
@@ -290,6 +603,21 @@ fn supervisor_loop(shared: Arc<Shared>) {
                 poisoned.into_inner()
             });
             entries.extend(keep);
+        }
+        if let Some((ticket, mut entry)) = active {
+            let deadline = Instant::now() + SUPERVISOR_ACTIVE_RETRY_BOUND;
+            match retry_claimed_active_gated(&shared, ticket, &mut entry, deadline) {
+                Ok(ActiveGatedRetryOutcome::Resolved) => {
+                    publish_resolved_entry(&shared, ticket);
+                }
+                Ok(ActiveGatedRetryOutcome::Retained) => {
+                    publish_retained_entry(&shared, ticket, entry);
+                }
+                Err(_) => {
+                    shared.supervisor_failed.store(true, Ordering::Release);
+                    publish_retained_entry(&shared, ticket, entry);
+                }
+            }
         }
         let empty = shared
             .entries
@@ -321,6 +649,9 @@ enum RetainedChildPoll {
 fn initially_owns_unreaped_child(launch: &RetainedRegistryEnvelope) -> bool {
     let execution = match launch {
         RetainedRegistryEnvelope::Gated(launch) => launch.execution.as_ref(),
+        RetainedRegistryEnvelope::ActiveGated(launch) => {
+            return !launch.lifecycle.retained_child_is_actually_reaped();
+        }
         RetainedRegistryEnvelope::Legacy(execution) => execution.as_ref(),
     };
     execution.is_some_and(|execution| match execution {
@@ -378,6 +709,13 @@ fn poll_retained_entry(
             ) == RetainedChildPoll::Reaped;
             // Reaping the local CLI does not discharge provider, control,
             // journal, plan, pin, inspection, or reason custody.
+            RetainedEntryPoll {
+                child_reaped,
+                resolved: false,
+            }
+        }
+        RetainedRegistryEnvelope::ActiveGated(launch) => {
+            let child_reaped = launch.lifecycle.retained_child_is_actually_reaped();
             RetainedEntryPoll {
                 child_reaped,
                 resolved: false,
@@ -590,147 +928,5 @@ fn record_managed_observation(shared: &Shared, state: Option<&ChildLifecycleStat
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    use super::*;
-
-    #[derive(Clone)]
-    pub(crate) struct RetentionProbe {
-        shared: Arc<Shared>,
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct RetentionSnapshot {
-        pub accepting: bool,
-        pub supervisor_failed: bool,
-        pub retained: usize,
-        pub unreaped: usize,
-        pub shutdown_requested: bool,
-        pub worker_detached: bool,
-        pub worker_finished: bool,
-        pub unbound_attempts: usize,
-        pub unbound_pending: usize,
-        pub unbound_errors: usize,
-        pub unbound_reaped: usize,
-        pub unbound_kill_calls: usize,
-        pub managed_prepared: usize,
-        pub managed_running: usize,
-        pub managed_failed: usize,
-        pub managed_exited: usize,
-        pub last_pid: Option<u32>,
-        pub last_errno: Option<i32>,
-        pub last_resources_present: bool,
-    }
-
-    pub(crate) fn registry_thread_start_failure(
-    ) -> Result<Arc<LaunchRetentionRegistry>, LaunchRetentionInitError> {
-        LaunchRetentionRegistry::new_inner(true)
-    }
-
-    pub(crate) fn registry_probe(registry: &LaunchRetentionRegistry) -> RetentionProbe {
-        RetentionProbe {
-            shared: Arc::clone(&registry.shared),
-        }
-    }
-
-    impl RetentionProbe {
-        pub(crate) fn contains(&self, ticket: LaunchRetentionTicket) -> bool {
-            self.shared
-                .tickets
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .contains(&ticket)
-        }
-
-        pub(crate) fn only_ticket(&self) -> Option<LaunchRetentionTicket> {
-            let tickets = self
-                .shared
-                .tickets
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if tickets.len() == 1 {
-                tickets.iter().next().copied()
-            } else {
-                None
-            }
-        }
-
-        pub(crate) fn only_termination_authorized(&self) -> Option<bool> {
-            let entries = self
-                .shared
-                .entries
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if entries.len() == 1 {
-                entries.values().next().map(|entry| entry.signal_authorized)
-            } else {
-                None
-            }
-        }
-
-        pub(crate) fn poison_entries(&self) {
-            let shared = Arc::clone(&self.shared);
-            let _ = std::thread::spawn(move || {
-                let _guard = shared.entries.lock().unwrap_or_else(|p| p.into_inner());
-                panic!("poison launch retention entries");
-            })
-            .join();
-        }
-
-        pub(crate) fn snapshot(&self) -> RetentionSnapshot {
-            let observation = self.shared.observation.lock().unwrap_or_else(|poisoned| {
-                self.shared.supervisor_failed.store(true, Ordering::Release);
-                poisoned.into_inner()
-            });
-            let retained = observation.retained;
-            let unreaped = observation.unreaped;
-            RetentionSnapshot {
-                accepting: self.shared.accepting.load(Ordering::Acquire),
-                supervisor_failed: self.shared.supervisor_failed.load(Ordering::Acquire),
-                retained,
-                unreaped,
-                shutdown_requested: self.shared.shutdown_requested.load(Ordering::Acquire),
-                worker_detached: self.shared.worker_detached.load(Ordering::Acquire),
-                worker_finished: self.shared.worker_finished.load(Ordering::Acquire),
-                unbound_attempts: observation.unbound_attempts,
-                unbound_pending: observation.unbound_pending,
-                unbound_errors: observation.unbound_errors,
-                unbound_reaped: observation.unbound_reaped,
-                unbound_kill_calls: observation.unbound_kill_calls,
-                managed_prepared: observation.managed_prepared,
-                managed_running: observation.managed_running,
-                managed_failed: observation.managed_failed,
-                managed_exited: observation.managed_exited,
-                last_pid: observation.last_pid,
-                last_errno: observation.last_errno,
-                last_resources_present: observation.last_resources_present,
-            }
-        }
-    }
-
-    pub(crate) fn drop_last_owner_on_worker(
-        registry: Arc<LaunchRetentionRegistry>,
-        deadline: Instant,
-    ) -> Result<RetentionProbe, EngineError> {
-        if Arc::strong_count(&registry) != 1 {
-            return Err(EngineError::Container(
-                "launch retention drop requires sole owner".into(),
-            ));
-        }
-        let probe = registry_probe(&registry);
-        let shared = Arc::clone(&registry.shared);
-        *shared
-            .drop_on_worker
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = Some(registry);
-        shared.changed.notify_all();
-        while Instant::now() < deadline {
-            if probe.snapshot().shutdown_requested {
-                return Ok(probe);
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        Err(EngineError::Container(
-            "launch retention worker drop deadline exceeded".into(),
-        ))
-    }
-}
+#[path = "retention_test_support.rs"]
+pub(crate) mod test_support;

@@ -101,14 +101,17 @@ awman exec prompt --help | grep -- --startup-gate-control
 awman exec workflow --help | grep -- --startup-gate-control
 ```
 
-All three checks must succeed before an orchestrator sends gate flags. Do not
-infer support from `awman --version` alone: the downstream package version
-identifies the fork candidate, while the command capability check establishes
-that a particular binary exposes the extension.
+All three checks must succeed before an orchestrator sends gate flags. They
+prove only that the binary exposes the startup-gate syntax. Do not infer
+split-control orchestrated Apple launch support from those checks or from
+`awman --version`: that profile also requires an exact source revision and
+artifact that passed the fork gates and a real Apple Containers qualification.
+The guarded `8fe0d4cc` revision is not such an artifact.
 
 After a reviewed `v0.12.1` tag and release assets exist, the intended fork
 installation form is `mise use -g github:vinnie357/awman@0.12.1`. Do not use
-that command as evidence that the unpublished candidate is available.
+that command as evidence that the unpublished candidate is available or that
+an unqualified build supports orchestrated Apple launch.
 
 Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-amd64`, `awman-macos-arm64`, `awman-windows-amd64.exe`.
 

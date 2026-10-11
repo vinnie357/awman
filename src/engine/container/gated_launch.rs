@@ -12,8 +12,9 @@ pub(crate) use child_lifecycle::{
 };
 #[allow(unused_imports)]
 pub(crate) use retention::{
-    LaunchRetentionInitError, LaunchRetentionReason, LaunchRetentionRegistry,
-    LaunchRetentionTicket, NotCreatedProof, RetainedAgentLaunch, REGISTRY_SHUTDOWN_GRACE,
+    ActiveGateMonitor, ActiveGatedCustody, ActiveGatedRetryOutcome, LaunchRetentionInitError,
+    LaunchRetentionReason, LaunchRetentionRegistry, LaunchRetentionTicket, NotCreatedProof,
+    RetainedAgentLaunch, REGISTRY_SHUTDOWN_GRACE,
 };
 
 #[cfg(test)]

@@ -9,10 +9,13 @@ use crate::engine::agent_runtime::execution::{AgentInstance, AgentStats};
 use crate::engine::container::attach_socket::AttachSocketGuard;
 use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::gated_launch::{
-    canonical_inspection_revision, parse_lower_hex_32, AppleProviderState,
-    CanonicalInspectionRevisionInput, ExactInspection, ImmutableImageId, InspectionObservationKind,
-    LaunchRetentionRegistry, ProviderKind, ProviderLaunchInspection, ProviderLaunchKey,
-    ProviderState, SanitizedProviderStateObservation,
+    canonical_inspection_revision, parse_lower_hex_32, run_bounded_provider_cli,
+    AbsenceObservation, AppleProviderState, BoundedProviderOutput,
+    CanonicalInspectionRevisionInput, CreateCliExitClass, CreateCliExitEvidence, ExactInspection,
+    GatedProviderAdapter, ImmutableImageId, InspectionObservationKind, LaunchIdentityError,
+    LaunchRetentionRegistry, NamePresence, ProviderCallDeadline, ProviderCliCustodyRegistry,
+    ProviderCliRunOutcome, ProviderCliStartFailure, ProviderKind, ProviderLaunchInspection,
+    ProviderLaunchKey, ProviderState, SanitizedProviderStateObservation,
 };
 use crate::engine::container::options::{ContainerName, ResolvedContainerOptions};
 use crate::engine::container::process::{AttachHookCtx, ContainerCli, ContainerInstance};
@@ -196,6 +199,147 @@ fn parse_gated_launch_inspection(bytes: &[u8], key: &ProviderLaunchKey) -> Exact
     ExactInspection::Matching(inspection)
 }
 
+struct AppleGatedProviderAdapter {
+    custody: std::sync::Arc<ProviderCliCustodyRegistry>,
+}
+
+impl AppleGatedProviderAdapter {
+    fn try_new() -> Result<std::sync::Arc<Self>, ProviderCliStartFailure> {
+        Ok(std::sync::Arc::new(Self {
+            custody: ProviderCliCustodyRegistry::try_new()?,
+        }))
+    }
+
+    fn run(&self, args: &[&str], deadline: ProviderCallDeadline) -> Option<BoundedProviderOutput> {
+        let mut command = Command::new("container");
+        command.args(args);
+        match run_bounded_provider_cli(command, deadline, &self.custody) {
+            ProviderCliRunOutcome::Completed(output) => Some(output),
+            ProviderCliRunOutcome::NotStarted(_)
+            | ProviderCliRunOutcome::ReapedFailure(_)
+            | ProviderCliRunOutcome::RetainedFailure(_) => None,
+        }
+    }
+
+    fn list_rows(&self, deadline: ProviderCallDeadline) -> Option<Vec<serde_json::Value>> {
+        let output = self.run(&["list", "--all", "--format", "json"], deadline)?;
+        if !output.status.success() {
+            return None;
+        }
+        serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+            .ok()
+            .or_else(|| {
+                let mut rows = Vec::new();
+                for line in output.stdout.split(|byte| *byte == b'\n') {
+                    if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+                        continue;
+                    }
+                    rows.push(serde_json::from_slice(line).ok()?);
+                }
+                Some(rows)
+            })
+    }
+}
+
+impl GatedProviderAdapter for AppleGatedProviderAdapter {
+    fn provider(&self) -> ProviderKind {
+        ProviderKind::AppleContainers
+    }
+
+    fn resolve_image_identity(
+        &self,
+        image: &crate::engine::container::options::ImageRef,
+        deadline: ProviderCallDeadline,
+    ) -> Result<ImmutableImageId, LaunchIdentityError> {
+        let output = self
+            .run(&["image", "inspect", image.as_str()], deadline)
+            .filter(|output| output.status.success())
+            .ok_or(LaunchIdentityError::ProviderInspectionUnavailable)?;
+        parse_gated_image_inspection(&output.stdout)
+            .map_err(|_| LaunchIdentityError::ImageIdentityMismatch)
+    }
+
+    fn inspect_name_absence(
+        &self,
+        name: &ContainerName,
+        deadline: ProviderCallDeadline,
+    ) -> Result<AbsenceObservation, NamePresence> {
+        let rows = self.list_rows(deadline).ok_or(NamePresence::Unavailable)?;
+        if rows
+            .iter()
+            .any(|row| extract_apple_name(row) == name.as_str())
+        {
+            return Err(NamePresence::Present);
+        }
+        let checked_at = chrono::Utc::now();
+        Ok(AbsenceObservation {
+            provider: ProviderKind::AppleContainers,
+            exact_name: name.clone(),
+            checked_at,
+            revision: canonical_inspection_revision(CanonicalInspectionRevisionInput {
+                kind: InspectionObservationKind::Absent,
+                provider: ProviderKind::AppleContainers,
+                exact_name: name,
+                runtime_id: None,
+                token_digest: None,
+                immutable_image_id: None,
+                created_at: None,
+                state: SanitizedProviderStateObservation::Absent,
+            }),
+        })
+    }
+
+    fn inspect_launch(
+        &self,
+        key: &ProviderLaunchKey,
+        deadline: ProviderCallDeadline,
+    ) -> ExactInspection {
+        let Some(output) = self.run(&["inspect", key.container_name.as_str()], deadline) else {
+            return ExactInspection::Unavailable;
+        };
+        if !output.status.success() {
+            return ExactInspection::Unavailable;
+        }
+        parse_gated_launch_inspection(&output.stdout, key)
+    }
+
+    fn classify_create_exit(&self, _exit: &CreateCliExitEvidence) -> CreateCliExitClass {
+        CreateCliExitClass::Other
+    }
+
+    fn stop_inspected(
+        &self,
+        inspection: &ProviderLaunchInspection,
+        deadline: ProviderCallDeadline,
+    ) -> Result<(), EngineError> {
+        let output = self
+            .run(&["stop", inspection.exact_name.as_str()], deadline)
+            .ok_or_else(|| EngineError::Container("Apple container stop unavailable".into()))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(EngineError::Container("Apple container stop failed".into()))
+        }
+    }
+
+    fn remove_inspected(
+        &self,
+        inspection: &ProviderLaunchInspection,
+        deadline: ProviderCallDeadline,
+    ) -> Result<(), EngineError> {
+        let output = self
+            .run(&["rm", inspection.exact_name.as_str()], deadline)
+            .ok_or_else(|| EngineError::Container("Apple container remove unavailable".into()))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(EngineError::Container(
+                "Apple container remove failed".into(),
+            ))
+        }
+    }
+}
+
 /// Extract the container name from an Apple Containers JSON row.
 ///
 /// Apple's schema uses `configuration.id` as the container name/identifier
@@ -348,25 +492,65 @@ fn parse_apple_list_output(stdout: &str, name_prefix: Option<&str>) -> Vec<Agent
     handles
 }
 
-#[derive(Debug, Default)]
-pub(super) struct AppleBackend;
+pub(super) struct AppleBackend {
+    gated_provider: std::sync::OnceLock<
+        Result<std::sync::Arc<dyn GatedProviderAdapter>, ProviderCliStartFailure>,
+    >,
+    #[cfg(test)]
+    test_boundary:
+        Option<std::sync::Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>>,
+}
+
+impl Default for AppleBackend {
+    fn default() -> Self {
+        Self {
+            gated_provider: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            test_boundary: None,
+        }
+    }
+}
 
 impl AppleBackend {
+    #[cfg(test)]
+    pub(super) fn with_test_boundary(
+        boundary: std::sync::Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
+    ) -> Self {
+        Self {
+            gated_provider: std::sync::OnceLock::from(Ok(boundary.provider())),
+            test_boundary: Some(boundary),
+        }
+    }
+
     fn build_common(
         &self,
         options: ResolvedContainerOptions,
         launch_retention: Option<std::sync::Arc<LaunchRetentionRegistry>>,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
-        if options
+        let orchestrated = options
             .startup_gate
             .as_ref()
-            .is_some_and(|gate| gate.control.orchestrated_parts().is_some())
-            && launch_retention.is_none()
-        {
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some());
+        if orchestrated && launch_retention.is_none() {
             return Err(EngineError::Config(
                 "orchestrated launch retention is unavailable".into(),
             ));
         }
+        let gated_provider = if orchestrated {
+            Some(
+                self.gated_provider
+                    .get_or_init(|| {
+                        AppleGatedProviderAdapter::try_new()
+                            .map(|adapter| adapter as std::sync::Arc<dyn GatedProviderAdapter>)
+                    })
+                    .clone()
+                    .map_err(|_| {
+                        EngineError::Config("Apple provider custody is unavailable".into())
+                    })?,
+            )
+        } else {
+            None
+        };
         let image = options.image.clone().ok_or_else(|| {
             EngineError::ConflictingOptions("missing required Image option".into())
         })?;
@@ -374,17 +558,38 @@ impl AppleBackend {
             ContainerName::new(crate::engine::container::naming::generate_container_name())
         });
         let leases = register_container_leases(&options, &name.0);
-        Ok(Box::new(ContainerInstance::new_with_launch_retention(
-            ContainerCli::APPLE,
+        let cli = ContainerCli::APPLE;
+        #[cfg(test)]
+        let cli = self
+            .test_boundary
+            .as_ref()
+            .map_or(cli, |boundary| cli.with_bin(boundary.executable()));
+        let instance = ContainerInstance::new_with_orchestrated_launch(
+            cli,
             image,
             name,
             options,
             leases,
             Some(serve_attach_socket),
-            launch_retention,
-        )))
+            (launch_retention, gated_provider),
+        );
+        #[cfg(test)]
+        let mut instance = instance;
+        #[cfg(test)]
+        if let Some(boundary) = &self.test_boundary {
+            instance.set_test_boundary(std::sync::Arc::clone(boundary));
+        }
+        Ok(Box::new(instance))
     }
 }
+
+#[cfg(test)]
+#[allow(non_upper_case_globals)]
+#[allow(clippy::declare_interior_mutable_const)]
+const AppleBackend: AppleBackend = AppleBackend {
+    gated_provider: std::sync::OnceLock::new(),
+    test_boundary: None,
+};
 
 impl ContainerBackend for AppleBackend {
     fn build(
