@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,15 +11,18 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
-use super::gated_launch::child_lifecycle_test_support::{lifecycle_probe, LifecycleProbe};
+use super::gated_launch::child_lifecycle_test_support::{
+    lifecycle_probe, prepare_with_pause, ActorPausePoint, LifecycleProbe,
+};
 use super::gated_launch::retention_test_support::{registry_probe, RetentionProbe};
 use super::gated_launch::{
     canonical_inspection_revision, prepare_orchestrated_launch, AbsenceObservation,
-    CanonicalInspectionRevisionInput, ChildLifecycleAuthority, CreateCliExitClass,
-    CreateCliExitEvidence, DurableLaunchPlan, ExactInspection, GatedProviderAdapter,
-    ImmutableImageId, InspectionObservationKind, LaunchIdentityError, LaunchRetentionRegistry,
-    NamePresence, ProviderCallDeadline, ProviderKind, ProviderLaunchInspection,
-    SanitizedProviderStateObservation,
+    CanonicalInspectionRevisionInput, ChildLifecycleAuthority, ChildLifecycleState,
+    CreateCliExitClass, CreateCliExitEvidence, DurableLaunchPlan, ExactInspection,
+    GatedProviderAdapter, ImmutableImageId, InspectionObservationKind, LaunchIdentityError,
+    LaunchRetentionReason, LaunchRetentionRegistry, NamePresence, ProviderCallDeadline,
+    ProviderKind, ProviderLaunchInspection, RetainedAgentLaunch, RetainedExecution,
+    SanitizedProviderStateObservation, SpawnedCreateCli,
 };
 use super::options::{ContainerName, ImageRef};
 use super::process::test_support::{
@@ -381,6 +385,96 @@ fn retained_bind_fault_quiesces_each_managed_cli_representation_once() -> Result
             snapshot.actor_finished && !snapshot.resources_present
         }));
     }
+    Ok(())
+}
+
+#[test]
+fn retained_managed_prepared_poll_defers_termination_until_running() -> Result<(), Box<dyn Error>> {
+    let gated = gated_fixture("managed-prepared")?;
+    let plan_path = gated._control.path().join("launch-plan.json");
+    let registry = LaunchRetentionRegistry::try_new()?;
+    let retention = registry_probe(&registry);
+    let (prepared, pause) = prepare_with_pause(ActorPausePoint::BeforeFirstCommand)?;
+    let child = Command::new("/bin/sh")
+        .args(["-c", "exec sleep 30"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let authority = match prepared.bind_started_child_with_resources(
+        SpawnedCreateCli::Piped(child),
+        Utc::now(),
+        Box::new(()),
+    ) {
+        Ok(authority) => authority,
+        Err(error) => {
+            super::gated_launch::retain_detached_after_error(error.into_retained());
+            return Err("managed prepared fixture failed to bind child custody".into());
+        }
+    };
+    let lifecycle = lifecycle_probe(&authority);
+    let release = ManagedFixtureRelease::new(authority.clone());
+    assert!(pause.wait_until_paused(Instant::now() + OBSERVATION_BOUND));
+    let ticket = registry.retain(RetainedAgentLaunch {
+        plan: gated.plan,
+        execution: Some(RetainedExecution::Managed {
+            execution: None,
+            lifecycle: authority,
+        }),
+        last_inspection: None,
+        reason: LaunchRetentionReason::ChildStateUnknown,
+    });
+
+    let managed_poll_observed = wait_until(Instant::now() + OBSERVATION_BOUND, || {
+        retention.snapshot().managed_prepared >= 1
+    });
+    let before_resume = lifecycle.snapshot();
+    let retained_before_resume = retention.snapshot();
+
+    assert!(managed_poll_observed);
+    assert_eq!(before_resume.state, ChildLifecycleState::Prepared);
+    assert_eq!(before_resume.terminate_calls, 0);
+    assert_eq!(before_resume.terminate_enqueued, 0);
+    assert_eq!(before_resume.terminate_commands, 0);
+    assert_eq!(before_resume.native_reaps, 0);
+    assert_eq!(before_resume.native_poll_reaped, 0);
+    assert!(before_resume.actual_exit.is_none());
+    assert!(before_resume.bound_pid.is_none());
+    assert!(!before_resume.owns_unreaped_child);
+    assert!(before_resume.resources_present);
+    assert_eq!(retained_before_resume.retained, 1);
+    assert_eq!(retained_before_resume.unreaped, 1);
+    assert!(retention.contains(ticket));
+    assert!(plan_path.exists());
+    assert_eq!(gated.adapter.destructive_calls(), (0, 0));
+
+    drop(pause);
+    assert!(wait_until(Instant::now() + REAP_BOUND, || {
+        lifecycle.snapshot().actual_exit.is_some() && retention.snapshot().unreaped == 0
+    }));
+    let final_lifecycle = lifecycle.snapshot();
+    let final_retention = retention.snapshot();
+    assert_eq!(final_lifecycle.terminate_calls, 1);
+    assert_eq!(final_lifecycle.terminate_enqueued, 1);
+    assert_eq!(final_lifecycle.terminate_commands, 1);
+    assert_eq!(final_lifecycle.native_reaps, 1);
+    assert_eq!(final_lifecycle.native_poll_reaped, 1);
+    assert!(final_lifecycle.actual_exit.is_some());
+    assert!(final_lifecycle.bound_pid.is_some());
+    assert!(!final_lifecycle.owns_unreaped_child);
+    assert!(final_lifecycle.resources_present);
+    assert_eq!(final_retention.retained, 1);
+    assert_eq!(final_retention.unreaped, 0);
+    assert!(retention.contains(ticket));
+    assert!(plan_path.exists());
+    assert_eq!(gated.adapter.destructive_calls(), (0, 0));
+
+    release.disarm();
+    assert!(wait_until(Instant::now() + OBSERVATION_BOUND, || {
+        let snapshot = lifecycle.snapshot();
+        snapshot.actor_finished && !snapshot.resources_present
+    }));
+    drop(registry);
     Ok(())
 }
 

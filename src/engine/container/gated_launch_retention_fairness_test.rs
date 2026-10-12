@@ -246,6 +246,8 @@ fn active_custody(
     plan: DurableLaunchPlan,
     adapter: Arc<CleanupAdapter>,
 ) -> Result<(ActiveGatedCustody, LifecycleProbe), Box<dyn Error>> {
+    let cleanup_registry = LaunchRetentionRegistry::try_new()
+        .map_err(|_| "fairness fixture cleanup registry failed to start")?;
     let prepared = ChildLifecycleAuthority::prepare()?;
     let child = Command::new("/bin/cat")
         .stdin(Stdio::piped())
@@ -271,11 +273,29 @@ fn active_custody(
             return Err(error.into());
         }
     };
-    let provider: Arc<dyn GatedProviderAdapter> = adapter;
-    Ok((
-        ActiveGatedCustody::new(plan, lifecycle, resource_loan, provider, None, None),
-        probe,
-    ))
+    let provider: Arc<dyn GatedProviderAdapter> = adapter.clone();
+    let custody = ActiveGatedCustody::new(plan, lifecycle, resource_loan, provider, None, None);
+    if !wait_until(Instant::now() + Duration::from_millis(600), || {
+        probe.snapshot().state == ChildLifecycleState::Running
+    }) {
+        adapter.authorize_cleanup();
+        let cleanup_probe = registry_probe(&cleanup_registry);
+        let cleanup_ticket = cleanup_registry.retain_active_gated(custody);
+        let cleaned = wait_until(Instant::now() + Duration::from_millis(600), || {
+            !cleanup_probe.contains(cleanup_ticket)
+        });
+        drop(cleanup_registry);
+        return if cleaned {
+            Err("fairness fixture lifecycle did not reach Running".into())
+        } else {
+            Err(
+                "fairness fixture lifecycle did not reach Running and cleanup remained retained"
+                    .into(),
+            )
+        };
+    }
+    drop(cleanup_registry);
+    Ok((custody, probe))
 }
 
 fn prepared_active_custody(

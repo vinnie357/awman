@@ -843,7 +843,11 @@ fn poll_managed_execution(
             execution: managed_execution,
             lifecycle,
         } => {
-            if *signal_authorized {
+            let state = lifecycle.state();
+            #[cfg(test)]
+            record_managed_observation(_shared, state.as_ref().ok());
+            let termination_ready = matches!(state.as_ref(), Ok(ChildLifecycleState::Running));
+            if *signal_authorized && termination_ready {
                 match lifecycle.request_terminate_local_cli(
                     Instant::now() + RETAINED_LOCAL_CLI_TERMINATE_BOUND,
                 ) {
@@ -854,9 +858,6 @@ fn poll_managed_execution(
                     TerminateRequestOutcome::NotAccepted(_) => {}
                 }
             }
-            let state = lifecycle.state();
-            #[cfg(test)]
-            record_managed_observation(_shared, state.as_ref().ok());
             match state {
                 Ok(ChildLifecycleState::Exited(_)) => {
                     // Dropping a successful execution returns its unique loan.

@@ -60,8 +60,7 @@ fn wait_for_retention_authority(probe: &RetentionProbe) -> Option<bool> {
 }
 
 #[test]
-fn prepared_attempt_without_accepted_command_preserves_retry_authority(
-) -> Result<(), Box<dyn Error>> {
+fn managed_prepared_poll_preserves_retry_authority_until_running() -> Result<(), Box<dyn Error>> {
     let registry = LaunchRetentionRegistry::try_new()?;
     let retention = registry_probe(&registry);
     let mut task = spawn_fixture_paused(
@@ -76,15 +75,15 @@ fn prepared_attempt_without_accepted_command_preserves_retry_authority(
     let authority = authority(&fixture)?;
     let lifecycle = lifecycle_probe(&authority);
     let retained = fixture.finish(Arc::clone(&registry)).is_err();
-    let attempted_prepared = wait_until(Instant::now() + OBSERVE, || {
-        lifecycle.snapshot().terminate_calls >= 1
+    let managed_prepared_observed = wait_until(Instant::now() + OBSERVE, || {
+        retention.snapshot().managed_prepared >= 1
     });
     let before_resume = lifecycle.snapshot();
     let retry_authority = wait_for_retention_authority(&retention);
 
     task.resume();
     let accepted_after_running = wait_until(Instant::now() + OBSERVE, || {
-        lifecycle.snapshot().terminate_enqueued == 1
+        retention.snapshot().managed_running >= 1 && lifecycle.snapshot().terminate_enqueued == 1
     });
     let actual_exit = wait_until(Instant::now() + CLEANUP, || {
         lifecycle.snapshot().actual_exit.is_some()
@@ -97,12 +96,15 @@ fn prepared_attempt_without_accepted_command_preserves_retry_authority(
 
     assert!(paused);
     assert!(retained);
-    assert!(attempted_prepared);
+    assert!(managed_prepared_observed);
     assert_eq!(before_resume.state, ChildLifecycleState::Prepared);
+    assert_eq!(before_resume.terminate_calls, 0);
     assert_eq!(before_resume.terminate_enqueued, 0);
+    assert_eq!(before_resume.terminate_commands, 0);
     assert_eq!(retry_authority, Some(true));
     assert!(accepted_after_running);
     assert!(actual_exit);
+    assert_eq!(final_snapshot.terminate_calls, 1);
     assert_eq!(final_snapshot.terminate_enqueued, 1);
     assert_eq!(final_snapshot.terminate_commands, 1);
     assert_eq!(final_snapshot.native_reaps, 1);
