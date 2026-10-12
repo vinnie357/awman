@@ -87,6 +87,16 @@ pub(crate) enum CancellationPoint {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum GateV2ReadyCase {
+    Exact,
+    MissingGuestCwd,
+    NullGuestCwd,
+    WrongGuestCwd,
+    DuplicateGuestCwd,
+    LegacyVersion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CleanupFault {
     TupleChanged,
     InspectionUnavailable,
@@ -116,6 +126,7 @@ pub(crate) enum RetryFaultPoint {
     CleanupInspection,
     FinalAbsence,
     RemoveEffectThenError,
+    CleanupPublication,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,6 +150,8 @@ pub(crate) enum AppleCommandScenario {
     ReceiptSecondInspection(SecondInspectionRelease),
     RepeatRetry(RetryFaultPoint, RetryOrigin),
     SupervisorRetry(RetryFaultPoint),
+    GateV2(GateV2ReadyCase),
+    NeverCreatedAfterPlan,
     Legacy,
 }
 
@@ -155,6 +168,8 @@ pub(crate) enum AppleCommandExternalPlan {
     ReceiptSecondInspection,
     RepeatRetry(RetryFaultPoint),
     SupervisorRetry(RetryFaultPoint),
+    GateV2(GateV2ReadyCase),
+    NeverCreatedAfterPlan,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +187,15 @@ pub(crate) enum CleanupStep {
     Reap,
     Remove,
     ProveAbsent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CleanupCustodyEvent {
+    ActualChildReaped,
+    ExactAbsenceProven,
+    CleanupPublicationAttemptFailed,
+    CleanupPublicationAttemptSucceeded,
+    ResourceLoanReleased,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -213,6 +237,7 @@ struct AppleCommandEffectState {
     second_inspection_waiting: bool,
     second_inspection_release: Option<SecondInspectionRelease>,
     retry_fault_active: bool,
+    cleanup_publication_fault_consumed: bool,
 }
 
 #[derive(Clone)]
@@ -297,6 +322,15 @@ impl AppleCommandEffects {
             .unwrap_or_else(|p| p.into_inner())
             .retry_fault_active
     }
+
+    pub(crate) fn take_cleanup_publication_fault(&self) -> bool {
+        let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.retry_fault_active || state.cleanup_publication_fault_consumed {
+            return false;
+        }
+        state.cleanup_publication_fault_consumed = true;
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -365,6 +399,17 @@ pub(crate) struct AppleCommandReport {
     pub protected_launch_identity: Option<CleanupIdentitySnapshot>,
     pub protected_receipt_runtime_id: Option<String>,
     pub protected_receipt_container_name: Option<String>,
+    pub protected_receipt_bytes: Option<Vec<u8>>,
+    pub launch_plan_bytes: Option<Vec<u8>>,
+    pub cleanup_record_bytes: Option<Vec<u8>>,
+    pub cleanup_record_present_before_retry: Option<bool>,
+    pub ownership_before_publication_retry: Option<OwnershipObservation>,
+    pub cleanup_publication_attempts: usize,
+    pub cleanup_publication_successes: usize,
+    pub actual_child_reaps: usize,
+    pub never_created_proofs: usize,
+    pub ready_rejections: usize,
+    pub cleanup_custody_events: Vec<CleanupCustodyEvent>,
     pub cleanup_retained_ticket: Option<LaunchRetentionTicket>,
     pub cleanup_retained_ticket_present: Option<bool>,
     pub cleanup_active_resource_loans: Option<usize>,
@@ -406,6 +451,11 @@ struct DriverEffects {
     drop_elapsed: Option<Duration>,
     protected_receipt_runtime_id: Option<String>,
     protected_receipt_container_name: Option<String>,
+    protected_receipt_bytes: Option<Vec<u8>>,
+    launch_plan_bytes: Option<Vec<u8>>,
+    cleanup_record_bytes: Option<Vec<u8>>,
+    cleanup_record_present_before_retry: Option<bool>,
+    ownership_before_publication_retry: Option<OwnershipObservation>,
     cleanup_retained_ticket: Option<LaunchRetentionTicket>,
     cleanup_retained_ticket_present: Option<bool>,
     cleanup_active_resource_loans: Option<usize>,
@@ -457,6 +507,12 @@ pub(crate) struct AppleCommandObservation {
     remove_identities: Vec<CleanupIdentitySnapshot>,
     planned_launch_identity: Option<PlannedLaunchIdentitySnapshot>,
     protected_launch_identity: Option<CleanupIdentitySnapshot>,
+    cleanup_publication_attempts: usize,
+    cleanup_publication_successes: usize,
+    actual_child_reaps: usize,
+    never_created_proofs: usize,
+    ready_rejections: usize,
+    cleanup_custody_events: Vec<CleanupCustodyEvent>,
     ownership: OwnershipObservation,
     legacy_orchestrated_plan: bool,
     terminal_observed: bool,
@@ -575,6 +631,74 @@ impl AppleCommandObserver {
         let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
         state.protected_ready_transitions += 1;
         self.state.1.notify_all();
+    }
+
+    pub(crate) fn observe_ready_rejected(&self) {
+        let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.ready_rejections += 1;
+        self.state.1.notify_all();
+    }
+
+    pub(crate) fn observe_cleanup_publication(&self, succeeded: bool) {
+        let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.cleanup_publication_attempts += 1;
+        state.cleanup_publication_successes += usize::from(succeeded);
+        state.cleanup_custody_events.push(if succeeded {
+            CleanupCustodyEvent::CleanupPublicationAttemptSucceeded
+        } else {
+            CleanupCustodyEvent::CleanupPublicationAttemptFailed
+        });
+        self.state.1.notify_all();
+    }
+
+    pub(crate) fn observe_exact_absence_proven(&self) {
+        let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .cleanup_custody_events
+            .push(CleanupCustodyEvent::ExactAbsenceProven);
+        self.state.1.notify_all();
+    }
+
+    pub(crate) fn observe_actual_child_reaped(&self) {
+        let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.actual_child_reaps += 1;
+        state
+            .cleanup_custody_events
+            .push(CleanupCustodyEvent::ActualChildReaped);
+        self.state.1.notify_all();
+    }
+
+    pub(crate) fn observe_resource_loan_released(&self) {
+        let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .cleanup_custody_events
+            .push(CleanupCustodyEvent::ResourceLoanReleased);
+        self.state.1.notify_all();
+    }
+
+    pub(crate) fn observe_never_created_proven(&self) {
+        let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.never_created_proofs += 1;
+        self.state.1.notify_all();
+    }
+
+    fn wait_for_ready_rejection(&self, deadline: Instant) -> bool {
+        let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
+        while state.ready_rejections == 0 {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (next, timeout) = self
+                .state
+                .1
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|p| p.into_inner());
+            state = next;
+            if timeout.timed_out() {
+                return false;
+            }
+        }
+        true
     }
 
     pub(crate) fn observe_accepted_release(&self) {
@@ -735,8 +859,14 @@ impl Drop for ReceiptPublicationWatch {
 }
 
 impl GateFixture {
-    fn new(legacy: bool) -> Result<Self, Box<dyn Error>> {
+    fn new(scenario: AppleCommandScenario) -> Result<Self, Box<dyn Error>> {
         use std::os::unix::fs::PermissionsExt as _;
+
+        let legacy = matches!(scenario, AppleCommandScenario::Legacy);
+        let v2 = matches!(
+            scenario,
+            AppleCommandScenario::GateV2(_) | AppleCommandScenario::NeverCreatedAfterPlan
+        );
 
         let root = tempfile::tempdir()?;
         let parent = root.path().join("control-parent");
@@ -748,10 +878,17 @@ impl GateFixture {
 
         let manifest_bytes = b"{\"version\":1,\"entries\":[]}\n".to_vec();
         let manifest_digest = lower_hex(&Sha256::digest(&manifest_bytes));
-        let request_bytes = format!(
-            "{{\"version\":1,\"bindings\":[{{\"id\":\"workspace\",\"workspace_path\":\"/workspace\",\"manifest_id\":\"{manifest_digest}\",\"manifest_file\":\"workspace.manifest.json\",\"access\":\"read-only\"}}]}}\n"
-        )
-        .into_bytes();
+        let request_bytes = if v2 {
+            format!(
+                "{{\"version\":2,\"bindings\":[{{\"id\":\"workspace\",\"workspace_path\":\"/workspace\",\"manifest_id\":\"{manifest_digest}\",\"manifest_file\":\"workspace.manifest.json\",\"access\":\"read-only\"}}],\"guest_cwd\":\"/workspace\"}}\n"
+            )
+            .into_bytes()
+        } else {
+            format!(
+                "{{\"version\":1,\"bindings\":[{{\"id\":\"workspace\",\"workspace_path\":\"/workspace\",\"manifest_id\":\"{manifest_digest}\",\"manifest_file\":\"workspace.manifest.json\",\"access\":\"read-only\"}}]}}\n"
+            )
+            .into_bytes()
+        };
         write_private(&parent.join(MANIFEST_NAME), &manifest_bytes)?;
         write_private(&parent.join("request.json"), &request_bytes)?;
         if !legacy {
@@ -912,6 +1049,14 @@ impl GateFixture {
         usize::from(self.guest.join(".released").is_file())
     }
 
+    fn optional_record(&self, name: &str) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+        match std::fs::read(self.parent.join(name)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn actual_provider_entries(&self) -> Result<usize, Box<dyn Error>> {
         match std::fs::read(self.guest.join(PROVIDER_ENTRY_MARKER)) {
             Ok(bytes) => Ok(bytes
@@ -983,6 +1128,10 @@ fn external_plan(scenario: AppleCommandScenario) -> AppleCommandExternalPlan {
         AppleCommandScenario::SupervisorRetry(fault) => {
             AppleCommandExternalPlan::SupervisorRetry(fault)
         }
+        AppleCommandScenario::GateV2(case) => AppleCommandExternalPlan::GateV2(case),
+        AppleCommandScenario::NeverCreatedAfterPlan => {
+            AppleCommandExternalPlan::NeverCreatedAfterPlan
+        }
         _ => AppleCommandExternalPlan::Normal,
     }
 }
@@ -994,6 +1143,7 @@ fn needs_external_release(scenario: AppleCommandScenario) -> bool {
             | AppleCommandScenario::SealedSourceMutated(_)
             | AppleCommandScenario::CleanupUncertain(_)
             | AppleCommandScenario::ExternalRelease
+            | AppleCommandScenario::GateV2(GateV2ReadyCase::Exact)
             | AppleCommandScenario::RepeatRetry(_, RetryOrigin::NormalWait)
     )
 }
@@ -1068,6 +1218,17 @@ fn report_from_observation(
         protected_launch_identity: observation.protected_launch_identity,
         protected_receipt_runtime_id: effects.protected_receipt_runtime_id,
         protected_receipt_container_name: effects.protected_receipt_container_name,
+        protected_receipt_bytes: effects.protected_receipt_bytes,
+        launch_plan_bytes: effects.launch_plan_bytes,
+        cleanup_record_bytes: effects.cleanup_record_bytes,
+        cleanup_record_present_before_retry: effects.cleanup_record_present_before_retry,
+        ownership_before_publication_retry: effects.ownership_before_publication_retry,
+        cleanup_publication_attempts: observation.cleanup_publication_attempts,
+        cleanup_publication_successes: observation.cleanup_publication_successes,
+        actual_child_reaps: observation.actual_child_reaps,
+        never_created_proofs: observation.never_created_proofs,
+        ready_rejections: observation.ready_rejections,
+        cleanup_custody_events: observation.cleanup_custody_events,
         cleanup_retained_ticket: effects.cleanup_retained_ticket,
         cleanup_retained_ticket_present: effects.cleanup_retained_ticket_present,
         cleanup_active_resource_loans: effects.cleanup_active_resource_loans,
@@ -1112,7 +1273,7 @@ pub(crate) fn exercise(scenario: AppleCommandScenario) -> AppleCommandReport {
 fn exercise_public_path(
     scenario: AppleCommandScenario,
 ) -> Result<AppleCommandReport, Box<dyn Error>> {
-    let fixture = GateFixture::new(matches!(scenario, AppleCommandScenario::Legacy))?;
+    let fixture = GateFixture::new(scenario)?;
     let expected_request = fixture.request_bytes.clone();
     let expected_manifests =
         BTreeMap::from([(MANIFEST_NAME.to_string(), fixture.manifest_bytes.clone())]);
@@ -1313,6 +1474,8 @@ fn exercise_public_path(
             | AppleCommandScenario::ReceiptSecondInspection(_)
             | AppleCommandScenario::RepeatRetry(_, _)
             | AppleCommandScenario::SupervisorRetry(_)
+            | AppleCommandScenario::GateV2(_)
+            | AppleCommandScenario::NeverCreatedAfterPlan
     ) {
         Some(runtime.launch_retention()?)
     } else {
@@ -1341,6 +1504,17 @@ fn exercise_public_path(
                 ));
             }
             execution.cancel()?;
+        }
+
+        if let AppleCommandScenario::GateV2(case) = scenario {
+            if case != GateV2ReadyCase::Exact {
+                if !observer.wait_for_ready_rejection(Instant::now() + Duration::from_secs(2)) {
+                    return Err(crate::engine::error::EngineError::Container(
+                        "v2 READY refusal was not observed through the production validator".into(),
+                    ));
+                }
+                return execution.wait().await.map(|_| ());
+            }
         }
 
         if let AppleCommandScenario::ReceiptSecondInspection(release) = scenario {
@@ -1406,9 +1580,12 @@ fn exercise_public_path(
                     effects.drop_elapsed = Some(drop_started.elapsed());
                 }
                 RetryOrigin::NormalWait => {
-                    if fault != RetryFaultPoint::FinalAbsence {
+                    if !matches!(
+                        fault,
+                        RetryFaultPoint::FinalAbsence | RetryFaultPoint::CleanupPublication
+                    ) {
                         return Err(crate::engine::error::EngineError::Container(
-                            "normal-wait repeat retry requires final-absence uncertainty".into(),
+                            "normal-wait repeat retry requires post-release uncertainty".into(),
                         ));
                     }
                     fixture.authorize_from_receipt(&receipt).map_err(|error| {
@@ -1440,6 +1617,45 @@ fn exercise_public_path(
                 }
                 std::thread::sleep(Duration::from_millis(10));
             };
+
+            if fault == RetryFaultPoint::CleanupPublication {
+                effects.retained_ticket_before_retry = probe.contains(initial_ticket);
+                effects.active_resource_loans_before_retry =
+                    probe.active_gated_resource_loans(initial_ticket);
+                effects.resource_loan_releases_before_retry =
+                    probe.resource_loan_releases(initial_ticket);
+                effects.cleanup_record_present_before_retry = Some(
+                    fixture
+                        .optional_record("cleanup.json")
+                        .map_err(|error| {
+                            crate::engine::error::EngineError::Container(error.to_string())
+                        })?
+                        .is_some(),
+                );
+                effects.ownership_before_publication_retry =
+                    Some(observer.snapshot_until(Instant::now()).ownership);
+                command_effects.clear_retry_fault();
+                let retry = registry
+                    .retry_active_gated(initial_ticket, Instant::now() + Duration::from_secs(2))?;
+                effects.retry_tickets.push(initial_ticket);
+                effects.retry_observations.push(match retry {
+                    ActiveGatedRetryOutcome::Resolved => RetryObservation::Resolved,
+                    ActiveGatedRetryOutcome::Retained => RetryObservation::Retained,
+                });
+                effects.retained_ticket_after_retry = probe.contains(initial_ticket);
+                effects.active_resource_loans_after_retry =
+                    probe.active_gated_resource_loans(initial_ticket);
+                effects.resource_loan_releases_after_retry =
+                    probe.resource_loan_releases(initial_ticket);
+                effects
+                    .cleanup_steps_after_retry_attempts
+                    .push(observer.cleanup_steps());
+                effects.actual_provider_entries_total =
+                    fixture.actual_provider_entries().map_err(|error| {
+                        crate::engine::error::EngineError::Container(error.to_string())
+                    })?;
+                return Ok(());
+            }
 
             if origin == RetryOrigin::NormalWait {
                 effects.retry_tickets.push(initial_ticket);
@@ -1665,6 +1881,7 @@ fn exercise_public_path(
                 external_release_boundary = ExternalReleaseBoundary::ProtectedReceiptRead;
             }
             effects.protected_receipt_observed = !receipt.is_empty();
+            effects.protected_receipt_bytes = Some(receipt.clone());
             let protected_receipt: serde_json::Value = serde_json::from_slice(&receipt)
                 .map_err(|error| crate::engine::error::EngineError::Container(error.to_string()))?;
             effects.protected_receipt_runtime_id = protected_receipt
@@ -1734,6 +1951,8 @@ fn exercise_public_path(
     }
     effects.released_acknowledgments = fixture.released_acknowledgments();
     effects.actual_provider_entries_total = fixture.actual_provider_entries()?;
+    effects.launch_plan_bytes = fixture.optional_record("launch-plan.json")?;
+    effects.cleanup_record_bytes = fixture.optional_record("cleanup.json")?;
     let observation = observer.snapshot_until(Instant::now() + Duration::from_secs(2));
     let fallback = match scenario {
         AppleCommandScenario::SpawnAmbiguous | AppleCommandScenario::CleanupUncertain(_)
@@ -1745,6 +1964,10 @@ fn exercise_public_path(
             TestDisposition::Retained
         }
         AppleCommandScenario::Cancel(_) => TestDisposition::Cancelled,
+        AppleCommandScenario::GateV2(case) if case != GateV2ReadyCase::Exact => {
+            TestDisposition::Rejected
+        }
+        AppleCommandScenario::NeverCreatedAfterPlan => TestDisposition::Rejected,
         AppleCommandScenario::DropWithoutWait(_) if effects.retained_ticket_before_retry => {
             TestDisposition::Retained
         }
@@ -2095,6 +2318,19 @@ fn uncertain_cleanup_stops_at_the_first_unproven_step_and_retains() {
             report.cleanup_steps, expected_steps,
             "cleanup fault {fault:?} crossed an uncertain step"
         );
+        if fault == CleanupFault::FinalAbsenceUnproven {
+            assert!(report.cleanup_record_bytes.is_none());
+            assert_eq!(report.cleanup_publication_attempts, 0);
+            assert_eq!(report.cleanup_publication_successes, 0);
+            assert!(!report
+                .cleanup_custody_events
+                .contains(&CleanupCustodyEvent::ExactAbsenceProven));
+            assert!(!report.cleanup_custody_events.iter().any(|event| matches!(
+                event,
+                CleanupCustodyEvent::CleanupPublicationAttemptFailed
+                    | CleanupCustodyEvent::CleanupPublicationAttemptSucceeded
+            )));
+        }
     }
 }
 
@@ -2457,4 +2693,324 @@ fn production_supervisor_retries_the_same_active_ticket_without_repeating_effect
     assert_eq!(report.actual_provider_entries_total, 0);
     assert!(!report.second_spawn_attempted);
     assert!(!report.name_only_cleanup_attempted);
+}
+
+fn assert_canonical_cleanup_record(report: &AppleCommandReport, runtime_id: Option<&str>) {
+    let plan = report
+        .launch_plan_bytes
+        .as_deref()
+        .expect("production path must retain canonical launch-plan bytes");
+    let raw = report
+        .cleanup_record_bytes
+        .as_deref()
+        .expect("production cleanup must publish the protected record");
+    let record: serde_json::Value =
+        serde_json::from_slice(raw).expect("cleanup record must be strict JSON");
+    let object = record
+        .as_object()
+        .expect("cleanup record must be an object");
+    let expected_keys = if runtime_id.is_some() {
+        vec!["launchPlanSha256", "outcome", "runtimeId", "version"]
+    } else {
+        vec!["launchPlanSha256", "outcome", "version"]
+    };
+    assert_eq!(
+        object.keys().map(String::as_str).collect::<Vec<_>>(),
+        expected_keys
+    );
+    assert_eq!(record["version"], 2);
+    assert_eq!(record["outcome"], "absent");
+    assert_eq!(record["launchPlanSha256"], lower_hex(&Sha256::digest(plan)));
+    match runtime_id {
+        Some(expected) => assert_eq!(record["runtimeId"], expected),
+        None => assert!(record.get("runtimeId").is_none()),
+    }
+    let text = String::from_utf8_lossy(raw).to_ascii_lowercase();
+    for forbidden in ["launch_token", "credential", "imageid", "provider stdout"] {
+        assert!(!text.contains(forbidden), "cleanup leaked {forbidden}");
+    }
+}
+
+#[test]
+fn v1_request_and_protected_receipt_bytes_remain_free_of_optional_v2_metadata() {
+    let report = exercise(AppleCommandScenario::Qualified);
+    assert_eq!(report.staged_request, report.expected_request);
+    assert!(!String::from_utf8_lossy(&report.staged_request).contains("guest_cwd"));
+    let receipt_bytes = report
+        .protected_receipt_bytes
+        .as_deref()
+        .expect("v1 protected receipt");
+    let receipt: serde_json::Value =
+        serde_json::from_slice(receipt_bytes).expect("v1 receipt JSON");
+    assert_eq!(
+        receipt
+            .as_object()
+            .expect("receipt object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["container_name", "nonce", "runtime_id", "version"]
+    );
+    assert_eq!(receipt["version"], 1);
+    assert!(receipt.get("guest_cwd").is_none());
+    assert_eq!(
+        receipt_bytes,
+        format!(
+            "{{\"version\":1,\"nonce\":\"{}\",\"container_name\":\"{}\",\"runtime_id\":\"{}\"}}",
+            receipt["nonce"].as_str().expect("v1 nonce"),
+            receipt["container_name"]
+                .as_str()
+                .expect("v1 container name"),
+            receipt["runtime_id"].as_str().expect("v1 runtime id"),
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
+fn v2_ready_cwd_is_validated_before_the_protected_receipt_and_release() {
+    let report = exercise(AppleCommandScenario::GateV2(GateV2ReadyCase::Exact));
+    assert_eq!(report.disposition, TestDisposition::Completed);
+    assert_eq!(report.actual_provider_entries_before_release, 0);
+    assert_eq!(report.actual_provider_entries_total, 1);
+    assert_eq!(report.accepted_releases, 1);
+    assert_eq!(report.ready_rejections, 0);
+    assert!(report.protected_receipt_observed);
+    assert!(report.release_absent_at_protected_receipt);
+    assert!(report
+        .argv
+        .windows(2)
+        .any(|pair| pair == ["-w", "/workspace"]));
+
+    let receipt: serde_json::Value = serde_json::from_slice(
+        report
+            .protected_receipt_bytes
+            .as_deref()
+            .expect("v2 protected receipt"),
+    )
+    .expect("v2 receipt JSON");
+    assert_eq!(
+        receipt
+            .as_object()
+            .expect("receipt object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![
+            "container_name",
+            "guest_cwd",
+            "nonce",
+            "runtime_id",
+            "version",
+        ]
+    );
+    assert_eq!(receipt["version"], 2);
+    assert_eq!(receipt["guest_cwd"], "/workspace");
+    assert_eq!(receipt["container_name"], NAME);
+    assert!(receipt["nonce"]
+        .as_str()
+        .is_some_and(|nonce| nonce.len() == 64
+            && nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))));
+    assert_eq!(
+        receipt["runtime_id"],
+        report
+            .protected_launch_identity
+            .as_ref()
+            .expect("protected exact inspection")
+            .runtime_id
+    );
+}
+
+#[test]
+fn v2_missing_wrong_or_duplicate_ready_cwd_never_releases_or_enters_provider() {
+    for case in [
+        GateV2ReadyCase::MissingGuestCwd,
+        GateV2ReadyCase::NullGuestCwd,
+        GateV2ReadyCase::WrongGuestCwd,
+        GateV2ReadyCase::DuplicateGuestCwd,
+        GateV2ReadyCase::LegacyVersion,
+    ] {
+        let report = exercise(AppleCommandScenario::GateV2(case));
+        assert_eq!(report.disposition, TestDisposition::Rejected, "{case:?}");
+        assert_eq!(report.ready_rejections, 1, "{case:?}");
+        assert!(!report.protected_receipt_observed, "{case:?}");
+        assert!(report.protected_receipt_bytes.is_none(), "{case:?}");
+        assert_eq!(report.accepted_releases, 0, "{case:?}");
+        assert_eq!(report.released_acknowledgments, 0, "{case:?}");
+        assert_eq!(report.actual_provider_entries_total, 0, "{case:?}");
+        assert!(
+            report.ownership.quiescence_proven
+                || (report.ownership.exact_plan
+                    && report.ownership.child
+                    && report.ownership.container
+                    && report.ownership.controls
+                    && report.ownership.staged_files
+                    && report.ownership.registry_ticket),
+            "{case:?} lost production custody"
+        );
+        assert!(!report.second_spawn_attempted, "{case:?}");
+    }
+}
+
+#[test]
+fn created_cleanup_publishes_after_actual_reap_and_exact_absence_before_custody_release() {
+    let report = exercise(AppleCommandScenario::Qualified);
+    assert_eq!(report.disposition, TestDisposition::Completed);
+    assert_eq!(report.actual_child_reaps, 1);
+    assert_eq!(report.never_created_proofs, 0);
+    assert_eq!(report.cleanup_publication_attempts, 1);
+    assert_eq!(report.cleanup_publication_successes, 1);
+    assert_eq!(report.actual_provider_entries_total, 1);
+    assert_eq!(
+        report.cleanup_custody_events,
+        vec![
+            CleanupCustodyEvent::ActualChildReaped,
+            CleanupCustodyEvent::ExactAbsenceProven,
+            CleanupCustodyEvent::CleanupPublicationAttemptSucceeded,
+            CleanupCustodyEvent::ResourceLoanReleased,
+        ]
+    );
+    let runtime_id = report
+        .protected_launch_identity
+        .as_ref()
+        .expect("created runtime identity")
+        .runtime_id
+        .as_str();
+    assert_canonical_cleanup_record(&report, Some(runtime_id));
+}
+
+#[test]
+fn cleanup_publication_fault_retains_full_custody_and_retry_only_publishes() {
+    let report = exercise(AppleCommandScenario::RepeatRetry(
+        RetryFaultPoint::CleanupPublication,
+        RetryOrigin::NormalWait,
+    ));
+    assert_eq!(report.retry_tickets.len(), 1);
+    assert_eq!(report.retry_observations, vec![RetryObservation::Resolved]);
+    assert!(report.retained_ticket_before_retry);
+    assert!(!report.retained_ticket_after_retry);
+    assert_eq!(report.active_resource_loans_before_retry, 1);
+    assert_eq!(report.active_resource_loans_after_retry, 0);
+    assert_eq!(report.resource_loan_releases_before_retry, 0);
+    assert_eq!(report.resource_loan_releases_after_retry, 1);
+    assert_eq!(report.cleanup_record_present_before_retry, Some(false));
+    let retained = report
+        .ownership_before_publication_retry
+        .as_ref()
+        .expect("publication failure custody snapshot");
+    assert!(retained.exact_plan);
+    assert!(retained.child);
+    assert!(retained.container);
+    assert!(retained.controls);
+    assert!(retained.staged_files);
+    assert!(retained.registry_ticket);
+    assert_eq!(report.cleanup_publication_attempts, 2);
+    assert_eq!(report.cleanup_publication_successes, 1);
+    assert_eq!(report.actual_child_reaps, 1);
+    assert_eq!(report.actual_provider_entries_total, 1);
+    assert!(!report.second_spawn_attempted);
+    assert_eq!(
+        report.cleanup_custody_events,
+        vec![
+            CleanupCustodyEvent::ActualChildReaped,
+            CleanupCustodyEvent::ExactAbsenceProven,
+            CleanupCustodyEvent::CleanupPublicationAttemptFailed,
+            CleanupCustodyEvent::CleanupPublicationAttemptSucceeded,
+            CleanupCustodyEvent::ResourceLoanReleased,
+        ]
+    );
+    let final_steps = report
+        .cleanup_steps_after_retry_attempts
+        .last()
+        .expect("final publication retry steps");
+    assert_eq!(
+        final_steps
+            .iter()
+            .filter(|step| **step == CleanupStep::Stop)
+            .count(),
+        1
+    );
+    assert_eq!(
+        final_steps
+            .iter()
+            .filter(|step| **step == CleanupStep::Remove)
+            .count(),
+        1
+    );
+    let runtime_id = report
+        .protected_launch_identity
+        .as_ref()
+        .expect("created runtime identity")
+        .runtime_id
+        .as_str();
+    assert_canonical_cleanup_record(&report, Some(runtime_id));
+}
+
+#[test]
+fn protected_plan_before_cli_start_uses_positive_never_created_proof() {
+    let report = exercise(AppleCommandScenario::NeverCreatedAfterPlan);
+    assert_eq!(report.disposition, TestDisposition::Rejected);
+    assert_eq!(report.spawn_attempts, 1);
+    assert_eq!(report.child_starts, 0);
+    assert_eq!(report.actual_child_reaps, 0);
+    assert_eq!(report.never_created_proofs, 1);
+    assert_eq!(report.actual_provider_entries_total, 0);
+    assert_eq!(report.cleanup_publication_attempts, 1);
+    assert_eq!(report.cleanup_publication_successes, 1);
+    assert_eq!(
+        report.cleanup_custody_events,
+        vec![
+            CleanupCustodyEvent::ExactAbsenceProven,
+            CleanupCustodyEvent::CleanupPublicationAttemptSucceeded,
+            CleanupCustodyEvent::ResourceLoanReleased,
+        ]
+    );
+    assert_eq!(
+        report
+            .cleanup_steps
+            .iter()
+            .filter(|step| **step == CleanupStep::Stop || **step == CleanupStep::Remove)
+            .count(),
+        0
+    );
+    assert!(report.cleanup_steps.contains(&CleanupStep::ProveAbsent));
+    assert_canonical_cleanup_record(&report, None);
+
+    let no_plan = exercise(AppleCommandScenario::Qualification(
+        QualificationFault::MissingRetentionRegistry,
+    ));
+    assert!(no_plan.launch_plan_bytes.is_none());
+    assert!(no_plan.cleanup_record_bytes.is_none());
+    assert_eq!(no_plan.cleanup_publication_attempts, 0);
+    assert_eq!(no_plan.never_created_proofs, 0);
+}
+
+#[test]
+fn cancellation_before_ready_has_zero_entry_and_publishes_only_after_created_child_reap() {
+    let report = exercise(AppleCommandScenario::Cancel(CancellationPoint::BeforeReady));
+    assert_eq!(report.actual_provider_entries_before_release, 0);
+    assert_eq!(report.actual_provider_entries_total, 0);
+    assert_eq!(report.accepted_releases, 0);
+    assert_eq!(report.actual_child_reaps, 1);
+    assert_eq!(report.never_created_proofs, 0);
+    assert_eq!(report.cleanup_publication_attempts, 1);
+    assert_eq!(report.cleanup_publication_successes, 1);
+    assert_eq!(
+        report.cleanup_custody_events,
+        vec![
+            CleanupCustodyEvent::ActualChildReaped,
+            CleanupCustodyEvent::ExactAbsenceProven,
+            CleanupCustodyEvent::CleanupPublicationAttemptSucceeded,
+            CleanupCustodyEvent::ResourceLoanReleased,
+        ]
+    );
+    let runtime_id = report
+        .remove_identities
+        .first()
+        .expect("created cancellation must remove by exact runtime authority")
+        .runtime_id
+        .as_str();
+    assert_canonical_cleanup_record(&report, Some(runtime_id));
 }

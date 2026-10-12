@@ -254,6 +254,71 @@ fn durable_plan_has_exact_private_bytes_and_precedes_any_spawn_surface(
 
 #[test]
 #[cfg(unix)]
+fn canonical_cleanup_record_binds_exact_plan_bytes_and_runtime_authority(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = PlanFixture::new()?;
+    let (controls, identity) = fixture.parts()?;
+    let adapter = ScriptedAdapter::absent(&identity.container_name);
+    let plan = prepare_orchestrated_launch(
+        &adapter,
+        &ImageRef::new("example:latest"),
+        &identity,
+        controls,
+        Instant::now() + Duration::from_secs(60),
+    )?;
+    let plan_bytes = std::fs::read(fixture.parent.join("launch-plan.json"))?;
+    let plan_digest = lower_hex(&Sha256::digest(&plan_bytes));
+    let displaced = fixture.parent.join("captured-launch-plan.json");
+    std::fs::rename(fixture.parent.join("launch-plan.json"), &displaced)?;
+    write_private(
+        &fixture.parent.join("launch-plan.json"),
+        b"replacement pathname bytes must not become authority\n",
+    )?;
+
+    let created =
+        canonical_protected_cleanup_record(&plan, CleanupRuntimeIdentity::Created("runtime-1"))?;
+    assert_eq!(
+        created,
+        format!(
+            "{{\"version\":2,\"launchPlanSha256\":\"{plan_digest}\",\"outcome\":\"absent\",\"runtimeId\":\"runtime-1\"}}\n"
+        )
+        .as_bytes()
+    );
+    assert!(!created
+        .windows(TOKEN.len())
+        .any(|window| window == TOKEN.as_bytes()));
+    assert!(!created
+        .windows(IMAGE.len())
+        .any(|window| window == IMAGE.as_bytes()));
+    assert!(
+        canonical_protected_cleanup_record(&plan, CleanupRuntimeIdentity::Created("")).is_err()
+    );
+    assert_ne!(
+        plan_digest,
+        lower_hex(&Sha256::digest(std::fs::read(
+            fixture.parent.join("launch-plan.json")
+        )?)),
+        "the pathname replacement must differ from the captured canonical plan"
+    );
+
+    let never_created_proof = ChildLifecycleAuthority::prepare()?.prove_never_created()?;
+    let never_created = canonical_protected_cleanup_record(
+        &plan,
+        CleanupRuntimeIdentity::NeverCreated(never_created_proof),
+    )?;
+    assert_eq!(
+        never_created,
+        format!(
+            "{{\"version\":2,\"launchPlanSha256\":\"{plan_digest}\",\"outcome\":\"absent\"}}\n"
+        )
+        .as_bytes()
+    );
+    assert!(!String::from_utf8(never_created)?.contains("runtimeId"));
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
 fn any_existing_plan_is_retained_without_image_or_provider_inspection() -> Result<(), Box<dyn Error>>
 {
     for bytes in [

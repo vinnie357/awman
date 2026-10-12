@@ -5,10 +5,14 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import select
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -59,6 +63,15 @@ def write_valid_control(control_path):
     (control_path / "request.json").chmod(0o600)
 
 
+def write_v2_control(control_path, guest_cwd="/workspace"):
+    write_valid_control(control_path)
+    request_path = control_path / "request.json"
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    request["version"] = 2
+    request["guest_cwd"] = guest_cwd
+    write_protected_json(request_path, request)
+
+
 def write_protected_json(path, value, padded_size=None):
     raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
     if padded_size is not None:
@@ -88,7 +101,379 @@ class FakeClock:
         self.now += seconds
 
 
+class _OwnedObserverChildren:
+    """Tracks only PIDs returned by real fork calls in the disposable runner."""
+
+    def __init__(self, real_fork, real_kill, real_waitpid):
+        self._real_fork = real_fork
+        self._real_kill = real_kill
+        self._real_waitpid = real_waitpid
+        self._lock = threading.RLock()
+        self.actual_pids = []
+        self._owned_pids = set()
+        self.production_killed = []
+        self.production_reaped = []
+        self.fallback_killed = []
+        self.fallback_reaped = []
+        self.fallback_not_owned = []
+        self._before_fallback = None
+        self._cleanup_active = False
+
+    def fork(self):
+        pid = self._real_fork()
+        if pid > 0:
+            with self._lock:
+                self.actual_pids.append(pid)
+                self._owned_pids.add(pid)
+        return pid
+
+    def kill(self, pid, signum):
+        result = self._real_kill(pid, signum)
+        with self._lock:
+            self.production_killed.append(pid)
+        return result
+
+    def waitpid(self, pid, options):
+        result = self._real_waitpid(pid, options)
+        if result[0] == pid:
+            with self._lock:
+                self.production_reaped.append(pid)
+                self._owned_pids.discard(pid)
+        return result
+
+    def cleanup(self):
+        with self._lock:
+            if self._cleanup_active:
+                return False
+            self._cleanup_active = True
+            if self._before_fallback is None:
+                self._before_fallback = {
+                    "production_killed": list(self.production_killed),
+                    "production_reaped": list(self.production_reaped),
+                }
+            pending = list(self._owned_pids)
+
+        try:
+            for pid in pending:
+                with self._lock:
+                    if pid not in self._owned_pids:
+                        continue
+                try:
+                    reaped, _ = self._real_waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    with self._lock:
+                        self._owned_pids.discard(pid)
+                        self.fallback_not_owned.append(pid)
+                    continue
+
+                if reaped == pid:
+                    with self._lock:
+                        self._owned_pids.discard(pid)
+                        self.fallback_reaped.append(pid)
+                    continue
+                if reaped != 0:
+                    raise AssertionError(f"unexpected waitpid result for owned PID {pid}")
+
+                self._real_kill(pid, signal.SIGKILL)
+                with self._lock:
+                    self.fallback_killed.append(pid)
+                try:
+                    reaped, _ = self._real_waitpid(pid, 0)
+                except ChildProcessError:
+                    with self._lock:
+                        self._owned_pids.discard(pid)
+                        self.fallback_not_owned.append(pid)
+                    continue
+                if reaped != pid:
+                    raise AssertionError(f"failed to reap exact owned PID {pid}")
+                with self._lock:
+                    self._owned_pids.discard(pid)
+                    self.fallback_reaped.append(pid)
+        finally:
+            with self._lock:
+                self._cleanup_active = False
+        return True
+
+    def result_fields(self):
+        with self._lock:
+            before = self._before_fallback or {
+                "production_killed": list(self.production_killed),
+                "production_reaped": list(self.production_reaped),
+            }
+            return {
+                "actual_pids": list(self.actual_pids),
+                "production_killed_before_fallback": before["production_killed"],
+                "production_reaped_before_fallback": before["production_reaped"],
+                "fallback_killed": list(self.fallback_killed),
+                "fallback_reaped": list(self.fallback_reaped),
+                "fallback_not_owned": list(self.fallback_not_owned),
+                "owned_pids_after_cleanup": sorted(self._owned_pids),
+            }
+
+
+def _observer_case_in_disposable_runner(case):
+    real_fork = os.fork
+    real_kill = os.kill
+    real_waitpid = os.waitpid
+    children = _OwnedObserverChildren(real_fork, real_kill, real_waitpid)
+    latch = os.pipe() if case in {"timeout", "guard_idempotence"} else None
+    child_started = (
+        os.pipe()
+        if case in {"timeout", "guard_idempotence", "guard_already_reaped"}
+        else None
+    )
+    termination_requested = False
+    result = {
+        "status": "missing",
+        "call_hung": False,
+        "child_latch_entered": False,
+    }
+
+    def cleanup_owned_children(*_args):
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        return children.cleanup()
+
+    def terminate_runner(_signum, _frame):
+        nonlocal termination_requested
+        termination_requested = True
+        if cleanup_owned_children():
+            os._exit(124)
+
+    def deadline_expired(_signum, _frame):
+        result["call_hung"] = True
+        cleanup_owned_children()
+        if termination_requested:
+            os._exit(124)
+        raise TimeoutError("observer call exceeded disposable runner deadline")
+
+    def hold_child(_identity):
+        os.write(child_started[1], b"1")
+        os.read(latch[0], 1)
+
+    def fork_and_wait_for_child_latch():
+        pid = children.fork()
+        if pid > 0 and child_started is not None:
+            readable, _, _ = select.select([child_started[0]], [], [], 1.0)
+            if not readable or os.read(child_started[0], 1) != b"1":
+                raise RuntimeError("observer child did not enter controlled latch")
+            result["child_latch_entered"] = True
+        return pid
+
+    previous_alarm = signal.signal(signal.SIGALRM, deadline_expired)
+    previous_term = signal.signal(signal.SIGTERM, terminate_runner)
+    signal.setitimer(signal.ITIMER_REAL, 2.0)
+    try:
+        if case in {"guard_idempotence", "guard_already_reaped"}:
+            pid = children.fork()
+            if pid == 0:
+                os.write(child_started[1], b"1")
+                if latch is not None:
+                    os.read(latch[0], 1)
+                os._exit(0)
+            readable, _, _ = select.select([child_started[0]], [], [], 1.0)
+            if not readable or os.read(child_started[0], 1) != b"1":
+                raise RuntimeError("guard child did not enter controlled latch")
+            result["child_latch_entered"] = True
+            if case == "guard_already_reaped":
+                reaped, _ = real_waitpid(pid, 0)
+                if reaped != pid:
+                    raise RuntimeError("guard did not reap the exact child")
+            cleanup_owned_children()
+            result["first_cleanup"] = children.result_fields()
+            cleanup_owned_children()
+            result["second_cleanup"] = children.result_fields()
+            result["status"] = "guard-ok"
+        else:
+            identity = bootstrap.resolve_runtime_identity(None)
+            if case == "invalid_identity":
+                identity = bootstrap.RuntimeIdentity(-1, -1, (), True)
+            patches = [
+                mock.patch.object(
+                    bootstrap.os, "fork", side_effect=fork_and_wait_for_child_latch
+                ),
+                mock.patch.object(bootstrap.os, "kill", side_effect=children.kill),
+                mock.patch.object(bootstrap.os, "waitpid", side_effect=children.waitpid),
+            ]
+            if case == "timeout":
+                patches.append(
+                    mock.patch.object(
+                        bootstrap, "apply_runtime_identity", side_effect=hold_child
+                    )
+                )
+            with patches[0], patches[1], patches[2]:
+                if len(patches) == 4:
+                    patches[3].start()
+                try:
+                    observation = bootstrap.observe_guest_cwd_as(
+                        identity, **({"timeout": 0} if case == "timeout" else {})
+                    )
+                    result.update(
+                        {
+                            "status": "ok",
+                            "cwd": observation.cwd,
+                            "effective_uid": observation.effective_uid,
+                            "effective_gid": observation.effective_gid,
+                        }
+                    )
+                except bootstrap.GateError as error:
+                    result.update({"status": "gate-error", "error_code": error.code})
+                finally:
+                    if len(patches) == 4:
+                        patches[3].stop()
+    except TimeoutError:
+        result["status"] = "runner-deadline"
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        children.cleanup()
+        if termination_requested:
+            os._exit(124)
+        if latch is not None:
+            os.close(latch[0])
+            os.close(latch[1])
+        if child_started is not None:
+            os.close(child_started[0])
+            os.close(child_started[1])
+        signal.signal(signal.SIGALRM, previous_alarm)
+        signal.signal(signal.SIGTERM, previous_term)
+    result.update(children.result_fields())
+    return result
+
+
+def _run_observer_case(case):
+    read_fd, write_fd = os.pipe()
+    runner_pid = os.fork()
+    if runner_pid == 0:
+        os.close(read_fd)
+        try:
+            payload = _observer_case_in_disposable_runner(case)
+        except BaseException as error:
+            payload = {"status": "runner-error", "detail": repr(error)}
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
+        try:
+            os.write(write_fd, encoded)
+        finally:
+            os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    data = b""
+    runner_reaped = False
+    pipe_eof = False
+    deadline = time.monotonic() + 4.0
+    try:
+        while not pipe_eof:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError("disposable observer runner did not report")
+            readable, _, _ = select.select([read_fd], [], [], remaining)
+            if not readable:
+                raise AssertionError("disposable observer runner did not report")
+            chunk = os.read(read_fd, 16 * 1024 - len(data))
+            if not chunk:
+                pipe_eof = True
+                break
+            data += chunk
+            if len(data) >= 16 * 1024:
+                raise AssertionError("disposable observer runner result was oversized")
+        waited, status = os.waitpid(runner_pid, 0)
+        runner_reaped = waited == runner_pid
+        if not runner_reaped or status != 0:
+            raise AssertionError(f"disposable observer runner failed: {status}")
+        if b"\n" not in data:
+            raise AssertionError("disposable observer runner returned no complete result")
+        return json.loads(data.split(b"\n", 1)[0])
+    finally:
+        if not runner_reaped:
+            try:
+                os.kill(runner_pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            cleanup_deadline = time.monotonic() + 1.0
+            while not pipe_eof:
+                remaining = cleanup_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                readable, _, _ = select.select([read_fd], [], [], remaining)
+                if not readable:
+                    break
+                if not os.read(read_fd, 16 * 1024):
+                    pipe_eof = True
+            if pipe_eof:
+                try:
+                    waited, _ = os.waitpid(runner_pid, 0)
+                    runner_reaped = waited == runner_pid
+                except ChildProcessError:
+                    runner_reaped = True
+            if not runner_reaped:
+                try:
+                    os.kill(runner_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(runner_pid, 0)
+                except ChildProcessError:
+                    pass
+        os.close(read_fd)
+
+
 class StartupGateBootstrapTest(unittest.TestCase):
+    def test_load_request_preserves_v1_and_requires_exact_v2_guest_cwd(self):
+        with tempfile.TemporaryDirectory() as control:
+            control_path = Path(control)
+            write_valid_control(control_path)
+            self.assertNotIn("guest_cwd", bootstrap._load_request(control_path))
+
+            write_v2_control(control_path)
+            request = bootstrap._load_request(control_path)
+            self.assertEqual(request["version"], 2)
+            self.assertEqual(request["guest_cwd"], "/workspace")
+
+            for value in [None, "", "workspace", "/review", "/workspace/"]:
+                write_v2_control(control_path, value)
+                with self.assertRaises(bootstrap.GateError) as raised:
+                    bootstrap._load_request(control_path)
+                self.assertEqual(raised.exception.code, "request-invalid")
+
+            write_valid_control(control_path)
+            raw = json.loads((control_path / "request.json").read_text(encoding="utf-8"))
+            raw["version"] = 2
+            write_protected_json(control_path / "request.json", raw)
+            with self.assertRaises(bootstrap.GateError):
+                bootstrap._load_request(control_path)
+
+            write_v2_control(control_path)
+            raw = json.loads((control_path / "request.json").read_text(encoding="utf-8"))
+            raw["bindings"] = []
+            write_protected_json(control_path / "request.json", raw)
+            with self.assertRaises(bootstrap.GateError):
+                bootstrap._load_request(control_path)
+
+            for version in [True, 2.0, "2"]:
+                write_v2_control(control_path)
+                raw = json.loads(
+                    (control_path / "request.json").read_text(encoding="utf-8")
+                )
+                raw["version"] = version
+                write_protected_json(control_path / "request.json", raw)
+                with self.assertRaises(bootstrap.GateError):
+                    bootstrap._load_request(control_path)
+
+            write_v2_control(control_path)
+            raw = json.loads((control_path / "request.json").read_text(encoding="utf-8"))
+            raw["extra"] = True
+            write_protected_json(control_path / "request.json", raw)
+            with self.assertRaises(bootstrap.GateError):
+                bootstrap._load_request(control_path)
+
+            write_v2_control(control_path)
+            request_path = control_path / "request.json"
+            raw = request_path.read_bytes()
+            self.assertTrue(raw.endswith(b"}"))
+            request_path.write_bytes(raw[:-1] + b',"guest_cwd":"/workspace"}')
+            request_path.chmod(0o600)
+            with self.assertRaises(bootstrap.GateError):
+                bootstrap._load_request(control_path)
+
     def test_parse_manifest_binds_exact_raw_bytes_and_strict_v1_schema(self):
         raw = manifest_bytes(
             [
@@ -333,6 +718,10 @@ class StartupGateBootstrapTest(unittest.TestCase):
         def release(control_dir, ready, _timeout, **_kwargs):
             events.append("ready")
             self.assertTrue((control_dir / "ready.json").exists())
+            self.assertEqual(
+                set(ready), {"version", "nonce", "container_name", "bindings"}
+            )
+            self.assertEqual(ready["version"], 1)
             self.assertRegex(ready["nonce"], r"^[0-9a-f]{64}$")
             self.assertNotIn("host", json.dumps(ready).lower())
             self.assertEqual(exec_calls, [], "agent must not exec before release")
@@ -358,9 +747,178 @@ class StartupGateBootstrapTest(unittest.TestCase):
                     container_name="fixture-container",
                     exec_fn=capture_exec,
                 )
+            ready_bytes = (control_path / "ready.json").read_bytes()
+            ready = json.loads(ready_bytes)
+            self.assertEqual(
+                ready_bytes,
+                json.dumps(ready, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+            )
+            self.assertNotIn("guest_cwd", ready)
 
         self.assertEqual(events, ["mount", "tree", "probe", "ready", "release", "exec"])
         self.assertEqual(exec_calls, [(original_argv[0], original_argv, original_env)])
+
+    def test_guest_cwd_observer_uses_a_real_bounded_runtime_identity_child(self):
+        result = _run_observer_case("success")
+
+        self.assertEqual(result["status"], "ok")
+        self.assertFalse(result["call_hung"])
+        self.assertEqual(Path(result["cwd"]), Path(os.getcwd()))
+        self.assertEqual(result["effective_uid"], os.geteuid())
+        self.assertEqual(result["effective_gid"], os.getegid())
+        self.assertEqual(len(result["actual_pids"]), 1)
+        self.assertEqual(
+            result["production_reaped_before_fallback"], result["actual_pids"]
+        )
+        self.assertEqual(result["fallback_killed"], [])
+        self.assertEqual(result["fallback_reaped"], [])
+
+    def test_guest_cwd_observer_timeout_and_child_error_reap_the_owned_child(self):
+        timeout = _run_observer_case("timeout")
+        self.assertEqual(timeout["status"], "gate-error")
+        self.assertEqual(timeout["error_code"], "identity-probe")
+        self.assertFalse(timeout["call_hung"])
+        self.assertTrue(timeout["child_latch_entered"])
+        self.assertEqual(len(timeout["actual_pids"]), 1)
+        self.assertEqual(
+            timeout["production_killed_before_fallback"], timeout["actual_pids"]
+        )
+        self.assertEqual(
+            timeout["production_reaped_before_fallback"], timeout["actual_pids"]
+        )
+        self.assertEqual(timeout["fallback_killed"], [])
+        self.assertEqual(timeout["fallback_reaped"], [])
+
+        invalid = _run_observer_case("invalid_identity")
+        self.assertEqual(invalid["status"], "gate-error")
+        self.assertEqual(invalid["error_code"], "identity-probe")
+        self.assertFalse(invalid["call_hung"])
+        self.assertEqual(len(invalid["actual_pids"]), 1)
+        self.assertEqual(
+            invalid["production_reaped_before_fallback"], invalid["actual_pids"]
+        )
+        self.assertEqual(invalid["fallback_killed"], [])
+        self.assertEqual(invalid["fallback_reaped"], [])
+
+    def test_observer_child_guard_consumes_pid_ownership_once(self):
+        result = _run_observer_case("guard_idempotence")
+        self.assertEqual(result["status"], "guard-ok")
+        self.assertTrue(result["child_latch_entered"])
+        self.assertEqual(len(result["actual_pids"]), 1)
+        self.assertEqual(result["production_killed_before_fallback"], [])
+        self.assertEqual(result["production_reaped_before_fallback"], [])
+        self.assertEqual(result["fallback_killed"], result["actual_pids"])
+        self.assertEqual(result["fallback_reaped"], result["actual_pids"])
+        self.assertEqual(result["fallback_not_owned"], [])
+        self.assertEqual(result["owned_pids_after_cleanup"], [])
+        self.assertEqual(result["second_cleanup"], result["first_cleanup"])
+
+        already_reaped = _run_observer_case("guard_already_reaped")
+        self.assertEqual(already_reaped["status"], "guard-ok")
+        self.assertEqual(len(already_reaped["actual_pids"]), 1)
+        self.assertEqual(already_reaped["production_reaped_before_fallback"], [])
+        self.assertEqual(already_reaped["fallback_killed"], [])
+        self.assertEqual(already_reaped["fallback_reaped"], [])
+        self.assertEqual(
+            already_reaped["fallback_not_owned"], already_reaped["actual_pids"]
+        )
+        self.assertEqual(already_reaped["owned_pids_after_cleanup"], [])
+        self.assertEqual(
+            already_reaped["second_cleanup"], already_reaped["first_cleanup"]
+        )
+
+    def test_v2_orders_runtime_identity_cwd_observation_before_ready_and_immediately_before_exec(self):
+        events = []
+        exec_calls = []
+        runtime_identity = object()
+
+        def observe_cwd(actual_identity):
+            self.assertIs(actual_identity, runtime_identity)
+            events.append("cwd")
+            return bootstrap.GuestCwdObservation("/workspace", 1000, 1000)
+
+        def release(control_dir, ready, _timeout, **_kwargs):
+            events.append("release")
+            self.assertEqual(ready["version"], 2)
+            self.assertEqual(ready["guest_cwd"], "/workspace")
+            self.assertEqual(exec_calls, [])
+
+        def capture_exec(file, argv, env):
+            events.append("exec")
+            exec_calls.append((file, list(argv), dict(env)))
+
+        with tempfile.TemporaryDirectory() as control:
+            control_path = Path(control)
+            write_v2_control(control_path)
+            with mock.patch.object(
+                bootstrap, "validate_mount", return_value=None
+            ), mock.patch.object(
+                bootstrap, "verify_binding_as", return_value=None
+            ), mock.patch.object(
+                bootstrap, "observe_guest_cwd_as", side_effect=observe_cwd
+            ), mock.patch.object(
+                bootstrap, "await_release", side_effect=release
+            ):
+                bootstrap.run_gate(
+                    control_path,
+                    ["agent", "--exact"],
+                    {"SAFE": "kept"},
+                    "fixture mountinfo",
+                    runtime_identity=runtime_identity,
+                    container_name="fixture-container",
+                    exec_fn=capture_exec,
+                )
+
+            ready = json.loads((control_path / "ready.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(ready["guest_cwd"], "/workspace")
+        self.assertEqual(events, ["cwd", "release", "cwd", "exec"])
+        self.assertEqual(exec_calls, [("agent", ["agent", "--exact"], {"SAFE": "kept"})])
+
+    def test_v2_cwd_mismatch_before_ready_or_after_release_never_executes_provider(self):
+        runtime_identity = object()
+        cases = [
+            (["/wrong"], False),
+            (["/workspace", "/changed"], True),
+        ]
+        for observations, ready_expected in cases:
+            with self.subTest(observations=observations):
+                exec_calls = []
+                observed = iter(observations)
+                with tempfile.TemporaryDirectory() as control:
+                    control_path = Path(control)
+                    write_v2_control(control_path)
+                    with mock.patch.object(
+                        bootstrap, "validate_mount", return_value=None
+                    ), mock.patch.object(
+                        bootstrap, "verify_binding_as", return_value=None
+                    ), mock.patch.object(
+                        bootstrap,
+                        "observe_guest_cwd_as",
+                        side_effect=lambda *_args: bootstrap.GuestCwdObservation(
+                            next(observed), 1000, 1000
+                        ),
+                    ), mock.patch.object(
+                        bootstrap, "await_release", return_value=None
+                    ):
+                        with self.assertRaises(bootstrap.GateError) as raised:
+                            bootstrap.run_gate(
+                                control_path,
+                                ["agent"],
+                                {},
+                                "fixture mountinfo",
+                                runtime_identity=runtime_identity,
+                                container_name="fixture-container",
+                                exec_fn=lambda *args: exec_calls.append(args),
+                            )
+
+                    self.assertEqual(raised.exception.code, "cwd-invalid")
+                    self.assertEqual((control_path / "ready.json").exists(), ready_expected)
+                    failure = json.loads(
+                        (control_path / "failure.json").read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(failure["code"], "cwd-invalid")
+                    self.assertEqual(exec_calls, [])
 
 
 class StartupGateGuestControlTest(unittest.TestCase):

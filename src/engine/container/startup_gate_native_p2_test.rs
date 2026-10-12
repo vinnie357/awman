@@ -127,6 +127,7 @@ fn orchestrated_stager_keeps_parent_and_secret_off_guest_surfaces() -> Result<()
         "launch-intent.json",
         "launch-plan.json",
         "launch.json",
+        "cleanup.json",
         "launch-failure.json",
         "ready.json",
         "failure.json",
@@ -170,9 +171,184 @@ fn orchestrated_stager_keeps_parent_and_secret_off_guest_surfaces() -> Result<()
         "launch-intent.json",
         "launch-plan.json",
         "launch.json",
+        "cleanup.json",
     ] {
         assert!(!fixture.guest.join(forbidden).exists());
     }
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn protected_cleanup_record_is_no_replace_and_exactly_idempotent() -> Result<(), Box<dyn Error>> {
+    let fixture = GateFixture::orchestrated()?;
+    let spec = fixture.load()?;
+    let (controls, _) = spec
+        .control
+        .orchestrated_parts()
+        .ok_or("expected orchestrated startup gate")?;
+    let bytes = br#"{"version":2,"launchPlanSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","outcome":"absent","runtimeId":"runtime-1"}"#;
+
+    let first = controls
+        .host_parent
+        .publish_or_verify_cleanup_record(bytes)?;
+    assert!(controls.host_parent.verify_cleanup_record(&first));
+    assert_eq!(std::fs::read(fixture.parent.join("cleanup.json"))?, bytes);
+    let metadata = std::fs::symlink_metadata(fixture.parent.join("cleanup.json"))?;
+    use std::os::unix::fs::MetadataExt as _;
+    assert!(metadata.file_type().is_file());
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    assert_eq!(metadata.nlink(), 1);
+    assert_eq!(metadata.uid(), nix::unistd::Uid::current().as_raw());
+
+    let repeated = controls
+        .host_parent
+        .publish_or_verify_cleanup_record(bytes)?;
+    assert_eq!(repeated, first);
+    assert!(controls
+        .host_parent
+        .publish_or_verify_cleanup_record(br#"{"version":2,"outcome":"absent"}"#)
+        .is_err());
+    assert_eq!(std::fs::read(fixture.parent.join("cleanup.json"))?, bytes);
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn protected_cleanup_record_rejects_symlink_and_hardlink_targets() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    for attack in ["symlink", "hardlink"] {
+        let fixture = GateFixture::orchestrated()?;
+        let spec = fixture.load()?;
+        let (controls, _) = spec
+            .control
+            .orchestrated_parts()
+            .ok_or("expected orchestrated startup gate")?;
+        let outside = fixture._root.path().join(format!("outside-{attack}"));
+        write_private(&outside, b"unchanged")?;
+        let target = fixture.parent.join("cleanup.json");
+        if attack == "symlink" {
+            symlink(&outside, &target)?;
+        } else {
+            std::fs::hard_link(&outside, &target)?;
+        }
+
+        assert!(controls
+            .host_parent
+            .publish_or_verify_cleanup_record(br#"{"version":2}"#)
+            .is_err());
+        assert_eq!(std::fs::read(outside)?, b"unchanged");
+    }
+
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn protected_cleanup_record_rejects_path_replacement_after_pinned_publication(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = GateFixture::orchestrated()?;
+    let spec = fixture.load()?;
+    let (controls, _) = spec
+        .control
+        .orchestrated_parts()
+        .ok_or("expected orchestrated startup gate")?;
+    let bytes = br#"{"version":2,"launchPlanSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","outcome":"absent","runtimeId":"runtime-1"}"#;
+    let pinned = controls
+        .host_parent
+        .publish_or_verify_cleanup_record(bytes)?;
+    let captured = fixture.parent.join("captured-cleanup.json");
+    std::fs::rename(fixture.parent.join("cleanup.json"), &captured)?;
+    write_private(
+        &fixture.parent.join("cleanup.json"),
+        b"replacement pathname bytes",
+    )?;
+
+    assert!(controls
+        .host_parent
+        .publish_or_verify_cleanup_record(bytes)
+        .is_err());
+    assert!(!controls.host_parent.verify_cleanup_record(&pinned));
+    assert_eq!(std::fs::read(captured)?, bytes);
+    assert_eq!(
+        std::fs::read(fixture.parent.join("cleanup.json"))?,
+        b"replacement pathname bytes"
+    );
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn protected_cleanup_record_rejects_nonregular_and_broad_existing_targets(
+) -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    for attack in ["directory", "fifo", "broad-file"] {
+        let fixture = GateFixture::orchestrated()?;
+        let spec = fixture.load()?;
+        let (controls, _) = spec
+            .control
+            .orchestrated_parts()
+            .ok_or("expected orchestrated startup gate")?;
+        let target = fixture.parent.join("cleanup.json");
+        match attack {
+            "directory" => std::fs::create_dir(&target)?,
+            "fifo" => {
+                let status = std::process::Command::new("mkfifo").arg(&target).status()?;
+                assert!(status.success(), "mkfifo must create the hostile target");
+            }
+            "broad-file" => {
+                write_private(&target, b"unchanged")?;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644))?;
+            }
+            _ => return Err("unknown cleanup-record attack fixture".into()),
+        }
+
+        assert!(controls
+            .host_parent
+            .publish_or_verify_cleanup_record(br#"{"version":2}"#)
+            .is_err());
+        let metadata = std::fs::symlink_metadata(&target)?;
+        match attack {
+            "directory" => assert!(metadata.file_type().is_dir()),
+            "fifo" => {
+                use std::os::unix::fs::FileTypeExt as _;
+                assert!(metadata.file_type().is_fifo());
+            }
+            "broad-file" => {
+                assert_eq!(metadata.mode() & 0o7777, 0o644);
+                assert_eq!(std::fs::read(&target)?, b"unchanged");
+            }
+            _ => return Err("unknown cleanup-record attack fixture".into()),
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(unix)]
+fn protected_cleanup_record_rejects_owner_mismatch_when_privileged() -> Result<(), Box<dyn Error>> {
+    use nix::unistd::{chown, Uid};
+
+    if !Uid::effective().is_root() {
+        return Ok(());
+    }
+    let fixture = GateFixture::orchestrated()?;
+    let spec = fixture.load()?;
+    let (controls, _) = spec
+        .control
+        .orchestrated_parts()
+        .ok_or("expected orchestrated startup gate")?;
+    let target = fixture.parent.join("cleanup.json");
+    write_private(&target, b"unchanged")?;
+    chown(&target, Some(Uid::from_raw(65_534)), None)?;
+
+    assert!(controls
+        .host_parent
+        .publish_or_verify_cleanup_record(br#"{"version":2}"#)
+        .is_err());
+    assert_eq!(std::fs::read(target)?, b"unchanged");
     Ok(())
 }
 

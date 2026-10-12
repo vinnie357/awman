@@ -191,9 +191,25 @@ fn loaded_spec_owns_the_exact_validated_manifest_bytes() {
 #[test]
 fn valid_v1_request_and_raw_manifest_digest_load_exactly() {
     let fixture = GateFixture::valid();
+    let exact_request = fs::read(fixture.control.join("request.json")).expect("v1 request");
     let spec = fixture.load().expect("valid gate");
     assert_eq!(spec.timeout, Duration::from_secs(120));
     assert_eq!(spec.request.version, 1);
+    assert_eq!(spec.request.guest_cwd, None);
+    assert_eq!(
+        spec.request_digest,
+        Sha256::digest(&exact_request).into(),
+        "legacy request digest remains bound to exact input bytes"
+    );
+    let legacy_serialization = format!(
+        "{{\"version\":1,\"bindings\":[{{\"id\":\"review-input\",\"workspace_path\":\"/review/input\",\"manifest_id\":\"{}\",\"manifest_file\":\"review.manifest.json\",\"access\":\"read-only\"}}]}}",
+        sha256_hex(br#"{"version":1,"entries":[{"path":"README.md","kind":"file","size":3,"sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"},{"path":"src","kind":"directory","size":0,"sha256":null}]}"#)
+    );
+    assert_eq!(
+        serde_json::to_vec(&spec.request).expect("serialize legacy request"),
+        legacy_serialization.as_bytes(),
+        "absent optional metadata must preserve v1 request serialization"
+    );
     assert_eq!(spec.request.bindings.len(), 1);
     let binding = &spec.request.bindings[0];
     assert_eq!(binding.id, "review-input");
@@ -206,6 +222,93 @@ fn valid_v1_request_and_raw_manifest_digest_load_exactly() {
     changed_wire.push(b'\n');
     fs::write(fixture.control.join("review.manifest.json"), changed_wire).expect("changed wire");
     assert_rejected(&fixture.control, "raw-byte digest mismatch");
+}
+
+#[test]
+fn v2_request_requires_the_exact_supported_guest_cwd_and_owns_raw_bytes() {
+    let fixture = GateFixture::valid();
+    let mut request = fixture.request_value();
+    request["version"] = serde_json::json!(2);
+    request["guest_cwd"] = serde_json::json!("/workspace");
+    fixture.rewrite_request(request);
+
+    let expected_bytes = fs::read(fixture.control.join("request.json")).expect("v2 request");
+    let spec = fixture.load().expect("valid v2 gate");
+    assert_eq!(spec.request.version, 2);
+    assert_eq!(spec.request.guest_cwd.as_deref(), Some("/workspace"));
+    assert_eq!(spec.request_digest, Sha256::digest(&expected_bytes).into());
+
+    for guest_cwd in [
+        serde_json::Value::Null,
+        serde_json::json!(""),
+        serde_json::json!("workspace"),
+        serde_json::json!("/review"),
+        serde_json::json!("/workspace/"),
+        serde_json::json!("/workspace/../workspace"),
+    ] {
+        let fixture = GateFixture::valid();
+        let mut request = fixture.request_value();
+        request["version"] = serde_json::json!(2);
+        request["guest_cwd"] = guest_cwd;
+        fixture.rewrite_request(request);
+        assert_rejected(&fixture.control, "invalid v2 guest cwd");
+    }
+
+    let missing = GateFixture::valid();
+    let mut request = missing.request_value();
+    request["version"] = serde_json::json!(2);
+    missing.rewrite_request(request);
+    assert_rejected(&missing.control, "missing v2 guest cwd");
+
+    let empty = GateFixture::valid();
+    let mut request = empty.request_value();
+    request["version"] = serde_json::json!(2);
+    request["guest_cwd"] = serde_json::json!("/workspace");
+    request["bindings"] = serde_json::json!([]);
+    empty.rewrite_request(request);
+    assert_rejected(&empty.control, "empty v2 bindings");
+
+    for version in [
+        serde_json::Value::Bool(true),
+        serde_json::json!(2.0),
+        serde_json::json!("2"),
+    ] {
+        let fixture = GateFixture::valid();
+        let mut request = fixture.request_value();
+        request["version"] = version;
+        request["guest_cwd"] = serde_json::json!("/workspace");
+        fixture.rewrite_request(request);
+        assert_rejected(&fixture.control, "non-integer v2 version");
+    }
+
+    let unknown = GateFixture::valid();
+    let mut request = unknown.request_value();
+    request["version"] = serde_json::json!(2);
+    request["guest_cwd"] = serde_json::json!("/workspace");
+    request["extra"] = serde_json::json!(true);
+    unknown.rewrite_request(request);
+    assert_rejected(&unknown.control, "unknown v2 request field");
+
+    let duplicate = GateFixture::valid();
+    let mut request = duplicate.request_value();
+    request["version"] = serde_json::json!(2);
+    request["guest_cwd"] = serde_json::json!("/workspace");
+    let mut raw = serde_json::to_vec(&request).expect("duplicate request base");
+    assert_eq!(raw.pop(), Some(b'}'));
+    raw.extend_from_slice(br#","guest_cwd":"/workspace"}"#);
+    fs::write(duplicate.control.join("request.json"), raw).expect("duplicate request");
+    fs::set_permissions(
+        duplicate.control.join("request.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("duplicate request mode");
+    assert_rejected(&duplicate.control, "duplicate v2 request field");
+
+    let legacy = GateFixture::valid();
+    let mut request = legacy.request_value();
+    request["guest_cwd"] = serde_json::json!("/workspace");
+    legacy.rewrite_request(request);
+    assert_rejected(&legacy.control, "v1 guest cwd extension");
 }
 
 #[test]

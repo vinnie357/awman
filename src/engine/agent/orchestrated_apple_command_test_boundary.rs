@@ -1,7 +1,8 @@
 use super::orchestrated_apple_command_acceptance_test::{
     AppleCommandEffects, AppleCommandExternalPlan, AppleCommandObserver, CancellationPoint,
-    CleanupFault, CleanupIdentitySnapshot, CleanupStep, MountObservation, OwnershipObservation,
-    PlannedLaunchIdentitySnapshot, QualificationFault, RetryFaultPoint, SecondInspectionRelease,
+    CleanupFault, CleanupIdentitySnapshot, CleanupStep, GateV2ReadyCase, MountObservation,
+    OwnershipObservation, PlannedLaunchIdentitySnapshot, QualificationFault, RetryFaultPoint,
+    SecondInspectionRelease,
 };
 use crate::engine::container::gated_launch::{
     canonical_inspection_revision, AbsenceObservation, AppleProviderState,
@@ -166,12 +167,65 @@ impl OrchestratedAppleTestBoundary for TestBoundary {
                 })
             })
             .collect::<Vec<_>>();
-        let bytes = serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "nonce": NONCE,
-            "container_name": plan.key.container_name.as_str(),
-            "bindings": bindings,
-        }))
+        let bindings_json = serde_json::to_string(&bindings)
+            .map_err(|_| LaunchRetentionReason::PostSpawnControlChanged)?;
+        let bytes = match self.plan {
+            AppleCommandExternalPlan::GateV2(GateV2ReadyCase::Exact) => {
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 2,
+                    "nonce": NONCE,
+                    "container_name": plan.key.container_name.as_str(),
+                    "bindings": bindings,
+                    "guest_cwd": "/workspace",
+                }))
+            }
+            AppleCommandExternalPlan::GateV2(GateV2ReadyCase::MissingGuestCwd) => {
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 2,
+                    "nonce": NONCE,
+                    "container_name": plan.key.container_name.as_str(),
+                    "bindings": bindings,
+                }))
+            }
+            AppleCommandExternalPlan::GateV2(GateV2ReadyCase::NullGuestCwd) => {
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 2,
+                    "nonce": NONCE,
+                    "container_name": plan.key.container_name.as_str(),
+                    "bindings": bindings,
+                    "guest_cwd": null,
+                }))
+            }
+            AppleCommandExternalPlan::GateV2(GateV2ReadyCase::WrongGuestCwd) => {
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 2,
+                    "nonce": NONCE,
+                    "container_name": plan.key.container_name.as_str(),
+                    "bindings": bindings,
+                    "guest_cwd": "/review",
+                }))
+            }
+            AppleCommandExternalPlan::GateV2(GateV2ReadyCase::DuplicateGuestCwd) => Ok(format!(
+                "{{\"version\":2,\"nonce\":\"{NONCE}\",\"container_name\":\"{}\",\"bindings\":{},\"guest_cwd\":\"/workspace\",\"guest_cwd\":\"/review\"}}",
+                plan.key.container_name.as_str(),
+                bindings_json,
+            )
+            .into_bytes()),
+            AppleCommandExternalPlan::GateV2(GateV2ReadyCase::LegacyVersion) => {
+                serde_json::to_vec(&serde_json::json!({
+                    "version": 1,
+                    "nonce": NONCE,
+                    "container_name": plan.key.container_name.as_str(),
+                    "bindings": bindings,
+                }))
+            }
+            _ => serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "nonce": NONCE,
+                "container_name": plan.key.container_name.as_str(),
+                "bindings": bindings,
+            })),
+        }
         .map_err(|_| LaunchRetentionReason::PostSpawnControlChanged)?;
         plan.controls
             .publish_guest_record("ready.json", ".ready", &bytes)
@@ -194,6 +248,17 @@ impl OrchestratedAppleTestBoundary for TestBoundary {
                 }
             });
         Ok(())
+    }
+
+    fn before_cli_start_after_plan(&self) -> bool {
+        matches!(self.plan, AppleCommandExternalPlan::NeverCreatedAfterPlan)
+    }
+
+    fn fail_cleanup_publication_once(&self) -> bool {
+        matches!(
+            self.plan,
+            AppleCommandExternalPlan::RepeatRetry(RetryFaultPoint::CleanupPublication)
+        ) && self.adapter.effects.take_cleanup_publication_fault()
     }
 
     fn pause_before_ready(&self) -> bool {
@@ -249,6 +314,10 @@ impl OrchestratedAppleTestBoundary for TestBoundary {
             .observe_protected_launch_identity(TestProviderAdapter::identity_snapshot(inspection));
     }
 
+    fn observe_ready_rejected(&self) {
+        self.observer.observe_ready_rejected();
+    }
+
     fn observe_protected_ready(&self) {
         self.observer.observe_protected_ready();
     }
@@ -277,6 +346,26 @@ impl OrchestratedAppleTestBoundary for TestBoundary {
 
     fn observe_reap(&self) {
         self.observer.observe_provider_call(Some(CleanupStep::Reap));
+    }
+
+    fn observe_actual_child_reaped(&self) {
+        self.observer.observe_actual_child_reaped();
+    }
+
+    fn observe_never_created_proven(&self) {
+        self.observer.observe_never_created_proven();
+    }
+
+    fn observe_cleanup_publication(&self, succeeded: bool) {
+        self.observer.observe_cleanup_publication(succeeded);
+    }
+
+    fn observe_exact_absence_proven(&self) {
+        self.observer.observe_exact_absence_proven();
+    }
+
+    fn observe_resource_loan_released(&self) {
+        self.observer.observe_resource_loan_released();
     }
 
     fn cleanup_reap_proven(&self) -> bool {
@@ -475,11 +564,14 @@ impl GatedProviderAdapter for TestProviderAdapter {
         _deadline: ProviderCallDeadline,
     ) -> Result<AbsenceObservation, NamePresence> {
         let removed = self.removed.load(Ordering::Acquire);
-        self.observer.observe_provider_call(if removed {
-            Some(CleanupStep::ProveAbsent)
-        } else {
-            None
-        });
+        let never_created =
+            self.cleanup.load(Ordering::Acquire) && !self.created.load(Ordering::Acquire);
+        self.observer
+            .observe_provider_call(if removed || never_created {
+                Some(CleanupStep::ProveAbsent)
+            } else {
+                None
+            });
         if removed
             && matches!(
                 self.plan,
