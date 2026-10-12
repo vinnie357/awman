@@ -66,6 +66,9 @@ nix = { version = "0.31", features = ["signal", "process", "fs", "poll", "user"]
 libc = "0.2"
 rustix = { version = "1.1", features = ["fs"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "=0.14.11"
+
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
 wiremock = "0.6"

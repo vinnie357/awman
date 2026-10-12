@@ -91,6 +91,8 @@ pub(crate) enum CleanupFault {
     TupleChanged,
     InspectionUnavailable,
     StopFailed,
+    PreRemoveRuntimeIdChanged,
+    PreRemoveCreatedAtChanged,
     ReapUncertain,
     PreRemoveInspectionUnavailable,
     RemoveFailed,
@@ -170,6 +172,25 @@ pub(crate) enum CleanupStep {
     Reap,
     Remove,
     ProveAbsent,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CleanupIdentitySnapshot {
+    pub provider: String,
+    pub runtime_id: String,
+    pub exact_name: String,
+    pub token_digest: String,
+    pub immutable_image_id: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PlannedLaunchIdentitySnapshot {
+    pub provider: String,
+    pub exact_name: String,
+    pub token_digest: String,
+    pub immutable_image_id: String,
+    pub created_not_before: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -337,6 +358,17 @@ pub(crate) struct AppleCommandReport {
     pub second_spawn_attempted: bool,
     pub name_only_cleanup_attempted: bool,
     pub cleanup_steps: Vec<CleanupStep>,
+    pub cleanup_inspection_identities: Vec<CleanupIdentitySnapshot>,
+    pub stop_identities: Vec<CleanupIdentitySnapshot>,
+    pub remove_identities: Vec<CleanupIdentitySnapshot>,
+    pub planned_launch_identity: Option<PlannedLaunchIdentitySnapshot>,
+    pub protected_launch_identity: Option<CleanupIdentitySnapshot>,
+    pub protected_receipt_runtime_id: Option<String>,
+    pub protected_receipt_container_name: Option<String>,
+    pub cleanup_retained_ticket: Option<LaunchRetentionTicket>,
+    pub cleanup_retained_ticket_present: Option<bool>,
+    pub cleanup_active_resource_loans: Option<usize>,
+    pub cleanup_resource_loan_releases: Option<usize>,
     pub ownership: OwnershipObservation,
     pub legacy_orchestrated_plan: bool,
     pub protected_receipt_observed: bool,
@@ -372,6 +404,12 @@ struct DriverEffects {
     actual_provider_entries_before_release: usize,
     actual_provider_entries_total: usize,
     drop_elapsed: Option<Duration>,
+    protected_receipt_runtime_id: Option<String>,
+    protected_receipt_container_name: Option<String>,
+    cleanup_retained_ticket: Option<LaunchRetentionTicket>,
+    cleanup_retained_ticket_present: Option<bool>,
+    cleanup_active_resource_loans: Option<usize>,
+    cleanup_resource_loan_releases: Option<usize>,
     retained_ticket_before_retry: bool,
     retained_ticket_after_retry: bool,
     active_resource_loans_before_retry: usize,
@@ -414,6 +452,11 @@ pub(crate) struct AppleCommandObservation {
     second_spawn_attempted: bool,
     name_only_cleanup_attempted: bool,
     cleanup_steps: Vec<CleanupStep>,
+    cleanup_inspection_identities: Vec<CleanupIdentitySnapshot>,
+    stop_identities: Vec<CleanupIdentitySnapshot>,
+    remove_identities: Vec<CleanupIdentitySnapshot>,
+    planned_launch_identity: Option<PlannedLaunchIdentitySnapshot>,
+    protected_launch_identity: Option<CleanupIdentitySnapshot>,
     ownership: OwnershipObservation,
     legacy_orchestrated_plan: bool,
     terminal_observed: bool,
@@ -474,6 +517,38 @@ impl AppleCommandObserver {
             state.cleanup_steps.push(step);
         }
         self.state.1.notify_all();
+    }
+
+    pub(crate) fn observe_cleanup_identity(
+        &self,
+        step: CleanupStep,
+        identity: CleanupIdentitySnapshot,
+    ) {
+        let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
+        match step {
+            CleanupStep::Inspect => state.cleanup_inspection_identities.push(identity),
+            CleanupStep::Stop => state.stop_identities.push(identity),
+            CleanupStep::Remove => state.remove_identities.push(identity),
+            CleanupStep::Reap | CleanupStep::ProveAbsent => {
+                panic!("cleanup identity recorded for a non-provider-identity step")
+            }
+        }
+    }
+
+    pub(crate) fn observe_planned_launch_identity(&self, identity: PlannedLaunchIdentitySnapshot) {
+        self.state
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .planned_launch_identity = Some(identity);
+    }
+
+    pub(crate) fn observe_protected_launch_identity(&self, identity: CleanupIdentitySnapshot) {
+        self.state
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .protected_launch_identity = Some(identity);
     }
 
     pub(crate) fn observe_provider_entry(&self, before_release: bool) {
@@ -986,6 +1061,17 @@ fn report_from_observation(
         second_spawn_attempted: observation.second_spawn_attempted,
         name_only_cleanup_attempted: observation.name_only_cleanup_attempted,
         cleanup_steps: observation.cleanup_steps,
+        cleanup_inspection_identities: observation.cleanup_inspection_identities,
+        stop_identities: observation.stop_identities,
+        remove_identities: observation.remove_identities,
+        planned_launch_identity: observation.planned_launch_identity,
+        protected_launch_identity: observation.protected_launch_identity,
+        protected_receipt_runtime_id: effects.protected_receipt_runtime_id,
+        protected_receipt_container_name: effects.protected_receipt_container_name,
+        cleanup_retained_ticket: effects.cleanup_retained_ticket,
+        cleanup_retained_ticket_present: effects.cleanup_retained_ticket_present,
+        cleanup_active_resource_loans: effects.cleanup_active_resource_loans,
+        cleanup_resource_loan_releases: effects.cleanup_resource_loan_releases,
         ownership: observation.ownership,
         legacy_orchestrated_plan: observation.legacy_orchestrated_plan,
         protected_receipt_observed: effects.protected_receipt_observed,
@@ -1018,7 +1104,7 @@ fn report_from_observation(
     }
 }
 
-fn exercise(scenario: AppleCommandScenario) -> AppleCommandReport {
+pub(crate) fn exercise(scenario: AppleCommandScenario) -> AppleCommandReport {
     exercise_public_path(scenario)
         .unwrap_or_else(|error| panic!("orchestrated Apple public-path fixture failed: {error}"))
 }
@@ -1579,6 +1665,16 @@ fn exercise_public_path(
                 external_release_boundary = ExternalReleaseBoundary::ProtectedReceiptRead;
             }
             effects.protected_receipt_observed = !receipt.is_empty();
+            let protected_receipt: serde_json::Value = serde_json::from_slice(&receipt)
+                .map_err(|error| crate::engine::error::EngineError::Container(error.to_string()))?;
+            effects.protected_receipt_runtime_id = protected_receipt
+                .get("runtime_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            effects.protected_receipt_container_name = protected_receipt
+                .get("container_name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
             effects.release_absent_at_protected_receipt = !fixture.release_exists();
             effects.actual_provider_entries_before_release = fixture
                 .actual_provider_entries()
@@ -1602,6 +1698,21 @@ fn exercise_public_path(
 
         execution_result
     });
+    if matches!(
+        scenario,
+        AppleCommandScenario::CleanupUncertain(CleanupFault::PreRemoveRuntimeIdChanged)
+            | AppleCommandScenario::CleanupUncertain(CleanupFault::PreRemoveCreatedAtChanged)
+    ) {
+        let probe = retry_probe
+            .as_ref()
+            .ok_or("cleanup-authority retention probe unavailable")?;
+        if let Some(ticket) = probe.only_ticket() {
+            effects.cleanup_retained_ticket = Some(ticket);
+            effects.cleanup_retained_ticket_present = Some(probe.contains(ticket));
+            effects.cleanup_active_resource_loans = Some(probe.active_gated_resource_loans(ticket));
+            effects.cleanup_resource_loan_releases = Some(probe.resource_loan_releases(ticket));
+        }
+    }
     if scenario == AppleCommandScenario::ExternalRelease {
         if let Err(error) = &wait_result {
             const ERROR_LIMIT: usize = 512;

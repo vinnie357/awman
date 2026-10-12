@@ -308,7 +308,28 @@ fn daemon_guard_check_accepts_absent_and_stale_pidfiles_in_both_directions() {
 }
 
 #[cfg(unix)]
-fn awman_named_test_process() -> Child {
+struct AwmanNamedTestProcess {
+    child: Child,
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+impl AwmanNamedTestProcess {
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AwmanNamedTestProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(unix)]
+fn awman_named_test_process() -> AwmanNamedTestProcess {
     // The guard deliberately rejects a live PID belonging to an unrelated
     // process. Copying the test harness to an `awman` basename gives the
     // child the same process identity a real daemon has without starting a
@@ -322,7 +343,7 @@ fn awman_named_test_process() -> Child {
     // the file as busy (`ETXTBSY`) until that fork execs and drops it. The
     // window is short, so retry rather than force `--test-threads=1`.
     let mut attempt = 0;
-    let mut child = loop {
+    let child = loop {
         let spawned = Command::new(&helper)
             // libtest names integration tests by module path, so `--exact` must
             // carry the `daemon_primitives::` prefix. The bare name matched
@@ -344,6 +365,8 @@ fn awman_named_test_process() -> Child {
             Err(e) => panic!("spawn awman-named helper process: {e}"),
         }
     };
+    // Keep the executable path resolvable until the owned child is reaped.
+    let child = AwmanNamedTestProcess { child, _dir: tmp };
     // Wait on the *identity*, not merely on liveness. `spawn` returns once the
     // child exists, and a forked-but-not-yet-exec'd child is already alive
     // while still reporting the command name it inherited from this thread —
@@ -351,15 +374,10 @@ fn awman_named_test_process() -> Child {
     // an awman process to the guard under test.
     for _ in 0..500 {
         if awman::data::fs::daemon_process::pid_is_awman(child.id()) {
-            // Exec has landed, so the child no longer needs the copied file.
-            // Dropping the TempDir avoids leaking a test binary.
-            drop(tmp);
             return child;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let _ = child.kill();
-    let _ = child.wait();
     panic!("awman-named helper process never presented an awman command name");
 }
 
@@ -377,7 +395,7 @@ fn assert_guard_rejects_live_other(kind: DaemonKind) {
         DaemonKind::Api => &api_root,
         DaemonKind::Squad => &squad_root,
     };
-    let mut child = awman_named_test_process();
+    let child = awman_named_test_process();
     for _ in 0..40 {
         if awman::data::fs::daemon_process::is_process_alive(child.id()) {
             break;
@@ -404,9 +422,6 @@ fn assert_guard_rejects_live_other(kind: DaemonKind) {
         DaemonKind::Api => assert!(text.contains("awman api"), "missing API name: {text}"),
         DaemonKind::Squad => assert!(text.contains("squad"), "missing squad name: {text}"),
     }
-
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 #[cfg(unix)]

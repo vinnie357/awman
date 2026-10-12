@@ -135,7 +135,8 @@ impl DaemonProcess {
 
     /// Terminate the running daemon: read the PID, and if it is a live awman
     /// process, send SIGTERM, then release the PID file. A stale/absent PID is
-    /// a no-op that still clears the file.
+    /// a no-op that still clears the file. An unverified live process is left
+    /// untouched and retains its claim.
     pub fn terminate(&self) -> Result<(), DataError> {
         self.terminate_running()?;
         Ok(())
@@ -143,16 +144,51 @@ impl DaemonProcess {
 
     /// Terminate this daemon and report what was actually found, so callers can
     /// render their own "stopped" / "stale pidfile" messages without reaching
-    /// for a free OS function. The pidfile is released on every outcome.
+    /// for a free OS function. The pidfile is released after a verified outcome.
     pub fn terminate_running(&self) -> Result<Termination, DataError> {
+        #[cfg(target_os = "macos")]
+        {
+            self.terminate_running_with(is_process_alive, process_identity, kill_process)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let outcome = match self.read_pid()? {
+                None => Termination::NotRunning,
+                Some(pid) if !is_process_alive(pid) => Termination::StalePidFile { pid },
+                Some(pid) if !pid_is_awman(pid) => Termination::NotAwman { pid },
+                Some(pid) => {
+                    kill_process(pid)?;
+                    Termination::Terminated { pid }
+                }
+            };
+            self.release_pidfile()?;
+            Ok(outcome)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn terminate_running_with<Alive, Identity, Signal>(
+        &self,
+        is_alive: Alive,
+        identity: Identity,
+        signal: Signal,
+    ) -> Result<Termination, DataError>
+    where
+        Alive: Fn(u32) -> bool,
+        Identity: Fn(u32) -> ProcessIdentity,
+        Signal: Fn(u32) -> Result<(), DataError>,
+    {
         let outcome = match self.read_pid()? {
             None => Termination::NotRunning,
-            Some(pid) if !is_process_alive(pid) => Termination::StalePidFile { pid },
-            Some(pid) if !pid_is_awman(pid) => Termination::NotAwman { pid },
-            Some(pid) => {
-                kill_process(pid)?;
-                Termination::Terminated { pid }
-            }
+            Some(pid) if !is_alive(pid) => Termination::StalePidFile { pid },
+            Some(pid) => match identity(pid) {
+                ProcessIdentity::Match => {
+                    signal(pid)?;
+                    Termination::Terminated { pid }
+                }
+                ProcessIdentity::NonMatch => Termination::NotAwman { pid },
+                ProcessIdentity::Unknown => return Err(unknown_process_identity()),
+            },
         };
         self.release_pidfile()?;
         Ok(outcome)
@@ -298,6 +334,23 @@ pub fn is_process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessIdentity {
+    Match,
+    NonMatch,
+    Unknown,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) const UNKNOWN_PROCESS_IDENTITY_ERROR: &str =
+    "could not verify the identity of the live process named by the PID file";
+
+#[cfg(target_os = "macos")]
+fn unknown_process_identity() -> DataError {
+    DataError::Other(UNKNOWN_PROCESS_IDENTITY_ERROR.into())
+}
+
 /// Whether the OS reports the process command name contains "awman". Used to
 /// disambiguate stale PID files from reused PIDs. Stateless — stays a free
 /// function. On platforms where the command name is unreadable, returns `true`
@@ -319,11 +372,7 @@ pub fn pid_is_awman(pid: u32) -> bool {
 
 #[cfg(target_os = "macos")]
 pub fn pid_is_awman(pid: u32) -> bool {
-    std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().contains("awman"))
-        .unwrap_or(false)
+    process_identity(pid) == ProcessIdentity::Match
 }
 
 #[cfg(target_os = "windows")]
@@ -344,15 +393,87 @@ pub fn pid_is_awman(_pid: u32) -> bool {
     true
 }
 
+#[cfg(target_os = "macos")]
+fn classify_macos_executable_path(path: Result<&str, &str>) -> ProcessIdentity {
+    let Ok(path) = path else {
+        return ProcessIdentity::Unknown;
+    };
+    if path.is_empty() || path.as_bytes().contains(&0) {
+        return ProcessIdentity::Unknown;
+    }
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return ProcessIdentity::Unknown;
+    }
+    let Some(basename) = path.file_name().and_then(|name| name.to_str()) else {
+        return ProcessIdentity::Unknown;
+    };
+    if basename.is_empty() {
+        ProcessIdentity::Unknown
+    } else if basename.contains("awman") {
+        ProcessIdentity::Match
+    } else {
+        ProcessIdentity::NonMatch
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn process_identity(pid: u32) -> ProcessIdentity {
+    let Ok(pid) = i32::try_from(pid) else {
+        return ProcessIdentity::Unknown;
+    };
+    if pid <= 0 {
+        return ProcessIdentity::Unknown;
+    }
+    match libproc::proc_pid::pidpath(pid) {
+        Ok(path) => classify_macos_executable_path(Ok(path.as_str())),
+        Err(error) => classify_macos_executable_path(Err(error.as_str())),
+    }
+}
+
 /// Check the PID file. Returns `Some(pid)` only when the process is alive AND
 /// looks like an awman server. Stale or wrong-process PIDs are cleaned up.
 pub(crate) fn check_already_running(pid_path: &Path) -> Result<Option<u32>, DataError> {
+    #[cfg(target_os = "macos")]
+    {
+        check_already_running_with(pid_path, is_process_alive, process_identity)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        match read_pid(pid_path)? {
+            Some(pid) if is_process_alive(pid) && pid_is_awman(pid) => Ok(Some(pid)),
+            Some(_) => {
+                clear_pid(pid_path)?;
+                Ok(None)
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn check_already_running_with<Alive, Identity>(
+    pid_path: &Path,
+    is_alive: Alive,
+    identity: Identity,
+) -> Result<Option<u32>, DataError>
+where
+    Alive: Fn(u32) -> bool,
+    Identity: Fn(u32) -> ProcessIdentity,
+{
     match read_pid(pid_path)? {
-        Some(pid) if is_process_alive(pid) && pid_is_awman(pid) => Ok(Some(pid)),
-        Some(_) => {
+        Some(pid) if !is_alive(pid) => {
             clear_pid(pid_path)?;
             Ok(None)
         }
+        Some(pid) => match identity(pid) {
+            ProcessIdentity::Match => Ok(Some(pid)),
+            ProcessIdentity::NonMatch => {
+                clear_pid(pid_path)?;
+                Ok(None)
+            }
+            ProcessIdentity::Unknown => Err(unknown_process_identity()),
+        },
         None => Ok(None),
     }
 }
@@ -1218,6 +1339,66 @@ mod tests {
         assert!(!pid_is_awman(1), "PID 1 is not awman");
     }
 
+    #[cfg(target_os = "macos")]
+    fn classify_macos_path(path: &str) -> ProcessIdentity {
+        classify_macos_executable_path(Ok(path))
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_executable_path_parser_classifies_only_the_complete_basename() {
+        assert_eq!(
+            classify_macos_path("/private/tmp/awman-squad-test-holder"),
+            ProcessIdentity::Match
+        );
+        assert_eq!(
+            classify_macos_path("/private/tmp/awman-project/cat"),
+            ProcessIdentity::NonMatch,
+            "an awman-named parent directory must not identify an unrelated executable"
+        );
+        assert_eq!(
+            classify_macos_path("/private/tmp/parent/awman-helper"),
+            ProcessIdentity::Match,
+            "a valid absolute path is classified from its basename"
+        );
+        assert_eq!(
+            classify_macos_path("/private/tmp/AWMAN-helper"),
+            ProcessIdentity::NonMatch,
+            "the established awman-name convention is case-sensitive"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_executable_path_parser_treats_missing_empty_and_malformed_paths_as_unknown() {
+        assert_eq!(
+            classify_macos_executable_path(Err("native query failed")),
+            ProcessIdentity::Unknown
+        );
+        assert_eq!(
+            classify_macos_executable_path(Err("native path was not UTF-8")),
+            ProcessIdentity::Unknown
+        );
+        assert_eq!(
+            classify_macos_executable_path(Ok("")),
+            ProcessIdentity::Unknown
+        );
+        assert_eq!(
+            classify_macos_executable_path(Ok("awman")),
+            ProcessIdentity::Unknown,
+            "a native executable path must be absolute"
+        );
+        assert_eq!(
+            classify_macos_executable_path(Ok("/")),
+            ProcessIdentity::Unknown
+        );
+        assert_eq!(
+            classify_macos_executable_path(Ok("/bin/\0awman")),
+            ProcessIdentity::Unknown,
+            "an embedded NUL must not create a synthetic executable basename"
+        );
+    }
+
     #[test]
     fn check_already_running_for_unrelated_alive_pid_treats_as_stale() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1249,6 +1430,131 @@ mod tests {
             API_UNIT_NAME,
             API_PLIST_LABEL,
         )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_unknown_identity(error: DataError) {
+        assert!(
+            matches!(error, DataError::Other(message) if message == UNKNOWN_PROCESS_IDENTITY_ERROR),
+            "unknown identity must surface the fixed controlled error"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_matching_identity_retains_the_original_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_path = tmp.path().join("matching.pid");
+        std::fs::write(&pid_path, b"004242\n").unwrap();
+
+        let result =
+            check_already_running_with(&pid_path, |_| true, |_| ProcessIdentity::Match).unwrap();
+
+        assert_eq!(result, Some(4242));
+        assert_eq!(std::fs::read(&pid_path).unwrap(), b"004242\n");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_nonmatching_identity_clears_the_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_path = tmp.path().join("unrelated.pid");
+        std::fs::write(&pid_path, b"004242\n").unwrap();
+
+        let result =
+            check_already_running_with(&pid_path, |_| true, |_| ProcessIdentity::NonMatch).unwrap();
+
+        assert_eq!(result, None);
+        assert!(!pid_path.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_unknown_identity_errors_and_preserves_the_claim_byte_for_byte() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_path = tmp.path().join("unknown.pid");
+        std::fs::write(&pid_path, b"004242\n").unwrap();
+
+        let error = check_already_running_with(&pid_path, |_| true, |_| ProcessIdentity::Unknown)
+            .expect_err("unknown identity must refuse a competing start");
+
+        assert_unknown_identity(error);
+        assert_eq!(std::fs::read(&pid_path).unwrap(), b"004242\n");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn termination_unknown_identity_neither_signals_nor_releases_the_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = api_daemon(tmp.path());
+        std::fs::write(daemon.paths().pid_file(), b"004242\n").unwrap();
+        let signaled = std::cell::Cell::new(None);
+
+        let error = daemon
+            .terminate_running_with(
+                |_| true,
+                |_| ProcessIdentity::Unknown,
+                |pid| {
+                    signaled.set(Some(pid));
+                    Ok(())
+                },
+            )
+            .expect_err("unknown identity must refuse termination");
+
+        assert_unknown_identity(error);
+        assert_eq!(signaled.get(), None);
+        assert_eq!(
+            std::fs::read(daemon.paths().pid_file()).unwrap(),
+            b"004242\n"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn termination_matching_identity_signals_then_releases_the_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = api_daemon(tmp.path());
+        daemon.force_write_pidfile(4242).unwrap();
+        let signaled = std::cell::Cell::new(None);
+
+        let outcome = daemon
+            .terminate_running_with(
+                |_| true,
+                |_| ProcessIdentity::Match,
+                |pid| {
+                    signaled.set(Some(pid));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome, Termination::Terminated { pid: 4242 });
+        assert_eq!(signaled.get(), Some(4242));
+        assert!(!daemon.paths().pid_file().exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn termination_nonmatching_identity_does_not_signal_and_releases_the_claim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = api_daemon(tmp.path());
+        daemon.force_write_pidfile(4242).unwrap();
+        let signaled = std::cell::Cell::new(None);
+
+        let outcome = daemon
+            .terminate_running_with(
+                |_| true,
+                |_| ProcessIdentity::NonMatch,
+                |pid| {
+                    signaled.set(Some(pid));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome, Termination::NotAwman { pid: 4242 });
+        assert_eq!(signaled.get(), None);
+        assert!(!daemon.paths().pid_file().exists());
     }
 
     #[test]

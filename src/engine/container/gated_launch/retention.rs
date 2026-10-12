@@ -164,6 +164,7 @@ struct Shared {
     worker_detached: AtomicBool,
     worker_finished: AtomicBool,
     next_ticket: AtomicU64,
+    active_ticket_cursor: AtomicU64,
     #[cfg(test)]
     resource_loan_releases: Mutex<BTreeMap<LaunchRetentionTicket, usize>>,
     #[cfg(test)]
@@ -242,6 +243,7 @@ impl LaunchRetentionRegistry {
             worker_detached: AtomicBool::new(false),
             worker_finished: AtomicBool::new(false),
             next_ticket: AtomicU64::new(1),
+            active_ticket_cursor: AtomicU64::new(0),
             #[cfg(test)]
             resource_loan_releases: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
@@ -554,71 +556,7 @@ fn supervisor_loop(shared: Arc<Shared>) {
             drop(registry);
         }
         let shutdown = shared.shutdown_requested.load(Ordering::Acquire);
-        let mut local = Vec::new();
-        let active = {
-            let mut entries = shared.entries.lock().unwrap_or_else(|poisoned| {
-                shared.supervisor_failed.store(true, Ordering::Release);
-                poisoned.into_inner()
-            });
-            let active_ticket = entries.iter().find_map(|(ticket, entry)| {
-                #[cfg(test)]
-                if shared
-                    .supervisor_active_claims_blocked
-                    .load(Ordering::Acquire)
-                    && matches!(&entry.launch, RetainedRegistryEnvelope::ActiveGated(_))
-                {
-                    return None;
-                }
-                matches!(&entry.launch, RetainedRegistryEnvelope::ActiveGated(_)).then_some(*ticket)
-            });
-            let active = active_ticket
-                .and_then(|ticket| entries.remove(&ticket).map(|entry| (ticket, entry)));
-            let tickets: Vec<_> = entries
-                .iter()
-                .filter_map(|(ticket, entry)| {
-                    (!matches!(&entry.launch, RetainedRegistryEnvelope::ActiveGated(_)))
-                        .then_some(*ticket)
-                })
-                .collect();
-            for ticket in tickets {
-                if let Some(entry) = entries.remove(&ticket) {
-                    local.push((ticket, entry));
-                }
-            }
-            active
-        };
-        let mut keep = Vec::new();
-        for (ticket, mut entry) in local {
-            let disposition = poll_retained_entry(&shared, &mut entry, shutdown);
-            record_poll_disposition(&shared, &mut entry, disposition);
-            if !disposition.resolved {
-                keep.push((ticket, entry));
-            } else {
-                publish_resolved_entry(&shared, ticket);
-            }
-        }
-        if !keep.is_empty() {
-            let mut entries = shared.entries.lock().unwrap_or_else(|poisoned| {
-                shared.supervisor_failed.store(true, Ordering::Release);
-                poisoned.into_inner()
-            });
-            entries.extend(keep);
-        }
-        if let Some((ticket, mut entry)) = active {
-            let deadline = Instant::now() + SUPERVISOR_ACTIVE_RETRY_BOUND;
-            match retry_claimed_active_gated(&shared, ticket, &mut entry, deadline) {
-                Ok(ActiveGatedRetryOutcome::Resolved) => {
-                    publish_resolved_entry(&shared, ticket);
-                }
-                Ok(ActiveGatedRetryOutcome::Retained) => {
-                    publish_retained_entry(&shared, ticket, entry);
-                }
-                Err(_) => {
-                    shared.supervisor_failed.store(true, Ordering::Release);
-                    publish_retained_entry(&shared, ticket, entry);
-                }
-            }
-        }
+        let _ = supervisor_iteration(&shared, shutdown, true);
         let empty = shared
             .entries
             .lock()
@@ -631,6 +569,108 @@ fn supervisor_loop(shared: Arc<Shared>) {
         let _ = shared.changed.wait_timeout(guard, SUPERVISOR_POLL_INTERVAL);
     }
     shared.worker_finished.store(true, Ordering::Release);
+}
+
+fn next_active_ticket(
+    entries: &BTreeMap<LaunchRetentionTicket, RetainedEntry>,
+    after: u64,
+) -> Option<LaunchRetentionTicket> {
+    entries
+        .iter()
+        .find_map(|(ticket, entry)| {
+            (ticket.0 > after && matches!(&entry.launch, RetainedRegistryEnvelope::ActiveGated(_)))
+                .then_some(*ticket)
+        })
+        .or_else(|| {
+            entries.iter().find_map(|(ticket, entry)| {
+                matches!(&entry.launch, RetainedRegistryEnvelope::ActiveGated(_)).then_some(*ticket)
+            })
+        })
+}
+
+fn supervisor_iteration(
+    shared: &Shared,
+    shutdown: bool,
+    #[cfg_attr(not(test), allow(unused_variables))] honor_active_claim_barrier: bool,
+) -> Result<Option<LaunchRetentionTicket>, EngineError> {
+    let mut local = Vec::new();
+    let active = {
+        let mut entries = shared.entries.lock().unwrap_or_else(|poisoned| {
+            shared.supervisor_failed.store(true, Ordering::Release);
+            poisoned.into_inner()
+        });
+        #[cfg(test)]
+        let active_claims_blocked = honor_active_claim_barrier
+            && shared
+                .supervisor_active_claims_blocked
+                .load(Ordering::Acquire);
+        #[cfg(not(test))]
+        let active_claims_blocked = false;
+        let active_ticket = if active_claims_blocked {
+            None
+        } else {
+            next_active_ticket(
+                &entries,
+                shared.active_ticket_cursor.load(Ordering::Acquire),
+            )
+        };
+        if let Some(ticket) = active_ticket {
+            shared
+                .active_ticket_cursor
+                .store(ticket.0, Ordering::Release);
+        }
+        let active =
+            active_ticket.and_then(|ticket| entries.remove(&ticket).map(|entry| (ticket, entry)));
+        let tickets: Vec<_> = entries
+            .iter()
+            .filter_map(|(ticket, entry)| {
+                (!matches!(&entry.launch, RetainedRegistryEnvelope::ActiveGated(_)))
+                    .then_some(*ticket)
+            })
+            .collect();
+        for ticket in tickets {
+            if let Some(entry) = entries.remove(&ticket) {
+                local.push((ticket, entry));
+            }
+        }
+        active
+    };
+    let mut keep = Vec::new();
+    for (ticket, mut entry) in local {
+        let disposition = poll_retained_entry(shared, &mut entry, shutdown);
+        record_poll_disposition(shared, &mut entry, disposition);
+        if !disposition.resolved {
+            keep.push((ticket, entry));
+        } else {
+            publish_resolved_entry(shared, ticket);
+        }
+    }
+    if !keep.is_empty() {
+        let mut entries = shared.entries.lock().unwrap_or_else(|poisoned| {
+            shared.supervisor_failed.store(true, Ordering::Release);
+            poisoned.into_inner()
+        });
+        entries.extend(keep);
+    }
+    let Some((ticket, mut entry)) = active else {
+        return Ok(None);
+    };
+    let deadline = Instant::now() + SUPERVISOR_ACTIVE_RETRY_BOUND;
+    match retry_claimed_active_gated(shared, ticket, &mut entry, deadline) {
+        Ok(ActiveGatedRetryOutcome::Resolved) => {
+            publish_resolved_entry(shared, ticket);
+            Ok(Some(ticket))
+        }
+        Ok(ActiveGatedRetryOutcome::Retained) => {
+            publish_retained_entry(shared, ticket, entry);
+            Ok(Some(ticket))
+        }
+        Err(error) => {
+            shared.supervisor_failed.store(true, Ordering::Release);
+            publish_retained_entry(shared, ticket, entry);
+            Err(error)
+        }
+    }
 }
 
 #[derive(Clone, Copy)]

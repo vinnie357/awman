@@ -27,6 +27,8 @@ pub mod download;
 pub mod frontend;
 
 #[cfg(all(test, unix))]
+mod orchestrated_apple_cleanup_authority_test;
+#[cfg(all(test, unix))]
 mod orchestrated_apple_command_acceptance_test;
 #[cfg(all(test, unix))]
 mod orchestrated_apple_command_test_boundary;

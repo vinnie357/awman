@@ -671,6 +671,9 @@ fn init_repo(path: &Path) {
 const AWMAN_SQUAD_GATEWAY_HOLDER_CHILD: &str = "AWMAN_SQUAD_GATEWAY_HOLDER_CHILD";
 
 #[cfg(unix)]
+const AWMAN_SQUAD_GATEWAY_HOLDER_PROOF: &str = "AWMAN_SQUAD_GATEWAY_HOLDER_PROOF";
+
+#[cfg(unix)]
 #[test]
 fn fake_awman_process_holder_child() {
     if std::env::var_os(AWMAN_SQUAD_GATEWAY_HOLDER_CHILD).as_deref()
@@ -679,13 +682,25 @@ fn fake_awman_process_holder_child() {
         return;
     }
 
+    let proof_path = std::env::var_os(AWMAN_SQUAD_GATEWAY_HOLDER_PROOF);
+    let proof_path = proof_path.map(std::path::PathBuf::from);
+    let record_proof = |event: &str| {
+        if let Some(path) = &proof_path {
+            std::fs::write(path, event).expect("holder child proof must be written");
+        }
+    };
+    record_proof("entered\n");
+
     use std::io::Read;
     let mut stdin = std::io::stdin().lock();
     let mut buffer = [0_u8; 256];
     loop {
         match stdin.read(&mut buffer) {
-            Ok(0) => return,
-            Ok(_) => {}
+            Ok(0) => {
+                record_proof("eof\n");
+                return;
+            }
+            Ok(_) => record_proof("stdin-consumed\n"),
             Err(error) => panic!("holder child must read stdin until EOF: {error}"),
         }
     }
@@ -711,6 +726,26 @@ impl FakeAwmanProcess {
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&executable, permissions).expect("holder permissions");
+        #[cfg(target_os = "macos")]
+        {
+            // Install a fresh ad-hoc signature on the owned copy before execution.
+            let sign_status = Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-", "--timestamp=none"])
+                .arg(&executable)
+                .status()
+                .expect("holder ad-hoc signing must start");
+            if !sign_status.success() {
+                panic!("holder ad-hoc signing failed: {sign_status}");
+            }
+            let verify_status = Command::new("/usr/bin/codesign")
+                .args(["--verify", "--strict"])
+                .arg(&executable)
+                .status()
+                .expect("holder signature verification must start");
+            if !verify_status.success() {
+                panic!("holder signature verification failed: {verify_status}");
+            }
+        }
         // Under `cargo test`'s default concurrent-test-function execution,
         // another test can fork while this thread still holds the holder's
         // write descriptor open; the kernel then reports the just-written
@@ -721,6 +756,10 @@ impl FakeAwmanProcess {
             match Command::new(&executable)
                 .args(["--exact", "fake_awman_process_holder_child", "--nocapture"])
                 .env(AWMAN_SQUAD_GATEWAY_HOLDER_CHILD, "1")
+                .env(
+                    AWMAN_SQUAD_GATEWAY_HOLDER_PROOF,
+                    dir.path().join("holder-child-proof"),
+                )
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -753,6 +792,7 @@ impl FakeAwmanProcess {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        drop(stdin);
         let _ = child.kill();
         let _ = child.wait();
         panic!("awman-named holder (PID {pid}) never presented an awman command name");
@@ -772,6 +812,94 @@ impl Drop for FakeAwmanProcess {
         }
         let _ = self.child.wait();
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn fake_awman_process_lives_until_its_owner_is_dropped() {
+    let holder = FakeAwmanProcess::spawn();
+    let pid = holder.id();
+    assert!(
+        awman::data::fs::daemon_process::is_process_alive(pid),
+        "holder must be alive after its readiness event"
+    );
+    assert!(
+        awman::data::fs::daemon_process::pid_is_awman(pid),
+        "ready holder must retain the awman process identity"
+    );
+
+    drop(holder);
+
+    assert!(
+        !awman::data::fs::daemon_process::is_process_alive(pid),
+        "dropping the owning guard must close and reap the holder"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fake_awman_process_holder_child_enters_reads_stdin_and_exits_on_eof() {
+    use std::io::Write;
+
+    let mut holder = FakeAwmanProcess::spawn();
+    let proof_path = holder._dir.path().join("holder-child-proof");
+    let wait_for_proof = |expected: &[u8]| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::fs::read(&proof_path).ok().as_deref() == Some(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "holder child must record {:?} in its owned proof file",
+                String::from_utf8_lossy(expected)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    wait_for_proof(b"entered\n");
+    assert!(
+        holder
+            .child
+            .try_wait()
+            .expect("holder entry status")
+            .is_none(),
+        "entered child must remain alive while its owner retains stdin"
+    );
+    holder
+        .stdin
+        .as_mut()
+        .expect("holder stdin must remain owned")
+        .write_all(b"holder child input proof\n")
+        .expect("holder child must accept input");
+    wait_for_proof(b"stdin-consumed\n");
+    assert!(
+        holder
+            .child
+            .try_wait()
+            .expect("holder input status")
+            .is_none(),
+        "child must consume input and remain alive until EOF"
+    );
+
+    drop(holder.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = holder.child.try_wait().expect("holder EOF status") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder child must exit after its owner closes stdin"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "holder child must exit successfully on EOF"
+    );
+    wait_for_proof(b"eof\n");
 }
 
 #[cfg(unix)]

@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::{
@@ -22,7 +23,11 @@ use crate::engine::container::apple::AppleBackend;
 use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::background::BackgroundContainer;
 use crate::engine::container::docker::DockerBackend;
-use crate::engine::container::gated_launch::{LaunchRetentionInitError, LaunchRetentionRegistry};
+use crate::engine::container::gated_launch::{
+    provider_call_deadline, run_bounded_provider_cli, LaunchRetentionInitError,
+    LaunchRetentionRegistry, ProviderCliCustodyRegistry, ProviderCliRunOutcome,
+    ProviderCliStartFailure,
+};
 use crate::engine::container::options::{OverlaySpec, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
 
@@ -56,8 +61,11 @@ static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
 pub struct ContainerRuntime {
     backend: Arc<dyn ContainerBackend>,
     launch_retention: Result<Arc<LaunchRetentionRegistry>, LaunchRetentionInitError>,
+    provider_cli_custody: Result<Arc<ProviderCliCustodyRegistry>, ProviderCliStartFailure>,
     #[cfg(test)]
     test_boundary: Option<Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>>,
+    #[cfg(test)]
+    test_provider_executable: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -165,8 +173,11 @@ impl ContainerRuntime {
         Self {
             backend: Arc::new(DockerBackend),
             launch_retention: LaunchRetentionRegistry::try_new(),
+            provider_cli_custody: ProviderCliCustodyRegistry::try_new(),
             #[cfg(test)]
             test_boundary: None,
+            #[cfg(test)]
+            test_provider_executable: None,
         }
     }
 
@@ -177,8 +188,22 @@ impl ContainerRuntime {
         Self {
             backend: Arc::new(AppleBackend::default()),
             launch_retention: LaunchRetentionRegistry::try_new(),
+            provider_cli_custody: ProviderCliCustodyRegistry::try_new(),
             #[cfg(test)]
             test_boundary: None,
+            #[cfg(test)]
+            test_provider_executable: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apple_with_provider_executable_for_test(executable: &Path) -> Self {
+        Self {
+            backend: Arc::new(AppleBackend::default()),
+            launch_retention: LaunchRetentionRegistry::try_new(),
+            provider_cli_custody: ProviderCliCustodyRegistry::try_new(),
+            test_boundary: None,
+            test_provider_executable: Some(executable.to_path_buf()),
         }
     }
 
@@ -194,7 +219,9 @@ impl ContainerRuntime {
         Self {
             backend: Arc::new(AppleBackend::with_test_boundary(Arc::clone(&boundary))),
             launch_retention,
+            provider_cli_custody: ProviderCliCustodyRegistry::try_new(),
             test_boundary: Some(boundary),
+            test_provider_executable: None,
         }
     }
 
@@ -241,7 +268,7 @@ impl ContainerRuntime {
             }
             Err(_) => None,
         };
-        if options.startup_gate.is_some() {
+        if let Some(startup_gate_timeout) = options.startup_gate.as_ref().map(|gate| gate.timeout) {
             if !options.startup_gate_trusted_template {
                 return Err(EngineError::Config(
                     "startup gate requires an awman-supported generated agent image".into(),
@@ -251,7 +278,7 @@ impl ContainerRuntime {
                 .image
                 .as_ref()
                 .ok_or_else(|| EngineError::MissingRequiredOption("startup gate image".into()))?;
-            let inspected = self.inspect_gate_image(image.as_str())?;
+            let inspected = self.inspect_gate_image(image.as_str(), startup_gate_timeout)?;
             debug_assert!(inspected.entrypoint.is_empty());
             debug_assert!(inspected.env.iter().all(|entry| !entry.is_empty()));
             if !inspected.trusted {
@@ -275,26 +302,51 @@ impl ContainerRuntime {
             .build_with_launch_retention(options, launch_retention)
     }
 
-    fn inspect_gate_image(&self, image: &str) -> Result<GateImageConfig, EngineError> {
+    fn inspect_gate_image(
+        &self,
+        image: &str,
+        startup_gate_timeout: Duration,
+    ) -> Result<GateImageConfig, EngineError> {
         #[cfg(test)]
         if let Some(boundary) = &self.test_boundary {
             let raw = boundary.image_inspection()?;
             return parse_gate_image_config(self.backend.name(), &raw);
         }
-        use std::process::{Command, Stdio};
-        let output = match self.backend.name() {
-            "apple-containers" => Command::new("container")
-                .args(["image", "inspect", image])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output(),
-            _ => Command::new("docker")
-                .args(["image", "inspect", "--format", "{{json .Config}}", image])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output(),
-        }
-        .map_err(|error| EngineError::Container(format!("inspect startup-gate image: {error}")))?;
+        use std::process::Command;
+        #[cfg(test)]
+        let apple_executable = self
+            .test_provider_executable
+            .as_deref()
+            .unwrap_or_else(|| Path::new("container"));
+        #[cfg(not(test))]
+        let apple_executable = Path::new("container");
+        let mut command = match self.backend.name() {
+            "apple-containers" => Command::new(apple_executable),
+            _ => Command::new("docker"),
+        };
+        match self.backend.name() {
+            "apple-containers" => command.args(["image", "inspect", image]),
+            _ => command.args(["image", "inspect", "--format", "{{json .Config}}", image]),
+        };
+        let custody = self
+            .provider_cli_custody
+            .as_ref()
+            .map_err(|_| EngineError::Container("could not inspect startup-gate image".into()))?;
+        let deadline = provider_call_deadline(Instant::now() + startup_gate_timeout);
+        let output = match run_bounded_provider_cli(command, deadline, custody) {
+            ProviderCliRunOutcome::Completed(output) => output,
+            ProviderCliRunOutcome::RetainedFailure(retained) => {
+                let _ = retained.transfer();
+                return Err(EngineError::Container(
+                    "could not inspect startup-gate image".into(),
+                ));
+            }
+            ProviderCliRunOutcome::NotStarted(_) | ProviderCliRunOutcome::ReapedFailure(_) => {
+                return Err(EngineError::Container(
+                    "could not inspect startup-gate image".into(),
+                ));
+            }
+        };
         if !output.status.success() {
             return Err(EngineError::Container(
                 "could not inspect startup-gate image".into(),

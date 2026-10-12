@@ -110,6 +110,22 @@ impl RetentionProbe {
         }
     }
 
+    pub(crate) fn advance_one_supervisor_active_attempt(
+        &self,
+    ) -> Result<Option<LaunchRetentionTicket>, EngineError> {
+        if !self
+            .shared
+            .supervisor_active_claims_blocked
+            .load(Ordering::Acquire)
+        {
+            return Err(EngineError::Container(
+                "supervisor active-claim barrier must be held".into(),
+            ));
+        }
+        let shutdown = self.shared.shutdown_requested.load(Ordering::Acquire);
+        supervisor_iteration(&self.shared, shutdown, false)
+    }
+
     fn only_active_gated_snapshot(
         &self,
         entries: &BTreeMap<LaunchRetentionTicket, RetainedEntry>,

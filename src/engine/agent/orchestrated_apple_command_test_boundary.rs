@@ -1,7 +1,7 @@
 use super::orchestrated_apple_command_acceptance_test::{
     AppleCommandEffects, AppleCommandExternalPlan, AppleCommandObserver, CancellationPoint,
-    CleanupFault, CleanupStep, MountObservation, OwnershipObservation, QualificationFault,
-    RetryFaultPoint, SecondInspectionRelease,
+    CleanupFault, CleanupIdentitySnapshot, CleanupStep, MountObservation, OwnershipObservation,
+    PlannedLaunchIdentitySnapshot, QualificationFault, RetryFaultPoint, SecondInspectionRelease,
 };
 use crate::engine::container::gated_launch::{
     canonical_inspection_revision, AbsenceObservation, AppleProviderState,
@@ -145,6 +145,9 @@ impl OrchestratedAppleTestBoundary for TestBoundary {
         &self,
         plan: &DurableLaunchPlan,
     ) -> Result<(), LaunchRetentionReason> {
+        self.observer.observe_planned_launch_identity(
+            TestProviderAdapter::planned_identity_snapshot(&plan.key),
+        );
         if self.pause_before_ready() {
             return Ok(());
         }
@@ -240,6 +243,11 @@ impl OrchestratedAppleTestBoundary for TestBoundary {
         self.observer.observe_child_start();
     }
 
+    fn observe_protected_launch_identity(&self, inspection: &ProviderLaunchInspection) {
+        self.observer
+            .observe_protected_launch_identity(TestProviderAdapter::identity_snapshot(inspection));
+    }
+
     fn observe_protected_ready(&self) {
         self.observer.observe_protected_ready();
     }
@@ -328,15 +336,55 @@ impl TestProviderAdapter {
         }
     }
 
-    fn matching(&self, key: &ProviderLaunchKey, stopped: bool) -> ProviderLaunchInspection {
+    fn identity_snapshot(inspection: &ProviderLaunchInspection) -> CleanupIdentitySnapshot {
+        CleanupIdentitySnapshot {
+            provider: match inspection.provider {
+                ProviderKind::Docker => "docker",
+                ProviderKind::AppleContainers => "apple-containers",
+            }
+            .into(),
+            runtime_id: inspection.runtime_id.clone(),
+            exact_name: inspection.exact_name.as_str().to_string(),
+            token_digest: inspection
+                .token_digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            immutable_image_id: inspection.immutable_image_id.as_str().to_string(),
+            created_at: inspection.created_at.to_owned(),
+        }
+    }
+
+    fn planned_identity_snapshot(key: &ProviderLaunchKey) -> PlannedLaunchIdentitySnapshot {
+        PlannedLaunchIdentitySnapshot {
+            provider: match key.provider {
+                ProviderKind::Docker => "docker",
+                ProviderKind::AppleContainers => "apple-containers",
+            }
+            .into(),
+            exact_name: key.container_name.as_str().to_string(),
+            token_digest: key
+                .token_digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            immutable_image_id: key.immutable_image_id.as_str().to_string(),
+            created_not_before: key.created_not_before.to_owned(),
+        }
+    }
+
+    fn matching_with_identity(
+        &self,
+        key: &ProviderLaunchKey,
+        stopped: bool,
+        runtime_id: String,
+        created_at: chrono::DateTime<Utc>,
+    ) -> ProviderLaunchInspection {
         let state = ProviderState::Apple(if stopped {
             AppleProviderState::Stopped
         } else {
             AppleProviderState::Running
         });
-        let runtime_id: String =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
-        let created_at = self.created_at.to_owned();
         let revision = canonical_inspection_revision(CanonicalInspectionRevisionInput {
             kind: InspectionObservationKind::Matching,
             provider: ProviderKind::AppleContainers,
@@ -357,6 +405,15 @@ impl TestProviderAdapter {
             state,
             revision,
         }
+    }
+
+    fn matching(&self, key: &ProviderLaunchKey, stopped: bool) -> ProviderLaunchInspection {
+        self.matching_with_identity(
+            key,
+            stopped,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            self.created_at.to_owned(),
+        )
     }
 
     fn absent(&self, name: &ContainerName) -> AbsenceObservation {
@@ -459,7 +516,7 @@ impl GatedProviderAdapter for TestProviderAdapter {
             return ExactInspection::Absent(self.absent(&key.container_name));
         }
         let index = self.cleanup_inspections.fetch_add(1, Ordering::AcqRel);
-        match (self.plan, index) {
+        let result = match (self.plan, index) {
             (AppleCommandExternalPlan::CleanupUncertain(CleanupFault::TupleChanged), 0) => {
                 ExactInspection::ForeignOrAmbiguous
             }
@@ -480,6 +537,28 @@ impl GatedProviderAdapter for TestProviderAdapter {
                 1,
             ) => ExactInspection::Unavailable,
             (
+                AppleCommandExternalPlan::CleanupUncertain(
+                    CleanupFault::PreRemoveRuntimeIdChanged,
+                ),
+                1,
+            ) => ExactInspection::Matching(self.matching_with_identity(
+                key,
+                true,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                self.created_at.to_owned(),
+            )),
+            (
+                AppleCommandExternalPlan::CleanupUncertain(
+                    CleanupFault::PreRemoveCreatedAtChanged,
+                ),
+                1,
+            ) => ExactInspection::Matching(self.matching_with_identity(
+                key,
+                true,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                self.created_at.to_owned() + chrono::Duration::seconds(1),
+            )),
+            (
                 AppleCommandExternalPlan::RepeatRetry(RetryFaultPoint::CleanupInspection),
                 0,
             ) if self.effects.retry_fault_is_active() => ExactInspection::Unavailable,
@@ -487,7 +566,14 @@ impl GatedProviderAdapter for TestProviderAdapter {
                 key,
                 self.stopped.load(Ordering::Acquire),
             )),
+        };
+        if let ExactInspection::Matching(inspection) = &result {
+            self.observer.observe_cleanup_identity(
+                CleanupStep::Inspect,
+                Self::identity_snapshot(inspection),
+            );
         }
+        result
     }
 
     fn classify_create_exit(&self, _exit: &CreateCliExitEvidence) -> CreateCliExitClass {
@@ -496,9 +582,11 @@ impl GatedProviderAdapter for TestProviderAdapter {
 
     fn stop_inspected(
         &self,
-        _inspection: &ProviderLaunchInspection,
+        inspection: &ProviderLaunchInspection,
         _deadline: ProviderCallDeadline,
     ) -> Result<(), EngineError> {
+        self.observer
+            .observe_cleanup_identity(CleanupStep::Stop, Self::identity_snapshot(inspection));
         self.observer.observe_provider_call(Some(CleanupStep::Stop));
         if matches!(
             self.plan,
@@ -513,9 +601,11 @@ impl GatedProviderAdapter for TestProviderAdapter {
 
     fn remove_inspected(
         &self,
-        _inspection: &ProviderLaunchInspection,
+        inspection: &ProviderLaunchInspection,
         _deadline: ProviderCallDeadline,
     ) -> Result<(), EngineError> {
+        self.observer
+            .observe_cleanup_identity(CleanupStep::Remove, Self::identity_snapshot(inspection));
         self.observer
             .observe_provider_call(Some(CleanupStep::Remove));
         if matches!(

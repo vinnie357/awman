@@ -199,18 +199,181 @@ fn parse_gated_launch_inspection(bytes: &[u8], key: &ProviderLaunchKey) -> Exact
     ExactInspection::Matching(inspection)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppleListValueContext {
+    Row,
+    Configuration,
+}
+
+struct DecodedAppleListValue {
+    value: serde_json::Value,
+    duplicate_identity: bool,
+}
+
+fn deserialize_apple_list_value<'de, D>(
+    deserializer: D,
+    context: AppleListValueContext,
+) -> Result<DecodedAppleListValue, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct AppleListValueVisitor {
+        context: AppleListValueContext,
+    }
+
+    impl AppleListValueVisitor {
+        fn decoded(value: serde_json::Value) -> DecodedAppleListValue {
+            DecodedAppleListValue {
+                value,
+                duplicate_identity: false,
+            }
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for AppleListValueVisitor {
+        type Value = DecodedAppleListValue;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an Apple container list row")
+        }
+
+        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+            Ok(Self::decoded(serde_json::Value::Bool(value)))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(Self::decoded(serde_json::Value::Number(value.into())))
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(Self::decoded(serde_json::Value::Number(value.into())))
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            let number = serde_json::Number::from_f64(value)
+                .ok_or_else(|| E::custom("invalid JSON number"))?;
+            Ok(Self::decoded(serde_json::Value::Number(number)))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_string(value.to_owned())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+            Ok(Self::decoded(serde_json::Value::String(value)))
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(Self::decoded(serde_json::Value::Null))
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(Self::decoded(serde_json::Value::Null))
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(value) = sequence.next_element()? {
+                values.push(value);
+            }
+            Ok(Self::decoded(serde_json::Value::Array(values)))
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            let mut values = serde_json::Map::new();
+            let mut duplicate_identity = false;
+            while let Some(key) = map.next_key::<String>()? {
+                let identity_key = match self.context {
+                    AppleListValueContext::Row => {
+                        matches!(key.as_str(), "configuration" | "Name" | "name" | "Names")
+                    }
+                    AppleListValueContext::Configuration => key == "id",
+                };
+                if identity_key && values.contains_key(&key) {
+                    duplicate_identity = true;
+                }
+                let decoded =
+                    if self.context == AppleListValueContext::Row && key == "configuration" {
+                        map.next_value::<AppleListConfigurationValue>()?.0
+                    } else {
+                        Self::decoded(map.next_value()?)
+                    };
+                duplicate_identity |= decoded.duplicate_identity;
+                values.insert(key, decoded.value);
+            }
+            Ok(DecodedAppleListValue {
+                value: serde_json::Value::Object(values),
+                duplicate_identity,
+            })
+        }
+    }
+
+    deserializer.deserialize_any(AppleListValueVisitor { context })
+}
+
+struct AppleListConfigurationValue(DecodedAppleListValue);
+
+impl<'de> serde::Deserialize<'de> for AppleListConfigurationValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_apple_list_value(deserializer, AppleListValueContext::Configuration).map(Self)
+    }
+}
+
+struct AppleListRow(DecodedAppleListValue);
+
+impl<'de> serde::Deserialize<'de> for AppleListRow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_apple_list_value(deserializer, AppleListValueContext::Row).map(Self)
+    }
+}
+
 struct AppleGatedProviderAdapter {
     custody: std::sync::Arc<ProviderCliCustodyRegistry>,
+    #[cfg(test)]
+    executable: std::path::PathBuf,
 }
 
 impl AppleGatedProviderAdapter {
     fn try_new() -> Result<std::sync::Arc<Self>, ProviderCliStartFailure> {
         Ok(std::sync::Arc::new(Self {
             custody: ProviderCliCustodyRegistry::try_new()?,
+            #[cfg(test)]
+            executable: std::path::PathBuf::from("container"),
+        }))
+    }
+
+    #[cfg(test)]
+    fn try_new_with_executable(
+        executable: &std::path::Path,
+    ) -> Result<std::sync::Arc<Self>, ProviderCliStartFailure> {
+        Ok(std::sync::Arc::new(Self {
+            custody: ProviderCliCustodyRegistry::try_new()?,
+            executable: executable.to_path_buf(),
         }))
     }
 
     fn run(&self, args: &[&str], deadline: ProviderCallDeadline) -> Option<BoundedProviderOutput> {
+        #[cfg(test)]
+        let mut command = Command::new(&self.executable);
+        #[cfg(not(test))]
         let mut command = Command::new("container");
         command.args(args);
         match run_bounded_provider_cli(command, deadline, &self.custody) {
@@ -221,24 +384,75 @@ impl AppleGatedProviderAdapter {
         }
     }
 
-    fn list_rows(&self, deadline: ProviderCallDeadline) -> Option<Vec<serde_json::Value>> {
+    fn list_rows(&self, deadline: ProviderCallDeadline) -> Option<Vec<AppleListRow>> {
         let output = self.run(&["list", "--all", "--format", "json"], deadline)?;
         if !output.status.success() {
             return None;
         }
-        serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout)
+        serde_json::from_slice::<Vec<AppleListRow>>(&output.stdout)
             .ok()
             .or_else(|| {
                 let mut rows = Vec::new();
+                let mut saw_row = false;
                 for line in output.stdout.split(|byte| *byte == b'\n') {
                     if line.iter().all(|byte| byte.is_ascii_whitespace()) {
                         continue;
                     }
+                    saw_row = true;
                     rows.push(serde_json::from_slice(line).ok()?);
                 }
-                Some(rows)
+                saw_row.then_some(rows)
             })
     }
+}
+
+fn set_strict_apple_list_name<'a>(
+    candidate: &mut Option<&'a str>,
+    value: &'a serde_json::Value,
+    trim_leading_slashes: bool,
+) -> Option<()> {
+    let raw = value.as_str()?;
+    if !trim_leading_slashes && raw.starts_with('/') {
+        return None;
+    }
+    let name = if trim_leading_slashes {
+        raw.trim_start_matches('/')
+    } else {
+        raw
+    };
+    if name.is_empty() || name.chars().any(char::is_whitespace) || candidate.is_some() {
+        return None;
+    }
+    *candidate = Some(name);
+    Some(())
+}
+
+fn strict_apple_list_row_name(row: &AppleListRow) -> Option<&str> {
+    if row.0.duplicate_identity {
+        return None;
+    }
+    let row = &row.0.value;
+    if !row.is_object() {
+        return None;
+    }
+    let mut candidate = None;
+    if let Some(configuration) = row.get("configuration") {
+        let id = configuration.as_object()?.get("id")?;
+        set_strict_apple_list_name(&mut candidate, id, false)?;
+    }
+    for key in ["Name", "name"] {
+        if let Some(value) = row.get(key) {
+            set_strict_apple_list_name(&mut candidate, value, true)?;
+        }
+    }
+    if let Some(value) = row.get("Names") {
+        let names = value.as_array()?;
+        if names.len() != 1 {
+            return None;
+        }
+        set_strict_apple_list_name(&mut candidate, &names[0], true)?;
+    }
+    candidate
 }
 
 impl GatedProviderAdapter for AppleGatedProviderAdapter {
@@ -265,10 +479,12 @@ impl GatedProviderAdapter for AppleGatedProviderAdapter {
         deadline: ProviderCallDeadline,
     ) -> Result<AbsenceObservation, NamePresence> {
         let rows = self.list_rows(deadline).ok_or(NamePresence::Unavailable)?;
-        if rows
-            .iter()
-            .any(|row| extract_apple_name(row) == name.as_str())
-        {
+        let mut present = false;
+        for row in &rows {
+            let row_name = strict_apple_list_row_name(row).ok_or(NamePresence::Ambiguous)?;
+            present |= row_name == name.as_str();
+        }
+        if present {
             return Err(NamePresence::Present);
         }
         let checked_at = chrono::Utc::now();
@@ -877,6 +1093,10 @@ fn serve_attach_socket(ctx: AttachHookCtx<'_>) -> Option<AttachSocketGuard> {
     })
     .ok()
 }
+
+#[cfg(all(test, unix))]
+#[path = "apple_cleanup_authority_test.rs"]
+mod cleanup_authority_test;
 
 #[cfg(test)]
 #[path = "apple_gated_p2_test.rs"]

@@ -10,6 +10,8 @@
 //! `AgentHandle`, …) live in `src/engine/agent_runtime/`.
 
 mod apple;
+#[cfg(all(test, unix))]
+mod apple_initial_inspection_bounds_test;
 mod attach_socket;
 mod backend;
 pub mod background;
@@ -24,6 +26,8 @@ mod gated_launch_p2b_test;
 mod gated_launch_p2c_test;
 #[cfg(all(test, unix))]
 mod gated_launch_retention_acceptance_test;
+#[cfg(all(test, unix))]
+mod gated_launch_retention_fairness_test;
 #[cfg(all(test, unix))]
 mod gated_launch_retention_quiescence_test;
 pub mod instance;

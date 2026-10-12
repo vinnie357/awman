@@ -131,6 +131,11 @@ pub(super) fn await_protected_release(
         return Err(LaunchRetentionReason::ChildStateUnknown);
     }
     revalidate_post_spawn(plan).map_err(|_| LaunchRetentionReason::PostSpawnControlChanged)?;
+    #[cfg(test)]
+    if let Some(boundary) = boundary {
+        boundary.observe_protected_launch_identity(&confirmed);
+    }
+
     let receipt = serde_json::to_vec(&LaunchReceipt {
         version: 1,
         nonce: &ready.nonce,
@@ -293,7 +298,8 @@ pub(super) fn cleanup_exact_launch(
     }
     let stopped = match adapter.inspect_launch(&plan.key, provider_call_deadline(enclosing)) {
         ExactInspection::Matching(inspection)
-            if inspection.state == ProviderState::Apple(AppleProviderState::Stopped) =>
+            if same_launch_identity(&inspection, &first)
+                && inspection.state == ProviderState::Apple(AppleProviderState::Stopped) =>
         {
             inspection
         }
@@ -470,6 +476,7 @@ pub(crate) trait OrchestratedAppleTestBoundary: Send + Sync {
         staged_manifests: std::collections::BTreeMap<String, Vec<u8>>,
     );
     fn observe_child_start(&self);
+    fn observe_protected_launch_identity(&self, inspection: &ProviderLaunchInspection);
     fn observe_protected_ready(&self);
     fn observe_accepted_release(&self);
     fn observe_provider_entry(&self, before_release: bool);

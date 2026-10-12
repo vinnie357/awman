@@ -299,16 +299,28 @@ async fn run_start(
             // Use exclusive write so a racing parallel `api start --background`
             // can't trample the PID we just spawned.
             if !daemon.claim_pidfile(child_pid)? {
-                if let Some(existing) = daemon.read_pid()? {
-                    if existing != child_pid
-                        && daemon_process::is_process_alive(existing)
-                        && daemon_process::pid_is_awman(existing)
-                    {
-                        return Err(CommandError::ApiServerAlreadyRunning { pid: existing });
-                    }
+                #[cfg(target_os = "macos")]
+                {
+                    resolve_background_claim_collision_with(
+                        &daemon,
+                        child_pid,
+                        daemon_process::is_process_alive,
+                        daemon_process::process_identity,
+                    )?;
                 }
-                // Stale or matching — overwrite.
-                daemon.force_write_pidfile(child_pid)?;
+                #[cfg(not(target_os = "macos"))]
+                {
+                    if let Some(existing) = daemon.read_pid()? {
+                        if existing != child_pid
+                            && daemon_process::is_process_alive(existing)
+                            && daemon_process::pid_is_awman(existing)
+                        {
+                            return Err(CommandError::ApiServerAlreadyRunning { pid: existing });
+                        }
+                    }
+                    // Stale or matching — overwrite.
+                    daemon.force_write_pidfile(child_pid)?;
+                }
             }
         }
 
@@ -420,6 +432,36 @@ async fn run_start(
         workdirs: workdir_strings,
         refreshed_key: false,
     }))
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_background_claim_collision_with<Alive, Identity>(
+    daemon: &DaemonProcess,
+    child_pid: u32,
+    is_alive: Alive,
+    identity: Identity,
+) -> Result<(), CommandError>
+where
+    Alive: Fn(u32) -> bool,
+    Identity: Fn(u32) -> daemon_process::ProcessIdentity,
+{
+    if let Some(existing) = daemon.read_pid()? {
+        if existing != child_pid && is_alive(existing) {
+            match identity(existing) {
+                daemon_process::ProcessIdentity::Match => {
+                    return Err(CommandError::ApiServerAlreadyRunning { pid: existing });
+                }
+                daemon_process::ProcessIdentity::NonMatch => {}
+                daemon_process::ProcessIdentity::Unknown => {
+                    return Err(CommandError::Data(crate::data::error::DataError::Other(
+                        daemon_process::UNKNOWN_PROCESS_IDENTITY_ERROR.into(),
+                    )));
+                }
+            }
+        }
+    }
+    daemon.force_write_pidfile(child_pid)?;
+    Ok(())
 }
 
 fn run_kill(
@@ -960,5 +1002,100 @@ mod tests {
         assert_eq!(frontend.messages.len(), 3, "must stream all lines");
         assert_eq!(frontend.messages[0], "line one");
         assert_eq!(frontend.messages[2], "line three");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn collision_daemon(root: &std::path::Path) -> DaemonProcess {
+        let engines = make_engines(root);
+        let api_paths = engines.auth_engine.api_paths().clone();
+        api_paths.ensure_root().unwrap();
+        api_daemon(&api_paths)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn background_claim_collision_with_unknown_identity_preserves_the_incumbent_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = collision_daemon(tmp.path());
+        std::fs::write(daemon.paths().pid_file(), b"004242\n").unwrap();
+
+        let error = resolve_background_claim_collision_with(
+            &daemon,
+            8484,
+            |_| true,
+            |_| daemon_process::ProcessIdentity::Unknown,
+        )
+        .expect_err("an unknown live incumbent must block the new child");
+
+        assert!(
+            matches!(
+                error,
+                CommandError::Data(crate::data::error::DataError::Other(message))
+                    if message == daemon_process::UNKNOWN_PROCESS_IDENTITY_ERROR
+            ),
+            "unknown identity must surface the fixed controlled error"
+        );
+        assert_eq!(
+            std::fs::read(daemon.paths().pid_file()).unwrap(),
+            b"004242\n",
+            "the distinct incumbent PID must survive byte for byte"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn background_claim_collision_with_matching_identity_reports_already_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = collision_daemon(tmp.path());
+        std::fs::write(daemon.paths().pid_file(), b"004242\n").unwrap();
+
+        let error = resolve_background_claim_collision_with(
+            &daemon,
+            8484,
+            |_| true,
+            |_| daemon_process::ProcessIdentity::Match,
+        )
+        .expect_err("a matching live incumbent must block the new child");
+
+        assert!(matches!(
+            error,
+            CommandError::ApiServerAlreadyRunning { pid: 4242 }
+        ));
+        assert_eq!(
+            std::fs::read(daemon.paths().pid_file()).unwrap(),
+            b"004242\n"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn background_claim_collision_overwrites_a_dead_incumbent_without_querying_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = collision_daemon(tmp.path());
+        daemon.force_write_pidfile(4242).unwrap();
+        resolve_background_claim_collision_with(
+            &daemon,
+            8484,
+            |_| false,
+            |_| panic!("a dead incumbent needs no identity query"),
+        )
+        .unwrap();
+        assert_eq!(daemon.read_pid().unwrap(), Some(8484));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn background_claim_collision_overwrites_a_live_nonmatching_incumbent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = collision_daemon(tmp.path());
+        daemon.force_write_pidfile(4242).unwrap();
+        resolve_background_claim_collision_with(
+            &daemon,
+            8484,
+            |_| true,
+            |_| daemon_process::ProcessIdentity::NonMatch,
+        )
+        .unwrap();
+        assert_eq!(daemon.read_pid().unwrap(), Some(8484));
     }
 }
