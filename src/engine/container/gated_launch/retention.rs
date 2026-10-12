@@ -419,6 +419,10 @@ fn retry_claimed_active_gated(
         ));
     };
 
+    if matches!(custody.lifecycle.state(), Ok(ChildLifecycleState::Prepared)) {
+        return Ok(ActiveGatedRetryOutcome::Retained);
+    }
+
     if let Some(monitor) = custody.gate_monitor.as_mut() {
         if !monitor.cancel_and_wait_until(deadline) {
             return Ok(ActiveGatedRetryOutcome::Retained);

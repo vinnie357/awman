@@ -1155,7 +1155,7 @@ fn exercise_public_path(
     let engine = AgentEngine::new(Arc::new(overlay), Arc::clone(&runtime));
     let sandbox_runtime =
         if scenario == AppleCommandScenario::Qualification(QualificationFault::SandboxRuntime) {
-            Some(SandboxRuntime::dsbx()?)
+            Some(SandboxRuntime::dsbx_for_option_resolution_test())
         } else {
             None
         };

@@ -194,6 +194,70 @@ struct ManagedFixtureRelease {
     authority: Option<ChildLifecycleAuthority>,
 }
 
+struct FailureSnapshot {
+    tag: String,
+    lifecycle: LifecycleProbe,
+    retention: RetentionProbe,
+    armed: bool,
+}
+
+impl FailureSnapshot {
+    fn new(tag: String, lifecycle: LifecycleProbe, retention: RetentionProbe) -> Self {
+        Self {
+            tag,
+            lifecycle,
+            retention,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for FailureSnapshot {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let lifecycle = self.lifecycle.snapshot();
+        let retention = self.retention.snapshot();
+        eprintln!(
+            "QUIESCENCE_DIAGNOSTIC tag={} state={:?} terminate_calls={} \
+             terminate_enqueued={} terminate_commands={} barrier_commands_consumed={} \
+             native_reaps={} poll_attempts={} poll_pending={} poll_errors={} \
+             poll_reaped={} poll_errno={:?} exit={:?} owns_unreaped_child={} \
+             resources_present={} retained={} unreaped={} managed_prepared={} \
+             managed_running={} managed_failed={} managed_exited={} \
+             retention_errno={:?} retention_resources_present={}",
+            self.tag,
+            lifecycle.state,
+            lifecycle.terminate_calls,
+            lifecycle.terminate_enqueued,
+            lifecycle.terminate_commands,
+            lifecycle.barrier_commands,
+            lifecycle.native_reaps,
+            lifecycle.native_poll_attempts,
+            lifecycle.native_poll_pending,
+            lifecycle.native_poll_errors,
+            lifecycle.native_poll_reaped,
+            lifecycle.last_poll_errno,
+            lifecycle.actual_exit,
+            lifecycle.owns_unreaped_child,
+            lifecycle.resources_present,
+            retention.retained,
+            retention.unreaped,
+            retention.managed_prepared,
+            retention.managed_running,
+            retention.managed_failed,
+            retention.managed_exited,
+            retention.last_errno,
+            retention.last_resources_present,
+        );
+    }
+}
+
 impl ManagedFixtureRelease {
     fn new(authority: ChildLifecycleAuthority) -> Self {
         Self {
@@ -282,6 +346,11 @@ fn retained_bind_fault_quiesces_each_managed_cli_representation_once() -> Result
         let ticket = retention
             .only_ticket()
             .ok_or("fixture did not retain exactly one gated launch")?;
+        let diagnostic = FailureSnapshot::new(
+            format!("quiesce-{index}"),
+            lifecycle.clone(),
+            retention.clone(),
+        );
 
         assert!(wait_until(Instant::now() + OBSERVATION_BOUND, || {
             let snapshot = lifecycle.snapshot();
@@ -304,6 +373,7 @@ fn retained_bind_fault_quiesces_each_managed_cli_representation_once() -> Result
         assert!(plan_path.exists());
         assert_eq!(adapter.destructive_calls(), (0, 0));
 
+        diagnostic.disarm();
         release.disarm();
         drop(slot);
         assert!(wait_until(Instant::now() + OBSERVATION_BOUND, || {

@@ -8,16 +8,18 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-use super::gated_launch::child_lifecycle_test_support::{lifecycle_probe, LifecycleProbe};
+use super::gated_launch::child_lifecycle_test_support::{
+    lifecycle_probe, prepare_with_pause, ActorPausePoint, LifecycleProbe, PollPause,
+};
 use super::gated_launch::retention_test_support::{registry_probe, RetentionProbe};
 use super::gated_launch::{
     canonical_inspection_revision, retain_detached_after_error, AbsenceObservation,
     ActiveGatedCustody, AppleProviderState, CanonicalInspectionRevisionInput,
-    ChildLifecycleAuthority, CreateCliExitClass, CreateCliExitEvidence, DurableLaunchPlan,
-    ExactInspection, GatedProviderAdapter, ImmutableImageId, InspectionObservationKind,
-    LaunchIdentityError, LaunchRetentionRegistry, LaunchRetentionTicket, NamePresence,
-    ProviderCallDeadline, ProviderKind, ProviderLaunchInspection, ProviderLaunchKey, ProviderState,
-    SanitizedProviderStateObservation, SpawnedCreateCli,
+    ChildLifecycleAuthority, ChildLifecycleState, CreateCliExitClass, CreateCliExitEvidence,
+    DurableLaunchPlan, ExactInspection, GatedProviderAdapter, ImmutableImageId,
+    InspectionObservationKind, LaunchIdentityError, LaunchRetentionRegistry, LaunchRetentionTicket,
+    NamePresence, ProviderCallDeadline, ProviderKind, ProviderLaunchInspection, ProviderLaunchKey,
+    ProviderState, SanitizedProviderStateObservation, SpawnedCreateCli,
 };
 use super::options::{ContainerName, ImageRef};
 use crate::data::startup_gate::load_startup_gate;
@@ -230,6 +232,16 @@ fn lower_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn wait_until(deadline: Instant, mut condition: impl FnMut() -> bool) -> bool {
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    condition()
+}
+
 fn active_custody(
     plan: DurableLaunchPlan,
     adapter: Arc<CleanupAdapter>,
@@ -263,6 +275,46 @@ fn active_custody(
     Ok((
         ActiveGatedCustody::new(plan, lifecycle, resource_loan, provider, None, None),
         probe,
+    ))
+}
+
+fn prepared_active_custody(
+    plan: DurableLaunchPlan,
+    adapter: Arc<CleanupAdapter>,
+) -> Result<(ActiveGatedCustody, LifecycleProbe, PollPause), Box<dyn Error>> {
+    let (prepared, pause) = prepare_with_pause(ActorPausePoint::BeforeFirstCommand)?;
+    let child = Command::new("/bin/sh")
+        .args(["-c", "exec sleep 30"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let lifecycle = match prepared.bind_started_child_with_resources(
+        SpawnedCreateCli::Piped(child),
+        Utc::now(),
+        Box::new(()),
+    ) {
+        Ok(lifecycle) => lifecycle,
+        Err(error) => {
+            drop(pause);
+            retain_detached_after_error(error.into_retained());
+            return Err("prepared retention fixture failed to bind child custody".into());
+        }
+    };
+    let probe = lifecycle_probe(&lifecycle);
+    let (_, resource_loan) = match lifecycle.transform_resources::<(), _>(|_| Ok(())) {
+        Ok(transformed) => transformed,
+        Err(error) => {
+            drop(pause);
+            let _ = lifecycle.terminate_local_cli(Instant::now() + Duration::from_secs(2));
+            return Err(error.into());
+        }
+    };
+    let provider: Arc<dyn GatedProviderAdapter> = adapter;
+    Ok((
+        ActiveGatedCustody::new(plan, lifecycle, resource_loan, provider, None, None),
+        probe,
+        pause,
     ))
 }
 
@@ -376,5 +428,88 @@ fn automatic_supervisor_rotates_past_retained_oldest_ticket_and_releases_later_c
     assert_eq!(later_final.resource_retain_calls, 1);
     assert_ne!(oldest_final.bound_pid, later_final.bound_pid);
     assert_eq!(adapter_final, (1, 1, 2, 2));
+    Ok(())
+}
+
+#[test]
+fn prepared_binding_defers_termination_until_running_then_consumes_one_command(
+) -> Result<(), Box<dyn Error>> {
+    let registry = LaunchRetentionRegistry::try_new()
+        .map_err(|_| "launch retention registry failed to start")?;
+    let probe = registry_probe(&registry);
+    let supervisor = probe.hold_supervisor_active_claims();
+    let adapter = Arc::new(CleanupAdapter::new("retention-prepared-binding", true));
+    let controls = ControlFixture::new(
+        "awman-altana-retention-prepared-binding",
+        "4141414141414141414141414141414141414141414141414141414141414141",
+    )?;
+    let plan = controls.plan(adapter.as_ref())?;
+    let (custody, lifecycle, pause) = prepared_active_custody(plan, Arc::clone(&adapter))?;
+    let paused = pause.wait_until_paused(Instant::now() + Duration::from_millis(600));
+    let ticket = registry.retain_active_gated(custody);
+    let initial = ticket_state(&probe, ticket);
+
+    let first_attempt = probe.advance_one_supervisor_active_attempt();
+    let after_first = ticket_state(&probe, ticket);
+    let second_attempt = probe.advance_one_supervisor_active_attempt();
+    let before_resume = lifecycle.snapshot();
+    let after_second = ticket_state(&probe, ticket);
+    let retention_before_resume = probe.snapshot();
+    let adapter_before_resume = (
+        CleanupAdapter::count(&adapter.inspect_attempts),
+        CleanupAdapter::count(&adapter.stop_calls),
+        CleanupAdapter::count(&adapter.remove_calls),
+    );
+
+    drop(pause);
+    let running_after_resume = wait_until(Instant::now() + Duration::from_millis(600), || {
+        lifecycle.snapshot().state == ChildLifecycleState::Running
+    });
+    let third_attempt = probe.advance_one_supervisor_active_attempt();
+    let final_state = ticket_state(&probe, ticket);
+    let final_lifecycle = lifecycle.snapshot();
+    let retention_final = probe.snapshot();
+    let adapter_final = (
+        CleanupAdapter::count(&adapter.inspect_attempts),
+        CleanupAdapter::count(&adapter.stop_calls),
+        CleanupAdapter::count(&adapter.remove_calls),
+    );
+    drop(supervisor);
+    drop(registry);
+
+    assert!(paused);
+    assert_eq!(initial, (true, 1, 0));
+    assert_eq!(first_attempt?, Some(ticket));
+    assert_eq!(after_first, (true, 1, 0));
+    assert_eq!(second_attempt?, Some(ticket));
+    assert_eq!(after_second, (true, 1, 0));
+    assert_eq!(before_resume.state, ChildLifecycleState::Prepared);
+    assert_eq!(before_resume.terminate_calls, 0);
+    assert_eq!(before_resume.terminate_enqueued, 0);
+    assert_eq!(before_resume.terminate_commands, 0);
+    assert_eq!(before_resume.native_reaps, 0);
+    assert!(before_resume.actual_exit.is_none());
+    assert!(before_resume.bound_pid.is_none());
+    assert!(!before_resume.owns_unreaped_child);
+    assert!(before_resume.resources_present);
+    assert_eq!(retention_before_resume.retained, 1);
+    assert_eq!(retention_before_resume.unreaped, 1);
+    assert_eq!(adapter_before_resume, (0, 0, 0));
+    assert!(running_after_resume);
+    assert_eq!(third_attempt?, Some(ticket));
+    assert_eq!(final_state, (false, 0, 1));
+    assert_eq!(final_lifecycle.terminate_calls, 1);
+    assert_eq!(final_lifecycle.terminate_enqueued, 1);
+    assert_eq!(final_lifecycle.terminate_commands, 1);
+    assert_eq!(final_lifecycle.native_reaps, 1);
+    assert_eq!(final_lifecycle.native_poll_reaped, 1);
+    assert!(final_lifecycle.actual_exit.is_some());
+    assert!(final_lifecycle.bound_pid.is_some());
+    assert!(!final_lifecycle.owns_unreaped_child);
+    assert!(!final_lifecycle.resources_present);
+    assert_eq!(final_lifecycle.resource_retain_calls, 1);
+    assert_eq!(retention_final.retained, 0);
+    assert_eq!(retention_final.unreaped, 0);
+    assert_eq!(adapter_final, (2, 1, 1));
     Ok(())
 }

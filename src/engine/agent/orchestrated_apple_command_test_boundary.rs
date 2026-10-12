@@ -20,7 +20,7 @@ use chrono::Utc;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const NONCE: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
@@ -50,7 +50,7 @@ impl TestBoundary {
         effects: AppleCommandEffects,
     ) -> Self {
         let script = format!(
-            "#!/bin/sh\ncontrol=''\nprev=''\nfor arg in \"$@\"; do\n  if [ \"$prev\" = '-v' ]; then\n    case \"$arg\" in *:/.awman/startup-gate/control) control=${{arg%:/.awman/startup-gate/control}} ;; esac\n  fi\n  prev=$arg\ndone\nif [ -z \"$control\" ]; then exit 0; fi\nif [ ! -f \"$control/../launch-plan.json\" ]; then exit 0; fi\nwhile [ ! -f \"$control/release.json\" ]; do sleep 0.01; done\numask 077\nprintf '%s' '{{\"nonce\":\"{NONCE}\",\"version\":1}}' > \"$control/.released\"\nprintf 'entered\\n' >> \"$control/provider-entry.marker\"\nsleep 0.05\nexit 0\n"
+            "#!/bin/sh\ncontrol=''\nprev=''\nfor arg in \"$@\"; do\n  if [ \"$prev\" = '-v' ]; then\n    case \"$arg\" in *:/.awman/startup-gate/control) control=${{arg%:/.awman/startup-gate/control}} ;; esac\n  fi\n  prev=$arg\ndone\nif [ -z \"$control\" ]; then exit 0; fi\nif [ ! -f \"$control/../launch-plan.json\" ]; then exit 0; fi\nwhile [ ! -f \"$control/release.json\" ]; do sleep 0.01; done\numask 077\nreleased_tmp=\"$control/.released.tmp.$$\"\nprintf '%s' '{{\"nonce\":\"{NONCE}\",\"version\":1}}' > \"$released_tmp\" || exit 1\nmv \"$released_tmp\" \"$control/.released\" || exit 1\nprintf 'entered\\n' >> \"$control/provider-entry.marker\"\nsleep 0.05\nexit 0\n"
         );
         let (cli_dir, executable) = match tempfile::tempdir() {
             Ok(cli_dir) => {
@@ -239,6 +239,7 @@ impl OrchestratedAppleTestBoundary for TestBoundary {
     }
 
     fn observe_child_start(&self) {
+        self.adapter.created_at.get_or_init(Utc::now);
         self.adapter.created.store(true, Ordering::Release);
         self.observer.observe_child_start();
     }
@@ -311,7 +312,7 @@ struct TestProviderAdapter {
     created: AtomicBool,
     stopped: AtomicBool,
     removed: AtomicBool,
-    created_at: chrono::DateTime<Utc>,
+    created_at: OnceLock<chrono::DateTime<Utc>>,
     launch_inspections: AtomicUsize,
     effects: AppleCommandEffects,
 }
@@ -330,7 +331,7 @@ impl TestProviderAdapter {
             created: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             removed: AtomicBool::new(false),
-            created_at: Utc::now(),
+            created_at: OnceLock::new(),
             launch_inspections: AtomicUsize::new(0),
             effects,
         }
@@ -407,12 +408,30 @@ impl TestProviderAdapter {
         }
     }
 
-    fn matching(&self, key: &ProviderLaunchKey, stopped: bool) -> ProviderLaunchInspection {
-        self.matching_with_identity(
+    fn matching_with_captured_identity(
+        &self,
+        key: &ProviderLaunchKey,
+        stopped: bool,
+        runtime_id: String,
+        created_at_offset: chrono::Duration,
+    ) -> ExactInspection {
+        let Some(created_at) = self.created_at.get() else {
+            return ExactInspection::Unavailable;
+        };
+        ExactInspection::Matching(self.matching_with_identity(
+            key,
+            stopped,
+            runtime_id,
+            created_at.to_owned() + created_at_offset,
+        ))
+    }
+
+    fn matching(&self, key: &ProviderLaunchKey, stopped: bool) -> ExactInspection {
+        self.matching_with_captured_identity(
             key,
             stopped,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-            self.created_at.to_owned(),
+            chrono::Duration::zero(),
         )
     }
 
@@ -502,13 +521,11 @@ impl GatedProviderAdapter for TestProviderAdapter {
             if matches!(self.plan, AppleCommandExternalPlan::ReceiptSecondInspection) && index == 1
             {
                 return match self.effects.wait_at_second_inspection(deadline.instant()) {
-                    SecondInspectionRelease::Matching => {
-                        ExactInspection::Matching(self.matching(key, false))
-                    }
+                    SecondInspectionRelease::Matching => self.matching(key, false),
                     SecondInspectionRelease::Unavailable => ExactInspection::Unavailable,
                 };
             }
-            return ExactInspection::Matching(self.matching(key, false));
+            return self.matching(key, false);
         }
         self.observer
             .observe_provider_call(Some(CleanupStep::Inspect));
@@ -541,31 +558,28 @@ impl GatedProviderAdapter for TestProviderAdapter {
                     CleanupFault::PreRemoveRuntimeIdChanged,
                 ),
                 1,
-            ) => ExactInspection::Matching(self.matching_with_identity(
+            ) => self.matching_with_captured_identity(
                 key,
                 true,
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
-                self.created_at.to_owned(),
-            )),
+                chrono::Duration::zero(),
+            ),
             (
                 AppleCommandExternalPlan::CleanupUncertain(
                     CleanupFault::PreRemoveCreatedAtChanged,
                 ),
                 1,
-            ) => ExactInspection::Matching(self.matching_with_identity(
+            ) => self.matching_with_captured_identity(
                 key,
                 true,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
-                self.created_at.to_owned() + chrono::Duration::seconds(1),
-            )),
+                chrono::Duration::seconds(1),
+            ),
             (
                 AppleCommandExternalPlan::RepeatRetry(RetryFaultPoint::CleanupInspection),
                 0,
             ) if self.effects.retry_fault_is_active() => ExactInspection::Unavailable,
-            _ => ExactInspection::Matching(self.matching(
-                key,
-                self.stopped.load(Ordering::Acquire),
-            )),
+            _ => self.matching(key, self.stopped.load(Ordering::Acquire)),
         };
         if let ExactInspection::Matching(inspection) = &result {
             self.observer.observe_cleanup_identity(
