@@ -1,9 +1,9 @@
 ---
 name: release-prep
-description: Prepare amux for a new release. Updates version numbers, docs, getting-started, release notes, and blog post. Does NOT run the release script.
+description: Prepare awman for a new release. Updates version numbers, docs, getting-started, release notes, and blog post. Does NOT run the release script.
 ---
 
-# amux Release Prep Skill
+# awman Release Prep Skill
 
 Use this skill when the user asks to "prepare for release vX.Y.Z", "bump the version", or "get ready to release".
 
@@ -39,8 +39,8 @@ Also read:
 - `docs/releases/` — understand the format of prior release notes
 - `docs/blog/` — understand the blog post style (first-person, problem-driven, no buzzwords)
 - `README.md` — check if new commands or features need to be added
-- `docs/getting-started.md` — check if new workflow steps need to be covered
-- `docs/usage.md` — verify new subcommands are already documented (usually they are; added alongside the code)
+- `docs/00-getting-started.md` — check if new workflow steps need to be covered
+- the relevant numbered doc under `docs/` (e.g. `docs/07-configuration.md`) — verify new subcommands/config fields are already documented (usually they are; added alongside the code)
 
 ---
 
@@ -58,13 +58,15 @@ Update to the new version. There is no `Cargo.lock` to worry about in this proje
 
 ## Step 3: Update README.md
 
+**Writing about squad:** squad is a *group of agents the reader owns*, not a daemon or a scheduler. Write "your squad is a group of agents that…", "create a squad to automate your work", "create a new task for your squad to tackle" — never "squad is a background daemon" or "automate work with squad". "squad daemon" stays only in lifecycle, auth, and API-conflict material (`squad start`/`stop`/`logs`, `AWMAN_SQUAD_KEY`), where it names the literal process and matches the literal error text a reader will hit.
+
 Check for any new top-level commands or major features that aren't mentioned. The README has a "Commands" section — add new subcommands there. Keep it brief: one line per command.
 
-If the feature is significant enough to have its own section (like `amux claws` got in v0.2), add one. Otherwise, a line in the commands table is enough.
+If the feature is significant enough to have its own section (like `awman claws` got in v0.2), add one. Otherwise, a line in the commands table is enough.
 
 ---
 
-## Step 4: Update docs/getting-started.md
+## Step 4: Update docs/00-getting-started.md
 
 The getting-started guide covers the first-time user workflow. Add any new commands that a new user would encounter in their first session. Skip internal implementation details; focus on workflow.
 
@@ -75,12 +77,12 @@ Common additions:
 
 ---
 
-## Step 5: Verify docs/usage.md
+## Step 5: Verify the numbered docs under docs/
 
-The usage guide is usually kept up to date alongside the code. Verify that new subcommands are documented. If anything is missing, add it following the existing pattern:
+The numbered guides (`docs/01-concepts.md` through `docs/15-parallel-workflows.md`) are usually kept up to date alongside the code. Verify that new subcommands or config fields are documented in the relevant one. If anything is missing, add it following the existing pattern:
 
 ```markdown
-### `amux <command> [flags]`
+### `awman <command> [flags]`
 
 Brief description of what it does.
 
@@ -92,7 +94,7 @@ Brief description of what it does.
 **Examples**
 
 ```sh
-amux <command>
+awman <command>
 ```
 ```
 
@@ -119,7 +121,7 @@ Create `docs/releases/vX.Y.Z.md`:
 - Fixed <symptom> in <context>.
 ```
 
-Keep it factual and brief. No marketing language. Focus on what a developer using amux would care about.
+Keep it factual and brief. No marketing language. Focus on what a developer using awman would care about.
 
 ---
 
@@ -132,7 +134,7 @@ Create `docs/blog/NNNN-slug.md` where NNNN is the next number after the last pos
 - Open with the problem or itch, not the solution
 - Explain *why* the feature matters before explaining *what* it does
 - Focus on the improved workflows, problems solved, and benefits to security that the tool brings rather than how it works internally
-- Show examples with code/shell blocks (or screenshot placeholders for the human to fill in later, don't try to do ASCII art)
+- Show examples with code/shell blocks (or screenshot placeholders for the human to fill in later, don't try to do ASCII art). Keep placeholders inside an HTML comment — see the blog-post skill — so the docs link check does not flag an image that does not exist yet
 - No buzzwords ("revolutionary", "game-changing", "seamless", "robust")
 - No fluff ("In this post I will...", "I'm excited to announce...")
 - Inlcude a quick blurb on how to install the tool in the first 1/3 of the post (the curl|sh version)
@@ -141,7 +143,7 @@ Create `docs/blog/NNNN-slug.md` where NNNN is the next number after the last pos
 
 Header format:
 ```markdown
-# amux X.Y: Short title
+# awman X.Y: Short title
 
 <short intro>
 
@@ -167,8 +169,8 @@ Before finishing, verify:
 
 - [ ] `Cargo.toml` version updated
 - [ ] `README.md` reflects new commands/features
-- [ ] `docs/getting-started.md` covers new workflow steps
-- [ ] `docs/usage.md` documents new subcommands (check, don't assume)
+- [ ] `docs/00-getting-started.md` covers new workflow steps
+- [ ] relevant numbered doc(s) under `docs/` document new subcommands/config fields (check, don't assume)
 - [ ] `docs/releases/vX.Y.Z.md` created
 - [ ] `docs/blog/NNNN-slug.md` created
 - [ ] Release script NOT run (user does that separately)

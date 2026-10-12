@@ -10,7 +10,9 @@
 //! handled by the TUI; the CLI uses safe non-interactive defaults for any
 //! interactive Q&A when stdin is not a TTY.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicI32;
+use std::sync::Arc;
 
 use clap::ArgMatches;
 
@@ -34,7 +36,7 @@ use super::user_message::CliUserMessageQueue;
 /// Single CLI frontend struct. Implements every per-command frontend trait
 /// in `src/frontend/cli/per_command/`.
 pub struct CliFrontend {
-    matches: ArgMatches,
+    pub(crate) matches: ArgMatches,
     /// Cached canonical command path (resolved via `command_path_from_matches`).
     pub(crate) command_path: Vec<String>,
     pub(crate) messages: CliUserMessageQueue,
@@ -68,6 +70,292 @@ pub struct CliFrontend {
     /// interactive prompt and rebind by spawning a fresh reader thread that
     /// shares the same channel. Cleared when the active step ends.
     pub(crate) container_stdin_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+    pub(crate) squad_attach_cancel: Option<tokio_util::sync::CancellationToken>,
+    pub(crate) squad_attach_exit_code: Arc<AtomicI32>,
+}
+
+#[async_trait::async_trait]
+impl crate::command::commands::squad::commands::SquadCommandFrontend for CliFrontend {
+    /// The CLI runs in the user's own shell, so the process's current
+    /// directory is theirs and the mount-scope question can be put to them.
+    fn is_local_user_session(&self) -> bool {
+        true
+    }
+
+    /// The daemon host: the unattended frontends its evaluator drives agents
+    /// and workflows with. Answers, not decisions — the policy behind them is
+    /// Layer 2's.
+    fn squad_run_frontends(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::command::commands::squad::evaluation::SquadRunFrontends>>
+    {
+        Some(crate::frontend::squad::unattended::UnattendedFrontends::shared())
+    }
+
+    async fn serve_squad_daemon(
+        &mut self,
+        handles: crate::command::commands::squad::daemon_runtime::SquadDaemonHandles,
+    ) -> Result<(), CommandError> {
+        crate::frontend::squad::serve(handles).await
+    }
+
+    /// stdout belongs to `--json` consumers, so the key banner goes to stderr
+    /// — the same place it has always been printed.
+    fn show_key_setup(
+        &mut self,
+        setup: &crate::command::commands::squad::supervisor::SquadKeySetup,
+    ) {
+        eprintln!("{}", setup.body);
+    }
+
+    fn ask_task_name(&mut self) -> Result<String, CommandError> {
+        require_named_input("task name (slug)?")
+    }
+
+    /// The same multi-line stdin read `new spec --interview` uses, so the CLI
+    /// interview collects the same freeform description the TUI's multiline
+    /// dialog does.
+    fn ask_task_description(&mut self) -> Result<String, CommandError> {
+        require_multiline_input(
+            "describe the new squad task including its triggering conditions and how squad \
+             should handle the task each time it is triggered?",
+        )
+    }
+
+    fn ask_task_workspace_choice(
+        &mut self,
+    ) -> Result<crate::command::commands::squad::commands::TaskWorkspaceChoice, CommandError> {
+        use crate::command::commands::squad::commands::TaskWorkspaceChoice;
+        let choice = super::per_command::helpers::pick_numbered(
+            "task workspace?",
+            &["Default Task Workspace", "Custom Folder / Repo"],
+            1,
+        );
+        Ok(if choice == 2 {
+            TaskWorkspaceChoice::CustomFolderOrRepo
+        } else {
+            TaskWorkspaceChoice::DefaultTaskWorkspace
+        })
+    }
+
+    fn ask_task_overlay(&mut self, existing: &[String]) -> Result<Option<String>, CommandError> {
+        let prompt = format!(
+            "add an overlay ({} so far)? [dir()/ssh()/env()/skill() syntax, blank to finish]",
+            existing.len()
+        );
+        match super::per_command::helpers::read_line(&prompt) {
+            Some(s) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    fn confirm_non_git_workspace(&mut self, path: &Path) -> Result<bool, CommandError> {
+        Ok(super::per_command::helpers::yes_no(
+            &format!(
+                "{} is not the root of a Git repository. Keep this path? \
+                 (no = choose a different one)",
+                path.display()
+            ),
+            false,
+        ))
+    }
+
+    fn confirm_parent_directory_workspace(
+        &mut self,
+        path: &Path,
+        current_dir: &Path,
+    ) -> Result<bool, CommandError> {
+        Ok(super::per_command::helpers::yes_no(
+            &format!(
+                "{} is a parent directory of {}. Mount it anyway? \
+                 (no = choose a different one)",
+                path.display(),
+                current_dir.display()
+            ),
+            false,
+        ))
+    }
+
+    fn ask_task_interval(&mut self) -> Result<String, CommandError> {
+        // Blank keeps the documented default; a value is parsed & validated in
+        // Layer 1/2, never here.
+        match super::per_command::helpers::read_line("evaluation interval [6h]?") {
+            Some(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
+            Some(_) => Ok("6h".to_string()),
+            None => Err(CommandError::InteractiveInputUnavailable {
+                prompt: "evaluation interval".into(),
+            }),
+        }
+    }
+
+    fn ask_task_repo(&mut self) -> Result<PathBuf, CommandError> {
+        match super::per_command::helpers::read_line("repository directory [current dir]?") {
+            Some(s) if !s.trim().is_empty() => Ok(PathBuf::from(s.trim())),
+            Some(_) => std::env::current_dir().map_err(|error| {
+                CommandError::Other(format!("cannot resolve current dir: {error}"))
+            }),
+            None => Err(CommandError::InteractiveInputUnavailable {
+                prompt: "repository directory".into(),
+            }),
+        }
+    }
+
+    fn ask_task_agent(&mut self) -> Result<Option<String>, CommandError> {
+        match super::per_command::helpers::read_line("leader agent (optional, Enter to skip)?") {
+            Some(s) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    fn ask_task_model(&mut self) -> Result<Option<String>, CommandError> {
+        match super::per_command::helpers::read_line("leader model (optional, Enter to skip)?") {
+            Some(s) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    // ── Task agent pool (WI 0110) ──────────────────────────────────────
+
+    fn ask_use_global_squad_config(&mut self) -> Result<bool, CommandError> {
+        Ok(super::per_command::helpers::yes_no(
+            "use the global squad agent/model settings for this task? \
+             (no = choose this task's own agents and models)",
+            true,
+        ))
+    }
+
+    fn ask_agent_model(
+        &mut self,
+        agent: &str,
+        existing: &[String],
+    ) -> Result<Option<String>, CommandError> {
+        let prompt = format!(
+            "add a model for {agent} ({} so far)? [blank to finish]",
+            existing.len()
+        );
+        match super::per_command::helpers::read_line(&prompt) {
+            Some(s) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    fn ask_additional_agent(
+        &mut self,
+        existing: &[String],
+    ) -> Result<Option<String>, CommandError> {
+        let prompt = format!(
+            "add another agent this task may use ({} so far)? [blank to finish]",
+            existing.len()
+        );
+        match super::per_command::helpers::read_line(&prompt) {
+            Some(s) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    // ── Task edit (WI 0110) ────────────────────────────────────────────
+
+    fn ask_edited_description(&mut self, current: &str) -> Result<String, CommandError> {
+        eprintln!("awman: current description:\n{current}");
+        require_multiline_input("new task description? (blank line then Ctrl-D keeps the current)")
+            .map(|edited| {
+                if edited.trim().is_empty() {
+                    current.to_string()
+                } else {
+                    edited
+                }
+            })
+    }
+
+    fn ask_edited_interval(&mut self, current: &str) -> Result<String, CommandError> {
+        match super::per_command::helpers::read_line(&format!("evaluation interval [{current}]?")) {
+            Some(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
+            Some(_) => Ok(current.to_string()),
+            None => Err(CommandError::InteractiveInputUnavailable {
+                prompt: "evaluation interval".into(),
+            }),
+        }
+    }
+
+    fn ask_edited_agent(&mut self, current: Option<&str>) -> Result<Option<String>, CommandError> {
+        Ok(edited_optional(
+            "leader agent",
+            current,
+            super::per_command::helpers::read_line,
+        ))
+    }
+
+    fn ask_edited_model(&mut self, current: Option<&str>) -> Result<Option<String>, CommandError> {
+        Ok(edited_optional(
+            "leader model",
+            current,
+            super::per_command::helpers::read_line,
+        ))
+    }
+
+    fn ask_replace_overlays(&mut self, current: &[String]) -> Result<bool, CommandError> {
+        let shown = if current.is_empty() {
+            "(none)".to_string()
+        } else {
+            current.join(", ")
+        };
+        Ok(super::per_command::helpers::yes_no(
+            &format!("replace the task's overlays? current: {shown}"),
+            false,
+        ))
+    }
+
+    fn ask_replace_agent_pool(
+        &mut self,
+        current: &std::collections::BTreeMap<String, Vec<String>>,
+    ) -> Result<bool, CommandError> {
+        let shown = if current.is_empty() {
+            "(inherits the global squad settings)".to_string()
+        } else {
+            current
+                .iter()
+                .map(|(agent, models)| format!("{agent}={}", models.join(",")))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        Ok(super::per_command::helpers::yes_no(
+            &format!("replace the task's agents and models? current: {shown}"),
+            false,
+        ))
+    }
+
+    fn ask_task_mount_scope(
+        &mut self,
+    ) -> Result<crate::data::fs::task_store::MountScope, CommandError> {
+        use crate::data::fs::task_store::MountScope;
+        match super::per_command::helpers::read_line("mount scope: [gitroot]/cwd?") {
+            Some(s) if s.trim().eq_ignore_ascii_case("cwd") => Ok(MountScope::Cwd),
+            Some(_) => Ok(MountScope::GitRoot),
+            None => Err(CommandError::InteractiveInputUnavailable {
+                prompt: "mount scope".into(),
+            }),
+        }
+    }
+
+    fn ask_delete_task_dir(
+        &mut self,
+        _name: &str,
+        path: &std::path::Path,
+    ) -> Result<bool, CommandError> {
+        // No TTY (piped / --non-interactive) keeps the safe default: do not
+        // delete the persistent directory.
+        if self.non_interactive || !super::output::stdin_is_tty() {
+            return Ok(false);
+        }
+        eprintln!(
+            "awman: also delete the task directory {}? [y/N]",
+            path.display()
+        );
+        match super::per_command::helpers::read_line("choice [y/N]:") {
+            Some(s) => Ok(matches!(s.trim().to_lowercase().as_str(), "y" | "yes")),
+            None => Ok(false),
+        }
+    }
 }
 
 /// RAII guard: enables raw mode on creation, disables it on drop.
@@ -89,21 +377,7 @@ impl Drop for RawModeGuard {
 impl CliFrontend {
     pub fn new(matches: ArgMatches) -> Self {
         let command_path = command_path_from_matches(&matches);
-        let explicit_flag = {
-            let path_strs: Vec<&str> = command_path.iter().map(|s| s.as_str()).collect();
-            let mut m = &matches;
-            for seg in &path_strs {
-                match m.subcommand_matches(seg) {
-                    Some(sub) => m = sub,
-                    None => break,
-                }
-            }
-            m.try_get_one::<bool>("non-interactive")
-                .ok()
-                .flatten()
-                .copied()
-                .unwrap_or(false)
-        };
+        let explicit_flag = Self::explicit_non_interactive(&matches, &command_path);
         let non_interactive = crate::frontend::effective_non_interactive(explicit_flag);
         Self {
             matches,
@@ -116,7 +390,37 @@ impl CliFrontend {
             stdin_reader_shutdown: None,
             stdin_reader_handle: None,
             container_stdin_tx: None,
+            squad_attach_cancel: None,
+            squad_attach_exit_code: Arc::new(AtomicI32::new(0)),
         }
+    }
+
+    /// The raw, TTY-independent half of the cached `non_interactive` mode:
+    /// `true` if either `--non-interactive` was passed explicitly, or
+    /// `--json` was — `--json` implies `--non-interactive` (one of the
+    /// catalogue's documented `implies` edges, see `ResolvedFlags`/F-10).
+    /// The built command's own flags always see this implication via
+    /// catalogue resolution; this cache must agree, or a `--json` caller on
+    /// a TTY gets a frontend that still thinks it is interactive while the
+    /// command it built believes it is non-interactive JSON. Callers pass
+    /// this into [`crate::frontend::effective_non_interactive`] to fold in
+    /// the no-TTY fallback.
+    fn explicit_non_interactive(matches: &ArgMatches, command_path: &[String]) -> bool {
+        let mut m = matches;
+        for seg in command_path {
+            match m.subcommand_matches(seg) {
+                Some(sub) => m = sub,
+                None => break,
+            }
+        }
+        let flag = |name: &str| {
+            m.try_get_one::<bool>(name)
+                .ok()
+                .flatten()
+                .copied()
+                .unwrap_or(false)
+        };
+        flag("non-interactive") || flag("json")
     }
 
     /// Returns `true` when the `--json` flag is active for the current
@@ -241,6 +545,13 @@ impl CommandFrontend for CliFrontend {
         Ok(m.get_one::<u16>(flag).copied())
     }
 
+    fn flag_usize(&self, command_path: &[&str], flag: &str) -> Result<Option<usize>, CommandError> {
+        let Some(m) = self.matches_for(command_path) else {
+            return Ok(None);
+        };
+        Ok(m.get_one::<usize>(flag).copied())
+    }
+
     fn argument(&self, command_path: &[&str], name: &str) -> Result<Option<String>, CommandError> {
         let Some(m) = self.matches_for(command_path) else {
             return Ok(None);
@@ -330,6 +641,7 @@ impl ConfigCommandFrontend for CliFrontend {
     fn present_config_table(
         &mut self,
         _rows: &[crate::command::commands::config::ConfigFieldRow],
+        _rejected: Option<&crate::command::commands::config::ConfigEditRejection>,
     ) -> Result<
         Option<crate::command::commands::config::ConfigEditRequest>,
         crate::command::error::CommandError,
@@ -510,6 +822,27 @@ fn ensure_watch_signal_handler_installed() {
     }
 }
 
+/// One optional-field edit prompt (WI 0110): show the current value, accept a
+/// replacement, keep the current value on a blank submission, and accept the
+/// literal `-` as "clear this back to the squad default".
+///
+/// The explicit clear token is what makes `Option<Option<_>>` answerable from a
+/// line-oriented prompt: blank already means "keep", so clearing needs a token
+/// of its own rather than a second question. The TUI needs no such token — its
+/// box arrives prefilled, so emptying it says the same thing.
+fn edited_optional(
+    label: &str,
+    current: Option<&str>,
+    read_line: fn(&str) -> Option<String>,
+) -> Option<String> {
+    let shown = current.unwrap_or("default");
+    match read_line(&format!("{label} [{shown}] ('-' to clear)?")) {
+        Some(value) if value.trim() == "-" => None,
+        Some(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        _ => current.map(str::to_string),
+    }
+}
+
 // `ApiServerStartCommandFrontend` requires a `serve_until_shutdown` method
 // — provided in `per_command::api_server`.
 
@@ -556,6 +889,42 @@ mod tests {
             .unwrap();
         let path = command_path_from_matches(&m);
         assert_eq!(path, vec!["remote", "session", "start"]);
+    }
+
+    // ─── explicit_non_interactive (--json implies --non-interactive) ──────────
+
+    /// Regression: `--json` alone (no explicit `--non-interactive`) must
+    /// still resolve `explicit_non_interactive` to `true`, matching
+    /// `ResolvedFlags`' `json -> non-interactive` catalogue implication —
+    /// otherwise a `--json` caller on a TTY gets a frontend that still
+    /// thinks it is interactive while the command it built (which reads its
+    /// flags through `ResolvedFlags`) believes it is non-interactive JSON.
+    #[test]
+    fn json_alone_implies_explicit_non_interactive() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        let m = cmd
+            .try_get_matches_from(["awman", "ready", "--json"])
+            .unwrap();
+        let path = command_path_from_matches(&m);
+        assert!(CliFrontend::explicit_non_interactive(&m, &path));
+    }
+
+    #[test]
+    fn explicit_non_interactive_flag_alone_is_still_honoured() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        let m = cmd
+            .try_get_matches_from(["awman", "ready", "--non-interactive"])
+            .unwrap();
+        let path = command_path_from_matches(&m);
+        assert!(CliFrontend::explicit_non_interactive(&m, &path));
+    }
+
+    #[test]
+    fn neither_json_nor_non_interactive_is_not_explicit() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        let m = cmd.try_get_matches_from(["awman", "ready"]).unwrap();
+        let path = command_path_from_matches(&m);
+        assert!(!CliFrontend::explicit_non_interactive(&m, &path));
     }
 
     // ─── flag_bool ────────────────────────────────────────────────────────────

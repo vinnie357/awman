@@ -7,10 +7,15 @@
 #[path = "../helpers/mod.rs"]
 mod helpers;
 
+mod acp_support;
 mod container_docker;
 mod container_io;
 mod context_overlay_0087;
+mod credential_argv_docker;
+mod credential_refresh_integration;
 mod git_engine;
+mod issue_e2e;
+mod issue_integration;
 mod overlay_engine;
 mod sbx;
 mod stuck_event_wiring;

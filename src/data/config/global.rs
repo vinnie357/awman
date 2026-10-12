@@ -7,8 +7,21 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::data::config::env::{Env, EnvSnapshot};
-use crate::data::config::repo::{ApiConfig, RemoteConfig};
+use crate::data::config::repo::{
+    validate_auth_refresh, ApiConfig, AuthRefreshConfig, RemoteConfig, SquadConfig,
+};
 use crate::data::error::DataError;
+use crate::data::fs::SquadPaths;
+
+/// Behavior when a configured ACP launch is requested for an agent that does
+/// not support ACP.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LaunchModeFallback {
+    Stdio,
+    #[default]
+    Error,
+}
 
 /// Filename of the global config inside the resolved global directory.
 pub const GLOBAL_CONFIG_FILENAME: &str = "config.json";
@@ -35,6 +48,8 @@ pub struct GlobalConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api: Option<ApiConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub squad: Option<SquadConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub remote: Option<RemoteConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlays: Option<Vec<String>>,
@@ -44,6 +59,15 @@ pub struct GlobalConfig {
     pub workers: Option<u8>,
     #[serde(rename = "baseImage", skip_serializing_if = "Option::is_none")]
     pub base_image: Option<String>,
+    #[serde(
+        rename = "maxConcurrentAgents",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_concurrent_agents: Option<usize>,
+    #[serde(rename = "launchModeFallback", skip_serializing_if = "Option::is_none")]
+    pub launch_mode_fallback: Option<LaunchModeFallback>,
+    #[serde(rename = "authRefresh", skip_serializing_if = "Option::is_none")]
+    pub auth_refresh: Option<AuthRefreshConfig>,
 }
 
 impl GlobalConfig {
@@ -103,12 +127,37 @@ impl GlobalConfig {
 
     /// Same as [`load`] but reads paths via the supplied env snapshot.
     pub fn load_with(env: &EnvSnapshot) -> Result<Self, DataError> {
-        let path = Self::path_with(env)?;
+        Self::load_path(&Self::path_with(env)?)
+    }
+
+    /// Load and validate a config document from an explicit path, returning
+    /// defaults when the file is absent.
+    ///
+    /// The global file is only the best-known instance of this shape: a squad
+    /// task may carry its own `config.json` beside its workspace (WI 0110), and
+    /// it goes through this same parse and the same validation, so a task file
+    /// can never accept a value the global file would reject.
+    pub fn load_path(path: &std::path::Path) -> Result<Self, DataError> {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(&path).map_err(|e| DataError::io(&path, e))?;
-        serde_json::from_str(&content).map_err(|e| DataError::config_parse(&path, e))
+        let content = std::fs::read_to_string(path).map_err(|e| DataError::io(path, e))?;
+        let cfg: Self =
+            serde_json::from_str(&content).map_err(|e| DataError::config_parse(path, e))?;
+        if let Some(n) = cfg.max_concurrent_agents {
+            if n < 1 {
+                return Err(DataError::Other(
+                    "maxConcurrentAgents must be >= 1".to_string(),
+                ));
+            }
+        }
+        if let Some(squad) = &cfg.squad {
+            squad.validate()?;
+        }
+        if let Some(auth_refresh) = &cfg.auth_refresh {
+            validate_auth_refresh(auth_refresh)?;
+        }
+        Ok(cfg)
     }
 
     /// Persist this config to disk, creating parent directories if needed.
@@ -128,11 +177,41 @@ impl GlobalConfig {
     }
 }
 
+/// Read a squad task's own `squad` config block, layered over the global one.
+///
+/// The single reader for a task's `config.json`, used by the scheduler on every
+/// tick — so an edited task config takes effect without a daemon restart — and
+/// by the task gateway when it validates an edit.
+///
+/// A malformed task file is an error rather than a silent fall back to the
+/// global block: the global config is loaded tolerantly because a broken one
+/// would stall every task, but a task file is scoped to the one task whose run
+/// should say what is wrong with it.
+///
+/// This lives in the data layer, not beside the gateway, because every input it
+/// touches does: the path comes from [`SquadPaths`], the parse and validation
+/// from [`GlobalConfig::load_path`], and the merge from
+/// [`SquadConfig::layered_over`]. Only its error type was ever Layer 2, and
+/// that was enough to make the scheduler — Layer 1 — import Layer 2 to reach
+/// it.
+pub fn task_squad_config(
+    paths: &SquadPaths,
+    name: &str,
+    global: &SquadConfig,
+) -> Result<SquadConfig, DataError> {
+    let path = paths.task_config_file(name)?;
+    let document = GlobalConfig::load_path(&path)?;
+    Ok(match document.squad {
+        Some(task) => task.layered_over(global),
+        None => global.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::data::config::env::AWMAN_CONFIG_HOME;
-    use crate::data::config::repo::{ApiConfig, RemoteConfig};
+    use crate::data::config::repo::{ApiConfig, RemoteConfig, SquadConfig};
 
     fn isolated_env(home_dir: &std::path::Path) -> EnvSnapshot {
         EnvSnapshot::with_overrides([(AWMAN_CONFIG_HOME, home_dir.to_str().unwrap())])
@@ -162,6 +241,16 @@ mod tests {
                 work_dirs: Some(vec!["/work".to_string()]),
                 always_non_interactive: Some(true),
             }),
+            squad: Some(SquadConfig {
+                agents_to_models: Some(std::collections::HashMap::from([(
+                    "claude".to_string(),
+                    vec!["claude-opus-4-8".to_string()],
+                )])),
+                max_concurrent_evaluations: Some(2),
+                default_leader: Some("claude::claude-opus-4-8".to_string()),
+                guidance: Some(vec!["Keep changes focused.".to_string()]),
+                env_persistence: None,
+            }),
             remote: Some(RemoteConfig {
                 default_addr: Some("http://localhost:7777".to_string()),
                 saved_dirs: Some(vec!["/projects".to_string()]),
@@ -171,11 +260,59 @@ mod tests {
             agent_stuck_timeout_secs: Some(45),
             workers: None,
             base_image: None,
+            max_concurrent_agents: Some(4),
+            launch_mode_fallback: None,
+            auth_refresh: None,
         };
 
         original.save_with(&env).unwrap();
         let reloaded = GlobalConfig::load_with(&env).unwrap();
         assert_eq!(original, reloaded);
+    }
+
+    #[test]
+    fn load_rejects_max_concurrent_agents_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = isolated_env(tmp.path());
+        let path = GlobalConfig::path_with(&env).unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, r#"{"maxConcurrentAgents": 0}"#).unwrap();
+
+        let err = GlobalConfig::load_with(&env).unwrap_err();
+        assert!(
+            err.to_string().contains("maxConcurrentAgents must be >= 1"),
+            "error must explain the >= 1 requirement, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_accepts_max_concurrent_agents_positive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = isolated_env(tmp.path());
+        let path = GlobalConfig::path_with(&env).unwrap();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, r#"{"maxConcurrentAgents": 8}"#).unwrap();
+
+        let cfg = GlobalConfig::load_with(&env).unwrap();
+        assert_eq!(cfg.max_concurrent_agents, Some(8));
+    }
+
+    #[test]
+    fn load_rejects_invalid_squad_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = isolated_env(tmp.path());
+        let path = GlobalConfig::path_with(&env).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"squad":{"maxConcurrentEvaluations":0}}"#).unwrap();
+
+        let err = GlobalConfig::load_with(&env).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("squad.maxConcurrentEvaluations must be >= 1"));
     }
 
     #[test]

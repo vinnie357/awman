@@ -26,11 +26,11 @@ impl MountScopeFrontend for TuiCommandFrontend {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::frontend::tui::dialogs::DialogResponse;
 
-    fn make_frontend() -> (
+    pub(crate) fn make_frontend() -> (
         TuiCommandFrontend,
         std::sync::mpsc::Receiver<DialogRequest>,
         std::sync::mpsc::Sender<DialogResponse>,
@@ -76,9 +76,11 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(None)),
+            std::sync::Arc::new(std::sync::Mutex::new(None)),
             std::sync::Arc::new(std::sync::Mutex::new(
                 crate::command::commands::status::StatusCommandTuiContext::default(),
             )),
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         );
         (frontend, req_rx, resp_tx)
     }

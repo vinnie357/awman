@@ -7,7 +7,10 @@
 mod helpers;
 
 mod config_session_roundtrip;
-mod issue_e2e;
-mod issue_integration;
+mod daemon_primitives;
+mod db_migration;
 mod rename_0077;
 mod sqlite_upgrade_compat;
+mod squad_config;
+mod squad_paths;
+mod task_store;

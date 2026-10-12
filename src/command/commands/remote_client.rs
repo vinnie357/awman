@@ -1,26 +1,224 @@
 //! `RemoteClient` — typed HTTP client for talking to a remote awman API
-//! server. Constructed fresh per `RemoteCommand` invocation; not exported
-//! beyond `command/commands/`.
+//! server. Constructed fresh per `RemoteCommand` invocation; its typed polling
+//! surface is also consumed directly by other Layer 2 commands.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 
+use crate::command::commands::http_core::{HttpCore, HttpResponse};
+use crate::command::commands::squad::gateway::TaskGateway;
 use crate::command::error::CommandError;
 use crate::data::execution_event::ExecutionEvent;
 use crate::data::session::Session;
 use crate::data::session_setup_event::SessionSetupState;
+use crate::data::workflow_state::WorkflowState;
 use crate::engine::auth::ApiKey;
 
+/// Typed HTTP client for talking to a remote awman API server. A thin façade
+/// over one [`HttpCore`]: `RemoteClient` owns only the route-specific methods,
+/// the generic transport lives in the core.
 pub struct RemoteClient {
-    base_url: String,
-    http: reqwest::Client,
+    core: HttpCore,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct RemoteResponse {
-    pub status: u16,
-    pub body: serde_json::Value,
+/// Response for the low-level verb helpers. Kept as a type alias so external
+/// callers referencing `remote_client::RemoteResponse` (e.g. `get_job`'s return
+/// type) do not change.
+pub type RemoteResponse = HttpResponse;
+
+/// How often a remote workflow snapshot is refreshed.
+pub const REMOTE_WORKFLOW_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The terminal-aware status vocabulary used by remote workflow polling.
+/// Parsing the wire strings here keeps status semantics out of frontends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Queued,
+    Running,
+    Done,
+    Error,
+}
+
+impl JobStatus {
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Error)
+    }
+}
+
+/// Source of workflow snapshots for [`RemoteWorkflowPoller`].
+#[async_trait]
+pub trait WorkflowStateSource: Send + Sync {
+    /// Fetch the current workflow snapshot. `Ok(None)` means that no workflow
+    /// state exists right now, not that the source is unreachable.
+    async fn fetch_workflow_state(&self) -> Result<Option<WorkflowState>, CommandError>;
+
+    /// Whether the remote job reached a terminal status. Sources without a
+    /// separate job-status route leave the default in place.
+    async fn is_terminal(&self) -> bool {
+        false
+    }
+}
+
+/// Workflow source backed by the API server's per-command routes.
+pub struct RemoteApiWorkflowSource {
+    client: Arc<RemoteClient>,
+    command_id: String,
+}
+
+impl RemoteApiWorkflowSource {
+    pub fn new(client: Arc<RemoteClient>, command_id: impl Into<String>) -> Self {
+        Self {
+            client,
+            command_id: command_id.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl WorkflowStateSource for RemoteApiWorkflowSource {
+    async fn fetch_workflow_state(&self) -> Result<Option<WorkflowState>, CommandError> {
+        let Some(value) = self.client.get_workflow_state(&self.command_id).await? else {
+            return Ok(None);
+        };
+        serde_json::from_value(value).map(Some).map_err(|error| {
+            CommandError::RemoteTransport(format!("invalid remote workflow state: {error}"))
+        })
+    }
+
+    async fn is_terminal(&self) -> bool {
+        self.client
+            .job_status(&self.command_id)
+            .await
+            .is_ok_and(JobStatus::is_terminal)
+    }
+}
+
+/// Workflow source backed by the squad task gateway.
+pub struct SquadTaskWorkflowSource {
+    gateway: Arc<dyn TaskGateway>,
+    task: String,
+}
+
+impl SquadTaskWorkflowSource {
+    pub fn new(gateway: Arc<dyn TaskGateway>, task: impl Into<String>) -> Self {
+        Self {
+            gateway,
+            task: task.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl WorkflowStateSource for SquadTaskWorkflowSource {
+    async fn fetch_workflow_state(&self) -> Result<Option<WorkflowState>, CommandError> {
+        self.gateway.workflow_state(&self.task).await
+    }
+}
+
+/// Polls a remote workflow and publishes each successful snapshot to a
+/// caller-owned presentation callback.
+pub struct RemoteWorkflowPoller {
+    source: Arc<dyn WorkflowStateSource>,
+    reachable: Arc<AtomicBool>,
+    on_state: Box<dyn FnMut(&WorkflowState) + Send>,
+    initial_state_seen: bool,
+}
+
+impl RemoteWorkflowPoller {
+    pub fn new(
+        source: Arc<dyn WorkflowStateSource>,
+        on_state: Box<dyn FnMut(&WorkflowState) + Send>,
+    ) -> Self {
+        Self {
+            source,
+            reachable: Arc::new(AtomicBool::new(true)),
+            on_state,
+            initial_state_seen: false,
+        }
+    }
+
+    /// Publish source reachability into a caller-owned indicator.
+    pub fn with_reachable(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.reachable = flag;
+        self
+    }
+
+    /// Seed disappearance detection when the caller fetched and published an
+    /// initial snapshot before starting this poller.
+    pub fn with_initial_state_seen(mut self, seen: bool) -> Self {
+        self.initial_state_seen = seen;
+        self
+    }
+
+    pub fn start(self, cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            self.poll_loop(cancel).await;
+        })
+    }
+
+    async fn poll_loop(mut self, cancel: CancellationToken) {
+        let mut saw_state = self.initial_state_seen;
+        loop {
+            let should_stop = tokio::select! {
+                _ = cancel.cancelled() => break,
+                result = self.poll_once(&mut saw_state) => result,
+            };
+
+            if should_stop {
+                // Preserve the final refresh: terminal API jobs get their
+                // last state, while a disappearing squad route leaves the
+                // last terminal snapshot frozen in the TUI.
+                let _ = tokio::select! {
+                    _ = cancel.cancelled() => None,
+                    result = self.fetch_and_publish(&mut saw_state) => result,
+                };
+                break;
+            }
+
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(REMOTE_WORKFLOW_POLL_INTERVAL) => {}
+            }
+        }
+    }
+
+    /// Returns true when polling should stop after one final refresh.
+    async fn poll_once(&mut self, saw_state: &mut bool) -> bool {
+        let terminal = self.source.is_terminal().await;
+        match self.fetch_and_publish(saw_state).await {
+            // A failed state fetch always keeps polling, even if a separate
+            // status route happened to report terminal in the same cycle.
+            None => false,
+            Some(disappeared_after_state) => terminal || disappeared_after_state,
+        }
+    }
+
+    /// Fetch and publish one snapshot. `Some(true)` means a source that
+    /// previously yielded state now reports no state; `None` means the fetch
+    /// failed. Errors freeze the view and never request termination.
+    async fn fetch_and_publish(&mut self, saw_state: &mut bool) -> Option<bool> {
+        match self.source.fetch_workflow_state().await {
+            Err(_) => {
+                self.reachable.store(false, Ordering::Relaxed);
+                None
+            }
+            Ok(None) => {
+                self.reachable.store(true, Ordering::Relaxed);
+                Some(*saw_state)
+            }
+            Ok(Some(state)) => {
+                self.reachable.store(true, Ordering::Relaxed);
+                *saw_state = true;
+                (self.on_state)(&state);
+                Some(false)
+            }
+        }
+    }
 }
 
 /// Test-only sink used by the legacy SSE parser test. Production code never
@@ -88,8 +286,12 @@ pub struct SessionSetupStatusResponse {
 }
 
 impl RemoteClient {
-    pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-    pub const READ_TIMEOUT: Duration = Duration::from_secs(600);
+    /// The API version prefix. Hardcoded here (rather than at every call site)
+    /// and threaded into the shared [`HttpCore`].
+    const PREFIX: &'static str = "v1";
+
+    pub const CONNECT_TIMEOUT: Duration = HttpCore::CONNECT_TIMEOUT;
+    pub const READ_TIMEOUT: Duration = HttpCore::READ_TIMEOUT;
 
     pub fn new(base_url: &str, api_key: Option<&ApiKey>) -> Result<Self, CommandError> {
         Self::new_with_pinned_cert(base_url, api_key, None)
@@ -106,28 +308,8 @@ impl RemoteClient {
         api_key: Option<&ApiKey>,
         pinned_cert_pem: Option<&str>,
     ) -> Result<Self, CommandError> {
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(Self::CONNECT_TIMEOUT)
-            .timeout(Self::READ_TIMEOUT);
-        if let Some(key) = api_key {
-            let mut headers = reqwest::header::HeaderMap::new();
-            let auth_value = format!("Bearer {}", key.as_str());
-            let value = reqwest::header::HeaderValue::from_str(&auth_value)
-                .map_err(|e| CommandError::Other(format!("invalid api key header: {e}")))?;
-            headers.insert(reqwest::header::AUTHORIZATION, value);
-            builder = builder.default_headers(headers);
-        }
-        if let Some(pem) = pinned_cert_pem {
-            let cert = reqwest::Certificate::from_pem(pem.as_bytes())
-                .map_err(|e| CommandError::Other(format!("invalid pinned cert: {e}")))?;
-            builder = builder.add_root_certificate(cert);
-        }
-        let http = builder
-            .build()
-            .map_err(|e| CommandError::RemoteTransport(e.to_string()))?;
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            http,
+            core: HttpCore::new_with_pinned_cert(base_url, Self::PREFIX, api_key, pinned_cert_pem)?,
         })
     }
 
@@ -135,21 +317,7 @@ impl RemoteClient {
     /// `::1`, `localhost`). Used to decide whether the locally-stored
     /// self-signed cert should be trusted.
     pub fn is_loopback_addr(addr: &str) -> bool {
-        let trimmed = addr.trim();
-        let after_scheme = trimmed
-            .split_once("://")
-            .map(|(_, rest)| rest)
-            .unwrap_or(trimmed);
-        let host_part = after_scheme
-            .split_once('/')
-            .map(|(h, _)| h)
-            .unwrap_or(after_scheme);
-        let host = host_part
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(host_part);
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        matches!(host, "127.0.0.1" | "::1" | "localhost")
+        HttpCore::is_loopback_addr(addr)
     }
 
     /// API-key resolution per spec §6.5: explicit > AWMAN_API_KEY > global
@@ -195,9 +363,10 @@ impl RemoteClient {
         &self,
         req: &StartSessionRequest,
     ) -> Result<StartSessionResponse, CommandError> {
-        let url = format!("{}/v1/sessions", self.base_url);
+        let url = self.core.url(&["sessions"]);
         let resp = self
-            .http
+            .core
+            .http()
             .post(&url)
             .json(req)
             .send()
@@ -273,6 +442,24 @@ impl RemoteClient {
         self.get(&["commands", command_id, "status"]).await
     }
 
+    /// `GET /v1/commands/{id}/status` — fetch the typed job status used by
+    /// remote workflow polling.
+    pub async fn job_status(&self, id: &str) -> Result<JobStatus, CommandError> {
+        let response = self.get_job(id).await?;
+        let status = response.body["status"].as_str().ok_or_else(|| {
+            CommandError::RemoteTransport("remote job status response has no status".into())
+        })?;
+        match status {
+            "queued" | "pending" => Ok(JobStatus::Queued),
+            "running" => Ok(JobStatus::Running),
+            "done" => Ok(JobStatus::Done),
+            "error" => Ok(JobStatus::Error),
+            other => Err(CommandError::RemoteTransport(format!(
+                "unknown remote job status: {other}"
+            ))),
+        }
+    }
+
     /// `GET /v1/workflows/{id}` — fetch the workflow state JSON for a job.
     /// Returns `None` on HTTP 404 (job is a prompt job or pending).
     pub async fn get_workflow_state(
@@ -298,10 +485,11 @@ impl RemoteClient {
         use crate::data::execution_event::EventPayload;
         use futures_util::StreamExt;
 
-        let url = format!("{}/v1/commands/{job_id}/logs", self.base_url);
+        let url = self.core.url(&["commands", job_id, "logs"]);
 
         let resp = self
-            .http
+            .core
+            .http()
             .get(&url)
             .timeout(Duration::from_secs(86400))
             .send()
@@ -364,12 +552,13 @@ impl RemoteClient {
 
     // ─── Generic low-level helpers (crate-private) ───────────────────────────
 
+    #[cfg(test)]
     pub(crate) async fn send_command(
         &self,
         path: &[&str],
         flags: &[(&str, serde_json::Value)],
     ) -> Result<RemoteResponse, CommandError> {
-        self.send_command_with_headers(path, flags, &[]).await
+        self.core.post_command(path, flags, &[]).await
     }
 
     /// Like `send_command` but also attaches request headers — used to set
@@ -381,72 +570,15 @@ impl RemoteClient {
         flags: &[(&str, serde_json::Value)],
         headers: &[(&str, &str)],
     ) -> Result<RemoteResponse, CommandError> {
-        let url = format!("{}/v1/{}", self.base_url, path.join("/"));
-        let mut body = serde_json::Map::new();
-        for (k, v) in flags {
-            body.insert(k.to_string(), v.clone());
-        }
-        let mut req = self.http.post(&url).json(&serde_json::Value::Object(body));
-        for (k, v) in headers {
-            req = req.header(*k, *v);
-        }
-        let resp = req.send().await.map_err(Self::map_reqwest_error)?;
-        let status = resp.status().as_u16();
-        let body = resp
-            .json::<serde_json::Value>()
-            .await
-            .map_err(Self::map_reqwest_error)?;
-        if status >= 400 {
-            return Err(CommandError::RemoteHttpStatus {
-                status,
-                body: body.to_string(),
-            });
-        }
-        Ok(RemoteResponse { status, body })
+        self.core.post_command(path, flags, headers).await
     }
 
     pub(crate) async fn get(&self, path: &[&str]) -> Result<RemoteResponse, CommandError> {
-        let url = format!("{}/v1/{}", self.base_url, path.join("/"));
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(Self::map_reqwest_error)?;
-        let status = resp.status().as_u16();
-        let body = resp
-            .json::<serde_json::Value>()
-            .await
-            .map_err(Self::map_reqwest_error)?;
-        if status >= 400 {
-            return Err(CommandError::RemoteHttpStatus {
-                status,
-                body: body.to_string(),
-            });
-        }
-        Ok(RemoteResponse { status, body })
+        self.core.get(path).await
     }
 
     pub(crate) async fn delete(&self, path: &[&str]) -> Result<RemoteResponse, CommandError> {
-        let url = format!("{}/v1/{}", self.base_url, path.join("/"));
-        let resp = self
-            .http
-            .delete(&url)
-            .send()
-            .await
-            .map_err(Self::map_reqwest_error)?;
-        let status = resp.status().as_u16();
-        let body = resp
-            .json::<serde_json::Value>()
-            .await
-            .unwrap_or(serde_json::json!({}));
-        if status >= 400 {
-            return Err(CommandError::RemoteHttpStatus {
-                status,
-                body: body.to_string(),
-            });
-        }
-        Ok(RemoteResponse { status, body })
+        self.core.delete(path).await
     }
 
     /// Stream raw SSE events to the given sink. Kept crate-private for tests
@@ -460,10 +592,11 @@ impl RemoteClient {
     ) -> Result<(), CommandError> {
         use futures_util::StreamExt;
 
-        let url = format!("{}/v1/{}", self.base_url, path.join("/"));
+        let url = self.core.url(path);
 
         let resp = self
-            .http
+            .core
+            .http()
             .get(&url)
             .timeout(Duration::from_secs(86400))
             .send()
@@ -537,13 +670,7 @@ impl RemoteClient {
     }
 
     pub fn map_reqwest_error(e: reqwest::Error) -> CommandError {
-        if e.is_timeout() {
-            CommandError::RemoteTimeout
-        } else if e.is_connect() {
-            CommandError::RemoteConnectionRefused(e.to_string())
-        } else {
-            CommandError::RemoteTransport(e.to_string())
-        }
+        HttpCore::map_reqwest_error(e)
     }
 }
 
@@ -584,6 +711,135 @@ mod tests {
     use super::*;
     use crate::data::config::env::EnvSnapshot;
     use crate::data::session::{Session, SessionOpenOptions};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct FakeWorkflowSource {
+        states: Mutex<VecDeque<Result<Option<WorkflowState>, CommandError>>>,
+        terminals: Mutex<VecDeque<bool>>,
+    }
+
+    impl FakeWorkflowSource {
+        fn new(
+            states: Vec<Result<Option<WorkflowState>, CommandError>>,
+            terminals: Vec<bool>,
+        ) -> Self {
+            Self {
+                states: Mutex::new(states.into()),
+                terminals: Mutex::new(terminals.into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WorkflowStateSource for FakeWorkflowSource {
+        async fn fetch_workflow_state(&self) -> Result<Option<WorkflowState>, CommandError> {
+            self.states.lock().unwrap().pop_front().unwrap_or(Ok(None))
+        }
+
+        async fn is_terminal(&self) -> bool {
+            self.terminals.lock().unwrap().pop_front().unwrap_or(false)
+        }
+    }
+
+    fn state(name: &str) -> WorkflowState {
+        WorkflowState::new(name.to_string(), &[], "test-hash".to_string(), None)
+    }
+
+    async fn cancel_after_states(
+        seen: &Arc<Mutex<Vec<String>>>,
+        count: usize,
+        cancel: &CancellationToken,
+    ) {
+        for _ in 0..250 {
+            if seen.lock().unwrap().len() >= count {
+                cancel.cancel();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("poller did not publish {count} states");
+    }
+
+    #[tokio::test]
+    async fn poller_finally_refreshes_after_terminal_status() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let callback_seen = seen.clone();
+        let source = Arc::new(FakeWorkflowSource::new(
+            vec![
+                Ok(Some(state("initial"))),
+                Ok(Some(state("terminal"))),
+                Ok(Some(state("final"))),
+            ],
+            vec![false, true],
+        ));
+        let cancel = CancellationToken::new();
+        let task = RemoteWorkflowPoller::new(
+            source,
+            Box::new(move |snapshot| {
+                callback_seen
+                    .lock()
+                    .unwrap()
+                    .push(snapshot.workflow_name.clone());
+            }),
+        )
+        .start(cancel.clone());
+
+        cancel_after_states(&seen, 3, &cancel).await;
+        task.await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["initial", "terminal", "final"]
+        );
+    }
+
+    #[tokio::test]
+    async fn poller_keeps_polling_after_transient_source_error() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let callback_seen = seen.clone();
+        let source = Arc::new(FakeWorkflowSource::new(
+            vec![
+                Ok(Some(state("before-error"))),
+                Err(CommandError::RemoteTransport("temporary outage".into())),
+                Ok(Some(state("after-error"))),
+            ],
+            vec![false, false, false],
+        ));
+        let cancel = CancellationToken::new();
+        let task = RemoteWorkflowPoller::new(
+            source,
+            Box::new(move |snapshot| {
+                callback_seen
+                    .lock()
+                    .unwrap()
+                    .push(snapshot.workflow_name.clone());
+            }),
+        )
+        .start(cancel.clone());
+
+        cancel_after_states(&seen, 2, &cancel).await;
+        task.await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["before-error", "after-error"]
+        );
+    }
+
+    #[tokio::test]
+    async fn poller_honours_an_initial_snapshot_published_by_its_caller() {
+        let source = Arc::new(FakeWorkflowSource::new(
+            vec![Ok(None), Ok(None)],
+            vec![false],
+        ));
+        let task = RemoteWorkflowPoller::new(source, Box::new(|_| {}))
+            .with_initial_state_seen(true)
+            .start(CancellationToken::new());
+
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("a disappeared pre-fetched state must stop polling")
+            .expect("poller task must not panic");
+    }
 
     // ─── is_loopback_addr ─────────────────────────────────────────────────────
 
