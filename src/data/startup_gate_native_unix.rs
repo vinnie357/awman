@@ -15,8 +15,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroize::Zeroizing;
@@ -28,6 +30,7 @@ const GUEST_CONTROL: &str = "guest-control";
 const INTENT_FILE: &str = "launch-intent.json";
 const PLAN_FILE: &str = "launch-plan.json";
 const RECEIPT_FILE: &str = "launch.json";
+const CLEANUP_FILE: &str = "cleanup.json";
 
 const RESERVED_GATE_NAMES: &[&str] = &[
     "bootstrap.py",
@@ -40,6 +43,7 @@ const RESERVED_GATE_NAMES: &[&str] = &[
     "launch-intent.json",
     "launch-plan.json",
     "launch.json",
+    "cleanup.json",
     "launch-failure.json",
     "guest-control",
 ];
@@ -69,10 +73,62 @@ impl fmt::Debug for NativeFileIdentity {
 struct PinnedDirInner {
     dir: File,
     identity: NativeFileIdentity,
+    #[cfg(test)]
+    fail_launch_plan_sync: Arc<AtomicBool>,
+    #[cfg(test)]
+    after_launch_plan_publication: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[derive(Clone)]
 pub(crate) struct PinnedControlDir(Arc<PinnedDirInner>);
+
+#[cfg(test)]
+pub(crate) struct LaunchPlanSyncFaultHandle {
+    armed: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl LaunchPlanSyncFaultHandle {
+    pub(crate) fn clear(&self) {
+        self.armed.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+impl Drop for LaunchPlanSyncFaultHandle {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn arm_launch_plan_post_rename_sync_failure(
+    controls: &Arc<OrchestratedControlAuthority>,
+) -> LaunchPlanSyncFaultHandle {
+    let armed = Arc::clone(&controls.host_parent.0.fail_launch_plan_sync);
+    assert!(
+        !armed.swap(true, Ordering::AcqRel),
+        "launch-plan sync fault is already armed for this control authority"
+    );
+    LaunchPlanSyncFaultHandle { armed }
+}
+
+#[cfg(test)]
+pub(crate) fn after_launch_plan_native_publication(
+    controls: &Arc<OrchestratedControlAuthority>,
+    action: Box<dyn FnOnce() + Send>,
+) {
+    let mut slot = controls
+        .host_parent
+        .0
+        .after_launch_plan_publication
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        slot.replace(action).is_none(),
+        "launch-plan publication action is already installed"
+    );
+}
 
 impl PartialEq for PinnedControlDir {
     fn eq(&self, other: &Self) -> bool {
@@ -92,8 +148,9 @@ impl fmt::Debug for PinnedControlDir {
 }
 
 struct PinnedRegularFileInner {
-    _file: File,
+    file: File,
     identity: NativeFileIdentity,
+    bytes: Arc<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -101,7 +158,7 @@ pub(crate) struct PinnedRegularFile(Arc<PinnedRegularFileInner>);
 
 impl PartialEq for PinnedRegularFile {
     fn eq(&self, other: &Self) -> bool {
-        self.0.identity == other.0.identity
+        self.0.identity == other.0.identity && self.0.bytes == other.0.bytes
     }
 }
 
@@ -113,6 +170,59 @@ impl fmt::Debug for PinnedRegularFile {
             .debug_tuple("PinnedRegularFile")
             .field(&self.0.identity)
             .finish()
+    }
+}
+
+impl PinnedRegularFile {
+    #[cfg(test)]
+    pub(crate) fn held_file_identity_observation(&self) -> Option<(u64, u64, u64)> {
+        self.0
+            .file
+            .metadata()
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino(), metadata.nlink()))
+    }
+
+    pub(crate) fn exact_bytes(&self) -> &[u8] {
+        self.0.bytes.as_slice()
+    }
+
+    pub(crate) fn held_bytes_match(&self) -> bool {
+        let Ok(before_metadata) = self.0.file.metadata() else {
+            return false;
+        };
+        if usize::try_from(before_metadata.len()).ok() != Some(self.0.bytes.len()) {
+            return false;
+        }
+        let Ok(before) = validate_regular_metadata(
+            &before_metadata,
+            0o600,
+            MAX_REQUEST,
+            self.0.identity.owner_uid,
+        ) else {
+            return false;
+        };
+        if before != self.0.identity {
+            return false;
+        }
+        let Ok(bytes) = read_bounded_at(&self.0.file, MAX_REQUEST) else {
+            return false;
+        };
+        let Ok(after_metadata) = self.0.file.metadata() else {
+            return false;
+        };
+        if usize::try_from(after_metadata.len()).ok() != Some(self.0.bytes.len()) {
+            return false;
+        }
+        matches!(
+            validate_regular_metadata(
+                &after_metadata,
+                0o600,
+                MAX_REQUEST,
+                self.0.identity.owner_uid,
+            ),
+            Ok(identity) if identity == self.0.identity && bytes == *self.0.bytes
+        )
     }
 }
 
@@ -445,6 +555,10 @@ fn open_parent(control_dir: &Path) -> Result<(PinnedControlDir, PathBuf), Startu
         PinnedControlDir(Arc::new(PinnedDirInner {
             dir,
             identity: held_identity,
+            #[cfg(test)]
+            fail_launch_plan_sync: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            after_launch_plan_publication: std::sync::Mutex::new(None),
         })),
         absolute,
     ))
@@ -462,6 +576,10 @@ fn open_child(parent: &PinnedControlDir) -> Result<PinnedGuestControl, StartupGa
         dir: Arc::new(PinnedDirInner {
             dir,
             identity: child_identity,
+            #[cfg(test)]
+            fail_launch_plan_sync: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            after_launch_plan_publication: std::sync::Mutex::new(None),
         }),
         parent: parent.clone(),
         basename: GUEST_CONTROL,
@@ -505,6 +623,25 @@ fn read_bounded(mut file: File, max: u64) -> Result<Vec<u8>, StartupGateError> {
         return Err(invalid("oversized startup gate file"));
     }
     Ok(raw)
+}
+
+fn read_bounded_at(file: &File, max: u64) -> Result<Vec<u8>, StartupGateError> {
+    let capacity = usize::try_from(max)
+        .ok()
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| invalid("oversized startup gate file"))?;
+    let mut raw = vec![0; capacity];
+    let mut offset = 0;
+    while offset < raw.len() {
+        let position = u64::try_from(offset).map_err(|_| invalid("oversized startup gate file"))?;
+        let count = file.read_at(&mut raw[offset..], position).map_err(io)?;
+        if count == 0 {
+            raw.truncate(offset);
+            return Ok(raw);
+        }
+        offset += count;
+    }
+    Err(invalid("oversized startup gate file"))
 }
 
 fn intent_exists(parent: &PinnedControlDir) -> Result<bool, StartupGateError> {
@@ -646,6 +783,21 @@ fn overlaps(first: &Path, second: &Path) -> bool {
     first == second || first.starts_with(second) || second.starts_with(first)
 }
 
+fn valid_request_schema(request: &StartupGateRequest, raw: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let guest_cwd_present = value
+        .as_object()
+        .is_some_and(|fields| fields.contains_key("guest_cwd"));
+    !request.bindings.is_empty()
+        && match request.version {
+            1 => !guest_cwd_present && request.guest_cwd.is_none(),
+            2 => guest_cwd_present && request.guest_cwd.as_deref() == Some("/workspace"),
+            _ => false,
+        }
+}
+
 fn is_reserved_gate_name(name: &str) -> bool {
     RESERVED_GATE_NAMES.contains(&name)
 }
@@ -671,6 +823,7 @@ fn safe_legacy_manifest_name(value: &str) -> bool {
                 | "ready.json"
                 | "release.json"
                 | "failure.json"
+                | "cleanup.json"
         )
         && Path::new(value).components().count() == 1
         && matches!(
@@ -810,7 +963,13 @@ fn load_legacy_startup_gate(
             "control directory must be a current-user-owned non-symlink mode-0700 directory",
         ));
     }
-    for stale in ["ready.json", "release.json", "failure.json", ".released"] {
+    for stale in [
+        "ready.json",
+        "release.json",
+        "failure.json",
+        ".released",
+        "cleanup.json",
+    ] {
         let path = control_dir.join(stale);
         match std::fs::symlink_metadata(&path) {
             Ok(_) => return Err(legacy_invalid(format!("stale {stale}"))),
@@ -823,7 +982,7 @@ fn load_legacy_startup_gate(
     let request_digest = Sha256::digest(&raw).into();
     let request: StartupGateRequest = serde_json::from_slice(&raw)
         .map_err(|error| legacy_invalid(format!("invalid request JSON: {error}")))?;
-    if request.version != 1 || request.bindings.is_empty() {
+    if !valid_request_schema(&request, &raw) {
         return Err(legacy_invalid(
             "unsupported request version or empty bindings",
         ));
@@ -899,7 +1058,7 @@ fn validate_request(parent: &PinnedControlDir) -> Result<ValidatedRequestParts, 
     let request_digest = Sha256::digest(&raw).into();
     let request: StartupGateRequest =
         serde_json::from_slice(&raw).map_err(|_| invalid("invalid request JSON"))?;
-    if request.version != 1 || request.bindings.is_empty() {
+    if !valid_request_schema(&request, &raw) {
         return Err(invalid("unsupported request version or empty bindings"));
     }
     let mut ids = HashSet::new();
@@ -1053,9 +1212,17 @@ pub(crate) enum PlanFileError {
     PublicationFailed,
 }
 
+type LaunchPlanPublicationResult = Result<
+    (PinnedControlDir, PinnedRegularFile),
+    (PlanFileError, Option<(PinnedControlDir, PinnedRegularFile)>),
+>;
+
 impl PinnedControlDir {
-    pub(crate) fn existing_launch_plan(&self) -> Result<Option<PinnedRegularFile>, PlanFileError> {
-        match openat_readonly(&self.0.dir, PLAN_FILE, false) {
+    fn open_pinned_record(
+        &self,
+        target: &'static str,
+    ) -> Result<Option<PinnedRegularFile>, PlanFileError> {
+        match openat_readonly(&self.0.dir, target, false) {
             Ok(file) => {
                 let metadata = file
                     .metadata()
@@ -1067,9 +1234,28 @@ impl PinnedControlDir {
                     self.0.identity.owner_uid,
                 )
                 .map_err(|_| PlanFileError::ExistingOrUnsafe)?;
+                let bytes = read_bounded_at(&file, MAX_REQUEST)
+                    .map_err(|_| PlanFileError::ExistingOrUnsafe)?;
+                let after_metadata = file
+                    .metadata()
+                    .map_err(|_| PlanFileError::ExistingOrUnsafe)?;
+                let after = validate_regular_metadata(
+                    &after_metadata,
+                    0o600,
+                    MAX_REQUEST,
+                    self.0.identity.owner_uid,
+                )
+                .map_err(|_| PlanFileError::ExistingOrUnsafe)?;
+                if usize::try_from(metadata.len()).ok() != Some(bytes.len())
+                    || usize::try_from(after_metadata.len()).ok() != Some(bytes.len())
+                    || after != identity
+                {
+                    return Err(PlanFileError::ExistingOrUnsafe);
+                }
                 Ok(Some(PinnedRegularFile(Arc::new(PinnedRegularFileInner {
-                    _file: file,
+                    file,
                     identity,
+                    bytes: Arc::new(bytes),
                 }))))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1077,14 +1263,114 @@ impl PinnedControlDir {
         }
     }
 
-    pub(crate) fn publish_launch_plan(
-        &self,
-        bytes: &[u8],
-    ) -> Result<PinnedRegularFile, PlanFileError> {
-        if self.existing_launch_plan()?.is_some() {
-            return Err(PlanFileError::ExistingOrUnsafe);
+    pub(crate) fn existing_launch_plan(&self) -> Result<Option<PinnedRegularFile>, PlanFileError> {
+        self.open_pinned_record(PLAN_FILE)
+    }
+
+    pub(crate) fn publish_launch_plan_owned(&self, bytes: &[u8]) -> LaunchPlanPublicationResult {
+        match self.existing_launch_plan() {
+            Ok(None) => {}
+            Ok(Some(_)) | Err(PlanFileError::ExistingOrUnsafe) => {
+                return Err((PlanFileError::ExistingOrUnsafe, None));
+            }
+            Err(PlanFileError::PublicationFailed) => {
+                return Err((PlanFileError::PublicationFailed, None));
+            }
         }
-        self.publish_record(PLAN_FILE, ".launch-plan", bytes)
+        if bytes.len() as u64 > MAX_REQUEST {
+            return Err((PlanFileError::PublicationFailed, None));
+        }
+
+        let temp_name = format!(".launch-plan.{}.tmp", uuid::Uuid::new_v4().simple());
+        let fd = nix::fcntl::openat(
+            &self.0.dir,
+            temp_name.as_str(),
+            nix::fcntl::OFlag::O_RDWR
+                | nix::fcntl::OFlag::O_CREAT
+                | nix::fcntl::OFlag::O_EXCL
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .map_err(|_| (PlanFileError::PublicationFailed, None))?;
+        let mut file = File::from(fd);
+        let prepared = (|| {
+            validate_regular_metadata(
+                &file
+                    .metadata()
+                    .map_err(|_| PlanFileError::PublicationFailed)?,
+                0o600,
+                MAX_REQUEST,
+                self.0.identity.owner_uid,
+            )
+            .map_err(|_| PlanFileError::PublicationFailed)?;
+            file.write_all(bytes)
+                .map_err(|_| PlanFileError::PublicationFailed)?;
+            file.sync_all()
+                .map_err(|_| PlanFileError::PublicationFailed)?;
+            let metadata = file
+                .metadata()
+                .map_err(|_| PlanFileError::PublicationFailed)?;
+            let identity =
+                validate_regular_metadata(&metadata, 0o600, MAX_REQUEST, self.0.identity.owner_uid)
+                    .map_err(|_| PlanFileError::PublicationFailed)?;
+            if usize::try_from(metadata.len()).ok() != Some(bytes.len()) {
+                return Err(PlanFileError::PublicationFailed);
+            }
+            Ok(PinnedRegularFile(Arc::new(PinnedRegularFileInner {
+                file,
+                identity,
+                bytes: Arc::new(bytes.to_vec()),
+            })))
+        })();
+        let pinned = match prepared {
+            Ok(pinned) => pinned,
+            Err(source) => {
+                let _ = nix::unistd::unlinkat(
+                    &self.0.dir,
+                    temp_name.as_str(),
+                    nix::unistd::UnlinkatFlags::NoRemoveDir,
+                );
+                return Err((source, None));
+            }
+        };
+        match rename_noreplace(&self.0.dir, temp_name.as_str(), PLAN_FILE) {
+            Ok(()) => {}
+            Err(PlanFileError::ExistingOrUnsafe) => {
+                let _ = nix::unistd::unlinkat(
+                    &self.0.dir,
+                    temp_name.as_str(),
+                    nix::unistd::UnlinkatFlags::NoRemoveDir,
+                );
+                return Err((PlanFileError::ExistingOrUnsafe, None));
+            }
+            Err(source @ PlanFileError::PublicationFailed) => {
+                let _ = nix::unistd::unlinkat(
+                    &self.0.dir,
+                    temp_name.as_str(),
+                    nix::unistd::UnlinkatFlags::NoRemoveDir,
+                );
+                return Err((source, Some((self.clone(), pinned))));
+            }
+        }
+        match self.sync_and_verify_launch_plan_attempt(&pinned) {
+            Ok(()) => {
+                #[cfg(test)]
+                {
+                    let action = self
+                        .0
+                        .after_launch_plan_publication
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if let Some(action) = action {
+                        action();
+                    }
+                }
+                Ok((self.clone(), pinned))
+            }
+            Err(source) => Err((source, Some((self.clone(), pinned)))),
+        }
     }
 
     pub(crate) fn publish_launch_receipt(
@@ -1097,6 +1383,141 @@ impl PinnedControlDir {
             Err(_) => return Err(PlanFileError::ExistingOrUnsafe),
         }
         self.publish_record(RECEIPT_FILE, ".launch", bytes)
+    }
+
+    fn sync_and_verify_record(
+        &self,
+        target: &'static str,
+        existing: PinnedRegularFile,
+        bytes: &[u8],
+    ) -> Result<PinnedRegularFile, PlanFileError> {
+        if existing.exact_bytes() != bytes || !existing.held_bytes_match() {
+            return Err(PlanFileError::ExistingOrUnsafe);
+        }
+        let parent_before = validate_directory_metadata(
+            &self
+                .0
+                .dir
+                .metadata()
+                .map_err(|_| PlanFileError::ExistingOrUnsafe)?,
+        )
+        .map_err(|_| PlanFileError::ExistingOrUnsafe)?;
+        if parent_before != self.0.identity {
+            return Err(PlanFileError::ExistingOrUnsafe);
+        }
+        existing
+            .0
+            .file
+            .sync_all()
+            .map_err(|_| PlanFileError::PublicationFailed)?;
+        self.0
+            .dir
+            .sync_all()
+            .map_err(|_| PlanFileError::PublicationFailed)?;
+        let parent_after = validate_directory_metadata(
+            &self
+                .0
+                .dir
+                .metadata()
+                .map_err(|_| PlanFileError::ExistingOrUnsafe)?,
+        )
+        .map_err(|_| PlanFileError::ExistingOrUnsafe)?;
+        if parent_after != self.0.identity {
+            return Err(PlanFileError::ExistingOrUnsafe);
+        }
+        match self.open_pinned_record(target)? {
+            Some(actual)
+                if actual == existing
+                    && actual.exact_bytes() == bytes
+                    && actual.held_bytes_match() =>
+            {
+                Ok(actual)
+            }
+            Some(_) | None => Err(PlanFileError::ExistingOrUnsafe),
+        }
+    }
+
+    fn sync_and_verify_launch_plan_attempt(
+        &self,
+        existing: &PinnedRegularFile,
+    ) -> Result<(), PlanFileError> {
+        if !existing.held_bytes_match() {
+            return Err(PlanFileError::ExistingOrUnsafe);
+        }
+        let parent_before = validate_directory_metadata(
+            &self
+                .0
+                .dir
+                .metadata()
+                .map_err(|_| PlanFileError::ExistingOrUnsafe)?,
+        )
+        .map_err(|_| PlanFileError::ExistingOrUnsafe)?;
+        if parent_before != self.0.identity {
+            return Err(PlanFileError::ExistingOrUnsafe);
+        }
+        existing
+            .0
+            .file
+            .sync_all()
+            .map_err(|_| PlanFileError::PublicationFailed)?;
+        #[cfg(test)]
+        if self.0.fail_launch_plan_sync.load(Ordering::Acquire) {
+            return Err(PlanFileError::PublicationFailed);
+        }
+        self.0
+            .dir
+            .sync_all()
+            .map_err(|_| PlanFileError::PublicationFailed)?;
+        let parent_after = validate_directory_metadata(
+            &self
+                .0
+                .dir
+                .metadata()
+                .map_err(|_| PlanFileError::ExistingOrUnsafe)?,
+        )
+        .map_err(|_| PlanFileError::ExistingOrUnsafe)?;
+        if parent_after != self.0.identity || !self.verify_launch_plan(existing) {
+            return Err(PlanFileError::ExistingOrUnsafe);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_pending_launch_plan(
+        &self,
+        existing: &PinnedRegularFile,
+    ) -> Result<(), PlanFileError> {
+        self.sync_and_verify_launch_plan_attempt(existing)
+    }
+
+    pub(crate) fn publish_or_verify_cleanup_record(
+        &self,
+        bytes: &[u8],
+    ) -> Result<PinnedRegularFile, PlanFileError> {
+        match self.open_pinned_record(CLEANUP_FILE)? {
+            Some(existing) if existing.exact_bytes() == bytes => {
+                return self.sync_and_verify_record(CLEANUP_FILE, existing, bytes);
+            }
+            Some(_) => return Err(PlanFileError::ExistingOrUnsafe),
+            None => {}
+        }
+        match self.publish_record(CLEANUP_FILE, ".cleanup", bytes) {
+            Ok(pinned) => self.sync_and_verify_record(CLEANUP_FILE, pinned, bytes),
+            Err(PlanFileError::ExistingOrUnsafe) => match self.open_pinned_record(CLEANUP_FILE)? {
+                Some(existing) if existing.exact_bytes() == bytes => {
+                    self.sync_and_verify_record(CLEANUP_FILE, existing, bytes)
+                }
+                Some(_) | None => Err(PlanFileError::ExistingOrUnsafe),
+            },
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn verify_cleanup_record(&self, expected: &PinnedRegularFile) -> bool {
+        expected.held_bytes_match()
+            && matches!(
+                self.open_pinned_record(CLEANUP_FILE),
+                Ok(Some(actual)) if actual == *expected
+            )
     }
 
     fn publish_record(
@@ -1136,6 +1557,10 @@ impl PinnedControlDir {
             file.sync_all()
                 .map_err(|_| PlanFileError::PublicationFailed)?;
             rename_noreplace(&self.0.dir, temp_name.as_str(), target)?;
+            #[cfg(test)]
+            if target == PLAN_FILE && self.0.fail_launch_plan_sync.load(Ordering::Acquire) {
+                return Err(PlanFileError::PublicationFailed);
+            }
             self.0
                 .dir
                 .sync_all()
@@ -1146,10 +1571,19 @@ impl PinnedControlDir {
             let identity =
                 validate_regular_metadata(&metadata, 0o600, MAX_REQUEST, self.0.identity.owner_uid)
                     .map_err(|_| PlanFileError::PublicationFailed)?;
-            Ok(PinnedRegularFile(Arc::new(PinnedRegularFileInner {
-                _file: file,
-                identity,
-            })))
+            let Some(pinned) = self
+                .open_pinned_record(target)
+                .map_err(|_| PlanFileError::PublicationFailed)?
+            else {
+                return Err(PlanFileError::PublicationFailed);
+            };
+            if pinned.0.identity != identity
+                || pinned.exact_bytes() != bytes
+                || !pinned.held_bytes_match()
+            {
+                return Err(PlanFileError::PublicationFailed);
+            }
+            Ok(pinned)
         })();
         if result.is_err() {
             let _ = nix::unistd::unlinkat(
@@ -1162,25 +1596,16 @@ impl PinnedControlDir {
     }
 
     pub(crate) fn verify_launch_plan(&self, expected: &PinnedRegularFile) -> bool {
-        matches!(self.existing_launch_plan(), Ok(Some(actual)) if actual == *expected)
+        expected.held_bytes_match()
+            && matches!(self.existing_launch_plan(), Ok(Some(actual)) if actual == *expected)
     }
 
     pub(crate) fn verify_launch_receipt(&self, expected: &PinnedRegularFile) -> bool {
-        let Ok(file) = openat_readonly(&self.0.dir, RECEIPT_FILE, false) else {
-            return false;
-        };
-        let Ok(metadata) = file.metadata() else {
-            return false;
-        };
-        let Ok(identity) =
-            validate_regular_metadata(&metadata, 0o600, MAX_REQUEST, self.0.identity.owner_uid)
-        else {
-            return false;
-        };
-        PinnedRegularFile(Arc::new(PinnedRegularFileInner {
-            _file: file,
-            identity,
-        })) == *expected
+        expected.held_bytes_match()
+            && matches!(
+                self.open_pinned_record(RECEIPT_FILE),
+                Ok(Some(actual)) if actual == *expected
+            )
     }
 }
 

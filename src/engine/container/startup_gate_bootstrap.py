@@ -6,6 +6,7 @@ from collections import namedtuple
 from pathlib import Path
 
 RuntimeIdentity = namedtuple("RuntimeIdentity", ("uid", "gid", "groups", "drop"))
+GuestCwdObservation = namedtuple("GuestCwdObservation", ("cwd", "effective_uid", "effective_gid"))
 
 class GateError(Exception):
     def __init__(self, code, message=None):
@@ -52,7 +53,7 @@ def open_control_directory(path):
 def _fail(code, message):
     raise GateError(code, message)
 
-def _json(raw, allowed, code):
+def _json(raw, allowed, code, alternatives=()):
     def strict_object(pairs):
         value = {}
         for key, item in pairs:
@@ -64,7 +65,8 @@ def _json(raw, allowed, code):
         value = json.loads(raw.decode("utf-8"), object_pairs_hook=strict_object)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         _fail(code, str(exc))
-    if not isinstance(value, dict) or set(value) != set(allowed):
+    allowed_fields = (set(allowed),) + tuple(set(fields) for fields in alternatives)
+    if not isinstance(value, dict) or set(value) not in allowed_fields:
         _fail(code, "invalid object fields")
     return value
 
@@ -214,6 +216,125 @@ def apply_runtime_identity(identity):
             _fail("runtime-user", "effective identity differs after restoration")
     except (KeyError, ValueError, OSError) as exc:
         _fail("runtime-user", str(exc))
+
+def _reap_observer_child(pid, terminate):
+    kill_error = None
+    if terminate:
+        try: os.kill(pid, 9)
+        except ProcessLookupError: pass
+        except OSError as exc: kill_error = exc
+    while True:
+        try:
+            waited, _ = os.waitpid(pid, os.WNOHANG if kill_error is not None else 0)
+        except InterruptedError:
+            continue
+        except ChildProcessError as exc:
+            _fail("identity-probe", str(exc))
+        except OSError as exc:
+            _fail("identity-probe", str(exc))
+        if waited == 0:
+            _fail("identity-probe", str(kill_error))
+        if waited != pid:
+            _fail("identity-probe", "failed to reap target-identity observer")
+        return
+
+def observe_guest_cwd_as(identity, timeout=30):
+    try:
+        read_fd, write_fd = os.pipe()
+    except BaseException as exc:
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        _fail("identity-probe", str(exc))
+    try:
+        pid = os.fork()
+    except BaseException as exc:
+        try: os.close(read_fd)
+        except OSError: pass
+        try: os.close(write_fd)
+        except OSError: pass
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
+        _fail("identity-probe", str(exc))
+    if pid == 0:
+        status = 1
+        try:
+            try:
+                os.close(read_fd)
+                apply_runtime_identity(identity)
+                payload = json.dumps({
+                    "cwd": os.getcwd(),
+                    "effective_uid": os.geteuid(),
+                    "effective_gid": os.getegid(),
+                }, separators=(",", ":"), sort_keys=True).encode("utf-8")
+                status = 0
+            except BaseException as exc:
+                payload = str(exc).encode("utf-8", "replace")[:4096]
+            offset = 0
+            while offset < len(payload):
+                written = os.write(write_fd, payload[offset:])
+                if written <= 0:
+                    raise OSError("short target-identity observer write")
+                offset += written
+        except BaseException:
+            status = 1
+        finally:
+            try: os.close(write_fd)
+            finally: os._exit(status)
+    deadline = time.monotonic() + timeout
+    reaped = False
+    write_open = True
+    try:
+        os.close(write_fd)
+        write_open = False
+        while True:
+            try:
+                waited, status = os.waitpid(pid, os.WNOHANG)
+            except InterruptedError:
+                continue
+            if waited == pid:
+                reaped = True
+                break
+            if waited != 0:
+                _fail("identity-probe", "unexpected target-identity observer")
+            if time.monotonic() >= deadline:
+                _fail("identity-probe", "target-identity observation timed out")
+            time.sleep(0.01)
+        chunks = []
+        size = 0
+        while size <= 4096:
+            block = os.read(read_fd, 4097 - size)
+            if not block:
+                break
+            chunks.append(block)
+            size += len(block)
+        payload = b"".join(chunks)
+    except BaseException as exc:
+        if not reaped:
+            _reap_observer_child(pid, True)
+            reaped = True
+        if isinstance(exc, (GateError, KeyboardInterrupt, SystemExit)):
+            raise
+        _fail("identity-probe", str(exc))
+    finally:
+        if write_open:
+            try: os.close(write_fd)
+            except OSError: pass
+        try: os.close(read_fd)
+        except OSError: pass
+    if len(payload) > 4096:
+        _fail("identity-probe", "target-identity observation response too large")
+    if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+        _fail("identity-probe", payload.decode("utf-8", "replace") or "target-identity observation failed")
+    observed = _json(payload, ("cwd", "effective_uid", "effective_gid"), "identity-probe")
+    if (not isinstance(observed["cwd"], str) or not observed["cwd"].startswith("/")
+            or type(observed["effective_uid"]) is not int
+            or type(observed["effective_gid"]) is not int
+            or observed["effective_uid"] != identity.uid
+            or observed["effective_gid"] != identity.gid):
+        _fail("identity-probe", "target-identity observation differs")
+    return GuestCwdObservation(
+        observed["cwd"], observed["effective_uid"], observed["effective_gid"]
+    )
 
 def verify_binding_as(binding, manifest, identity):
     try:
@@ -454,9 +575,22 @@ def _load_request(control_dir, protected=False):
         owner = directory.st_uid
         mode = 0o600
     raw = _read_bounded_regular(control_dir / "request.json", 4096, "request-invalid", owner, mode)
-    request = _json(raw, ("version", "bindings"), "request-invalid")
-    if type(request["version"]) is not int or request["version"] != 1 or not isinstance(request["bindings"], list) or not request["bindings"]:
+    request = _json(
+        raw,
+        ("version", "bindings"),
+        "request-invalid",
+        alternatives=(("version", "bindings", "guest_cwd"),),
+    )
+    if (type(request["version"]) is not int
+            or request["version"] not in (1, 2)
+            or not isinstance(request["bindings"], list)
+            or not request["bindings"]):
         _fail("request-invalid", "unsupported request")
+    if request["version"] == 1:
+        if "guest_cwd" in request:
+            _fail("request-invalid", "unsupported request")
+    elif request.get("guest_cwd") != "/workspace":
+        _fail("request-invalid", "unsupported guest working directory")
     ids, paths = set(), []
     for binding in request["bindings"]:
         if not isinstance(binding, dict) or set(binding) != {"id", "workspace_path", "manifest_id", "manifest_file", "access"}: _fail("request-invalid", "invalid binding fields")
@@ -467,7 +601,7 @@ def _load_request(control_dir, protected=False):
         if any(path == prior or path.startswith(prior + "/") or prior.startswith(path + "/") for prior in paths): _fail("request-invalid", "overlapping workspace paths")
         paths.append(path)
         name = binding["manifest_file"]
-        reserved = {"bootstrap.py", "request.json", "original-python-env.json", ".released", "ready.json", "release.json", "failure.json"}
+        reserved = {"bootstrap.py", "request.json", "original-python-env.json", ".released", "ready.json", "release.json", "failure.json", "cleanup.json"}
         if not isinstance(name, str) or not name or "/" in name or "\\" in name or name in reserved or name in (".", ".."): _fail("request-invalid", "invalid manifest basename")
         if binding["access"] not in ("read-only", "read-write") or not _hex64(binding["manifest_id"]): _fail("request-invalid", "invalid binding")
     return request
@@ -496,12 +630,24 @@ def run_gate(control_dir, original_argv, original_env, mountinfo_text, cancel_ch
                 verify_binding_as(binding, manifest, runtime_identity)
             verified.append({k: binding[k] for k in ("id", "manifest_id", "access", "workspace_path")})
         if not container_name: _fail("identity-invalid", "missing authoritative container identity")
-        ready = {"version": 1, "nonce": secrets.token_hex(32), "container_name": container_name, "bindings": verified}
+        ready = {"version": request["version"], "nonce": secrets.token_hex(32), "container_name": container_name, "bindings": verified}
+        observation_identity = runtime_identity
+        if request["version"] == 2:
+            if observation_identity is None:
+                observation_identity = resolve_runtime_identity(None)
+            observed = observe_guest_cwd_as(observation_identity)
+            if observed.cwd != request["guest_cwd"]:
+                _fail("cwd-invalid", "guest working directory differs")
+            ready["guest_cwd"] = observed.cwd
         _atomic_control_json(control, "ready.json", ready)
         print("AWMAN_STARTUP_GATE_READY " + ready["nonce"], file=sys.stderr, flush=True)
         await_release(control_dir, ready, timeout, cancel_check=cancel_check, clock=clock, sleep=sleep, control_handle=control)
         _atomic_control_json(control, ".released", {"version": 1, "nonce": ready["nonce"]})
         print("AWMAN_STARTUP_GATE_RELEASED " + ready["nonce"], file=sys.stderr, flush=True)
+        if request["version"] == 2:
+            observed = observe_guest_cwd_as(observation_identity)
+            if observed.cwd != request["guest_cwd"]:
+                _fail("cwd-invalid", "guest working directory differs")
         exec_fn(original_argv[0], original_argv, original_env)
     except GateError as exc:
         _atomic_control_json(control, "failure.json", {"version": 1, "code": exc.code, "message": str(exc)})

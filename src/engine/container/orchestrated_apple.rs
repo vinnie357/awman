@@ -2,28 +2,51 @@
 
 use crate::data::startup_gate::{StartupGateAccess, StartupGateRequest};
 use crate::engine::container::gated_launch::{
-    provider_call_deadline, revalidate_post_spawn, AppleProviderState, ChildLifecycleAuthority,
+    canonical_protected_cleanup_record, provider_call_deadline, revalidate_post_spawn,
+    AppleProviderState, ChildLifecycleAuthority, ChildLifecycleState, CleanupRuntimeIdentity,
     DurableLaunchPlan, ExactInspection, GatedProviderAdapter, LaunchRetentionReason, NamePresence,
-    ProviderLaunchInspection, ProviderState,
+    NeverCreatedLifecycleProof, ProviderLaunchInspection, ProviderState,
 };
 #[cfg(test)]
 use crate::engine::error::EngineError;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const MAX_HANDSHAKE_RECORD: u64 = 64 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ReadyRecord {
     version: u32,
     nonce: String,
     container_name: String,
     bindings: Vec<ReadyBinding>,
+    guest_cwd: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReadyVersion {
+    version: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadyRecordV1 {
+    version: u32,
+    nonce: String,
+    container_name: String,
+    bindings: Vec<ReadyBinding>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadyRecordV2 {
+    version: u32,
+    nonce: String,
+    container_name: String,
+    bindings: Vec<ReadyBinding>,
+    guest_cwd: String,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Eq)]
@@ -48,6 +71,8 @@ struct LaunchReceipt<'a> {
     nonce: &'a str,
     container_name: &'a str,
     runtime_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guest_cwd: Option<&'a str>,
 }
 
 pub(super) struct ProtectedGateRelease {
@@ -58,8 +83,16 @@ pub(super) struct ProtectedGateRelease {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::engine::container) enum ExactCleanupPhase {
     NeedsCleanup,
+    NeverCreatedNeedsAbsence {
+        proof: NeverCreatedLifecycleProof,
+    },
+    ReapProvenNeedsCleanup,
     AwaitingAbsence {
         removal_authority: ProviderLaunchInspection,
+    },
+    PublicationPending {
+        record: Arc<Vec<u8>>,
+        last_inspection: Option<ProviderLaunchInspection>,
     },
     Complete,
 }
@@ -99,7 +132,16 @@ pub(super) fn await_protected_release(
             .controls
             .read_guest_record("ready.json", MAX_HANDSHAKE_RECORD)
         {
-            Ok(Some(bytes)) => break parse_ready(plan, &bytes)?,
+            Ok(Some(bytes)) => match parse_ready(plan, &bytes) {
+                Ok(ready) => break ready,
+                Err(reason) => {
+                    #[cfg(test)]
+                    if let Some(boundary) = boundary {
+                        boundary.observe_ready_rejected();
+                    }
+                    return Err(reason);
+                }
+            },
             Ok(None) => std::thread::sleep(POLL_INTERVAL),
             Err(_) => return Err(LaunchRetentionReason::PostSpawnControlChanged),
         }
@@ -137,10 +179,11 @@ pub(super) fn await_protected_release(
     }
 
     let receipt = serde_json::to_vec(&LaunchReceipt {
-        version: 1,
+        version: ready.version,
         nonce: &ready.nonce,
         container_name: plan.key.container_name.as_str(),
         runtime_id: &confirmed.runtime_id,
+        guest_cwd: ready.guest_cwd.as_deref(),
     })
     .map_err(|_| LaunchRetentionReason::PostSpawnControlChanged)?;
     let pinned_receipt = plan
@@ -203,12 +246,43 @@ fn parse_ready(
     plan: &DurableLaunchPlan,
     bytes: &[u8],
 ) -> Result<ReadyRecord, LaunchRetentionReason> {
-    let ready: ReadyRecord = serde_json::from_slice(bytes)
+    let version: ReadyVersion = serde_json::from_slice(bytes)
         .map_err(|_| LaunchRetentionReason::PostSpawnControlChanged)?;
-    if ready.version != 1
+    let ready = match version.version {
+        1 => {
+            let ready: ReadyRecordV1 = serde_json::from_slice(bytes)
+                .map_err(|_| LaunchRetentionReason::PostSpawnControlChanged)?;
+            ReadyRecord {
+                version: ready.version,
+                nonce: ready.nonce,
+                container_name: ready.container_name,
+                bindings: ready.bindings,
+                guest_cwd: None,
+            }
+        }
+        2 => {
+            let ready: ReadyRecordV2 = serde_json::from_slice(bytes)
+                .map_err(|_| LaunchRetentionReason::PostSpawnControlChanged)?;
+            ReadyRecord {
+                version: ready.version,
+                nonce: ready.nonce,
+                container_name: ready.container_name,
+                bindings: ready.bindings,
+                guest_cwd: Some(ready.guest_cwd),
+            }
+        }
+        _ => return Err(LaunchRetentionReason::PostSpawnControlChanged),
+    };
+    let request = &plan.controls.request.request;
+    let version_and_cwd_match = match request.version {
+        1 => ready.version == 1 && ready.guest_cwd.is_none(),
+        2 => ready.version == 2 && ready.guest_cwd == request.guest_cwd,
+        _ => false,
+    };
+    if !version_and_cwd_match
         || ready.container_name != plan.key.container_name.as_str()
         || !valid_lower_hex_32(&ready.nonce)
-        || ready.bindings != expected_bindings(&plan.controls.request.request)
+        || ready.bindings != expected_bindings(request)
     {
         return Err(LaunchRetentionReason::PostSpawnControlChanged);
     }
@@ -246,9 +320,37 @@ pub(super) fn cleanup_exact_launch(
     if matches!(phase, ExactCleanupPhase::Complete) {
         return Ok(());
     }
+    if matches!(phase, ExactCleanupPhase::PublicationPending { .. }) {
+        return publish_pending_cleanup(
+            plan,
+            phase,
+            #[cfg(test)]
+            boundary,
+        );
+    }
     if let ExactCleanupPhase::AwaitingAbsence { removal_authority } = phase {
         let removal_authority = removal_authority.clone();
-        return retry_authorized_removal(plan, adapter, phase, enclosing, &removal_authority);
+        return retry_authorized_removal(
+            plan,
+            adapter,
+            phase,
+            enclosing,
+            &removal_authority,
+            #[cfg(test)]
+            boundary,
+        );
+    }
+    if let ExactCleanupPhase::NeverCreatedNeedsAbsence { proof } = phase {
+        let proof = proof.clone();
+        return cleanup_never_created(
+            plan,
+            adapter,
+            phase,
+            enclosing,
+            proof,
+            #[cfg(test)]
+            boundary,
+        );
     }
     #[cfg(test)]
     if let Some(boundary) = boundary {
@@ -289,12 +391,25 @@ pub(super) fn cleanup_exact_launch(
             Some(first),
         ));
     }
+    if !matches!(lifecycle.state(), Ok(ChildLifecycleState::Exited(_))) {
+        return Err(cleanup_error(
+            LaunchRetentionReason::ChildStateUnknown,
+            Some(first),
+        ));
+    }
     #[cfg(test)]
     if boundary.is_some_and(|boundary| !boundary.cleanup_reap_proven()) {
         return Err(cleanup_error(
             LaunchRetentionReason::ChildStateUnknown,
             Some(first),
         ));
+    }
+    if matches!(phase, ExactCleanupPhase::NeedsCleanup) {
+        *phase = ExactCleanupPhase::ReapProvenNeedsCleanup;
+        #[cfg(test)]
+        if let Some(boundary) = boundary {
+            boundary.observe_actual_child_reaped();
+        }
     }
     let stopped = match adapter.inspect_launch(&plan.key, provider_call_deadline(enclosing)) {
         ExactInspection::Matching(inspection)
@@ -333,7 +448,60 @@ pub(super) fn cleanup_exact_launch(
                 Some(stopped.clone()),
             )
         })?;
-    prove_exact_absence(plan, adapter, phase, enclosing, Some(stopped))
+    prove_exact_absence(
+        plan,
+        adapter,
+        phase,
+        enclosing,
+        stopped,
+        #[cfg(test)]
+        boundary,
+    )
+}
+
+fn cleanup_never_created(
+    plan: &DurableLaunchPlan,
+    adapter: &dyn GatedProviderAdapter,
+    phase: &mut ExactCleanupPhase,
+    enclosing: Instant,
+    proof: NeverCreatedLifecycleProof,
+    #[cfg(test)] boundary: Option<&dyn OrchestratedAppleTestBoundary>,
+) -> Result<(), ExactCleanupError> {
+    #[cfg(test)]
+    if let Some(boundary) = boundary {
+        boundary.begin_cleanup();
+    }
+    match adapter.inspect_name_absence(&plan.key.container_name, provider_call_deadline(enclosing))
+    {
+        Ok(absence)
+            if absence.provider == plan.key.provider
+                && absence.exact_name == plan.key.container_name =>
+        {
+            let record = canonical_protected_cleanup_record(
+                plan,
+                CleanupRuntimeIdentity::NeverCreated(proof),
+            )
+            .map_err(|_| cleanup_error(LaunchRetentionReason::PostSpawnControlChanged, None))?;
+            *phase = ExactCleanupPhase::PublicationPending {
+                record: Arc::new(record),
+                last_inspection: None,
+            };
+            #[cfg(test)]
+            if let Some(boundary) = boundary {
+                boundary.observe_exact_absence_proven();
+            }
+            publish_pending_cleanup(
+                plan,
+                phase,
+                #[cfg(test)]
+                boundary,
+            )
+        }
+        Ok(_) | Err(_) => Err(cleanup_error(
+            LaunchRetentionReason::InspectionUnavailable,
+            None,
+        )),
+    }
 }
 
 fn retry_authorized_removal(
@@ -342,6 +510,7 @@ fn retry_authorized_removal(
     phase: &mut ExactCleanupPhase,
     enclosing: Instant,
     removal_authority: &ProviderLaunchInspection,
+    #[cfg(test)] boundary: Option<&dyn OrchestratedAppleTestBoundary>,
 ) -> Result<(), ExactCleanupError> {
     match adapter.inspect_name_absence(&plan.key.container_name, provider_call_deadline(enclosing))
     {
@@ -349,8 +518,13 @@ fn retry_authorized_removal(
             if absence.provider == plan.key.provider
                 && absence.exact_name == plan.key.container_name =>
         {
-            *phase = ExactCleanupPhase::Complete;
-            return Ok(());
+            return accept_created_absence(
+                plan,
+                phase,
+                removal_authority.clone(),
+                #[cfg(test)]
+                boundary,
+            );
         }
         Ok(_) | Err(NamePresence::Ambiguous | NamePresence::Unavailable) => {
             return Err(cleanup_error(
@@ -395,7 +569,15 @@ fn retry_authorized_removal(
                 Some(current.clone()),
             )
         })?;
-    prove_exact_absence(plan, adapter, phase, enclosing, Some(current))
+    prove_exact_absence(
+        plan,
+        adapter,
+        phase,
+        enclosing,
+        current,
+        #[cfg(test)]
+        boundary,
+    )
 }
 
 fn same_launch_identity(
@@ -410,12 +592,110 @@ fn same_launch_identity(
         && current.created_at == authorized.created_at
 }
 
+fn accept_created_absence(
+    plan: &DurableLaunchPlan,
+    phase: &mut ExactCleanupPhase,
+    last_inspection: ProviderLaunchInspection,
+    #[cfg(test)] boundary: Option<&dyn OrchestratedAppleTestBoundary>,
+) -> Result<(), ExactCleanupError> {
+    let record = canonical_protected_cleanup_record(
+        plan,
+        CleanupRuntimeIdentity::Created(last_inspection.runtime_id.as_str()),
+    )
+    .map_err(|_| {
+        cleanup_error(
+            LaunchRetentionReason::PostSpawnControlChanged,
+            Some(last_inspection.clone()),
+        )
+    })?;
+    *phase = ExactCleanupPhase::PublicationPending {
+        record: Arc::new(record),
+        last_inspection: Some(last_inspection),
+    };
+    #[cfg(test)]
+    if let Some(boundary) = boundary {
+        boundary.observe_exact_absence_proven();
+    }
+    publish_pending_cleanup(
+        plan,
+        phase,
+        #[cfg(test)]
+        boundary,
+    )
+}
+
+fn publish_pending_cleanup(
+    plan: &DurableLaunchPlan,
+    phase: &mut ExactCleanupPhase,
+    #[cfg(test)] boundary: Option<&dyn OrchestratedAppleTestBoundary>,
+) -> Result<(), ExactCleanupError> {
+    let (record, last_inspection) = match phase {
+        ExactCleanupPhase::PublicationPending {
+            record,
+            last_inspection,
+        } => (Arc::clone(record), last_inspection.clone()),
+        _ => {
+            return Err(cleanup_error(
+                LaunchRetentionReason::PostSpawnControlChanged,
+                None,
+            ));
+        }
+    };
+
+    #[cfg(test)]
+    if boundary.is_some_and(|boundary| boundary.fail_cleanup_publication_once()) {
+        if let Some(boundary) = boundary {
+            boundary.observe_cleanup_publication(false);
+        }
+        return Err(cleanup_error(
+            LaunchRetentionReason::PostSpawnControlChanged,
+            last_inspection,
+        ));
+    }
+
+    let pinned = match plan
+        .controls
+        .host_parent
+        .publish_or_verify_cleanup_record(record.as_slice())
+    {
+        Ok(pinned) => pinned,
+        Err(_) => {
+            #[cfg(test)]
+            if let Some(boundary) = boundary {
+                boundary.observe_cleanup_publication(false);
+            }
+            return Err(cleanup_error(
+                LaunchRetentionReason::PostSpawnControlChanged,
+                last_inspection,
+            ));
+        }
+    };
+    if !plan.controls.host_parent.verify_cleanup_record(&pinned) {
+        #[cfg(test)]
+        if let Some(boundary) = boundary {
+            boundary.observe_cleanup_publication(false);
+        }
+        return Err(cleanup_error(
+            LaunchRetentionReason::PostSpawnControlChanged,
+            last_inspection,
+        ));
+    }
+
+    *phase = ExactCleanupPhase::Complete;
+    #[cfg(test)]
+    if let Some(boundary) = boundary {
+        boundary.observe_cleanup_publication(true);
+    }
+    Ok(())
+}
+
 fn prove_exact_absence(
     plan: &DurableLaunchPlan,
     adapter: &dyn GatedProviderAdapter,
     phase: &mut ExactCleanupPhase,
     enclosing: Instant,
-    last_inspection: Option<ProviderLaunchInspection>,
+    last_inspection: ProviderLaunchInspection,
+    #[cfg(test)] boundary: Option<&dyn OrchestratedAppleTestBoundary>,
 ) -> Result<(), ExactCleanupError> {
     match adapter.inspect_name_absence(&plan.key.container_name, provider_call_deadline(enclosing))
     {
@@ -423,12 +703,17 @@ fn prove_exact_absence(
             if absence.provider == plan.key.provider
                 && absence.exact_name == plan.key.container_name =>
         {
-            *phase = ExactCleanupPhase::Complete;
-            Ok(())
+            accept_created_absence(
+                plan,
+                phase,
+                last_inspection,
+                #[cfg(test)]
+                boundary,
+            )
         }
         Ok(_) | Err(_) => Err(cleanup_error(
             LaunchRetentionReason::InspectionUnavailable,
-            last_inspection,
+            Some(last_inspection),
         )),
     }
 }
@@ -477,12 +762,24 @@ pub(crate) trait OrchestratedAppleTestBoundary: Send + Sync {
     );
     fn observe_child_start(&self);
     fn observe_protected_launch_identity(&self, inspection: &ProviderLaunchInspection);
+    fn observe_ready_rejected(&self);
     fn observe_protected_ready(&self);
     fn observe_accepted_release(&self);
     fn observe_provider_entry(&self, before_release: bool);
     fn observe_cancel_point(&self, point: TestCancellationPoint);
+    fn before_cli_start_after_plan(&self) -> bool {
+        false
+    }
     fn begin_cleanup(&self);
     fn observe_reap(&self);
+    fn observe_actual_child_reaped(&self);
+    fn observe_never_created_proven(&self);
+    fn observe_exact_absence_proven(&self);
+    fn observe_cleanup_publication(&self, succeeded: bool);
+    fn observe_resource_loan_released(&self);
+    fn fail_cleanup_publication_once(&self) -> bool {
+        false
+    }
     fn cleanup_reap_proven(&self) -> bool;
     fn observe_custody(&self, ownership: TestOwnershipObservation, legacy: bool);
 }

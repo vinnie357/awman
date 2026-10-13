@@ -17,16 +17,26 @@ mod platform;
 mod platform;
 
 pub use platform::load_startup_gate;
+#[cfg(all(test, unix))]
+pub(crate) use platform::{
+    after_launch_plan_native_publication, arm_launch_plan_post_rename_sync_failure,
+};
 pub(crate) use platform::{
     revalidate_mount_source, OrchestratedControlAuthority, PinnedControlDir, PinnedRegularFile,
     PlanFileError,
 };
+
+fn guest_cwd_absent_or_empty(value: &Option<String>) -> bool {
+    value.as_deref().is_none_or(str::is_empty)
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartupGateRequest {
     pub version: u32,
     pub bindings: Vec<StartupGateBinding>,
+    #[serde(skip_serializing_if = "guest_cwd_absent_or_empty")]
+    pub guest_cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]

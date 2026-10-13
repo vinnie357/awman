@@ -50,6 +50,7 @@ fn valid_gate() -> (tempfile::TempDir, StartupGateSpec) {
 fn gate_spec(control_dir: PathBuf) -> StartupGateSpec {
     let request = StartupGateRequest {
         version: 1,
+        guest_cwd: None,
         bindings: vec![StartupGateBinding {
             id: "review-input".into(),
             workspace_path: "/review/input".into(),

@@ -252,6 +252,62 @@ pub(crate) struct PreparedChildLifecycle {
     bind: mpsc::SyncSender<BindCommand>,
     #[cfg(test)]
     bind_fault: Option<test_support::PrepareFault>,
+    #[cfg(test)]
+    never_created_retention_blocked: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NeverCreatedLifecycleProof {
+    _sealed: (),
+}
+
+pub(crate) struct NeverCreatedRetentionFailure {
+    _source: EngineError,
+    _prepared: PreparedChildLifecycle,
+    _resources: Box<dyn Any + Send>,
+}
+
+impl NeverCreatedRetentionFailure {
+    fn new(
+        source: EngineError,
+        prepared: PreparedChildLifecycle,
+        resources: Box<dyn Any + Send>,
+    ) -> Box<Self> {
+        Box::new(Self {
+            _source: source,
+            _prepared: prepared,
+            _resources: resources,
+        })
+    }
+
+    pub(in crate::engine::container::gated_launch) fn authority(&self) -> ChildLifecycleAuthority {
+        self._prepared.authority.clone()
+    }
+
+    pub(in crate::engine::container::gated_launch) fn retry(
+        self,
+    ) -> Result<NeverCreatedChildLifecycle, Box<Self>> {
+        self._prepared
+            .retain_never_created_resources(self._resources)
+    }
+}
+
+pub(crate) struct NeverCreatedChildLifecycle {
+    authority: ChildLifecycleAuthority,
+    resource_loan: ExecutionResourceLoan,
+    proof: NeverCreatedLifecycleProof,
+}
+
+impl NeverCreatedChildLifecycle {
+    pub(in crate::engine::container::gated_launch) fn into_parts(
+        self,
+    ) -> (
+        ChildLifecycleAuthority,
+        ExecutionResourceLoan,
+        NeverCreatedLifecycleProof,
+    ) {
+        (self.authority, self.resource_loan, self.proof)
+    }
 }
 
 impl fmt::Debug for PreparedChildLifecycle {
@@ -476,6 +532,8 @@ impl ChildLifecycleAuthority {
             None,
             #[cfg(test)]
             None,
+            #[cfg(test)]
+            None,
         )
     }
 
@@ -676,6 +734,91 @@ impl Drop for PreparedChildLifecycle {
 }
 
 impl PreparedChildLifecycle {
+    #[cfg(test)]
+    pub(crate) fn prove_never_created(self) -> Result<NeverCreatedLifecycleProof, EngineError> {
+        self.verify_never_bound()?;
+        Ok(self.close_never_created())
+    }
+
+    pub(in crate::engine::container) fn retain_never_created_resources(
+        self,
+        resources: Box<dyn Any + Send>,
+    ) -> Result<NeverCreatedChildLifecycle, Box<NeverCreatedRetentionFailure>> {
+        #[cfg(test)]
+        if self
+            .never_created_retention_blocked
+            .as_ref()
+            .is_some_and(|blocked| blocked.load(Ordering::Acquire))
+        {
+            return Err(NeverCreatedRetentionFailure::new(
+                state_unknown(),
+                self,
+                resources,
+            ));
+        }
+
+        let authority = self.authority.clone();
+        let custody = Arc::clone(&authority.shared.custody);
+        let mut slot = match try_lock_resource_slot(&custody) {
+            Ok(slot) => slot,
+            Err(error) => {
+                return Err(NeverCreatedRetentionFailure::new(error, self, resources));
+            }
+        };
+        let never_bound = matches!(authority.state(), Ok(ChildLifecycleState::Prepared))
+            && !custody.may_have_child.load(Ordering::Acquire)
+            && !custody.bind_decided.load(Ordering::Acquire)
+            && !custody.resources_present.load(Ordering::Acquire)
+            && !custody.loan_issued.load(Ordering::Acquire)
+            && slot.is_none();
+        if !never_bound {
+            drop(slot);
+            return Err(NeverCreatedRetentionFailure::new(
+                state_unknown(),
+                self,
+                resources,
+            ));
+        }
+
+        *slot = Some(resources);
+        custody.resources_present.store(true, Ordering::Release);
+        custody.loan_issued.store(true, Ordering::Release);
+        drop(slot);
+        let resource_loan = ExecutionResourceLoan {
+            custody: Arc::clone(&custody),
+            released: false,
+        };
+        let proof = self.close_never_created();
+        Ok(NeverCreatedChildLifecycle {
+            authority,
+            resource_loan,
+            proof,
+        })
+    }
+
+    #[cfg(test)]
+    fn verify_never_bound(&self) -> Result<(), EngineError> {
+        let custody = &self.authority.shared.custody;
+        if !matches!(self.authority.state(), Ok(ChildLifecycleState::Prepared))
+            || custody.may_have_child.load(Ordering::Acquire)
+            || custody.bind_decided.load(Ordering::Acquire)
+            || custody.loan_issued.load(Ordering::Acquire)
+        {
+            return Err(state_unknown());
+        }
+        Ok(())
+    }
+
+    fn close_never_created(self) -> NeverCreatedLifecycleProof {
+        self.authority
+            .shared
+            .custody
+            .bind_decided
+            .store(true, Ordering::Release);
+        self.authority.shared.custody.changed.notify_all();
+        NeverCreatedLifecycleProof { _sealed: () }
+    }
+
     // Packet 1 compatibility method; production uses the resource-owning sibling.
     #[allow(dead_code)]
     pub(crate) fn bind_started_child(
@@ -795,6 +938,7 @@ impl ChildLifecycleSlot {
 fn prepare_inner(
     #[cfg(test)] fault: Option<test_support::PrepareFault>,
     #[cfg(test)] initial_pause: Option<test_support::ActorPausePoint>,
+    #[cfg(test)] never_created_retention_blocked: Option<Arc<AtomicBool>>,
 ) -> Result<PreparedChildLifecycle, EngineError> {
     #[cfg(test)]
     if fault == Some(test_support::PrepareFault::ThreadStart) {
@@ -905,6 +1049,8 @@ fn prepare_inner(
         bind,
         #[cfg(test)]
         bind_fault: fault,
+        #[cfg(test)]
+        never_created_retention_blocked,
     })
 }
 
@@ -1106,7 +1252,21 @@ fn resource_custody_loop(custody: Arc<ResourceCustody>) {
         if custody.bind_decided.load(Ordering::Acquire)
             && !custody.may_have_child.load(Ordering::Acquire)
         {
-            return;
+            if !custody.resources_present.load(Ordering::Acquire) {
+                return;
+            }
+            if custody.loan_issued.load(Ordering::Acquire)
+                && custody.loan_released.load(Ordering::Acquire)
+            {
+                if let Ok(mut slot) = try_lock_resource_slot(&custody) {
+                    let resources = slot.take();
+                    drop(slot);
+                    drop(resources);
+                    custody.resources_present.store(false, Ordering::Release);
+                    custody.changed.notify_all();
+                    return;
+                }
+            }
         }
         let (next, _) = custody
             .changed
@@ -1410,6 +1570,32 @@ pub(crate) mod test_support {
         BeforePoll,
     }
 
+    pub(crate) struct NeverCreatedRetentionGate {
+        blocked: Arc<AtomicBool>,
+        custody: Arc<ResourceCustody>,
+    }
+
+    impl NeverCreatedRetentionGate {
+        pub(crate) fn release(&self) {
+            self.blocked.store(false, Ordering::Release);
+            self.custody.changed.notify_all();
+        }
+    }
+
+    impl Drop for NeverCreatedRetentionGate {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    pub(crate) fn prepare_with_never_created_retention_blocked(
+    ) -> Result<(PreparedChildLifecycle, NeverCreatedRetentionGate), EngineError> {
+        let blocked = Arc::new(AtomicBool::new(true));
+        let prepared = prepare_inner(None, None, Some(Arc::clone(&blocked)))?;
+        let custody = Arc::clone(&prepared.authority.shared.custody);
+        Ok((prepared, NeverCreatedRetentionGate { blocked, custody }))
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub(crate) enum CreateCliKind {
         Pty,
@@ -1420,13 +1606,13 @@ pub(crate) mod test_support {
     pub(crate) fn prepare_with_fault(
         fault: PrepareFault,
     ) -> Result<PreparedChildLifecycle, EngineError> {
-        prepare_inner(Some(fault), None)
+        prepare_inner(Some(fault), None, None)
     }
 
     pub(crate) fn prepare_with_pause(
         point: ActorPausePoint,
     ) -> Result<(PreparedChildLifecycle, PollPause), EngineError> {
-        let prepared = prepare_inner(None, Some(point))?;
+        let prepared = prepare_inner(None, Some(point), None)?;
         let pause = {
             let guard = lock_state(&prepared.authority.shared);
             match point {

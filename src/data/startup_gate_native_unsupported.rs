@@ -28,6 +28,16 @@ impl fmt::Debug for PinnedRegularFile {
     }
 }
 
+impl PinnedRegularFile {
+    pub(crate) fn exact_bytes(&self) -> &[u8] {
+        match &self.0 {}
+    }
+
+    pub(crate) fn held_bytes_match(&self) -> bool {
+        match &self.0 {}
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct PinnedGuestControl(Infallible);
 
@@ -102,7 +112,35 @@ impl PinnedControlDir {
         Err(PlanFileError::PublicationFailed)
     }
 
-    pub(crate) fn publish_launch_plan(
+    pub(crate) fn publish_launch_plan_owned(
+        &self,
+        _bytes: &[u8],
+    ) -> Result<
+        (PinnedControlDir, PinnedRegularFile),
+        (PlanFileError, Option<(PinnedControlDir, PinnedRegularFile)>),
+    > {
+        let _ = &self.0;
+        Err((PlanFileError::PublicationFailed, None))
+    }
+
+    pub(crate) fn verify_pending_launch_plan(
+        &self,
+        expected: &PinnedRegularFile,
+    ) -> Result<(), PlanFileError> {
+        let _ = (&self.0, &expected.0);
+        Err(PlanFileError::PublicationFailed)
+    }
+
+    pub(crate) fn publish_launch_receipt(
+        &self,
+        _bytes: &[u8],
+    ) -> Result<PinnedRegularFile, PlanFileError> {
+        let _ = &self.0;
+        Err(PlanFileError::PublicationFailed)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn publish_or_verify_cleanup_record(
         &self,
         _bytes: &[u8],
     ) -> Result<PinnedRegularFile, PlanFileError> {
@@ -111,6 +149,17 @@ impl PinnedControlDir {
     }
 
     pub(crate) fn verify_launch_plan(&self, expected: &PinnedRegularFile) -> bool {
+        let _ = (&self.0, &expected.0);
+        false
+    }
+
+    pub(crate) fn verify_launch_receipt(&self, expected: &PinnedRegularFile) -> bool {
+        let _ = (&self.0, &expected.0);
+        false
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn verify_cleanup_record(&self, expected: &PinnedRegularFile) -> bool {
         let _ = (&self.0, &expected.0);
         false
     }

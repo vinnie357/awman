@@ -48,9 +48,10 @@ use crate::engine::container::gated_launch::LaunchRetentionRegistry;
 use crate::engine::container::gated_launch::NotCreatedProof;
 use crate::engine::container::gated_launch::{
     retain_detached_after_error, validate_immediate_pre_spawn, ActiveGateMonitor,
-    ActiveGatedCustody, ChildLifecycleAuthority, ChildLifecycleSlot, DurableLaunchPlan,
-    ExecutionResourceLoan, GatedProviderAdapter, LaunchRetentionReason, RetainedAgentLaunch,
-    RetainedExecution, SpawnStageError, SpawnedCreateCli,
+    ActiveGatedCustody, BindStartedChildError, ChildLifecycleAuthority, ChildLifecycleSlot,
+    DurableLaunchPlan, ExecutionResourceLoan, GatedProviderAdapter, LaunchIdentityError,
+    LaunchRetentionReason, RetainedAgentLaunch, RetainedExecution, SpawnStageError,
+    SpawnedCreateCli,
 };
 use crate::engine::container::instance::{handle_now, ContainerId};
 use crate::engine::container::io_bridge::{BridgeConfig, CancelFn};
@@ -171,6 +172,7 @@ pub(super) struct GatedSpawnContext {
     pub plan: DurableLaunchPlan,
     pub adapter: Arc<dyn GatedProviderAdapter>,
     pub enclosing: Instant,
+    pub registry: Arc<LaunchRetentionRegistry>,
     #[cfg(test)]
     pub tuple_validation_only: bool,
 }
@@ -369,6 +371,7 @@ impl AgentInstance for ContainerInstance {
     ) -> Result<AgentExecution, EngineError> {
         let cli = self.cli;
         let post_bridge = self.post_bridge;
+        let mut prepared = Some(ChildLifecycleAuthority::prepare()?);
         let mut gated = None;
         if let Some(spec) = self.options.startup_gate.clone() {
             let mut staged = match super::startup_gate::stage_startup_gate(&spec) {
@@ -382,6 +385,8 @@ impl AgentInstance for ContainerInstance {
                     return Err(error);
                 }
             };
+            #[cfg(test)]
+            test_support::observe_publication_staged_gate(&staged);
             staged
                 .wrapper_argv
                 .extend(["--container-name".into(), self.name.0.clone()]);
@@ -429,23 +434,55 @@ impl AgentInstance for ContainerInstance {
                 let adapter = self.gated_provider.clone().ok_or_else(|| {
                     EngineError::Config("orchestrated Apple provider is unavailable".into())
                 })?;
+                let registry = self.launch_retention.clone().ok_or_else(|| {
+                    EngineError::Container("launch retention registry unavailable".into())
+                })?;
+                let mount = staged.orchestrated_mount.take().ok_or_else(|| {
+                    EngineError::Config("orchestrated guest control mount is unavailable".into())
+                })?;
+                let overlay = mount.revalidated_overlay()?;
                 let enclosing = Instant::now() + spec.timeout;
-                let plan = super::gated_launch::prepare_orchestrated_launch(
+                let plan = match super::gated_launch::prepare_orchestrated_launch(
                     adapter.as_ref(),
                     &self.image,
                     identity,
                     Arc::clone(controls),
                     enclosing,
-                )
-                .map_err(|error| EngineError::Container(error.to_string()))?;
-                let mount = staged.orchestrated_mount.take().ok_or_else(|| {
-                    EngineError::Config("orchestrated guest control mount is unavailable".into())
-                })?;
-                staged.overlays.push(mount.revalidated_overlay()?);
+                ) {
+                    Ok(plan) => plan,
+                    Err(LaunchIdentityError::LaunchPlanPublicationUncertain(publication)) => {
+                        let Some(prepared) = prepared.take() else {
+                            return Err(EngineError::Container(
+                                "prepared launch custody unavailable".into(),
+                            ));
+                        };
+                        let resources = Box::new(PendingPublicationResources {
+                            _leases: std::mem::take(&mut self.leases),
+                            _gate_cleanup: Some(staged.cleanup),
+                            post_wait: cli.post_wait,
+                            #[cfg(test)]
+                            _custody_witness: test_support::take_custody_witness(),
+                        });
+                        let _ticket = registry.retain_pending_publication(
+                            publication,
+                            prepared,
+                            resources,
+                            adapter,
+                            #[cfg(test)]
+                            self.test_boundary.clone(),
+                        );
+                        return Err(EngineError::Container(
+                            "launch plan publication failed".into(),
+                        ));
+                    }
+                    Err(error) => return Err(EngineError::Container(error.to_string())),
+                };
+                staged.overlays.push(overlay);
                 gated = Some(GatedSpawnContext {
                     plan,
                     adapter,
                     enclosing,
+                    registry,
                     #[cfg(test)]
                     tuple_validation_only: false,
                 });
@@ -472,7 +509,8 @@ impl AgentInstance for ContainerInstance {
         let stuck_timeout = frontend.stuck_timeout();
         let io = frontend.take_io();
 
-        let prepared = ChildLifecycleAuthority::prepare()?;
+        let prepared = prepared
+            .ok_or_else(|| EngineError::Container("prepared launch custody unavailable".into()))?;
         let slot = Arc::new(ChildLifecycleSlot::new());
         let retention =
             SpawnRetentionContext::new(gated.as_ref().map(|context| context.plan.clone()));
@@ -568,6 +606,20 @@ struct SpawnCustodyResources {
     attach_permit: Option<AttachStorePermit>,
     #[cfg(test)]
     custody_witness: Option<test_support::CustodyWitness>,
+}
+
+struct PendingPublicationResources {
+    _leases: Vec<CredentialLease>,
+    _gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
+    post_wait: PostWaitHook,
+    #[cfg(test)]
+    _custody_witness: Option<test_support::CustodyWitness>,
+}
+
+impl Drop for PendingPublicationResources {
+    fn drop(&mut self) {
+        (self.post_wait)();
+    }
 }
 
 struct SpawnExecutionParts {
@@ -876,52 +928,182 @@ fn spawn_child(cli: ContainerCli, cmd: &mut Command) -> Result<std::process::Chi
     })
 }
 
+struct ProtectedLaunchContext {
+    plan: DurableLaunchPlan,
+    adapter: Arc<dyn GatedProviderAdapter>,
+    enclosing: Instant,
+    registry: Arc<LaunchRetentionRegistry>,
+    #[cfg(test)]
+    tuple_validation_only: bool,
+}
+
+#[must_use = "a published launch plan must become spawn authority or retained custody"]
+enum PublishedSpawnGate {
+    Legacy,
+    Orchestrated(ProtectedLaunchContext),
+}
+
+struct PrepareSpawnGateFailure {
+    published: PublishedSpawnGate,
+    source: EngineError,
+}
+
 enum PreparedSpawnGate {
     Legacy,
-    Orchestrated {
-        plan: DurableLaunchPlan,
-        adapter: Arc<dyn GatedProviderAdapter>,
-        enclosing: Instant,
-        registry: Arc<LaunchRetentionRegistry>,
+    Orchestrated(ProtectedLaunchContext),
+}
+
+impl ProtectedLaunchContext {
+    fn reject_never_created(
+        self,
+        prepared: super::gated_launch::PreparedChildLifecycle,
+        resources: Box<LifecycleResources>,
+        source: EngineError,
+        #[cfg(test)] boundary: Option<
+            Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
+        >,
+    ) -> SpawnStageError {
         #[cfg(test)]
-        tuple_validation_only: bool,
-    },
+        if self.tuple_validation_only {
+            return before_cli_start(source);
+        }
+
+        let Self {
+            plan,
+            adapter,
+            enclosing,
+            registry,
+            ..
+        } = self;
+        let lifecycle = match prepared.retain_never_created_resources(resources) {
+            Ok(lifecycle) => lifecycle,
+            Err(failure) => {
+                let custody = ActiveGatedCustody::new_never_created_uncertain(
+                    plan,
+                    failure,
+                    adapter,
+                    #[cfg(test)]
+                    boundary,
+                );
+                let _ticket = registry.retain_active_gated(custody);
+                return before_cli_start(source);
+            }
+        };
+        let custody = ActiveGatedCustody::new_never_created(
+            plan,
+            lifecycle,
+            adapter,
+            #[cfg(test)]
+            boundary.clone(),
+        );
+        #[cfg(test)]
+        if let Some(boundary) = boundary {
+            boundary.observe_never_created_proven();
+        }
+        let ticket = registry.retain_active_gated(custody);
+        let _ = registry.retry_active_gated(ticket, enclosing);
+        before_cli_start(source)
+    }
+}
+
+impl PublishedSpawnGate {
+    fn new(gated: Option<GatedSpawnContext>) -> Self {
+        let Some(gated) = gated else {
+            return Self::Legacy;
+        };
+        Self::Orchestrated(ProtectedLaunchContext {
+            plan: gated.plan,
+            adapter: gated.adapter,
+            enclosing: gated.enclosing,
+            registry: gated.registry,
+            #[cfg(test)]
+            tuple_validation_only: gated.tuple_validation_only,
+        })
+    }
+
+    fn prepare(self) -> Result<PreparedSpawnGate, Box<PrepareSpawnGateFailure>> {
+        let Self::Orchestrated(mut context) = self else {
+            return Ok(PreparedSpawnGate::Legacy);
+        };
+        let barrier = match validate_immediate_pre_spawn(
+            &context.plan,
+            context.adapter.as_ref(),
+            context.enclosing,
+        ) {
+            Ok(barrier) => barrier,
+            Err(error) => {
+                return Err(Box::new(PrepareSpawnGateFailure {
+                    published: Self::Orchestrated(context),
+                    source: EngineError::Container(error.to_string()),
+                }));
+            }
+        };
+        let plan = match barrier.consume_for_spawn(context.plan.clone()) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Err(Box::new(PrepareSpawnGateFailure {
+                    published: Self::Orchestrated(context),
+                    source: EngineError::Container(error.to_string()),
+                }));
+            }
+        };
+        context.plan = plan;
+        Ok(PreparedSpawnGate::Orchestrated(context))
+    }
+
+    fn reject_never_created(
+        self,
+        prepared: super::gated_launch::PreparedChildLifecycle,
+        resources: Box<LifecycleResources>,
+        source: EngineError,
+        #[cfg(test)] boundary: Option<
+            Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
+        >,
+    ) -> SpawnStageError {
+        match self {
+            Self::Legacy => before_cli_start(source),
+            Self::Orchestrated(context) => context.reject_never_created(
+                prepared,
+                resources,
+                source,
+                #[cfg(test)]
+                boundary,
+            ),
+        }
+    }
 }
 
 impl PreparedSpawnGate {
     fn plan(&self) -> Option<&DurableLaunchPlan> {
         match self {
             Self::Legacy => None,
-            Self::Orchestrated { plan, .. } => Some(plan),
+            Self::Orchestrated(context) => Some(&context.plan),
         }
     }
 
     fn adapter(&self) -> Option<&Arc<dyn GatedProviderAdapter>> {
         match self {
             Self::Legacy => None,
-            Self::Orchestrated { adapter, .. } => Some(adapter),
+            Self::Orchestrated(context) => Some(&context.adapter),
         }
     }
 
     fn enclosing(&self) -> Option<Instant> {
         match self {
             Self::Legacy => None,
-            Self::Orchestrated { enclosing, .. } => Some(*enclosing),
+            Self::Orchestrated(context) => Some(context.enclosing),
         }
     }
 
     fn is_orchestrated(&self) -> bool {
-        matches!(self, Self::Orchestrated { .. })
+        matches!(self, Self::Orchestrated(_))
     }
 
     #[cfg(test)]
     fn tuple_validation_only(&self) -> bool {
         matches!(
             self,
-            Self::Orchestrated {
-                tuple_validation_only: true,
-                ..
-            }
+            Self::Orchestrated(context) if context.tuple_validation_only
         )
     }
 
@@ -944,12 +1126,12 @@ impl PreparedSpawnGate {
 
         match self {
             Self::Legacy => (None, Some(resource_loan)),
-            Self::Orchestrated {
+            Self::Orchestrated(ProtectedLaunchContext {
                 plan,
                 adapter,
                 registry,
                 ..
-            } => (
+            }) => (
                 Some(OrchestratedExecutionOwner {
                     registry,
                     custody: Some(ActiveGatedCustody::new(
@@ -966,40 +1148,33 @@ impl PreparedSpawnGate {
             ),
         }
     }
+
+    fn reject_never_created(
+        self,
+        prepared: super::gated_launch::PreparedChildLifecycle,
+        resources: Box<LifecycleResources>,
+        source: EngineError,
+        #[cfg(test)] boundary: Option<
+            Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
+        >,
+    ) -> SpawnStageError {
+        match self {
+            Self::Legacy => before_cli_start(source),
+            Self::Orchestrated(context) => context.reject_never_created(
+                prepared,
+                resources,
+                source,
+                #[cfg(test)]
+                boundary,
+            ),
+        }
+    }
 }
 
 type PreparedChild = (
     super::gated_launch::PreparedChildLifecycle,
     Arc<ChildLifecycleSlot>,
 );
-
-fn prepare_spawn_gate(
-    gated: Option<GatedSpawnContext>,
-    registry: Option<&Arc<LaunchRetentionRegistry>>,
-) -> Result<PreparedSpawnGate, EngineError> {
-    let Some(gated) = gated else {
-        return Ok(PreparedSpawnGate::Legacy);
-    };
-    #[cfg(test)]
-    let tuple_validation_only = gated.tuple_validation_only;
-    let registry = registry
-        .cloned()
-        .ok_or_else(|| EngineError::Container("launch retention registry unavailable".into()))?;
-    let barrier =
-        validate_immediate_pre_spawn(&gated.plan, gated.adapter.as_ref(), gated.enclosing)
-            .map_err(|error| EngineError::Container(error.to_string()))?;
-    let plan = barrier
-        .consume_for_spawn(gated.plan)
-        .map_err(|error| EngineError::Container(error.to_string()))?;
-    Ok(PreparedSpawnGate::Orchestrated {
-        plan,
-        adapter: gated.adapter,
-        enclosing: gated.enclosing,
-        registry,
-        #[cfg(test)]
-        tuple_validation_only,
-    })
-}
 
 #[cfg(test)]
 fn observe_test_spawn(
@@ -1154,20 +1329,10 @@ pub(super) fn spawn_pty_bridged(
     let leases = std::mem::take(&mut instance.leases);
     let gate_cleanup = instance.gate_cleanup.take();
 
-    let (cols, rows) = io.initial_size.expect("PTY path requires initial_size");
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| before_cli_start(EngineError::Container(format!("openpty: {e}"))))?;
     assert_leases_before_spawn(&instance.options, &leases);
     let (attach_store, attach_permit) = PreallocatedAttachStore::pair();
-    let custody = Box::new(LifecycleResources::Spawn(SpawnCustodyResources {
-        io: Some(SpawnIoResources::Pty(pair)),
+    let mut custody = Box::new(LifecycleResources::Spawn(SpawnCustodyResources {
+        io: None,
         leases: Some(leases),
         gate_cleanup,
         post_wait: cli.post_wait,
@@ -1177,6 +1342,43 @@ pub(super) fn spawn_pty_bridged(
         #[cfg(test)]
         custody_witness: test_support::take_custody_witness(),
     }));
+    let published_gate = PublishedSpawnGate::new(gated);
+
+    let (cols, rows) = io.initial_size.expect("PTY path requires initial_size");
+    let pty_system = native_pty_system();
+    let pair = match pty_system.openpty(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return Err(published_gate.reject_never_created(
+                prepared,
+                custody,
+                EngineError::Container(format!("openpty: {error}")),
+                #[cfg(test)]
+                test_boundary,
+            ));
+        }
+    };
+    let installed = match custody.spawn_mut() {
+        Some(resources) => {
+            resources.io = Some(SpawnIoResources::Pty(pair));
+            true
+        }
+        None => false,
+    };
+    if !installed {
+        return Err(published_gate.reject_never_created(
+            prepared,
+            custody,
+            EngineError::Container("preallocated PTY custody unavailable".into()),
+            #[cfg(test)]
+            test_boundary,
+        ));
+    }
 
     let mut cmd = CommandBuilder::new(cli.bin);
     for arg in &argv {
@@ -1195,8 +1397,19 @@ pub(super) fn spawn_pty_bridged(
         cmd.env(k, v);
     }
 
-    let prepared_gate =
-        prepare_spawn_gate(gated, instance.launch_retention.as_ref()).map_err(before_cli_start)?;
+    let prepared_gate = match published_gate.prepare() {
+        Ok(prepared_gate) => prepared_gate,
+        Err(failure) => {
+            let PrepareSpawnGateFailure { published, source } = *failure;
+            return Err(published.reject_never_created(
+                prepared,
+                custody,
+                source,
+                #[cfg(test)]
+                test_boundary,
+            ));
+        }
+    };
     #[cfg(test)]
     observe_test_spawn(
         test_boundary.as_deref(),
@@ -1204,28 +1417,38 @@ pub(super) fn spawn_pty_bridged(
         &argv,
         prepared_gate.plan(),
     );
+    #[cfg(test)]
+    if test_boundary
+        .as_deref()
+        .is_some_and(|boundary| boundary.before_cli_start_after_plan())
+    {
+        return Err(prepared_gate.reject_never_created(
+            prepared,
+            custody,
+            EngineError::Container("create CLI rejected after protected plan".into()),
+            test_boundary,
+        ));
+    }
 
-    let spawn_custody = custody.spawn().ok_or_else(|| {
-        before_cli_start(EngineError::Container(
+    let child = match custody.spawn().and_then(|resources| resources.io.as_ref()) {
+        Some(SpawnIoResources::Pty(pair)) => pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|error| EngineError::Container(format!("spawn {} via pty: {error}", cli.bin))),
+        Some(SpawnIoResources::Piped(_)) | None => Err(EngineError::Container(
             "preallocated PTY custody unavailable".into(),
-        ))
-    })?;
-    let child = match spawn_custody.io.as_ref() {
-        None => {
-            return Err(before_cli_start(EngineError::Container(
-                "preallocated PTY custody unavailable".into(),
-            )))
-        }
-        Some(SpawnIoResources::Pty(pair)) => pair.slave.spawn_command(cmd).map_err(|e| {
-            before_cli_start(EngineError::Container(format!(
-                "spawn {} via pty: {e}",
-                cli.bin
-            )))
-        })?,
-        Some(SpawnIoResources::Piped(_)) => {
-            return Err(before_cli_start(EngineError::Container(
-                "preallocated PTY custody has wrong I/O kind".into(),
-            )))
+        )),
+    };
+    let child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(prepared_gate.reject_never_created(
+                prepared,
+                custody,
+                error,
+                #[cfg(test)]
+                test_boundary,
+            ));
         }
     };
     let lifecycle = prepared
@@ -1509,9 +1732,21 @@ pub(super) fn spawn_piped(
         #[cfg(test)]
         custody_witness: test_support::take_custody_witness(),
     }));
+    let published_gate = PublishedSpawnGate::new(gated);
 
-    let prepared_gate =
-        prepare_spawn_gate(gated, instance.launch_retention.as_ref()).map_err(before_cli_start)?;
+    let prepared_gate = match published_gate.prepare() {
+        Ok(prepared_gate) => prepared_gate,
+        Err(failure) => {
+            let PrepareSpawnGateFailure { published, source } = *failure;
+            return Err(published.reject_never_created(
+                prepared,
+                custody,
+                source,
+                #[cfg(test)]
+                test_boundary,
+            ));
+        }
+    };
     #[cfg(test)]
     observe_test_spawn(
         test_boundary.as_deref(),
@@ -1519,22 +1754,65 @@ pub(super) fn spawn_piped(
         &argv,
         prepared_gate.plan(),
     );
-    let pipes = match custody
-        .spawn_mut()
-        .and_then(|resources| resources.io.as_mut())
+    #[cfg(test)]
+    if test_boundary
+        .as_deref()
+        .is_some_and(|boundary| boundary.before_cli_start_after_plan())
     {
-        Some(SpawnIoResources::Piped(pipes)) => pipes,
-        Some(SpawnIoResources::Pty(_)) | None => {
-            return Err(before_cli_start(EngineError::Container(
-                "preallocated pipe custody unavailable".into(),
-            )))
+        return Err(prepared_gate.reject_never_created(
+            prepared,
+            custody,
+            EngineError::Container("create CLI rejected after protected plan".into()),
+            test_boundary,
+        ));
+    }
+    if !matches!(
+        custody.spawn().and_then(|resources| resources.io.as_ref()),
+        Some(SpawnIoResources::Piped(_))
+    ) {
+        return Err(prepared_gate.reject_never_created(
+            prepared,
+            custody,
+            EngineError::Container("preallocated pipe custody unavailable".into()),
+            #[cfg(test)]
+            test_boundary,
+        ));
+    }
+    let mut child = match spawn_child(cli, &mut cmd) {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(prepared_gate.reject_never_created(
+                prepared,
+                custody,
+                error,
+                #[cfg(test)]
+                test_boundary,
+            ));
         }
     };
-    let mut child = spawn_child(cli, &mut cmd).map_err(before_cli_start)?;
     #[cfg(test)]
     if let Some(boundary) = &test_boundary {
         boundary.observe_child_start();
     }
+    let Some(SpawnIoResources::Piped(pipes)) = custody
+        .spawn_mut()
+        .and_then(|resources| resources.io.as_mut())
+    else {
+        let owned = prepared
+            .bind_started_child_with_resources(SpawnedCreateCli::Piped(child), started_at, custody)
+            .map_or_else(BindStartedChildError::into_retained, |lifecycle| {
+                RetainedExecution::Managed {
+                    execution: None,
+                    lifecycle,
+                }
+            });
+        return Err(after_cli_start(
+            &retention,
+            EngineError::Container("preallocated pipe custody unavailable".into()),
+            owned,
+            LaunchRetentionReason::ChildStateUnknown,
+        ));
+    };
     pipes.take_from(&mut child);
     let lifecycle = prepared
         .bind_started_child_with_resources(SpawnedCreateCli::Piped(child), started_at, custody)
@@ -1738,21 +2016,91 @@ pub(super) fn spawn_piped_interactive(
         #[cfg(test)]
         custody_witness: test_support::take_custody_witness(),
     }));
+    let published_gate = PublishedSpawnGate::new(gated);
 
-    let prepared_gate =
-        prepare_spawn_gate(gated, instance.launch_retention.as_ref()).map_err(before_cli_start)?;
-    let pipes = match custody
-        .spawn_mut()
-        .and_then(|resources| resources.io.as_mut())
-    {
-        Some(SpawnIoResources::Piped(pipes)) => pipes,
-        Some(SpawnIoResources::Pty(_)) | None => {
-            return Err(before_cli_start(EngineError::Container(
-                "preallocated persistent pipe custody unavailable".into(),
-            )))
+    let prepared_gate = match published_gate.prepare() {
+        Ok(prepared_gate) => prepared_gate,
+        Err(failure) => {
+            let PrepareSpawnGateFailure { published, source } = *failure;
+            return Err(published.reject_never_created(
+                prepared,
+                custody,
+                source,
+                #[cfg(test)]
+                test_boundary,
+            ));
         }
     };
-    let mut child = spawn_child(cli, &mut cmd).map_err(before_cli_start)?;
+    #[cfg(test)]
+    observe_test_spawn(
+        test_boundary.as_deref(),
+        &instance,
+        &argv,
+        prepared_gate.plan(),
+    );
+    #[cfg(test)]
+    if test_boundary
+        .as_deref()
+        .is_some_and(|boundary| boundary.before_cli_start_after_plan())
+    {
+        return Err(prepared_gate.reject_never_created(
+            prepared,
+            custody,
+            EngineError::Container("create CLI rejected after protected plan".into()),
+            test_boundary,
+        ));
+    }
+    if !matches!(
+        custody.spawn().and_then(|resources| resources.io.as_ref()),
+        Some(SpawnIoResources::Piped(_))
+    ) {
+        return Err(prepared_gate.reject_never_created(
+            prepared,
+            custody,
+            EngineError::Container("preallocated persistent pipe custody unavailable".into()),
+            #[cfg(test)]
+            test_boundary,
+        ));
+    }
+    let mut child = match spawn_child(cli, &mut cmd) {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(prepared_gate.reject_never_created(
+                prepared,
+                custody,
+                error,
+                #[cfg(test)]
+                test_boundary,
+            ));
+        }
+    };
+    #[cfg(test)]
+    if let Some(boundary) = &test_boundary {
+        boundary.observe_child_start();
+    }
+    let Some(SpawnIoResources::Piped(pipes)) = custody
+        .spawn_mut()
+        .and_then(|resources| resources.io.as_mut())
+    else {
+        let owned = prepared
+            .bind_started_child_with_resources(
+                SpawnedCreateCli::PersistentPiped(child),
+                started_at,
+                custody,
+            )
+            .map_or_else(BindStartedChildError::into_retained, |lifecycle| {
+                RetainedExecution::Managed {
+                    execution: None,
+                    lifecycle,
+                }
+            });
+        return Err(after_cli_start(
+            &retention,
+            EngineError::Container("preallocated persistent pipe custody unavailable".into()),
+            owned,
+            LaunchRetentionReason::ChildStateUnknown,
+        ));
+    };
     pipes.take_from(&mut child);
     let lifecycle = prepared
         .bind_started_child_with_resources(
@@ -2015,19 +2363,28 @@ impl ExecutionBackend for ContainerExecution {
             },
             None => None,
         };
-        if let Some(Err(reason)) = gate_result {
-            self.retain_uncertain(reason, None)?;
-            return Err(EngineError::Container(
-                "orchestrated launch retained for recovery".into(),
-            ));
-        }
-        let info = match self.lifecycle.wait_actual() {
-            Ok(info) => info,
-            Err(error) if self.orchestrated_owner.is_some() => {
-                self.retain_uncertain(LaunchRetentionReason::ChildStateUnknown, None)?;
-                return Err(error);
-            }
-            Err(error) => return Err(error),
+        let mut gate_rejection = None;
+        let info = match gate_result {
+            Some(Err(reason)) => match self.lifecycle.wait_actual_until(Instant::now()) {
+                Ok(Some(info)) => {
+                    gate_rejection = Some(reason);
+                    info
+                }
+                Ok(None) | Err(_) => {
+                    self.retain_uncertain(reason, None)?;
+                    return Err(EngineError::Container(
+                        "orchestrated launch retained for recovery".into(),
+                    ));
+                }
+            },
+            Some(Ok(())) | None => match self.lifecycle.wait_actual() {
+                Ok(info) => info,
+                Err(error) if self.orchestrated_owner.is_some() => {
+                    self.retain_uncertain(LaunchRetentionReason::ChildStateUnknown, None)?;
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            },
         };
         if self.orchestrated_owner.is_some() {
             let custody = self
@@ -2057,6 +2414,10 @@ impl ExecutionBackend for ContainerExecution {
                 EngineError::Container("orchestrated execution resource loan unavailable".into())
             })?;
             resource_loan.release_and_wait();
+            #[cfg(test)]
+            if let Some(boundary) = custody.boundary.as_deref() {
+                boundary.observe_resource_loan_released();
+            }
             self.orchestrated_owner = None;
         }
         if let Some(resource_loan) = self.resource_loan.take() {
@@ -2074,6 +2435,11 @@ impl ExecutionBackend for ContainerExecution {
                 },
                 false,
             );
+        }
+        if let Some(reason) = gate_rejection {
+            return Err(EngineError::Container(format!(
+                "orchestrated launch rejected: {reason:?}"
+            )));
         }
         Ok(info)
     }
@@ -2135,7 +2501,8 @@ impl ExecutionBackend for ContainerExecution {
 pub(crate) mod test_support {
     use super::*;
     use crate::engine::container::gated_launch::child_lifecycle_test_support::{
-        prepare_with_fault, prepare_with_pause, ActorPausePoint, PollPause, PrepareFault,
+        prepare_with_fault, prepare_with_never_created_retention_blocked, prepare_with_pause,
+        ActorPausePoint, NeverCreatedRetentionGate, PollPause, PrepareFault,
     };
     use crate::engine::container::gated_launch::PreparedChildLifecycle;
     use std::cell::RefCell;
@@ -2144,6 +2511,14 @@ pub(crate) mod test_support {
         static PREPARED_OVERRIDE: RefCell<Option<(PreparedChildLifecycle, Arc<ChildLifecycleSlot>)>> =
             const { RefCell::new(None) };
         static CUSTODY_WITNESS: RefCell<Option<CustodyWitness>> = const { RefCell::new(None) };
+        static FULL_CUSTODY_OVERRIDE: RefCell<Option<FixtureFullCustody>> = const { RefCell::new(None) };
+        static PUBLICATION_STAGED_GATE_OBSERVER: RefCell<Option<Arc<Mutex<Option<std::path::PathBuf>>>>> =
+            const { RefCell::new(None) };
+    }
+
+    struct FixtureFullCustody {
+        leases: Vec<CredentialLease>,
+        gate_cleanup: super::super::startup_gate::StartupGateCleanup,
     }
 
     pub(crate) struct CustodyWitness {
@@ -2168,6 +2543,46 @@ pub(crate) mod test_support {
         }
     }
 
+    pub(crate) struct ActualBarrierCustodyProbe {
+        aggregate: CustodyWitnessProbe,
+        leases: Arc<crate::engine::credential_refresh::LeaseRegistry>,
+        gate_directory: std::path::PathBuf,
+    }
+
+    pub(crate) struct PublicationCustodyProbe {
+        aggregate: CustodyWitnessProbe,
+        leases: Arc<crate::engine::credential_refresh::LeaseRegistry>,
+        gate_directory: std::path::PathBuf,
+    }
+
+    impl PublicationCustodyProbe {
+        pub(crate) fn aggregate_releases(&self) -> usize {
+            self.aggregate.releases()
+        }
+
+        pub(crate) fn active_leases(&self) -> usize {
+            self.leases.len()
+        }
+
+        pub(crate) fn gate_directory_exists(&self) -> bool {
+            self.gate_directory.is_dir()
+        }
+    }
+
+    impl ActualBarrierCustodyProbe {
+        pub(crate) fn aggregate_releases(&self) -> usize {
+            self.aggregate.releases()
+        }
+
+        pub(crate) fn active_leases(&self) -> usize {
+            self.leases.len()
+        }
+
+        pub(crate) fn gate_directory_exists(&self) -> bool {
+            self.gate_directory.is_dir()
+        }
+    }
+
     fn custody_witness_pair() -> (CustodyWitness, CustodyWitnessProbe) {
         let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         (
@@ -2180,6 +2595,137 @@ pub(crate) mod test_support {
 
     pub(crate) fn take_custody_witness() -> Option<CustodyWitness> {
         CUSTODY_WITNESS.with(|witness| witness.borrow_mut().take())
+    }
+
+    pub(crate) fn observe_publication_staged_gate(
+        staged: &super::super::startup_gate::StagedStartupGate,
+    ) {
+        let Some(path) = staged
+            .overlays
+            .first()
+            .map(|overlay| overlay.host_path.clone())
+        else {
+            return;
+        };
+        PUBLICATION_STAGED_GATE_OBSERVER.with(|slot| {
+            let Some(observer) = slot.borrow().as_ref().cloned() else {
+                return;
+            };
+            *observer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(path);
+        });
+    }
+
+    struct PublicationFrontend;
+
+    impl crate::data::message::UserMessageSink for PublicationFrontend {
+        fn write_message(&mut self, _message: crate::data::message::UserMessage) {}
+
+        fn replay_queued(&mut self) {}
+    }
+
+    #[async_trait::async_trait]
+    impl crate::engine::agent_runtime::frontend::AgentFrontend for PublicationFrontend {
+        fn report_status(&mut self, _status: crate::engine::agent_runtime::frontend::AgentStatus) {}
+
+        fn report_progress(
+            &mut self,
+            _progress: crate::engine::agent_runtime::frontend::AgentProgress,
+        ) {
+        }
+
+        fn take_io(&mut self) -> AgentIo {
+            let (stdout, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stderr, _) = tokio::sync::mpsc::unbounded_channel();
+            let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+            AgentIo {
+                stdout,
+                stderr,
+                stdin_tx,
+                stdin_rx,
+                resize: None,
+                initial_size: None,
+            }
+        }
+    }
+
+    pub(crate) fn run_publication_custody_fixture(
+        startup_gate: crate::data::startup_gate::StartupGateSpec,
+        adapter: Arc<dyn GatedProviderAdapter>,
+        registry: Arc<LaunchRetentionRegistry>,
+        executable: &'static str,
+    ) -> Result<(Result<AgentExecution, EngineError>, PublicationCustodyProbe), EngineError> {
+        let name = startup_gate_container_name(&startup_gate)?;
+        let name = ContainerName::new(name);
+        let image = ImageRef::new("awman-publication-custody:local");
+        let gate_directory = Arc::new(Mutex::new(None));
+        PUBLICATION_STAGED_GATE_OBSERVER.with(|slot| {
+            assert!(
+                slot.borrow_mut()
+                    .replace(Arc::clone(&gate_directory))
+                    .is_none(),
+                "publication staging observer is already installed"
+            );
+        });
+
+        let leases = Arc::new(crate::engine::credential_refresh::LeaseRegistry::new());
+        let delivery = crate::engine::auth::RefreshableCredentialDelivery {
+            agent: crate::data::session::AgentName::new("publication-custody-fixture")
+                .map_err(|error| EngineError::Config(error.to_string()))?,
+            spec_agent: "claude",
+            credential_env_key: "CLAUDE_CODE_OAUTH_TOKEN",
+            staged_path: std::env::temp_dir().join("awman-publication-custody-credential.json"),
+            staged_root: std::env::temp_dir(),
+            initial_fingerprint: crate::engine::auth::credential::CredentialFingerprint::zeroed(),
+        };
+        let lease = leases.register(&delivery, name.as_str());
+        let (witness, aggregate) = custody_witness_pair();
+        CUSTODY_WITNESS.with(|slot| {
+            assert!(
+                slot.borrow_mut().replace(witness).is_none(),
+                "publication custody witness is already installed"
+            );
+        });
+
+        let options = ResolvedContainerOptions {
+            image: Some(image.clone()),
+            entrypoint: Some(crate::engine::container::options::Entrypoint(vec![
+                "/bin/true".into(),
+            ])),
+            name: Some(name.clone()),
+            startup_gate: Some(Box::new(startup_gate)),
+            ..ResolvedContainerOptions::default()
+        };
+        let instance = ContainerInstance::new_with_orchestrated_launch(
+            ContainerCli::APPLE.with_bin(executable),
+            image,
+            name,
+            options,
+            vec![lease],
+            None,
+            (Some(registry), Some(adapter)),
+        );
+        let result = Box::new(instance).run_with_frontend(Box::new(PublicationFrontend));
+        drop(take_custody_witness());
+        PUBLICATION_STAGED_GATE_OBSERVER.with(|slot| {
+            let _ = slot.borrow_mut().take();
+        });
+        let gate_directory = gate_directory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| {
+                EngineError::Container("publication fixture did not stage the startup gate".into())
+            })?;
+        Ok((
+            result,
+            PublicationCustodyProbe {
+                aggregate,
+                leases,
+                gate_directory,
+            },
+        ))
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2332,6 +2878,89 @@ pub(crate) mod test_support {
         (spawn_fixture(spec, registry), probe)
     }
 
+    pub(crate) fn spawn_fixture_with_never_created_retention_blocked(
+        spec: FixtureSpawnSpec,
+        registry: Arc<LaunchRetentionRegistry>,
+    ) -> Result<
+        (
+            FixtureSpawnResult,
+            NeverCreatedRetentionGate,
+            CustodyWitnessProbe,
+        ),
+        EngineError,
+    > {
+        let (prepared, gate) = prepare_with_never_created_retention_blocked()?;
+        let slot = Arc::new(ChildLifecycleSlot::new());
+        PREPARED_OVERRIDE.with(|prepared_override| {
+            *prepared_override.borrow_mut() = Some((prepared, slot));
+        });
+        let (result, custody) = spawn_fixture_with_custody_witness(spec, registry);
+        Ok((result, gate, custody))
+    }
+
+    pub(crate) fn spawn_actual_barrier_fixture_with_full_custody(
+        spec: FixtureSpawnSpec,
+        registry: Arc<LaunchRetentionRegistry>,
+        startup_gate: crate::data::startup_gate::StartupGateSpec,
+    ) -> Result<
+        (
+            FixtureSpawnResult,
+            NeverCreatedRetentionGate,
+            ActualBarrierCustodyProbe,
+        ),
+        EngineError,
+    > {
+        let staged = super::super::startup_gate::stage_startup_gate(&startup_gate)?;
+        let gate_directory = staged
+            .overlays
+            .first()
+            .map(|overlay| overlay.host_path.clone())
+            .ok_or_else(|| {
+                EngineError::Container("fixture startup-gate directory missing".into())
+            })?;
+        let leases = Arc::new(crate::engine::credential_refresh::LeaseRegistry::new());
+        let delivery = crate::engine::auth::RefreshableCredentialDelivery {
+            agent: crate::data::session::AgentName::new("actual-barrier-fixture")
+                .map_err(|error| EngineError::Config(error.to_string()))?,
+            spec_agent: "claude",
+            credential_env_key: "CLAUDE_CODE_OAUTH_TOKEN",
+            staged_path: gate_directory.join("fixture-credential.json"),
+            staged_root: gate_directory.clone(),
+            initial_fingerprint: crate::engine::auth::credential::CredentialFingerprint::zeroed(),
+        };
+        let lease = leases.register(&delivery, startup_gate_container_name(&startup_gate)?);
+        let (prepared, gate) = prepare_with_never_created_retention_blocked()?;
+        let slot = Arc::new(ChildLifecycleSlot::new());
+        PREPARED_OVERRIDE.with(|prepared_override| {
+            *prepared_override.borrow_mut() = Some((prepared, slot));
+        });
+        FULL_CUSTODY_OVERRIDE.with(|custody| {
+            *custody.borrow_mut() = Some(FixtureFullCustody {
+                leases: vec![lease],
+                gate_cleanup: staged.cleanup,
+            });
+        });
+        let (result, aggregate) = spawn_fixture_with_custody_witness(spec, registry);
+        Ok((
+            result,
+            gate,
+            ActualBarrierCustodyProbe {
+                aggregate,
+                leases,
+                gate_directory,
+            },
+        ))
+    }
+
+    fn startup_gate_container_name(
+        spec: &crate::data::startup_gate::StartupGateSpec,
+    ) -> Result<&str, EngineError> {
+        spec.control
+            .orchestrated_parts()
+            .map(|(_, identity)| identity.container_name.as_str())
+            .ok_or_else(|| EngineError::Config("fixture requires orchestrated controls".into()))
+    }
+
     impl FixtureSpawnResult {
         pub(crate) fn finish(
             self,
@@ -2360,6 +2989,7 @@ pub(crate) mod test_support {
         registry: Arc<LaunchRetentionRegistry>,
         gate_mode: FixtureGateMode,
     ) -> FixtureSpawnResult {
+        let full_custody = FULL_CUSTODY_OVERRIDE.with(|custody| custody.borrow_mut().take());
         let prepared_override = PREPARED_OVERRIDE.with(|prepared| prepared.borrow_mut().take());
         let slot = prepared_override
             .as_ref()
@@ -2431,20 +3061,25 @@ pub(crate) mod test_support {
             start_delay: Duration::ZERO,
             post_wait: no_post_wait,
         };
-        let instance = Box::new(ContainerInstance::new_with_launch_retention(
+        let mut instance = Box::new(ContainerInstance::new_with_launch_retention(
             cli,
             image.clone(),
             name.clone(),
             options,
             Vec::new(),
             None,
-            Some(registry),
+            Some(Arc::clone(&registry)),
         ));
+        if let Some(custody) = full_custody {
+            instance.leases = custody.leases;
+            instance.gate_cleanup = Some(custody.gate_cleanup);
+        }
         let handle = handle_now(&ContainerId::new(name.0.clone()), &name, &image);
         let gated = spec.gate.map(|gate| GatedSpawnContext {
             plan: gate.plan,
             adapter: gate.adapter,
             enclosing: gate.enclosing,
+            registry,
             tuple_validation_only: gate_mode == FixtureGateMode::TupleValidationOnly,
         });
         let request = SpawnRequest {

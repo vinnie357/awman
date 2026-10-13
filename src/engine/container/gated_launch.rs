@@ -7,8 +7,9 @@ mod retention;
 #[allow(unused_imports)]
 pub(crate) use child_lifecycle::{
     retain_detached_after_error, BindStartedChildError, ChildLifecycleAuthority,
-    ChildLifecycleSlot, ChildLifecycleState, ExecutionResourceLoan, PreparedChildLifecycle,
-    RetainedExecution, SpawnStageError, SpawnedCreateCli, UnboundStartedCli,
+    ChildLifecycleSlot, ChildLifecycleState, ExecutionResourceLoan, NeverCreatedLifecycleProof,
+    PreparedChildLifecycle, RetainedExecution, SpawnStageError, SpawnedCreateCli,
+    UnboundStartedCli,
 };
 #[allow(unused_imports)]
 pub(crate) use retention::{
@@ -34,8 +35,8 @@ pub(crate) use provider_cli::{
 
 use crate::data::container::ContainerName;
 use crate::data::startup_gate::{
-    revalidate_mount_source, GatedLaunchIdentity, OrchestratedControlAuthority, PinnedRegularFile,
-    PlanFileError,
+    revalidate_mount_source, GatedLaunchIdentity, OrchestratedControlAuthority, PinnedControlDir,
+    PinnedRegularFile, PlanFileError,
 };
 use crate::engine::container::options::ImageRef;
 use crate::engine::error::EngineError;
@@ -312,18 +313,76 @@ pub(crate) trait GatedProviderAdapter: Send + Sync {
 }
 
 #[derive(Clone)]
+struct CanonicalLaunchPlanAuthority {
+    file: Arc<PinnedRegularFile>,
+    bytes: Arc<Vec<u8>>,
+    digest: [u8; 32],
+}
+
+#[derive(Clone)]
 pub(crate) struct DurableLaunchPlan {
     pub key: ProviderLaunchKey,
     #[allow(dead_code)]
     // Pre-spawn barrier reads this after AgentEngine removes its native-launch rejection.
     pub request_digest: [u8; 32],
     pub controls: Arc<OrchestratedControlAuthority>,
-    plan_file: Arc<PinnedRegularFile>,
+    canonical: Arc<CanonicalLaunchPlanAuthority>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct PendingPublication {
+    key: ProviderLaunchKey,
+    request_digest: [u8; 32],
+    pub(crate) controls: Arc<OrchestratedControlAuthority>,
+    native_parent: PinnedControlDir,
+    native_file: PinnedRegularFile,
+    pub(crate) canonical_bytes: Arc<Vec<u8>>,
+    pub(crate) canonical_digest: [u8; 32],
+}
+
+impl fmt::Debug for PendingPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingPublication")
+            .field("key", &self.key)
+            .field("controls", &self.controls)
+            .field("canonical_digest", &self.canonical_digest)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingPublication {
+    pub(crate) fn try_promote(self) -> Result<DurableLaunchPlan, Box<Self>> {
+        if self.controls.request.request_digest != self.request_digest
+            || self.native_file.exact_bytes() != self.canonical_bytes.as_slice()
+            || !self.native_file.held_bytes_match()
+            || <[u8; 32]>::from(Sha256::digest(self.canonical_bytes.as_slice()))
+                != self.canonical_digest
+            || revalidate_mount_source(&self.controls).is_err()
+            || self
+                .native_parent
+                .verify_pending_launch_plan(&self.native_file)
+                .is_err()
+            || revalidate_mount_source(&self.controls).is_err()
+        {
+            return Err(Box::new(self));
+        }
+        Ok(DurableLaunchPlan {
+            key: self.key,
+            request_digest: self.request_digest,
+            controls: self.controls,
+            canonical: Arc::new(CanonicalLaunchPlanAuthority {
+                file: Arc::new(self.native_file),
+                bytes: self.canonical_bytes,
+                digest: self.canonical_digest,
+            }),
+        })
+    }
 }
 
 #[must_use = "the validated barrier must be consumed by the matching spawn"]
 pub(crate) struct ValidatedSpawnBarrier {
-    _plan_file: Arc<PinnedRegularFile>,
+    _canonical: Arc<CanonicalLaunchPlanAuthority>,
     _controls: Arc<OrchestratedControlAuthority>,
     _key: ProviderLaunchKey,
     _absence: AbsenceObservation,
@@ -334,7 +393,7 @@ impl ValidatedSpawnBarrier {
         self,
         plan: DurableLaunchPlan,
     ) -> Result<DurableLaunchPlan, LaunchIdentityError> {
-        if !Arc::ptr_eq(&self._plan_file, &plan.plan_file)
+        if !Arc::ptr_eq(&self._canonical, &plan.canonical)
             || !Arc::ptr_eq(&self._controls, &plan.controls)
             || self._key != plan.key
         {
@@ -350,8 +409,15 @@ impl fmt::Debug for DurableLaunchPlan {
             .debug_struct("DurableLaunchPlan")
             .field("key", &self.key)
             .field("controls", &self.controls)
-            .field("plan_file", &self.plan_file)
+            .field("plan_file", &self.canonical.file)
             .finish_non_exhaustive()
+    }
+}
+
+impl DurableLaunchPlan {
+    #[cfg(test)]
+    pub(crate) fn canonical_digest(&self) -> [u8; 32] {
+        self.canonical.digest
     }
 }
 
@@ -374,8 +440,12 @@ pub(crate) enum LaunchIdentityError {
     ImageIdentityMismatch,
     #[error("launch plan publication failed")]
     LaunchPlanPublicationFailed,
+    #[error("launch plan publication failed")]
+    LaunchPlanPublicationUncertain(Box<PendingPublication>),
     #[error("launch receipt failed")]
     LaunchReceiptFailed,
+    #[error("protected cleanup record failed")]
+    CleanupRecordFailed,
 }
 
 #[derive(Serialize)]
@@ -391,6 +461,53 @@ struct LaunchPlanRecord<'a> {
     created_not_before: String,
     #[serde(rename = "requestDigest")]
     request_digest: String,
+}
+
+#[derive(Serialize)]
+struct ProtectedCleanupRecord<'a> {
+    version: u32,
+    #[serde(rename = "launchPlanSha256")]
+    launch_plan_sha256: String,
+    outcome: &'static str,
+    #[serde(rename = "runtimeId", skip_serializing_if = "Option::is_none")]
+    runtime_id: Option<&'a str>,
+}
+
+#[allow(dead_code)]
+pub(crate) enum CleanupRuntimeIdentity<'a> {
+    Created(&'a str),
+    NeverCreated(NeverCreatedLifecycleProof),
+}
+
+#[allow(dead_code)]
+pub(crate) fn canonical_protected_cleanup_record(
+    plan: &DurableLaunchPlan,
+    runtime: CleanupRuntimeIdentity<'_>,
+) -> Result<Vec<u8>, LaunchIdentityError> {
+    if plan.request_digest != plan.controls.request.request_digest
+        || plan.canonical.bytes.as_slice() != plan.canonical.file.exact_bytes()
+        || !plan.canonical.file.held_bytes_match()
+        || <[u8; 32]>::from(Sha256::digest(plan.canonical.bytes.as_slice()))
+            != plan.canonical.digest
+    {
+        return Err(LaunchIdentityError::CleanupRecordFailed);
+    }
+    let runtime_id = match runtime {
+        CleanupRuntimeIdentity::Created("") => {
+            return Err(LaunchIdentityError::CleanupRecordFailed);
+        }
+        CleanupRuntimeIdentity::Created(runtime_id) => Some(runtime_id),
+        CleanupRuntimeIdentity::NeverCreated(_proof) => None,
+    };
+    let mut bytes = serde_json::to_vec(&ProtectedCleanupRecord {
+        version: 2,
+        launch_plan_sha256: lower_hex(&plan.canonical.digest),
+        outcome: "absent",
+        runtime_id,
+    })
+    .map_err(|_| LaunchIdentityError::CleanupRecordFailed)?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 #[allow(dead_code)]
@@ -461,29 +578,42 @@ pub(crate) fn prepare_orchestrated_launch(
     let mut bytes = serde_json::to_vec(&record)
         .map_err(|_| LaunchIdentityError::LaunchPlanPublicationFailed)?;
     bytes.push(b'\n');
-    let plan_file =
-        controls
-            .host_parent
-            .publish_launch_plan(&bytes)
-            .map_err(|error| match error {
-                PlanFileError::ExistingOrUnsafe => {
-                    LaunchIdentityError::ExistingPlanRecoveryRequired
-                }
-                PlanFileError::PublicationFailed => {
-                    LaunchIdentityError::LaunchPlanPublicationFailed
-                }
-            })?;
-    if revalidate_mount_source(&controls).is_err()
-        || !controls.host_parent.verify_launch_plan(&plan_file)
+    let digest = Sha256::digest(&bytes).into();
+    let (native_parent, native_file) = match controls.host_parent.publish_launch_plan_owned(&bytes)
     {
-        return Err(LaunchIdentityError::LaunchPlanPublicationFailed);
-    }
-    Ok(DurableLaunchPlan {
+        Ok(publication) => publication,
+        Err((PlanFileError::ExistingOrUnsafe, None)) => {
+            return Err(LaunchIdentityError::ExistingPlanRecoveryRequired);
+        }
+        Err((PlanFileError::PublicationFailed, None)) => {
+            return Err(LaunchIdentityError::LaunchPlanPublicationFailed);
+        }
+        Err((_source, Some((native_parent, native_file)))) => {
+            return Err(LaunchIdentityError::LaunchPlanPublicationUncertain(
+                Box::new(PendingPublication {
+                    key,
+                    request_digest: identity.request_digest,
+                    controls,
+                    native_parent,
+                    native_file,
+                    canonical_bytes: Arc::new(bytes),
+                    canonical_digest: digest,
+                }),
+            ));
+        }
+    };
+    let publication = PendingPublication {
         key,
         request_digest: identity.request_digest,
         controls,
-        plan_file: Arc::new(plan_file),
-    })
+        native_parent,
+        native_file,
+        canonical_bytes: Arc::new(bytes),
+        canonical_digest: digest,
+    };
+    publication
+        .try_promote()
+        .map_err(LaunchIdentityError::LaunchPlanPublicationUncertain)
 }
 
 fn unexpired_provider_call_deadline(
@@ -512,7 +642,7 @@ pub(crate) fn validate_immediate_pre_spawn(
     if !plan
         .controls
         .host_parent
-        .verify_launch_plan(&plan.plan_file)
+        .verify_launch_plan(&plan.canonical.file)
     {
         return Err(LaunchIdentityError::UnsafeControl);
     }
@@ -536,12 +666,12 @@ pub(crate) fn validate_immediate_pre_spawn(
     if !plan
         .controls
         .host_parent
-        .verify_launch_plan(&plan.plan_file)
+        .verify_launch_plan(&plan.canonical.file)
     {
         return Err(LaunchIdentityError::UnsafeControl);
     }
     Ok(ValidatedSpawnBarrier {
-        _plan_file: Arc::clone(&plan.plan_file),
+        _canonical: Arc::clone(&plan.canonical),
         _controls: Arc::clone(&plan.controls),
         _key: plan.key.clone(),
         _absence: absence,
@@ -554,7 +684,7 @@ pub(crate) fn revalidate_post_spawn(plan: &DurableLaunchPlan) -> Result<(), Laun
         || !plan
             .controls
             .host_parent
-            .verify_launch_plan(&plan.plan_file)
+            .verify_launch_plan(&plan.canonical.file)
     {
         return Err(LaunchIdentityError::UnsafeControl);
     }

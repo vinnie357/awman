@@ -18,12 +18,22 @@ pub mod background;
 pub mod display;
 mod docker;
 pub(crate) mod gated_launch;
+#[cfg(all(test, unix))]
+mod gated_launch_actual_barrier_retention_test;
+#[cfg(all(test, unix))]
+mod gated_launch_gate_rejection_cleanup_test;
 #[cfg(test)]
 mod gated_launch_native_poll_diagnostic_test;
+#[cfg(all(test, unix))]
+mod gated_launch_never_created_reconciliation_test;
 #[cfg(test)]
 mod gated_launch_p2b_test;
 #[cfg(test)]
 mod gated_launch_p2c_test;
+#[cfg(all(test, unix))]
+mod gated_launch_publication_acceptance_test;
+#[cfg(all(test, unix))]
+mod gated_launch_publication_custody_test;
 #[cfg(all(test, unix))]
 mod gated_launch_retention_acceptance_test;
 #[cfg(all(test, unix))]

@@ -192,13 +192,13 @@ fn loaded_spec_owns_the_exact_validated_manifest_bytes() {
 fn valid_v1_request_and_raw_manifest_digest_load_exactly() {
     let fixture = GateFixture::valid();
     let exact_request = fs::read(fixture.control.join("request.json")).expect("v1 request");
+    let expected_digest: [u8; 32] = Sha256::digest(&exact_request).into();
     let spec = fixture.load().expect("valid gate");
     assert_eq!(spec.timeout, Duration::from_secs(120));
     assert_eq!(spec.request.version, 1);
     assert_eq!(spec.request.guest_cwd, None);
     assert_eq!(
-        spec.request_digest,
-        Sha256::digest(&exact_request).into(),
+        spec.request_digest, expected_digest,
         "legacy request digest remains bound to exact input bytes"
     );
     let legacy_serialization = format!(
@@ -233,10 +233,11 @@ fn v2_request_requires_the_exact_supported_guest_cwd_and_owns_raw_bytes() {
     fixture.rewrite_request(request);
 
     let expected_bytes = fs::read(fixture.control.join("request.json")).expect("v2 request");
+    let expected_digest: [u8; 32] = Sha256::digest(&expected_bytes).into();
     let spec = fixture.load().expect("valid v2 gate");
     assert_eq!(spec.request.version, 2);
     assert_eq!(spec.request.guest_cwd.as_deref(), Some("/workspace"));
-    assert_eq!(spec.request_digest, Sha256::digest(&expected_bytes).into());
+    assert_eq!(spec.request_digest, expected_digest);
 
     for guest_cwd in [
         serde_json::Value::Null,

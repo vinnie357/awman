@@ -9,6 +9,16 @@ pub(crate) struct SupervisorActiveClaimBarrier {
     shared: Arc<Shared>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PendingPublicationSnapshot {
+    pub ticket: LaunchRetentionTicket,
+    pub canonical_bytes: Vec<u8>,
+    pub canonical_digest: [u8; 32],
+    pub same_controls: bool,
+    pub prepared_present: bool,
+    pub resource_bundle_present: bool,
+}
+
 impl Drop for SupervisorActiveClaimBarrier {
     fn drop(&mut self) {
         self.shared
@@ -34,6 +44,19 @@ pub(crate) struct ActiveGatedResolutionSnapshot {
     pub entry_present: bool,
     pub resource_loans: usize,
     pub resource_loan_releases: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct NeverCreatedReconciliationSnapshot {
+    pub ticket: LaunchRetentionTicket,
+    pub ticket_present: bool,
+    pub entry_present: bool,
+    pub reason: LaunchRetentionReason,
+    pub reconciliation_pending: bool,
+    pub proof_present: bool,
+    pub resource_loans: usize,
+    pub resource_loan_releases: usize,
+    pub cleanup_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -68,6 +91,83 @@ pub(crate) fn registry_probe(registry: &LaunchRetentionRegistry) -> RetentionPro
     RetentionProbe {
         shared: Arc::clone(&registry.shared),
     }
+}
+
+pub(crate) fn pending_publication_snapshot(
+    registry: &LaunchRetentionRegistry,
+    expected_controls: &Arc<crate::data::startup_gate::OrchestratedControlAuthority>,
+) -> Option<PendingPublicationSnapshot> {
+    let entries = registry
+        .shared
+        .entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut pending = entries.iter().filter_map(|(ticket, entry)| {
+        let RetainedRegistryEnvelope::PendingPublication {
+            publication,
+            prepared,
+            resources,
+            ..
+        } = &entry.launch
+        else {
+            return None;
+        };
+        let publication = publication.as_deref()?;
+        Some(PendingPublicationSnapshot {
+            ticket: *ticket,
+            canonical_bytes: publication.canonical_bytes.as_ref().clone(),
+            canonical_digest: publication.canonical_digest,
+            same_controls: Arc::ptr_eq(&publication.controls, expected_controls),
+            prepared_present: prepared.is_some(),
+            resource_bundle_present: resources.is_some(),
+        })
+    });
+    let snapshot = pending.next()?;
+    pending.next().is_none().then_some(snapshot)
+}
+
+pub(crate) fn ticket_is_pending(
+    registry: &LaunchRetentionRegistry,
+    ticket: LaunchRetentionTicket,
+) -> bool {
+    let entries = registry
+        .shared
+        .entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    matches!(
+        entries.get(&ticket).map(|entry| &entry.launch),
+        Some(RetainedRegistryEnvelope::PendingPublication { .. })
+    )
+}
+
+pub(crate) fn active_plan_matches_publication(
+    registry: &LaunchRetentionRegistry,
+    ticket: LaunchRetentionTicket,
+    expected_controls: &Arc<crate::data::startup_gate::OrchestratedControlAuthority>,
+    canonical_digest: [u8; 32],
+) -> bool {
+    let entries = registry
+        .shared
+        .entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let Some(RetainedEntry {
+        launch: RetainedRegistryEnvelope::ActiveGated(custody),
+        ..
+    }) = entries.get(&ticket)
+    else {
+        return false;
+    };
+    Arc::ptr_eq(&custody.plan.controls, expected_controls)
+        && custody.plan.canonical_digest() == canonical_digest
+}
+
+fn exact_plan_matches(held: &DurableLaunchPlan, expected: &DurableLaunchPlan) -> bool {
+    held.key == expected.key
+        && held.request_digest == expected.request_digest
+        && Arc::ptr_eq(&held.controls, &expected.controls)
+        && Arc::ptr_eq(&held.canonical, &expected.canonical)
 }
 
 impl RetentionProbe {
@@ -209,6 +309,7 @@ impl RetentionProbe {
             Some(RetainedRegistryEnvelope::ActiveGated(custody)) => {
                 usize::from(custody.resource_loan.is_some())
             }
+            Some(RetainedRegistryEnvelope::PendingPublication { .. }) => return None,
             Some(RetainedRegistryEnvelope::Gated(_) | RetainedRegistryEnvelope::Legacy(_)) => {
                 return None;
             }
@@ -268,6 +369,7 @@ impl RetentionProbe {
             Some(RetainedRegistryEnvelope::ActiveGated(custody)) => {
                 usize::from(custody.resource_loan.is_some())
             }
+            Some(RetainedRegistryEnvelope::PendingPublication { .. }) => 0,
             Some(RetainedRegistryEnvelope::Gated(_) | RetainedRegistryEnvelope::Legacy(_))
             | None => 0,
         }
@@ -281,6 +383,89 @@ impl RetentionProbe {
             .get(&ticket)
             .copied()
             .unwrap_or(0)
+    }
+
+    pub(crate) fn never_created_reconciliation_snapshot(
+        &self,
+        ticket: LaunchRetentionTicket,
+    ) -> Option<NeverCreatedReconciliationSnapshot> {
+        let entries = self
+            .shared
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let RetainedRegistryEnvelope::ActiveGated(custody) = &entries.get(&ticket)?.launch else {
+            return None;
+        };
+        let ticket_present = self
+            .shared
+            .tickets
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&ticket);
+        let resource_loan_releases = self
+            .shared
+            .resource_loan_releases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&ticket)
+            .copied()
+            .unwrap_or(0);
+        Some(NeverCreatedReconciliationSnapshot {
+            ticket,
+            ticket_present,
+            entry_present: true,
+            reason: custody.reason,
+            reconciliation_pending: custody.cleanup_lifecycle
+                == CleanupLifecycleProvenance::NeverCreatedUncertain
+                && custody.never_created_reconciliation.is_some(),
+            proof_present: custody.cleanup_lifecycle == CleanupLifecycleProvenance::NeverCreated,
+            resource_loans: usize::from(custody.resource_loan.is_some()),
+            resource_loan_releases,
+            cleanup_complete: matches!(
+                &custody.cleanup_phase,
+                crate::engine::container::orchestrated_apple::ExactCleanupPhase::Complete
+            ),
+        })
+    }
+
+    pub(crate) fn retains_exact_plan(
+        &self,
+        ticket: LaunchRetentionTicket,
+        expected: &DurableLaunchPlan,
+    ) -> bool {
+        let entries = self
+            .shared
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let Some(RetainedEntry {
+            launch: RetainedRegistryEnvelope::ActiveGated(custody),
+            ..
+        }) = entries.get(&ticket)
+        else {
+            return false;
+        };
+        exact_plan_matches(&custody.plan, expected)
+    }
+
+    pub(crate) fn ticket_for_exact_plan(
+        &self,
+        expected: &DurableLaunchPlan,
+    ) -> Option<LaunchRetentionTicket> {
+        let entries = self
+            .shared
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut matches = entries.iter().filter_map(|(ticket, entry)| {
+            let RetainedRegistryEnvelope::ActiveGated(custody) = &entry.launch else {
+                return None;
+            };
+            exact_plan_matches(&custody.plan, expected).then_some(*ticket)
+        });
+        let ticket = matches.next()?;
+        matches.next().is_none().then_some(ticket)
     }
 
     pub(crate) fn only_termination_authorized(&self) -> Option<bool> {
@@ -361,4 +546,46 @@ pub(crate) fn drop_last_owner_on_worker(
     Err(EngineError::Container(
         "launch retention worker drop deadline exceeded".into(),
     ))
+}
+
+pub(crate) fn pending_publication_file_identity(
+    registry: &LaunchRetentionRegistry,
+    ticket: LaunchRetentionTicket,
+) -> Option<(u64, u64, u64)> {
+    let entries = registry
+        .shared
+        .entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let RetainedRegistryEnvelope::PendingPublication { publication, .. } =
+        &entries.get(&ticket)?.launch
+    else {
+        return None;
+    };
+    publication
+        .as_deref()?
+        .native_file
+        .held_file_identity_observation()
+}
+
+pub(crate) fn pending_cleanup_record_bytes(
+    registry: &LaunchRetentionRegistry,
+    ticket: LaunchRetentionTicket,
+) -> Option<Vec<u8>> {
+    let entries = registry
+        .shared
+        .entries
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let RetainedRegistryEnvelope::ActiveGated(custody) = &entries.get(&ticket)?.launch else {
+        return None;
+    };
+    let crate::engine::container::orchestrated_apple::ExactCleanupPhase::PublicationPending {
+        record,
+        ..
+    } = &custody.cleanup_phase
+    else {
+        return None;
+    };
+    Some(record.as_ref().clone())
 }

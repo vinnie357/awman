@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -6,10 +7,13 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::child_lifecycle::{
-    ChildLifecycleAuthority, ChildLifecycleState, ExecutionResourceLoan, RawCustodyCapability,
-    RawCustodyOutcome, RetainedExecution, TerminateRequestOutcome,
+    ChildLifecycleAuthority, ChildLifecycleState, ExecutionResourceLoan,
+    NeverCreatedChildLifecycle, NeverCreatedRetentionFailure, PreparedChildLifecycle,
+    RawCustodyCapability, RawCustodyOutcome, RetainedExecution, TerminateRequestOutcome,
 };
-use super::{DurableLaunchPlan, GatedProviderAdapter, ProviderLaunchInspection};
+use super::{
+    DurableLaunchPlan, GatedProviderAdapter, PendingPublication, ProviderLaunchInspection,
+};
 #[cfg(test)]
 use crate::engine::container::orchestrated_apple::OrchestratedAppleTestBoundary;
 use crate::engine::error::EngineError;
@@ -101,6 +105,14 @@ impl fmt::Debug for RetainedAgentLaunch {
 
 enum RetainedRegistryEnvelope {
     Gated(Box<RetainedAgentLaunch>),
+    PendingPublication {
+        publication: Option<Box<PendingPublication>>,
+        prepared: Option<PreparedChildLifecycle>,
+        resources: Option<Box<dyn Any + Send>>,
+        adapter: Arc<dyn GatedProviderAdapter>,
+        #[cfg(test)]
+        boundary: Option<Arc<dyn OrchestratedAppleTestBoundary>>,
+    },
     ActiveGated(Box<ActiveGatedCustody>),
     Legacy(Option<RetainedExecution>),
 }
@@ -115,8 +127,17 @@ pub(crate) struct ActiveGatedCustody {
     pub(in crate::engine::container) gate_monitor: Option<ActiveGateMonitor>,
     pub(in crate::engine::container) cleanup_phase:
         crate::engine::container::orchestrated_apple::ExactCleanupPhase,
+    cleanup_lifecycle: CleanupLifecycleProvenance,
+    never_created_reconciliation: Option<Box<NeverCreatedRetentionFailure>>,
     #[cfg(test)]
     pub(in crate::engine::container) boundary: Option<Arc<dyn OrchestratedAppleTestBoundary>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupLifecycleProvenance {
+    Created,
+    NeverCreatedUncertain,
+    NeverCreated,
 }
 
 impl ActiveGatedCustody {
@@ -138,6 +159,58 @@ impl ActiveGatedCustody {
             gate_monitor,
             cleanup_phase:
                 crate::engine::container::orchestrated_apple::ExactCleanupPhase::NeedsCleanup,
+            cleanup_lifecycle: CleanupLifecycleProvenance::Created,
+            never_created_reconciliation: None,
+            #[cfg(test)]
+            boundary,
+        }
+    }
+
+    pub(in crate::engine::container) fn new_never_created(
+        plan: DurableLaunchPlan,
+        lifecycle: NeverCreatedChildLifecycle,
+        adapter: Arc<dyn GatedProviderAdapter>,
+        #[cfg(test)] boundary: Option<Arc<dyn OrchestratedAppleTestBoundary>>,
+    ) -> Self {
+        let (lifecycle, resource_loan, proof) = lifecycle.into_parts();
+        Self {
+            plan,
+            lifecycle,
+            resource_loan: Some(resource_loan),
+            adapter,
+            last_inspection: None,
+            reason: LaunchRetentionReason::SpawnResultUnknown,
+            gate_monitor: None,
+            cleanup_phase:
+                crate::engine::container::orchestrated_apple::ExactCleanupPhase::NeverCreatedNeedsAbsence {
+                    proof,
+                },
+            cleanup_lifecycle: CleanupLifecycleProvenance::NeverCreated,
+            never_created_reconciliation: None,
+            #[cfg(test)]
+            boundary,
+        }
+    }
+
+    pub(in crate::engine::container) fn new_never_created_uncertain(
+        plan: DurableLaunchPlan,
+        failure: Box<NeverCreatedRetentionFailure>,
+        adapter: Arc<dyn GatedProviderAdapter>,
+        #[cfg(test)] boundary: Option<Arc<dyn OrchestratedAppleTestBoundary>>,
+    ) -> Self {
+        let lifecycle = failure.authority();
+        Self {
+            plan,
+            lifecycle,
+            resource_loan: None,
+            adapter,
+            last_inspection: None,
+            reason: LaunchRetentionReason::ChildStateUnknown,
+            gate_monitor: None,
+            cleanup_phase:
+                crate::engine::container::orchestrated_apple::ExactCleanupPhase::NeedsCleanup,
+            cleanup_lifecycle: CleanupLifecycleProvenance::NeverCreatedUncertain,
+            never_created_reconciliation: Some(failure),
             #[cfg(test)]
             boundary,
         }
@@ -288,6 +361,32 @@ impl LaunchRetentionRegistry {
         ticket
     }
 
+    pub(in crate::engine::container) fn retain_pending_publication(
+        &self,
+        publication: Box<PendingPublication>,
+        prepared: PreparedChildLifecycle,
+        resources: Box<dyn Any + Send>,
+        adapter: Arc<dyn GatedProviderAdapter>,
+        #[cfg(test)] boundary: Option<Arc<dyn OrchestratedAppleTestBoundary>>,
+    ) -> LaunchRetentionTicket {
+        let ticket = self.retain_envelope(RetainedRegistryEnvelope::PendingPublication {
+            publication: Some(publication),
+            prepared: Some(prepared),
+            resources: Some(resources),
+            adapter,
+            #[cfg(test)]
+            boundary,
+        });
+        #[cfg(test)]
+        self.shared
+            .resource_loan_releases
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(ticket)
+            .or_insert(0);
+        ticket
+    }
+
     // Exact-ticket callers share the same operation now used by the production supervisor.
     #[allow(dead_code)]
     pub(crate) fn retry_active_gated(
@@ -413,14 +512,123 @@ fn retry_claimed_active_gated(
     entry: &mut RetainedEntry,
     deadline: Instant,
 ) -> Result<ActiveGatedRetryOutcome, EngineError> {
+    if let RetainedRegistryEnvelope::PendingPublication {
+        publication,
+        prepared,
+        resources,
+        adapter,
+        #[cfg(test)]
+        boundary,
+    } = &mut entry.launch
+    {
+        let Some(pending) = publication.take() else {
+            return Err(EngineError::Container(
+                "retained pending publication custody unavailable".into(),
+            ));
+        };
+        let Some(prepared_owner) = prepared.take() else {
+            *publication = Some(pending);
+            return Err(EngineError::Container(
+                "retained pending publication custody unavailable".into(),
+            ));
+        };
+        let Some(resource_owner) = resources.take() else {
+            *publication = Some(pending);
+            *prepared = Some(prepared_owner);
+            return Err(EngineError::Container(
+                "retained pending publication custody unavailable".into(),
+            ));
+        };
+        let plan = match (*pending).try_promote() {
+            Ok(plan) => plan,
+            Err(pending) => {
+                *publication = Some(pending);
+                *prepared = Some(prepared_owner);
+                *resources = Some(resource_owner);
+                return Ok(ActiveGatedRetryOutcome::Retained);
+            }
+        };
+        let adapter = Arc::clone(adapter);
+        #[cfg(test)]
+        let boundary = boundary.clone();
+        let custody = match prepared_owner.retain_never_created_resources(resource_owner) {
+            Ok(lifecycle) => {
+                #[cfg(test)]
+                if let Some(boundary) = boundary.as_deref() {
+                    boundary.observe_never_created_proven();
+                }
+                ActiveGatedCustody::new_never_created(
+                    plan,
+                    lifecycle,
+                    adapter,
+                    #[cfg(test)]
+                    boundary,
+                )
+            }
+            Err(failure) => ActiveGatedCustody::new_never_created_uncertain(
+                plan,
+                failure,
+                adapter,
+                #[cfg(test)]
+                boundary,
+            ),
+        };
+        entry.launch = RetainedRegistryEnvelope::ActiveGated(Box::new(custody));
+        return Ok(ActiveGatedRetryOutcome::Retained);
+    }
+
     let RetainedRegistryEnvelope::ActiveGated(custody) = &mut entry.launch else {
         return Err(EngineError::Container(
             "retained launch ticket is not an active gated launch".into(),
         ));
     };
 
-    if matches!(custody.lifecycle.state(), Ok(ChildLifecycleState::Prepared)) {
+    if custody.cleanup_lifecycle == CleanupLifecycleProvenance::NeverCreatedUncertain {
+        let Some(failure) = custody.never_created_reconciliation.take() else {
+            custody.reason = LaunchRetentionReason::ChildStateUnknown;
+            return Err(EngineError::Container(
+                "retained never-created reconciliation unavailable".into(),
+            ));
+        };
+        let lifecycle = match (*failure).retry() {
+            Ok(lifecycle) => lifecycle,
+            Err(failure) => {
+                custody.never_created_reconciliation = Some(failure);
+                custody.reason = LaunchRetentionReason::ChildStateUnknown;
+                return Ok(ActiveGatedRetryOutcome::Retained);
+            }
+        };
+        let (lifecycle, resource_loan, proof) = lifecycle.into_parts();
+        custody.lifecycle = lifecycle;
+        custody.resource_loan = Some(resource_loan);
+        custody.cleanup_phase =
+            crate::engine::container::orchestrated_apple::ExactCleanupPhase::NeverCreatedNeedsAbsence {
+                proof,
+            };
+        custody.cleanup_lifecycle = CleanupLifecycleProvenance::NeverCreated;
+        custody.reason = LaunchRetentionReason::SpawnResultUnknown;
+        #[cfg(test)]
+        if let Some(boundary) = custody.boundary.as_deref() {
+            boundary.observe_never_created_proven();
+        }
         return Ok(ActiveGatedRetryOutcome::Retained);
+    }
+
+    if matches!(custody.lifecycle.state(), Ok(ChildLifecycleState::Prepared)) {
+        let positively_never_created = custody.cleanup_lifecycle
+            == CleanupLifecycleProvenance::NeverCreated
+            && matches!(
+                custody.cleanup_phase,
+                crate::engine::container::orchestrated_apple::ExactCleanupPhase::NeverCreatedNeedsAbsence { .. }
+                    | crate::engine::container::orchestrated_apple::ExactCleanupPhase::PublicationPending {
+                        last_inspection: None,
+                        ..
+                    }
+                    | crate::engine::container::orchestrated_apple::ExactCleanupPhase::Complete
+            );
+        if !positively_never_created {
+            return Ok(ActiveGatedRetryOutcome::Retained);
+        }
     }
 
     if let Some(monitor) = custody.gate_monitor.as_mut() {
@@ -482,6 +690,10 @@ fn retry_claimed_active_gated(
             .unwrap_or_else(|p| p.into_inner());
         let count = releases.entry(_ticket).or_default();
         *count = count.saturating_add(1);
+    }
+    #[cfg(test)]
+    if let Some(boundary) = custody.boundary.as_deref() {
+        boundary.observe_resource_loan_released();
     }
 
     record_poll_disposition(
@@ -582,14 +794,21 @@ fn next_active_ticket(
     entries
         .iter()
         .find_map(|(ticket, entry)| {
-            (ticket.0 > after && matches!(&entry.launch, RetainedRegistryEnvelope::ActiveGated(_)))
-                .then_some(*ticket)
+            (ticket.0 > after && is_supervisor_active(&entry.launch)).then_some(*ticket)
         })
         .or_else(|| {
-            entries.iter().find_map(|(ticket, entry)| {
-                matches!(&entry.launch, RetainedRegistryEnvelope::ActiveGated(_)).then_some(*ticket)
-            })
+            entries
+                .iter()
+                .find_map(|(ticket, entry)| is_supervisor_active(&entry.launch).then_some(*ticket))
         })
+}
+
+fn is_supervisor_active(launch: &RetainedRegistryEnvelope) -> bool {
+    matches!(
+        launch,
+        RetainedRegistryEnvelope::PendingPublication { .. }
+            | RetainedRegistryEnvelope::ActiveGated(_)
+    )
 }
 
 fn supervisor_iteration(
@@ -627,10 +846,7 @@ fn supervisor_iteration(
             active_ticket.and_then(|ticket| entries.remove(&ticket).map(|entry| (ticket, entry)));
         let tickets: Vec<_> = entries
             .iter()
-            .filter_map(|(ticket, entry)| {
-                (!matches!(&entry.launch, RetainedRegistryEnvelope::ActiveGated(_)))
-                    .then_some(*ticket)
-            })
+            .filter_map(|(ticket, entry)| (!is_supervisor_active(&entry.launch)).then_some(*ticket))
             .collect();
         for ticket in tickets {
             if let Some(entry) = entries.remove(&ticket) {
@@ -693,8 +909,15 @@ enum RetainedChildPoll {
 fn initially_owns_unreaped_child(launch: &RetainedRegistryEnvelope) -> bool {
     let execution = match launch {
         RetainedRegistryEnvelope::Gated(launch) => launch.execution.as_ref(),
+        RetainedRegistryEnvelope::PendingPublication { .. } => return false,
         RetainedRegistryEnvelope::ActiveGated(launch) => {
-            return !launch.lifecycle.retained_child_is_actually_reaped();
+            return match launch.cleanup_lifecycle {
+                CleanupLifecycleProvenance::Created => {
+                    !launch.lifecycle.retained_child_is_actually_reaped()
+                }
+                CleanupLifecycleProvenance::NeverCreatedUncertain
+                | CleanupLifecycleProvenance::NeverCreated => false,
+            };
         }
         RetainedRegistryEnvelope::Legacy(execution) => execution.as_ref(),
     };
@@ -758,6 +981,10 @@ fn poll_retained_entry(
                 resolved: false,
             }
         }
+        RetainedRegistryEnvelope::PendingPublication { .. } => RetainedEntryPoll {
+            child_reaped: true,
+            resolved: false,
+        },
         RetainedRegistryEnvelope::ActiveGated(launch) => {
             let child_reaped = launch.lifecycle.retained_child_is_actually_reaped();
             RetainedEntryPoll {

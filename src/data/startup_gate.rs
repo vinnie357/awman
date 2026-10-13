@@ -3,6 +3,10 @@
 #[path = "startup_gate_native.rs"]
 mod native;
 
+#[cfg(all(test, unix))]
+pub(crate) use native::{
+    after_launch_plan_native_publication, arm_launch_plan_post_rename_sync_failure,
+};
 pub use native::{
     load_startup_gate, StartupGateAccess, StartupGateBinding, StartupGateControlLayout,
     StartupGateError, StartupGateRequest, StartupGateSpec,
