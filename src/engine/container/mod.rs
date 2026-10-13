@@ -10,17 +10,44 @@
 //! `AgentHandle`, …) live in `src/engine/agent_runtime/`.
 
 mod apple;
+#[cfg(all(test, unix))]
+mod apple_initial_inspection_bounds_test;
 mod attach_socket;
 mod backend;
 pub mod background;
 pub mod display;
 mod docker;
+pub(crate) mod gated_launch;
+#[cfg(all(test, unix))]
+mod gated_launch_actual_barrier_retention_test;
+#[cfg(all(test, unix))]
+mod gated_launch_gate_rejection_cleanup_test;
+#[cfg(test)]
+mod gated_launch_native_poll_diagnostic_test;
+#[cfg(all(test, unix))]
+mod gated_launch_never_created_reconciliation_test;
+#[cfg(test)]
+mod gated_launch_p2b_test;
+#[cfg(test)]
+mod gated_launch_p2c_test;
+#[cfg(all(test, unix))]
+mod gated_launch_publication_acceptance_test;
+#[cfg(all(test, unix))]
+mod gated_launch_publication_custody_test;
+#[cfg(all(test, unix))]
+mod gated_launch_retention_acceptance_test;
+#[cfg(all(test, unix))]
+mod gated_launch_retention_fairness_test;
+#[cfg(all(test, unix))]
+mod gated_launch_retention_quiescence_test;
 pub mod instance;
 pub mod io_bridge;
 pub mod naming;
 pub mod options;
+pub(crate) mod orchestrated_apple;
 mod process;
 pub mod runtime;
+pub mod startup_gate;
 pub mod timing;
 
 pub use background::BackgroundContainer;

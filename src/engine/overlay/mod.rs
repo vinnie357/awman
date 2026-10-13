@@ -519,7 +519,7 @@ impl OverlayEngine {
                     }
                 }
             }
-            "antigravity" => {
+            "agy" | "antigravity" => {
                 // Antigravity reads its OAuth token from a fixed file inside
                 // `~/.gemini/antigravity-cli/` when the in-container keyring
                 // (Secret Service / D-Bus) is unreachable — which is always
@@ -665,7 +665,9 @@ impl OverlayEngine {
             "codex" => format!("{container_home}/.codex/skills"),
             "opencode" => format!("{container_home}/.config/opencode/commands"),
             "gemini" => format!("{container_home}/.gemini/commands"),
-            "antigravity" => format!("{container_home}/.gemini/antigravity-cli/skills"),
+            "agy" | "antigravity" => {
+                format!("{container_home}/.gemini/antigravity-cli/skills")
+            }
             "copilot" => format!("{container_home}/.copilot/instructions"),
             "crush" => format!("{container_home}/.config/crush/commands"),
             "cline" => format!("{container_home}/.cline/skills"),
@@ -1209,7 +1211,12 @@ pub(crate) fn detect_home_from_dockerfile(path: &Path) -> Option<String> {
 /// in `Dockerfile.<agent>` files under `<git_root>/.awman/` and `<home>/.awman/`.
 /// Returns `Some("/home/<name>")` when found, `None` otherwise.
 pub(crate) fn detect_container_home(home: &Path, agent: &str, git_root: &Path) -> Option<String> {
-    let dockerfile_name = format!("Dockerfile.{agent}");
+    let asset_name = if matches!(agent, "agy" | "antigravity") {
+        "antigravity"
+    } else {
+        agent
+    };
+    let dockerfile_name = format!("Dockerfile.{asset_name}");
     let search_dirs: Vec<PathBuf> = [git_root.join(".awman"), home.join(".awman")]
         .into_iter()
         .collect();
@@ -1494,6 +1501,93 @@ mod tests {
         assert!(staged_token.exists(), "synthesized dir must hold the token");
     }
 
+    #[test]
+    fn agy_and_legacy_alias_stage_existing_settings_at_the_legacy_container_home() {
+        for input in ["agy", "antigravity"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let gemini_dir = tmp.path().join(".gemini");
+            std::fs::create_dir_all(&gemini_dir).unwrap();
+            std::fs::write(gemini_dir.join("settings.json"), input).unwrap();
+            let awman_dir = tmp.path().join(".awman");
+            std::fs::create_dir_all(&awman_dir).unwrap();
+            std::fs::write(
+                awman_dir.join("Dockerfile.antigravity"),
+                "FROM scratch\nUSER awman\n",
+            )
+            .unwrap();
+            let engine = make_engine(tmp.path());
+            let agent = AgentName::new(input).unwrap();
+
+            let overlays = engine
+                .agent_settings_overlays_with(&agent, false, tmp.path(), None)
+                .unwrap();
+
+            assert_eq!(overlays.len(), 1, "input {input}: {overlays:?}");
+            assert_eq!(
+                overlays[0].container_path,
+                Path::new("/home/awman/.gemini"),
+                "input {input} must use the home from Dockerfile.antigravity"
+            );
+            assert_eq!(overlays[0].permission, OverlayPermission::ReadWrite);
+            assert_ne!(overlays[0].host_path, gemini_dir);
+            assert_eq!(
+                std::fs::read_to_string(overlays[0].host_path.join("settings.json")).unwrap(),
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn agy_and_legacy_alias_synthesize_settings_from_an_injected_keychain_file() {
+        use crate::engine::auth::keychain::AgentSecretFile;
+
+        for input in ["agy", "antigravity"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let token = format!("fixture-token-{input}").into_bytes();
+            let engine = make_engine_with_secrets(
+                tmp.path(),
+                vec![AgentSecretFile {
+                    relative_path: PathBuf::from("antigravity-cli").join("antigravity-oauth-token"),
+                    contents: token.clone(),
+                    mode: 0o600,
+                }],
+            );
+            let agent = AgentName::new(input).unwrap();
+
+            let overlays = engine
+                .agent_settings_overlays_with(&agent, false, tmp.path(), None)
+                .unwrap();
+
+            assert_eq!(overlays.len(), 1, "input {input}: {overlays:?}");
+            assert_eq!(overlays[0].container_path, Path::new("/root/.gemini"));
+            assert_eq!(overlays[0].permission, OverlayPermission::ReadWrite);
+            assert_eq!(
+                std::fs::read(
+                    overlays[0]
+                        .host_path
+                        .join("antigravity-cli/antigravity-oauth-token")
+                )
+                .unwrap(),
+                token
+            );
+        }
+    }
+
+    #[test]
+    fn agy_and_legacy_alias_without_settings_or_keychain_have_no_overlay() {
+        for input in ["agy", "antigravity"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let engine = make_engine(tmp.path());
+            let agent = AgentName::new(input).unwrap();
+
+            let overlays = engine
+                .agent_settings_overlays_with(&agent, false, tmp.path(), None)
+                .unwrap();
+
+            assert!(overlays.is_empty(), "input {input}: {overlays:?}");
+        }
+    }
+
     // ─── antigravity skill_overlays ───────────────────────────────────────────
 
     #[test]
@@ -1601,6 +1695,54 @@ mod tests {
             "antigravity container path must end with .gemini/antigravity-cli/skills; got {:?}",
             specs[0].container_path
         );
+    }
+
+    #[test]
+    fn agy_and_legacy_alias_mount_all_and_named_skills_at_the_legacy_destination() {
+        let (tmp, skills_canon) = make_home_with_skills();
+        let lint_dir = tmp.path().join("skills/lint");
+        std::fs::create_dir_all(&lint_dir).unwrap();
+        std::fs::write(lint_dir.join("SKILL.md"), "# lint").unwrap();
+        let lint_canon = std::fs::canonicalize(&lint_dir).unwrap();
+        let awman_dir = tmp.path().join(".awman");
+        std::fs::create_dir_all(&awman_dir).unwrap();
+        std::fs::write(
+            awman_dir.join("Dockerfile.antigravity"),
+            "FROM scratch\nUSER awman\n",
+        )
+        .unwrap();
+        let git_root = tmp.path().join("repo-without-agent-dockerfile");
+        std::fs::create_dir_all(&git_root).unwrap();
+        let engine = make_engine(tmp.path());
+
+        for input in ["agy", "antigravity"] {
+            let agent = AgentName::new(input).unwrap();
+            let all = with_awman_config_home(tmp.path(), || {
+                engine
+                    .skill_overlays(&agent, true, &[], &None, &git_root)
+                    .unwrap()
+            });
+            let named = with_awman_config_home(tmp.path(), || {
+                engine
+                    .skill_overlays(&agent, false, &["lint".to_string()], &None, &git_root)
+                    .unwrap()
+            });
+
+            assert_eq!(all.len(), 1, "all skills for input {input}: {all:?}");
+            assert_eq!(all[0].host_path, skills_canon);
+            assert_eq!(all[0].permission, OverlayPermission::ReadOnly);
+            assert_eq!(
+                all[0].container_path,
+                Path::new("/home/awman/.gemini/antigravity-cli/skills")
+            );
+            assert_eq!(named.len(), 1, "named skill for input {input}: {named:?}");
+            assert_eq!(named[0].host_path, lint_canon);
+            assert_eq!(named[0].permission, OverlayPermission::ReadOnly);
+            assert_eq!(
+                named[0].container_path,
+                Path::new("/home/awman/.gemini/antigravity-cli/skills/lint")
+            );
+        }
     }
 
     #[test]
@@ -2056,6 +2198,45 @@ mod tests {
             Some("/home/appuser".to_string()),
             "detect_container_home must return /home/appuser for USER appuser"
         );
+    }
+
+    #[test]
+    fn agy_and_legacy_alias_find_the_legacy_dockerfile_in_repo_and_home() {
+        let repo_fixture = tempfile::tempdir().unwrap();
+        let repo_home = repo_fixture.path().join("home");
+        let repo_root = repo_fixture.path().join("repo");
+        std::fs::create_dir_all(repo_root.join(".awman")).unwrap();
+        std::fs::write(
+            repo_root.join(".awman/Dockerfile.antigravity"),
+            "FROM scratch\nUSER awman\n",
+        )
+        .unwrap();
+        assert!(!repo_root.join(".awman/Dockerfile.agy").exists());
+
+        let home_fixture = tempfile::tempdir().unwrap();
+        let global_home = home_fixture.path().join("home");
+        let global_repo = home_fixture.path().join("repo");
+        std::fs::create_dir_all(global_home.join(".awman")).unwrap();
+        std::fs::create_dir_all(&global_repo).unwrap();
+        std::fs::write(
+            global_home.join(".awman/Dockerfile.antigravity"),
+            "FROM scratch\nUSER awman\n",
+        )
+        .unwrap();
+        assert!(!global_home.join(".awman/Dockerfile.agy").exists());
+
+        for input in ["agy", "antigravity"] {
+            assert_eq!(
+                detect_container_home(&repo_home, input, &repo_root),
+                Some("/home/awman".to_string()),
+                "input {input} must use the repo-local legacy Dockerfile"
+            );
+            assert_eq!(
+                detect_container_home(&global_home, input, &global_repo),
+                Some("/home/awman".to_string()),
+                "input {input} must use the global legacy Dockerfile"
+            );
+        }
     }
 
     #[test]

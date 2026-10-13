@@ -1,0 +1,12 @@
+# .gitleaksignore — reviewed documentation false positives
+#
+# These findings are the same reused public API-key example in historical
+# user documentation. AWMan generates a fresh random per-instance key and
+# persists only its hash. Current documentation uses <generated-api-key>.
+# Keep these exceptions fingerprint-scoped; never suppress the rule or path.
+
+# Historical squad documentation example.
+b1f9d7404e688b74c6425c4e1d13dd7f490a5f00:docs/16-squad.md:generic-api-key:461
+
+# Historical amie documentation example.
+364c0bf515d450e47e89392b91a256bebbfceaee:docs/16-amie.md:generic-api-key:352

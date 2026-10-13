@@ -494,6 +494,7 @@ const AGENT_VALUES: &[&str] = &[
     "copilot",
     "crush",
     "cline",
+    "agy",
     "antigravity",
 ];
 
@@ -1332,7 +1333,7 @@ const SQUAD_ADD: CommandSpec = CommandSpec {
         },
     ],
     api_allowed: true,
-     build: crate::command::dispatch::build::squad,
+    build: crate::command::dispatch::build::squad,
     gateway_need: GatewayNeed::Running,
     requires_container_tier: true,
     subcommands: &[],
@@ -2268,7 +2269,7 @@ const NEW_SKILL: CommandSpec = CommandSpec {
         },
     ],
     api_allowed: false,
-     build: crate::command::dispatch::build::new,
+    build: crate::command::dispatch::build::new,
     gateway_need: GatewayNeed::None,
     requires_container_tier: false,
     subcommands: &[],
@@ -2279,7 +2280,7 @@ const NEW_SKILL: CommandSpec = CommandSpec {
 /// Agent-run flag set used by `chat` and `exec prompt` (no worktree, no
 /// workflow). All optional. Mode flags `yolo` / `auto` / `plan` are mutually
 /// exclusive.
-const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
+const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 11] = [
     FlagSpec {
         long: "non-interactive",
         short: Some('n'),
@@ -2309,7 +2310,7 @@ const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::All,
-        conflicts_with: &[],
+        conflicts_with: &["startup-gate-control"],
         implies: &[],
         optional: true,
     },
@@ -2379,11 +2380,33 @@ const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 9] = [
         implies: &[],
         optional: true,
     },
+    FlagSpec {
+        long: "startup-gate-control",
+        short: None,
+        help: "Gate agent startup using the request and release files in DIR.",
+        kind: FlagKind::OptionalPath,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &["allow-docker"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "startup-gate-timeout",
+        short: None,
+        help: "Seconds to wait for startup-gate release (default 120, range 1..=3600).",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
 ];
 
 /// Agent-run flags for `exec prompt` — extends `AGENT_RUN_FLAGS_NO_WORKTREE`
 /// with `--issue`. Scoped to `exec prompt` only; `chat` retains the base set.
-const EXEC_PROMPT_FLAGS: [FlagSpec; 10] = [
+const EXEC_PROMPT_FLAGS: [FlagSpec; 12] = [
     FlagSpec {
         long: "non-interactive",
         short: Some('n'),
@@ -2413,7 +2436,7 @@ const EXEC_PROMPT_FLAGS: [FlagSpec; 10] = [
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::All,
-        conflicts_with: &[],
+        conflicts_with: &["startup-gate-control"],
         implies: &[],
         optional: true,
     },
@@ -2494,9 +2517,31 @@ const EXEC_PROMPT_FLAGS: [FlagSpec; 10] = [
         implies: &[],
         optional: true,
     },
+    FlagSpec {
+        long: "startup-gate-control",
+        short: None,
+        help: "Gate agent startup using the request and release files in DIR.",
+        kind: FlagKind::OptionalPath,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &["allow-docker"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "startup-gate-timeout",
+        short: None,
+        help: "Seconds to wait for startup-gate release (default 120, range 1..=3600).",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
 ];
 
-const EXEC_WORKFLOW_FLAGS: [FlagSpec; 15] = [
+const EXEC_WORKFLOW_FLAGS: [FlagSpec; 17] = [
     FlagSpec {
         long: "work-item",
         short: None,
@@ -2537,7 +2582,7 @@ const EXEC_WORKFLOW_FLAGS: [FlagSpec; 15] = [
         kind: FlagKind::Bool,
         default: FlagDefault::Bool(false),
         frontends: FrontendVisibility::All,
-        conflicts_with: &[],
+        conflicts_with: &["startup-gate-control"],
         implies: &[],
         optional: true,
     },
@@ -2668,6 +2713,28 @@ const EXEC_WORKFLOW_FLAGS: [FlagSpec; 15] = [
         implies: &[],
         optional: true,
     },
+    FlagSpec {
+        long: "startup-gate-control",
+        short: None,
+        help: "Gate agent startup using the request and release files in DIR.",
+        kind: FlagKind::OptionalPath,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &["allow-docker"],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "startup-gate-timeout",
+        short: None,
+        help: "Seconds to wait for startup-gate release (default 120, range 1..=3600).",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
 ];
 
 #[cfg(test)]
@@ -2741,6 +2808,25 @@ mod tests {
         let cat = CommandCatalogue::get();
         let spec = cat.lookup(&["init"]).expect("init must be present");
         assert_eq!(spec.name, "init");
+    }
+
+    #[test]
+    fn init_agent_catalogue_exposes_agy_and_accepts_the_legacy_input_alias() {
+        let init = CommandCatalogue::get()
+            .lookup(&["init"])
+            .expect("init must be present");
+        let agent = init.find_flag("agent").expect("init must expose --agent");
+        let FlagKind::Enum(values) = agent.kind else {
+            panic!("init --agent must remain an enum")
+        };
+        assert!(
+            values.contains(&"agy"),
+            "canonical agy value missing: {values:?}"
+        );
+        assert!(
+            values.contains(&"antigravity"),
+            "migration alias must remain accepted as input: {values:?}"
+        );
     }
 
     #[test]

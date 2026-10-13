@@ -264,3 +264,13 @@ With the Apple Containers runtime, the same commands are shown with `container` 
 ---
 
 [← Agent Sessions](03-agent-sessions.md) · [Next: Workflows →](05-workflows.md)
+# Startup-gate trust boundary
+
+The optional startup gate verifies prepared workspace mounts inside the same
+container that will run the agent. It uses an awman-authored bootstrap mounted
+under `/.awman/startup-gate` and the fixed interpreter
+`/usr/bin/python3 -I -S`. Gated launches reject protected-path overlays,
+dynamic-loader environment variables, symlinks, hard links, special files,
+unexpected nested mounts, and mismatched access modes before releasing the
+agent. The proof covers the complete guest tree at gate time; a writable tree
+may change after release.

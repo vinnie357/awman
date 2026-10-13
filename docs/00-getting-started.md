@@ -85,6 +85,34 @@ That's it — you have an isolated agent working in your repo.
 | GitHub Releases | Download the asset for your platform, `chmod +x`, move onto `PATH` |
 | From source | `git clone https://github.com/prettysmartdev/awman.git && cd awman && make install` (Rust 1.94+) |
 
+## Altana startup-gate fork candidate
+
+The upstream `0.12.0` release does not include the orchestrator startup gate.
+The `vinnie357/awman` fork identifies its reviewed candidate as `0.12.1`, based
+on upstream commit `c730732b`. This candidate has not been tagged or published;
+deployment records should retain both that upstream base and the exact fork
+commit used to build the binary.
+
+Callers should detect the extension from CLI metadata already exposed by awman:
+
+```sh
+awman chat --help | grep -- --startup-gate-control
+awman exec prompt --help | grep -- --startup-gate-control
+awman exec workflow --help | grep -- --startup-gate-control
+```
+
+All three checks must succeed before an orchestrator sends gate flags. They
+prove only that the binary exposes the startup-gate syntax. Do not infer
+split-control orchestrated Apple launch support from those checks or from
+`awman --version`: that profile also requires an exact source revision and
+artifact that passed the fork gates and a real Apple Containers qualification.
+The guarded `8fe0d4cc` revision is not such an artifact.
+
+After a reviewed `v0.12.1` tag and release assets exist, the intended fork
+installation form is `mise use -g github:vinnie357/awman@0.12.1`. Do not use
+that command as evidence that the unpublished candidate is available or that
+an unqualified build supports orchestrated Apple launch.
+
 Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-amd64`, `awman-macos-arm64`, `awman-windows-amd64.exe`.
 
 ### `awman init`

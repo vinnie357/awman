@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
@@ -41,6 +42,8 @@ struct LeaseRecord {
     staged_path: PathBuf,
     staged_root: PathBuf,
     container: String,
+    gate_control_dir: Option<PathBuf>,
+    gate_released: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -159,6 +162,7 @@ pub struct LeaseSnapshot {
     pub staged_path: PathBuf,
     pub staged_root: PathBuf,
     pub container: String,
+    pub gate_pending: bool,
 }
 
 /// The process-wide set of live credential leases.
@@ -197,6 +201,15 @@ impl LeaseRegistry {
         delivery: &RefreshableCredentialDelivery,
         container: &str,
     ) -> CredentialLease {
+        self.register_pending(delivery, container, None)
+    }
+
+    pub fn register_pending(
+        &self,
+        delivery: &RefreshableCredentialDelivery,
+        container: &str,
+        gate_control_dir: Option<PathBuf>,
+    ) -> CredentialLease {
         let mut inner = self.shared.inner.lock().unwrap();
         let was_empty = inner.entries.is_empty();
         let generation = LeaseGeneration(inner.next_gen);
@@ -209,6 +222,8 @@ impl LeaseRegistry {
                 staged_path: delivery.staged_path.clone(),
                 staged_root: delivery.staged_root.clone(),
                 container: container.to_string(),
+                gate_control_dir,
+                gate_released: Arc::new(AtomicBool::new(false)),
             },
         );
         if was_empty {
@@ -238,6 +253,17 @@ impl LeaseRegistry {
                 staged_path: rec.staged_path.clone(),
                 staged_root: rec.staged_root.clone(),
                 container: rec.container.clone(),
+                gate_pending: rec.gate_control_dir.as_ref().is_some_and(|dir| {
+                    if rec.gate_released.load(Ordering::Acquire) {
+                        return false;
+                    }
+                    if released_marker_matches_ready(dir, &rec.container) {
+                        rec.gate_released.store(true, Ordering::Release);
+                        false
+                    } else {
+                        true
+                    }
+                }),
             })
             .collect()
     }
@@ -273,10 +299,153 @@ impl LeaseRegistry {
     }
 }
 
+#[derive(serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct GateBindingRecord {
+    id: String,
+    workspace_path: String,
+    manifest_id: String,
+    access: String,
+}
+
+#[derive(serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct GateReadyFile {
+    version: u32,
+    nonce: String,
+    container_name: String,
+    bindings: Vec<GateBindingRecord>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GateRequestBinding {
+    id: String,
+    workspace_path: String,
+    manifest_id: String,
+    manifest_file: String,
+    access: String,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GateRequestFile {
+    version: u32,
+    bindings: Vec<GateRequestBinding>,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GateReceiptFile {
+    version: u32,
+    nonce: String,
+}
+
+fn released_marker_matches_ready(control_dir: &std::path::Path, expected_container: &str) -> bool {
+    #[cfg(unix)]
+    fn read<T: serde::de::DeserializeOwned>(
+        path: &std::path::Path,
+        maximum: u64,
+        owner: u32,
+    ) -> Option<T> {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.file_type().is_file()
+            || metadata.len() > maximum
+            || metadata.len() == 0
+            || metadata.nlink() != 1
+            || metadata.uid() != owner
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return None;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = options.open(path).ok()?;
+        let opened = file.metadata().ok()?;
+        if metadata.dev() != opened.dev()
+            || metadata.ino() != opened.ino()
+            || opened.nlink() != 1
+            || !opened.file_type().is_file()
+            || opened.len() > maximum
+        {
+            return None;
+        }
+        let mut raw = Vec::new();
+        file.take(maximum + 1).read_to_end(&mut raw).ok()?;
+        if raw.len() as u64 > maximum {
+            return None;
+        }
+        serde_json::from_slice(&raw).ok()
+    }
+    #[cfg(not(unix))]
+    fn read<T: serde::de::DeserializeOwned>(_: &std::path::Path, _: u64, _: u32) -> Option<T> {
+        None
+    }
+    #[cfg(unix)]
+    let owner = {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Ok(metadata) = std::fs::symlink_metadata(control_dir) else {
+            return false;
+        };
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != nix::unistd::Uid::current().as_raw()
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            return false;
+        }
+        metadata.uid()
+    };
+    #[cfg(not(unix))]
+    let owner = 0;
+    if std::fs::symlink_metadata(control_dir.join("failure.json")).is_ok() {
+        return false;
+    }
+    let Some(request): Option<GateRequestFile> =
+        read(&control_dir.join("request.json"), 4096, owner)
+    else {
+        return false;
+    };
+    let Some(ready): Option<GateReadyFile> =
+        read(&control_dir.join("ready.json"), 64 * 1024, owner)
+    else {
+        return false;
+    };
+    let Some(released): Option<GateReceiptFile> = read(&control_dir.join(".released"), 4096, owner)
+    else {
+        return false;
+    };
+    if ready.version != 1 || released.version != 1 {
+        return false;
+    }
+    ready.nonce.len() == 64
+        && ready
+            .nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && ready.container_name == expected_container
+        && ready.nonce == released.nonce
+        && request.version == 1
+        && ready.bindings.len() == request.bindings.len()
+        && ready
+            .bindings
+            .iter()
+            .zip(request.bindings.iter())
+            .all(|(a, b)| {
+                a.id == b.id
+                    && a.workspace_path == b.workspace_path
+                    && a.manifest_id == b.manifest_id
+                    && a.access == b.access
+                    && !b.manifest_file.is_empty()
+            })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::auth::credential::CredentialFingerprint;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn delivery(agent: &str) -> RefreshableCredentialDelivery {
         let dir = std::env::temp_dir().join(format!("awman-lease-test-{agent}"));
@@ -288,6 +457,246 @@ mod tests {
             staged_root: dir,
             initial_fingerprint: CredentialFingerprint::zeroed(),
         }
+    }
+
+    #[cfg(unix)]
+    const READY_NONCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[cfg(unix)]
+    fn write_protected(path: &Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).expect("write protected gate record");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("protect gate record");
+    }
+
+    #[cfg(unix)]
+    fn write_json(path: &Path, value: &serde_json::Value) {
+        write_protected(
+            path,
+            &serde_json::to_vec(value).expect("serialize gate record"),
+        );
+    }
+
+    #[cfg(unix)]
+    fn valid_json_padded_to(value: &serde_json::Value, exact_len: usize) -> Vec<u8> {
+        let mut raw = serde_json::to_vec(value).expect("serialize padded gate record");
+        assert!(raw.len() <= exact_len, "fixture must fit requested length");
+        raw.resize(exact_len, b' ');
+        raw
+    }
+
+    #[cfg(unix)]
+    fn request_record() -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "bindings": [{
+                "id": "review-input",
+                "workspace_path": "/review/input",
+                "manifest_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "manifest_file": "review.manifest.json",
+                "access": "read-only"
+            }]
+        })
+    }
+
+    #[cfg(unix)]
+    fn ready_record(container: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "nonce": READY_NONCE,
+            "container_name": container,
+            "bindings": [{
+                "id": "review-input",
+                "workspace_path": "/review/input",
+                "manifest_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "access": "read-only"
+            }]
+        })
+    }
+
+    #[cfg(unix)]
+    struct PendingGateFixture {
+        control: tempfile::TempDir,
+        registry: LeaseRegistry,
+        _lease: CredentialLease,
+    }
+
+    #[cfg(unix)]
+    impl PendingGateFixture {
+        fn new() -> Self {
+            let control = tempfile::tempdir().expect("gate control");
+            std::fs::set_permissions(control.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("protect gate control");
+            write_json(&control.path().join("request.json"), &request_record());
+            write_json(
+                &control.path().join("ready.json"),
+                &ready_record("awman-reviewer"),
+            );
+            let registry = LeaseRegistry::new();
+            let lease = registry.register_pending(
+                &delivery("claude"),
+                "awman-reviewer",
+                Some(control.path().to_path_buf()),
+            );
+            Self {
+                control,
+                registry,
+                _lease: lease,
+            }
+        }
+
+        fn write_release(&self, nonce: &str) {
+            write_json(
+                &self.control.path().join(".released"),
+                &serde_json::json!({"version": 1, "nonce": nonce}),
+            );
+        }
+
+        fn gate_pending(&self) -> bool {
+            self.registry
+                .snapshot()
+                .into_iter()
+                .next()
+                .expect("registered lease")
+                .gate_pending
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_production_ready_and_two_field_receipt_release_once_and_latch() {
+        let fixture = PendingGateFixture::new();
+        assert!(fixture.gate_pending(), "release receipt is not present yet");
+        fixture.write_release(READY_NONCE);
+        assert!(
+            !fixture.gate_pending(),
+            "matching request, container, ready record and receipt must release"
+        );
+
+        std::fs::remove_file(fixture.control.path().join("ready.json")).expect("remove ready");
+        std::fs::remove_file(fixture.control.path().join(".released")).expect("remove receipt");
+        assert!(
+            !fixture.gate_pending(),
+            "a successful release is monotonic for this lease generation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrong_nonce_container_or_binding_identity_stays_pending() {
+        let wrong_nonce = PendingGateFixture::new();
+        wrong_nonce
+            .write_release("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+        assert!(wrong_nonce.gate_pending(), "wrong receipt nonce");
+
+        let wrong_container = PendingGateFixture::new();
+        write_json(
+            &wrong_container.control.path().join("ready.json"),
+            &ready_record("awman-other"),
+        );
+        wrong_container.write_release(READY_NONCE);
+        assert!(wrong_container.gate_pending(), "wrong ready container");
+
+        let wrong_binding = PendingGateFixture::new();
+        let mut ready = ready_record("awman-reviewer");
+        ready["bindings"][0]["manifest_id"] =
+            serde_json::json!("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc");
+        write_json(&wrong_binding.control.path().join("ready.json"), &ready);
+        wrong_binding.write_release(READY_NONCE);
+        assert!(
+            wrong_binding.gate_pending(),
+            "ready bindings must identify the current request"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incomplete_malformed_or_failed_records_stay_pending() {
+        let incomplete = PendingGateFixture::new();
+        write_json(
+            &incomplete.control.path().join("ready.json"),
+            &serde_json::json!({"version": 1, "nonce": READY_NONCE}),
+        );
+        incomplete.write_release(READY_NONCE);
+        assert!(incomplete.gate_pending(), "legacy two-field ready record");
+
+        let malformed_ready = PendingGateFixture::new();
+        write_protected(&malformed_ready.control.path().join("ready.json"), b"{");
+        malformed_ready.write_release(READY_NONCE);
+        assert!(malformed_ready.gate_pending(), "invalid ready JSON bytes");
+
+        let malformed_receipt = PendingGateFixture::new();
+        write_protected(&malformed_receipt.control.path().join(".released"), b"{");
+        assert!(
+            malformed_receipt.gate_pending(),
+            "invalid receipt JSON bytes"
+        );
+
+        let failed = PendingGateFixture::new();
+        failed.write_release(READY_NONCE);
+        write_json(
+            &failed.control.path().join("failure.json"),
+            &serde_json::json!({
+                "version": 1,
+                "code": "release-timeout",
+                "message": "release was not consumed"
+            }),
+        );
+        assert!(
+            failed.gate_pending(),
+            "a failure record must prevent a fabricated release from winning"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_or_oversized_marker_files_stay_pending() {
+        let unsafe_ready_mode = PendingGateFixture::new();
+        unsafe_ready_mode.write_release(READY_NONCE);
+        std::fs::set_permissions(
+            unsafe_ready_mode.control.path().join("ready.json"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("weaken ready mode");
+        assert!(unsafe_ready_mode.gate_pending(), "unsafe ready mode");
+
+        let linked_receipt = PendingGateFixture::new();
+        linked_receipt.write_release(READY_NONCE);
+        std::fs::hard_link(
+            linked_receipt.control.path().join(".released"),
+            linked_receipt.control.path().join("receipt-alias"),
+        )
+        .expect("hard-link receipt");
+        assert!(linked_receipt.gate_pending(), "hard-linked receipt");
+
+        let oversized_ready = PendingGateFixture::new();
+        let oversized_ready_bytes =
+            valid_json_padded_to(&ready_record("awman-reviewer"), 64 * 1024 + 1);
+        assert_eq!(oversized_ready_bytes.len(), 64 * 1024 + 1);
+        write_protected(
+            &oversized_ready.control.path().join("ready.json"),
+            &oversized_ready_bytes,
+        );
+        oversized_ready.write_release(READY_NONCE);
+        assert!(
+            oversized_ready.gate_pending(),
+            "otherwise-valid ready JSON above 64 KiB"
+        );
+
+        let oversized_receipt = PendingGateFixture::new();
+        let oversized_receipt_bytes = valid_json_padded_to(
+            &serde_json::json!({"version": 1, "nonce": READY_NONCE}),
+            4097,
+        );
+        assert_eq!(oversized_receipt_bytes.len(), 4097);
+        write_protected(
+            &oversized_receipt.control.path().join(".released"),
+            &oversized_receipt_bytes,
+        );
+        assert!(
+            oversized_receipt.gate_pending(),
+            "otherwise-valid receipt JSON above 4 KiB"
+        );
     }
 
     #[test]
@@ -409,5 +818,76 @@ mod tests {
             .expect("parked waiter must wake on shutdown");
         assert!(!active, "shutdown must report inactive, not a live lease");
         waiter.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_gate_records_require_strict_json_before_release_latches() {
+        let manifest = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let binding = format!(
+            "{{\"id\":\"review-input\",\"workspace_path\":\"/review/input\",\"manifest_id\":\"{manifest}\",\"manifest_file\":\"review.manifest.json\",\"access\":\"read-only\"}}"
+        );
+        let invalid_requests = [
+            format!("{{\"version\":2,\"version\":1,\"bindings\":[{binding}]}}"),
+            format!(
+                "{{\"version\":1,\"bindings\":[{{\"id\":\"other\",\"id\":\"review-input\",\"workspace_path\":\"/review/input\",\"manifest_id\":\"{manifest}\",\"manifest_file\":\"review.manifest.json\",\"access\":\"read-only\"}}]}}"
+            ),
+            format!("{{\"version\":true,\"bindings\":[{binding}]}}"),
+            format!("{{\"version\":1.0,\"bindings\":[{binding}]}}"),
+            format!("{{\"version\":1e0,\"bindings\":[{binding}]}}"),
+            format!("{{\"version\":1,\"bindings\":[{binding}],\"extra\":false}}"),
+            format!("{{\"version\":1,\"bindings\":[{binding}]}} {{}}"),
+        ];
+        for raw in invalid_requests {
+            let fixture = PendingGateFixture::new();
+            write_protected(&fixture.control.path().join("request.json"), raw.as_bytes());
+            fixture.write_release(READY_NONCE);
+            assert!(
+                fixture.gate_pending(),
+                "invalid request released gate: {raw}"
+            );
+        }
+
+        let ready_binding = format!(
+            "{{\"id\":\"review-input\",\"workspace_path\":\"/review/input\",\"manifest_id\":\"{manifest}\",\"access\":\"read-only\"}}"
+        );
+        let invalid_ready = [
+            format!("{{\"version\":2,\"version\":1,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}]}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{{\"id\":\"other\",\"id\":\"review-input\",\"workspace_path\":\"/review/input\",\"manifest_id\":\"{manifest}\",\"access\":\"read-only\"}}]}}"),
+            format!("{{\"version\":true,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}]}}"),
+            format!("{{\"version\":1.0,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}]}}"),
+            format!("{{\"version\":1e0,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}]}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}0\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}]}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}],\"extra\":false}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}\",\"container_name\":\"awman-reviewer\",\"bindings\":[{ready_binding}]}} {{}}"),
+        ];
+        for raw in invalid_ready {
+            let fixture = PendingGateFixture::new();
+            write_protected(&fixture.control.path().join("ready.json"), raw.as_bytes());
+            fixture.write_release(READY_NONCE);
+            assert!(fixture.gate_pending(), "invalid ready released gate: {raw}");
+        }
+
+        let invalid_receipts = [
+            format!("{{\"version\":2,\"version\":1,\"nonce\":\"{READY_NONCE}\"}}"),
+            format!(
+                "{{\"version\":1,\"nonce\":\"{}\",\"nonce\":\"{READY_NONCE}\"}}",
+                "c".repeat(64)
+            ),
+            format!("{{\"version\":true,\"nonce\":\"{READY_NONCE}\"}}"),
+            format!("{{\"version\":1.0,\"nonce\":\"{READY_NONCE}\"}}"),
+            format!("{{\"version\":1e0,\"nonce\":\"{READY_NONCE}\"}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}0\"}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}\",\"extra\":false}}"),
+            format!("{{\"version\":1,\"nonce\":\"{READY_NONCE}\"}} {{}}"),
+        ];
+        for raw in invalid_receipts {
+            let fixture = PendingGateFixture::new();
+            write_protected(&fixture.control.path().join(".released"), raw.as_bytes());
+            assert!(
+                fixture.gate_pending(),
+                "invalid receipt released gate: {raw}"
+            );
+        }
     }
 }

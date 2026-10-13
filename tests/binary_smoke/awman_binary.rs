@@ -89,7 +89,7 @@ fn newest_real_cli_deps_binary(top_level: &Path) -> Option<PathBuf> {
             entry.path(),
         ));
     }
-    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     candidates
         .into_iter()
         .map(|(_, path)| path)

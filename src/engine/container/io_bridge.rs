@@ -183,19 +183,53 @@ pub(crate) fn spawn_stuck_detector(
 /// the `BridgeResult`.
 type PtyMaster = Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>;
 
+pub(crate) struct PtyBridgeFailure {
+    pub error: EngineError,
+    pub pair: portable_pty::PtyPair,
+    pub reader: Option<Box<dyn std::io::Read + Send>>,
+    pub io: AgentIo,
+    pub config: BridgeConfig,
+}
+
 pub(crate) fn bridge_pty(
     io: AgentIo,
     pair: portable_pty::PtyPair,
     config: BridgeConfig,
 ) -> Result<(PtyMaster, BridgeResult), EngineError> {
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| EngineError::Container(format!("clone pty reader: {e}")))?;
-    let mut writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| EngineError::Container(format!("take pty writer: {e}")))?;
+    bridge_pty_owned(io, pair, config).map_err(|failure| failure.error)
+}
+
+// The direct error preserves all post-spawn PTY custody without another allocation.
+#[allow(clippy::result_large_err)]
+pub(crate) fn bridge_pty_owned(
+    io: AgentIo,
+    pair: portable_pty::PtyPair,
+    config: BridgeConfig,
+) -> Result<(PtyMaster, BridgeResult), PtyBridgeFailure> {
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            return Err(PtyBridgeFailure {
+                error: EngineError::Container(format!("clone pty reader: {error}")),
+                pair,
+                reader: None,
+                io,
+                config,
+            });
+        }
+    };
+    let mut writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            return Err(PtyBridgeFailure {
+                error: EngineError::Container(format!("take pty writer: {error}")),
+                pair,
+                reader: Some(reader),
+                io,
+                config,
+            });
+        }
+    };
 
     let activity: SharedActivity = Arc::new(Mutex::new(None));
     let first_byte = Arc::new(AtomicBool::new(false));
@@ -301,9 +335,45 @@ pub(crate) fn bridge_pty(
 /// - Writer task: `io.stdin_rx` → child stdin
 ///
 /// The child's stdout/stderr/stdin pipes are taken from the `Child`.
+pub(crate) struct PipedChildIo {
+    pub stdin: Option<std::process::ChildStdin>,
+    pub stdout: Option<std::process::ChildStdout>,
+    pub stderr: Option<std::process::ChildStderr>,
+}
+
+impl PipedChildIo {
+    pub(crate) fn empty() -> Self {
+        Self {
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        }
+    }
+
+    pub(crate) fn take_from(&mut self, child: &mut std::process::Child) {
+        self.stdin = child.stdin.take();
+        self.stdout = child.stdout.take();
+        self.stderr = child.stderr.take();
+    }
+
+    pub(crate) fn take(child: &mut std::process::Child) -> Self {
+        let mut pipes = Self::empty();
+        pipes.take_from(child);
+        pipes
+    }
+}
+
 pub(crate) fn bridge_piped(
     io: AgentIo,
     child: &mut std::process::Child,
+    config: BridgeConfig,
+) -> BridgeResult {
+    bridge_piped_io(io, PipedChildIo::take(child), config)
+}
+
+pub(crate) fn bridge_piped_io(
+    io: AgentIo,
+    mut pipes: PipedChildIo,
     config: BridgeConfig,
 ) -> BridgeResult {
     let activity: SharedActivity = Arc::new(Mutex::new(None));
@@ -315,7 +385,7 @@ pub(crate) fn bridge_piped(
     // a piped child will block on stdout if we stop reading. Activity
     // tracking continues unconditionally so the stuck detector reflects what
     // the container actually produces.
-    if let Some(child_stdout) = child.stdout.take() {
+    if let Some(child_stdout) = pipes.stdout.take() {
         let stdout_tx = io.stdout;
         let act = Arc::clone(&activity);
         let fb = Arc::clone(&first_byte);
@@ -348,7 +418,7 @@ pub(crate) fn bridge_piped(
 
     // stderr reader thread — same drain-after-sink-dies semantics as stdout.
     // Feeds the same tail as stdout so the buffer holds combined output.
-    if let Some(child_stderr) = child.stderr.take() {
+    if let Some(child_stderr) = pipes.stderr.take() {
         let stderr_tx = io.stderr;
         let act = Arc::clone(&activity);
         let fb = Arc::clone(&first_byte);
@@ -381,7 +451,7 @@ pub(crate) fn bridge_piped(
 
     // stdin writer task
     let stdin_tx = io.stdin_tx;
-    if let Some(child_stdin) = child.stdin.take() {
+    if let Some(child_stdin) = pipes.stdin.take() {
         let mut stdin_rx = io.stdin_rx;
         tokio::spawn(async move {
             use std::io::Write;

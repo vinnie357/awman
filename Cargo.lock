@@ -215,7 +215,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "awman"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "anyhow",
  "arboard",
@@ -238,6 +238,7 @@ dependencies = [
  "reqwest",
  "ring",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -261,6 +262,7 @@ dependencies = [
  "vt100-ctt",
  "which",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]

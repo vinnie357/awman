@@ -141,15 +141,7 @@ fn field_scope(name: &str) -> Option<FieldScope> {
 /// this list is checked at config-write time so unsupported values are rejected
 /// before they reach the engine.
 const VALID_AGENT_VALUES: &[&str] = &[
-    "claude",
-    "codex",
-    "gemini",
-    "opencode",
-    "crush",
-    "cline",
-    "copilot",
-    "maki",
-    "antigravity",
+    "claude", "codex", "gemini", "opencode", "crush", "cline", "copilot", "maki", "agy",
 ];
 
 /// Validate and coerce a string value into the appropriate JSON type for the
@@ -194,6 +186,7 @@ fn validate_and_coerce(field: &str, value: &str) -> Result<serde_json::Value, St
     }
     match field {
         "agent" | "default_agent" => {
+            let value = if value == "antigravity" { "agy" } else { value };
             if !VALID_AGENT_VALUES.contains(&value) {
                 return Err(format!(
                     "'{}' is not a known agent; valid agents: {}",
@@ -1340,6 +1333,16 @@ mod tests {
     fn validate_and_coerce_agent_valid() {
         let v = validate_and_coerce("agent", "claude").unwrap();
         assert_eq!(v, serde_json::Value::String("claude".into()));
+    }
+
+    #[test]
+    fn validate_and_coerce_agy_canonicalizes_the_legacy_config_alias() {
+        for field in ["agent", "default_agent"] {
+            let canonical = validate_and_coerce(field, "agy").unwrap();
+            let migrated = validate_and_coerce(field, "antigravity").unwrap();
+            assert_eq!(canonical, serde_json::Value::String("agy".into()));
+            assert_eq!(migrated, canonical, "legacy value must migrate in {field}");
+        }
     }
 
     #[test]

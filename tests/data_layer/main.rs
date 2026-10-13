@@ -13,4 +13,5 @@ mod rename_0077;
 mod sqlite_upgrade_compat;
 mod squad_config;
 mod squad_paths;
+mod startup_gate;
 mod task_store;

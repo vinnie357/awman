@@ -7,7 +7,7 @@
 //! envelopes against the daemon's wire responses.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -668,6 +668,45 @@ fn init_repo(path: &Path) {
 }
 
 #[cfg(unix)]
+const AWMAN_SQUAD_GATEWAY_HOLDER_CHILD: &str = "AWMAN_SQUAD_GATEWAY_HOLDER_CHILD";
+
+#[cfg(unix)]
+const AWMAN_SQUAD_GATEWAY_HOLDER_PROOF: &str = "AWMAN_SQUAD_GATEWAY_HOLDER_PROOF";
+
+#[cfg(unix)]
+#[test]
+fn fake_awman_process_holder_child() {
+    if std::env::var_os(AWMAN_SQUAD_GATEWAY_HOLDER_CHILD).as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return;
+    }
+
+    let proof_path = std::env::var_os(AWMAN_SQUAD_GATEWAY_HOLDER_PROOF);
+    let proof_path = proof_path.map(std::path::PathBuf::from);
+    let record_proof = |event: &str| {
+        if let Some(path) = &proof_path {
+            std::fs::write(path, event).expect("holder child proof must be written");
+        }
+    };
+    record_proof("entered\n");
+
+    use std::io::Read;
+    let mut stdin = std::io::stdin().lock();
+    let mut buffer = [0_u8; 256];
+    loop {
+        match stdin.read(&mut buffer) {
+            Ok(0) => {
+                record_proof("eof\n");
+                return;
+            }
+            Ok(_) => record_proof("stdin-consumed\n"),
+            Err(error) => panic!("holder child must read stdin until EOF: {error}"),
+        }
+    }
+}
+
+#[cfg(unix)]
 struct FakeAwmanProcess {
     _dir: tempfile::TempDir,
     child: std::process::Child,
@@ -679,9 +718,8 @@ impl FakeAwmanProcess {
     fn spawn() -> Self {
         let dir = tempfile::tempdir().expect("fake awman process directory");
         let executable = dir.path().join("awman-squad-test-holder");
-        // `cat` blocks on this fixture's pipe until its owning guard closes
-        // stdin, so the holder has no independent wall-clock expiry.
-        std::fs::copy("/bin/cat", &executable).expect("copy pipe-held process");
+        let test_binary = std::env::current_exe().expect("current squad gateway test binary");
+        std::fs::copy(test_binary, &executable).expect("copy squad gateway test holder");
         use std::os::unix::fs::PermissionsExt;
         let mut permissions = std::fs::metadata(&executable)
             .expect("holder metadata")
@@ -716,9 +754,15 @@ impl FakeAwmanProcess {
         let mut attempt = 0;
         let mut child = loop {
             match Command::new(&executable)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .args(["--exact", "fake_awman_process_holder_child", "--nocapture"])
+                .env(AWMAN_SQUAD_GATEWAY_HOLDER_CHILD, "1")
+                .env(
+                    AWMAN_SQUAD_GATEWAY_HOLDER_PROOF,
+                    dir.path().join("holder-child-proof"),
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .spawn()
             {
                 Ok(child) => break child,
@@ -729,7 +773,7 @@ impl FakeAwmanProcess {
                 Err(e) => panic!("awman-named holder must start: {e}"),
             }
         };
-        let stdin = child.stdin.take().expect("holder stdin pipe");
+        let stdin = child.stdin.take().expect("holder child stdin");
 
         // `spawn` returns once the child *exists*, not once it has finished
         // `execve`. Until that exec lands, the child's command name is still
@@ -762,9 +806,10 @@ impl FakeAwmanProcess {
 #[cfg(unix)]
 impl Drop for FakeAwmanProcess {
     fn drop(&mut self) {
-        // Close the ownership event before the fallback kill-and-reap path.
         drop(self.stdin.take());
-        let _ = self.child.kill();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
     }
 }
@@ -789,6 +834,72 @@ fn fake_awman_process_lives_until_its_owner_is_dropped() {
         !awman::data::fs::daemon_process::is_process_alive(pid),
         "dropping the owning guard must close and reap the holder"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn fake_awman_process_holder_child_enters_reads_stdin_and_exits_on_eof() {
+    use std::io::Write;
+
+    let mut holder = FakeAwmanProcess::spawn();
+    let proof_path = holder._dir.path().join("holder-child-proof");
+    let wait_for_proof = |expected: &[u8]| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::fs::read(&proof_path).ok().as_deref() == Some(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "holder child must record {:?} in its owned proof file",
+                String::from_utf8_lossy(expected)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    wait_for_proof(b"entered\n");
+    assert!(
+        holder
+            .child
+            .try_wait()
+            .expect("holder entry status")
+            .is_none(),
+        "entered child must remain alive while its owner retains stdin"
+    );
+    holder
+        .stdin
+        .as_mut()
+        .expect("holder stdin must remain owned")
+        .write_all(b"holder child input proof\n")
+        .expect("holder child must accept input");
+    wait_for_proof(b"stdin-consumed\n");
+    assert!(
+        holder
+            .child
+            .try_wait()
+            .expect("holder input status")
+            .is_none(),
+        "child must consume input and remain alive until EOF"
+    );
+
+    drop(holder.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = holder.child.try_wait().expect("holder EOF status") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder child must exit after its owner closes stdin"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "holder child must exit successfully on EOF"
+    );
+    wait_for_proof(b"eof\n");
 }
 
 #[cfg(unix)]
@@ -988,7 +1099,7 @@ fn newest_real_cli_deps_binary(top_level: &Path) -> Option<std::path::PathBuf> {
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         candidates.push((mtime, entry.path()));
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     candidates
         .into_iter()
         .map(|(_, path)| path)

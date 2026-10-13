@@ -19,6 +19,8 @@ use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 
 #[derive(Debug, Clone)]
 pub struct ExecPromptCommandFlags {
+    pub startup_gate_control: Option<std::path::PathBuf>,
+    pub startup_gate_timeout: u64,
     pub prompt: Option<String>,
     pub non_interactive: bool,
     pub plan: bool,
@@ -105,6 +107,7 @@ pub struct ExecPromptCommand {
     flags: ExecPromptCommandFlags,
     engines: Engines,
     session: Session,
+    startup_gate: Option<crate::data::startup_gate::StartupGateSpec>,
 }
 
 impl ExecPromptCommand {
@@ -113,6 +116,7 @@ impl ExecPromptCommand {
             flags,
             engines,
             session,
+            startup_gate: None,
         }
     }
 
@@ -121,12 +125,31 @@ impl ExecPromptCommand {
     /// prompt-or-issue requirement is checked at run time, where `--issue`
     /// can still supply the text.
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        if ctx.flags.supplied("startup-gate-timeout") && !ctx.flags.supplied("startup-gate-control")
+        {
+            return Err(CommandError::Other(
+                "exec prompt: --startup-gate-timeout requires --startup-gate-control".into(),
+            ));
+        }
         let prompt = match ctx.args.get("prompt") {
             Some(prompt) if prompt.trim().is_empty() => None,
             other => other.map(str::to_string),
         };
-        Ok(Self::new(
+        let command = Self::new(
             ExecPromptCommandFlags {
+                startup_gate_control: ctx.flags.path("startup-gate-control"),
+                startup_gate_timeout: ctx
+                    .flags
+                    .string("startup-gate-timeout")
+                    .as_deref()
+                    .unwrap_or("120")
+                    .parse()
+                    .map_err(|_| {
+                        CommandError::Other(
+                            "exec prompt: --startup-gate-timeout must be an integer in 1..=3600"
+                                .into(),
+                        )
+                    })?,
                 prompt,
                 non_interactive: ctx.flags.bool("non-interactive"),
                 plan: ctx.flags.bool("plan"),
@@ -146,7 +169,17 @@ impl ExecPromptCommand {
             },
             ctx.engines.clone(),
             ctx.session.clone(),
-        ))
+        );
+        let startup_gate = crate::command::commands::preflight_startup_gate(
+            "exec prompt",
+            command.flags.startup_gate_control.as_deref(),
+            command.flags.startup_gate_timeout,
+            command.flags.allow_docker,
+        )?;
+        Ok(Self {
+            startup_gate,
+            ..command
+        })
     }
 
     pub fn flags(&self) -> &ExecPromptCommandFlags {
@@ -163,6 +196,15 @@ impl Command for ExecPromptCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        let startup_gate = match self.startup_gate.clone() {
+            Some(gate) => Some(gate),
+            None => crate::command::commands::preflight_startup_gate(
+                "exec prompt",
+                self.flags.startup_gate_control.as_deref(),
+                self.flags.startup_gate_timeout,
+                self.flags.allow_docker,
+            )?,
+        };
         let session = self.session;
 
         // Validate that at least one of prompt and --issue is provided.
@@ -348,6 +390,7 @@ impl Command for ExecPromptCommand {
         )?;
 
         let run_opts = AgentRunOptions {
+            startup_gate,
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),

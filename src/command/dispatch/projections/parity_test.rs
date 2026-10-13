@@ -530,6 +530,102 @@ fn api_profile_yolo_is_overridable_non_interactive_is_forced() {
     assert_eq!(with_plan.flag_bool("yolo"), None);
 }
 
+#[test]
+fn gated_allow_docker_is_rejected_by_cli_grammar_before_dispatch() {
+    let cat = CommandCatalogue::get();
+    let cases = [
+        (
+            &["chat"][..],
+            vec![
+                "--startup-gate-control",
+                "/orchestrator/gate",
+                "--allow-docker",
+            ],
+            vec![
+                "awman",
+                "chat",
+                "--startup-gate-control",
+                "/orchestrator/gate",
+                "--allow-docker",
+            ],
+        ),
+        (
+            &["exec", "prompt"][..],
+            vec![
+                "--startup-gate-control",
+                "/orchestrator/gate",
+                "--allow-docker",
+                "review",
+            ],
+            vec![
+                "awman",
+                "exec",
+                "prompt",
+                "--startup-gate-control",
+                "/orchestrator/gate",
+                "--allow-docker",
+                "review",
+            ],
+        ),
+        (
+            &["exec", "workflow"][..],
+            vec![
+                "workflow.toml",
+                "--startup-gate-control",
+                "/orchestrator/gate",
+                "--allow-docker",
+            ],
+            vec![
+                "awman",
+                "exec",
+                "workflow",
+                "workflow.toml",
+                "--startup-gate-control",
+                "/orchestrator/gate",
+                "--allow-docker",
+            ],
+        ),
+    ];
+
+    for (path, raw, cli) in cases {
+        let error = cat
+            .parse_raw_args_with_profile(path, &to_vec(&raw), FrontendKind::Cli)
+            .expect_err("gated --allow-docker must fail during argument resolution");
+        let (flag, reason) = match error {
+            CommandError::InvalidFlagValue { flag, reason, .. } => (flag, reason),
+            other => panic!("unexpected gated --allow-docker error: {other:?}"),
+        };
+        assert!(matches!(
+            (flag.as_str(), reason.as_str()),
+            (
+                "allow-docker",
+                "--allow-docker conflicts with --startup-gate-control"
+            ) | (
+                "startup-gate-control",
+                "--startup-gate-control conflicts with --allow-docker"
+            )
+        ));
+        assert!(
+            cat.build_clap_command().try_get_matches_from(cli).is_err(),
+            "the CLI must reject the combination before command construction"
+        );
+    }
+
+    assert!(cat
+        .build_clap_command()
+        .try_get_matches_from(["awman", "chat", "--allow-docker"])
+        .is_ok());
+    assert!(cat
+        .build_clap_command()
+        .try_get_matches_from([
+            "awman",
+            "chat",
+            "--startup-gate-control",
+            "/orchestrator/gate",
+        ])
+        .is_ok());
+}
+
 // ─── WI 0113 F-10: the catalogue owns defaults and implications ─────────────
 //
 // The two regression guards for the root cause F-10 names: six literal
