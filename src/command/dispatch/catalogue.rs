@@ -2405,8 +2405,41 @@ const AGENT_RUN_FLAGS_NO_WORKTREE: [FlagSpec; 11] = [
 ];
 
 /// Agent-run flags for `exec prompt` — extends `AGENT_RUN_FLAGS_NO_WORKTREE`
-/// with `--issue`. Scoped to `exec prompt` only; `chat` retains the base set.
-const EXEC_PROMPT_FLAGS: [FlagSpec; 12] = [
+/// with `--issue` and `--isolated-settings`. Scoped to `exec prompt` only.
+const EXEC_PROMPT_FLAGS: [FlagSpec; 15] = [
+    FlagSpec {
+        long: "native-print",
+        short: None,
+        help: "Stream native Claude, Codex or AGY JSON output with an explicit agent and model.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &["launch-mode", "allow-docker", "yolo", "auto", "plan"],
+        implies: &["non-interactive", "isolated-settings"],
+        optional: true,
+    },
+    FlagSpec {
+        long: "native-session",
+        short: None,
+        help: "Continue the selected native provider session.",
+        kind: FlagKind::OptionalString,
+        default: FlagDefault::None,
+        frontends: FrontendVisibility::CliOnly,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
+    FlagSpec {
+        long: "isolated-settings",
+        short: None,
+        help: "Use owned writable settings copies for Codex, AGY and Claude.",
+        kind: FlagKind::Bool,
+        default: FlagDefault::Bool(false),
+        frontends: FrontendVisibility::All,
+        conflicts_with: &[],
+        implies: &[],
+        optional: true,
+    },
     FlagSpec {
         long: "non-interactive",
         short: Some('n'),

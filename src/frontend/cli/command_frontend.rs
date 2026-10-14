@@ -35,6 +35,9 @@ use super::user_message::CliUserMessageQueue;
 
 /// Single CLI frontend struct. Implements every per-command frontend trait
 /// in `src/frontend/cli/per_command/`.
+pub(crate) type NativeOutputWriters =
+    std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<std::io::Result<()>>>>>;
+
 pub struct CliFrontend {
     pub(crate) matches: ArgMatches,
     /// Cached canonical command path (resolved via `command_path_from_matches`).
@@ -43,6 +46,7 @@ pub struct CliFrontend {
     /// Effective non-interactive mode: true when explicitly requested via
     /// `--non-interactive` OR when stdin is not a TTY.
     pub(crate) non_interactive: bool,
+    pub(crate) native_output_writers: NativeOutputWriters,
     /// Receiver end of the background stdin-reader thread spawned for yolo
     /// countdown input. `None` until the first `yolo_countdown_tick` call on a
     /// TTY; consumed lines are mapped to `YoloTickOutcome` by the
@@ -384,6 +388,7 @@ impl CliFrontend {
             command_path,
             messages: CliUserMessageQueue::new(),
             non_interactive,
+            native_output_writers: Default::default(),
             yolo_stdin_rx: None,
             last_sink_message_time: None,
             raw_mode_guard: None,
@@ -420,7 +425,7 @@ impl CliFrontend {
                 .copied()
                 .unwrap_or(false)
         };
-        flag("non-interactive") || flag("json")
+        flag("non-interactive") || flag("json") || flag("native-print")
     }
 
     /// Returns `true` when the `--json` flag is active for the current
@@ -1306,3 +1311,7 @@ mod tests {
         assert_eq!(v, None);
     }
 }
+
+#[cfg(test)]
+#[path = "native_print_cli_test.rs"]
+mod native_print_cli_test;

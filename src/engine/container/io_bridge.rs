@@ -58,6 +58,7 @@ pub(crate) struct BridgeConfig {
 /// Bundle returned by `bridge_pty` / `bridge_piped` containing the artifacts
 /// the backend needs to store for the execution lifetime.
 pub(crate) struct BridgeResult {
+    pub output_readers: Vec<std::thread::JoinHandle<()>>,
     /// Sender for `try_inject_stdin` — the engine retains a clone.
     pub stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// Broadcast sender for stuck events — stored in `AgentExecution`.
@@ -320,6 +321,7 @@ pub(crate) fn bridge_pty_owned(
     Ok((
         master_arc,
         BridgeResult {
+            output_readers: Vec::new(),
             stdin_injector: stdin_tx,
             stuck_tx,
             output_tail: config.output_tail,
@@ -379,6 +381,7 @@ pub(crate) fn bridge_piped_io(
     let activity: SharedActivity = Arc::new(Mutex::new(None));
     let first_byte = Arc::new(AtomicBool::new(false));
 
+    let mut output_readers = Vec::new();
     // stdout reader thread.
     //
     // If the frontend's sink dies, keep draining the pipe but discard bytes —
@@ -391,7 +394,7 @@ pub(crate) fn bridge_piped_io(
         let fb = Arc::clone(&first_byte);
         let tail = Arc::clone(&config.output_tail);
         let broadcast = config.output_broadcast.clone();
-        std::thread::spawn(move || {
+        output_readers.push(std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stdout;
             let mut buf = [0u8; 4096];
@@ -413,7 +416,7 @@ pub(crate) fn bridge_piped_io(
                     }
                 }
             }
-        });
+        }));
     }
 
     // stderr reader thread — same drain-after-sink-dies semantics as stdout.
@@ -424,7 +427,7 @@ pub(crate) fn bridge_piped_io(
         let fb = Arc::clone(&first_byte);
         let tail = Arc::clone(&config.output_tail);
         let broadcast = config.output_broadcast.clone();
-        std::thread::spawn(move || {
+        output_readers.push(std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stderr;
             let mut buf = [0u8; 4096];
@@ -446,7 +449,7 @@ pub(crate) fn bridge_piped_io(
                     }
                 }
             }
-        });
+        }));
     }
 
     // stdin writer task
@@ -477,6 +480,7 @@ pub(crate) fn bridge_piped_io(
     );
 
     BridgeResult {
+        output_readers,
         stdin_injector: stdin_tx,
         stuck_tx,
         output_tail: config.output_tail,

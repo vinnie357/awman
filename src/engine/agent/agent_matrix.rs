@@ -4,6 +4,117 @@
 use crate::engine::container::options::{Entrypoint, ModelFlagForm};
 use crate::engine::error::EngineError;
 
+#[derive(Debug, Clone, Copy)]
+enum NativeProvider {
+    Claude,
+    Codex,
+    Agy,
+}
+
+#[derive(Debug, Clone)]
+enum NativeSession {
+    Claude(String),
+    Codex(String),
+    Agy(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativePrintRequest {
+    provider: NativeProvider,
+    model: String,
+    session: Option<NativeSession>,
+}
+
+impl NativePrintRequest {
+    pub(crate) fn new(
+        agent: &str,
+        model: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<Self, EngineError> {
+        let provider = match agent {
+            "claude" => NativeProvider::Claude,
+            "codex" => NativeProvider::Codex,
+            "agy" => NativeProvider::Agy,
+            _ => {
+                return Err(EngineError::Config(
+                    "native print requires canonical --agent claude, codex or agy".into(),
+                ))
+            }
+        };
+        let model = model
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                EngineError::Config("native print requires a non-empty explicit --model".into())
+            })?;
+        let session = match session {
+            Some(value) if value.trim().is_empty() => {
+                return Err(EngineError::Config(
+                    "native print requires a non-empty --native-session".into(),
+                ))
+            }
+            Some(value) => Some(match provider {
+                NativeProvider::Claude => NativeSession::Claude(value.into()),
+                NativeProvider::Codex => NativeSession::Codex(value.into()),
+                NativeProvider::Agy => NativeSession::Agy(value.into()),
+            }),
+            None => None,
+        };
+        Ok(Self {
+            provider,
+            model: model.into(),
+            session,
+        })
+    }
+
+    pub(crate) fn invocation(&self, prompt: &str) -> (Entrypoint, Option<String>) {
+        let (mut argv, stdin) = match self.provider {
+            NativeProvider::Codex => (
+                vec![
+                    "codex".into(),
+                    "exec".into(),
+                    "--model".into(),
+                    self.model.clone(),
+                    "--json".into(),
+                    "--output-last-message".into(),
+                    "/workspace/awman-native-last-message.txt".into(),
+                    "--skip-git-repo-check".into(),
+                ],
+                Some(prompt.into()),
+            ),
+            NativeProvider::Claude | NativeProvider::Agy => {
+                let agent = match self.provider {
+                    NativeProvider::Claude => "claude",
+                    _ => "agy",
+                };
+                (
+                    vec![
+                        agent.into(),
+                        "-p".into(),
+                        prompt.into(),
+                        "--model".into(),
+                        self.model.clone(),
+                        "--output-format".into(),
+                        "json".into(),
+                    ],
+                    None,
+                )
+            }
+        };
+        if let Some(session) = &self.session {
+            let (flag, id) = match session {
+                NativeSession::Claude(id) => ("--resume", id),
+                NativeSession::Codex(id) => ("resume", id),
+                NativeSession::Agy(id) => ("--conversation", id),
+            };
+            argv.extend([flag.into(), id.clone()]);
+        }
+        if matches!(self.provider, NativeProvider::Codex) {
+            argv.push("-".into());
+        }
+        (Entrypoint(argv), stdin)
+    }
+}
+
 /// Supported agent names — derived from the legacy `Agent` enum in
 /// `oldsrc/cli.rs`.
 pub const SUPPORTED_AGENTS: &[&str] = &[

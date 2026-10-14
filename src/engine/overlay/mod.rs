@@ -115,6 +115,8 @@ pub struct OverlayRequest {
     /// passthrough/none auth modes must never cause host credentials to be
     /// copied into a mount.
     pub materialize_credentials: bool,
+    /// Use owned writable settings copies and reject unsafe host fallbacks.
+    pub isolated_settings: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,6 +274,7 @@ impl OverlayEngine {
                 session.git_root(),
                 request.container_home.as_deref(),
                 request.materialize_credentials,
+                request.isolated_settings,
             )?;
             staged_credentials.extend(staged);
             for spec in agent_overlays {
@@ -385,6 +388,7 @@ impl OverlayEngine {
             git_root,
             container_home_override,
             false,
+            false,
         )
         .map(|(overlays, _)| overlays)
     }
@@ -396,7 +400,13 @@ impl OverlayEngine {
         git_root: &Path,
         container_home_override: Option<&str>,
         materialize_credentials: bool,
+        isolated_settings: bool,
     ) -> Result<(Vec<OverlaySpec>, Vec<StagedCredentialFile>), EngineError> {
+        if isolated_settings && !matches!(agent.as_str(), "codex" | "agy" | "claude") {
+            return Err(EngineError::NotImplemented(
+                "isolated settings are supported only for Codex, AGY and Claude",
+            ));
+        }
         let home = self.auth_resolver.home();
         let paths = self.auth_resolver.resolve(agent.as_str());
         let mut out = Vec::new();
@@ -419,6 +429,9 @@ impl OverlayEngine {
                         Ok((dir, path)) => {
                             let _retained = self.retain_tempdir(dir);
                             path
+                        }
+                        Err(error) if isolated_settings => {
+                            return Err(EngineError::io(cfg, error));
                         }
                         Err(_) => cfg.clone(),
                     };
@@ -500,8 +513,21 @@ impl OverlayEngine {
             "codex" => {
                 if let Some(dir) = paths.settings_dir.as_ref() {
                     if dir.exists() {
+                        let host_path = if isolated_settings {
+                            let (tmp, path) = stage_settings_dir_with_secrets_with_policy(
+                                dir,
+                                &[],
+                                "awman-codex-",
+                                true,
+                            )
+                            .map_err(|error| EngineError::io(dir, error))?;
+                            let _retained = self.retain_tempdir(tmp);
+                            path
+                        } else {
+                            dir.clone()
+                        };
                         out.push(OverlaySpec {
-                            host_path: dir.clone(),
+                            host_path,
                             container_path: PathBuf::from(format!("{container_home}/.codex")),
                             permission: OverlayPermission::ReadWrite,
                         });
@@ -530,23 +556,29 @@ impl OverlayEngine {
                 let dir_exists = host_dir.map(|p| p.exists()).unwrap_or(false);
                 if dir_exists || !secret_files.is_empty() {
                     let staged = if dir_exists {
-                        stage_settings_dir_with_secrets(
+                        stage_settings_dir_with_secrets_with_policy(
                             host_dir.unwrap(),
                             &secret_files,
                             "awman-antigravity-",
+                            isolated_settings,
                         )
                     } else {
                         // First-time user: no host `~/.gemini` but a keychain
                         // token is still good enough for agy to authenticate.
-                        synthesize_settings_dir_with_secrets(
+                        synthesize_settings_dir_with_secrets_with_policy(
                             &secret_files,
                             "awman-antigravity-minimal-",
+                            isolated_settings,
                         )
                     };
                     let host_path = match staged {
                         Ok((tmp, path)) => {
                             let _retained = self.retain_tempdir(tmp);
                             path
+                        }
+                        Err(error) if isolated_settings => {
+                            let source = if dir_exists { host_dir.unwrap() } else { home };
+                            return Err(EngineError::io(source, error));
                         }
                         Err(_) => host_dir
                             .cloned()
@@ -989,6 +1021,50 @@ fn synthesize_settings_dir_with_secrets(
     Ok((tmp, tmp_root))
 }
 
+fn stage_settings_dir_with_secrets_with_policy(
+    src: &Path,
+    secret_files: &[crate::engine::auth::keychain::AgentSecretFile],
+    tmpdir_prefix: &str,
+    isolated_settings: bool,
+) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
+    if !isolated_settings {
+        return stage_settings_dir_with_secrets(src, secret_files, tmpdir_prefix);
+    }
+    let tmp = private_settings_tempdir(tmpdir_prefix)?;
+    let tmp_root = tmp.path().to_path_buf();
+    copy_dir_all_strict(src, &tmp_root)?;
+    for file in secret_files {
+        write_secret_file(&tmp_root, file)?;
+    }
+    Ok((tmp, tmp_root))
+}
+
+fn synthesize_settings_dir_with_secrets_with_policy(
+    secret_files: &[crate::engine::auth::keychain::AgentSecretFile],
+    tmpdir_prefix: &str,
+    isolated_settings: bool,
+) -> Result<(tempfile::TempDir, PathBuf), std::io::Error> {
+    if !isolated_settings {
+        return synthesize_settings_dir_with_secrets(secret_files, tmpdir_prefix);
+    }
+    let tmp = private_settings_tempdir(tmpdir_prefix)?;
+    let tmp_root = tmp.path().to_path_buf();
+    for file in secret_files {
+        write_secret_file(&tmp_root, file)?;
+    }
+    Ok((tmp, tmp_root))
+}
+
+fn private_settings_tempdir(tmpdir_prefix: &str) -> Result<tempfile::TempDir, std::io::Error> {
+    let tmp = tempfile::Builder::new().prefix(tmpdir_prefix).tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(tmp)
+}
+
 /// Write a single `AgentSecretFile` under the staged root, creating parent
 /// directories. On Unix the file is opened with the requested mode so the
 /// secret never lands on disk world-readable.
@@ -1134,6 +1210,20 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
             } else {
                 std::fs::copy(entry.path(), target)?;
             }
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_all_strict(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all_strict(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
         }
     }
     Ok(())
@@ -2015,6 +2105,7 @@ mod tests {
             container_home: None,
             context_overlays: vec![],
             materialize_credentials: false,
+            isolated_settings: false,
         };
         let overlays = engine.build_overlays(&session, &request).unwrap();
         // The two entries sharing the same canonicalized host path must collapse.
@@ -2835,6 +2926,7 @@ mod tests {
             container_home: None,
             context_overlays: vec![],
             materialize_credentials: false,
+            isolated_settings: false,
         };
 
         let overlays = engine.build_overlays(&session, &request).unwrap();
@@ -3315,4 +3407,6 @@ mod tests {
              never a truncated or partial file"
         );
     }
+
+    include!("isolated_settings_test.rs");
 }

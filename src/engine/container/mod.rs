@@ -59,3 +59,6 @@ pub use options::{
     YoloMode,
 };
 pub use runtime::ContainerRuntime;
+
+#[cfg(all(test, unix))]
+mod native_print_acceptance_test;

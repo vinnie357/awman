@@ -163,6 +163,8 @@ pub enum ContainerOption {
         flag: ModelFlagForm,
     },
     NonInteractivePrintFlag(String),
+    /// Exact one-shot native stdin and output completion semantics.
+    NativePrint(bool),
     /// Container-side `$HOME` remapped from `/root` when a non-root `USER`
     /// directive is detected in the agent's Dockerfile.
     DockerfileUser(String),
@@ -401,6 +403,7 @@ pub struct ResolvedContainerOptions {
     pub env_passthrough: Vec<EnvVar>,
     pub env_literal: Vec<EnvLiteral>,
     pub seeded_prompt: Option<String>,
+    pub native_print: bool,
     /// Flag used to deliver `seeded_prompt` in interactive mode. When `None`,
     /// the prompt is appended as a trailing positional argv arg. When `Some`,
     /// it is delivered as `<flag> <text>` (e.g. opencode `--prompt <text>`,
@@ -486,6 +489,7 @@ impl ResolvedContainerOptions {
             ContainerOption::EnvPassthrough(v) => self.env_passthrough.push(v),
             ContainerOption::EnvLiteral(v) => self.env_literal.push(v),
             ContainerOption::SeededPrompt(v) => self.seeded_prompt = Some(v),
+            ContainerOption::NativePrint(v) => self.native_print = v,
             ContainerOption::InteractiveSeedFlag(v) => self.interactive_seed_flag = Some(v),
             ContainerOption::Interactive(v) => self.interactive = v,
             ContainerOption::Acp(v) => self.acp = v,

@@ -94,8 +94,17 @@ Initialize the current Git repo for use with awman.
 
 | Subcommand | Arguments | Flags |
 |---|---|---|
-| `prompt <prompt>` | `<prompt>` | `-n/--non-interactive`, `--plan`, `--allow-docker`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--launch-mode <stdio\|acp>`, `--overlay <spec>` (repeatable). |
+| `prompt <prompt>` | `<prompt>` | `--native-print`, `--native-session <id>`, `--isolated-settings`, `-n/--non-interactive`, `--plan`, `--allow-docker`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--launch-mode <stdio\|acp>`, `--overlay <spec>` (repeatable). |
 | `workflow <path>` (alias `wf`) | `<path>` | `--work-item <num>`, `-n/--non-interactive`, `--plan`, `--allow-docker`, `--worktree`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--launch-mode <stdio\|acp>`, `--overlay <spec>` (repeatable). `--yolo`/`--auto` imply `--worktree`. ACP is not yet driven for workflow steps; a step that resolves to `acp` is rejected pre-flight (see `docs/17-acp-mode.md`). |
+
+`exec prompt --native-print` requires an explicit canonical `--agent claude`,
+`--agent codex`, or `--agent agy`, plus a non-empty `--model`. It streams the
+provider's native JSON output on stdout, preserves provider stderr and exit status,
+and adds no stdout summary. It always uses one-shot stdio without a PTY and
+engine-owned writable settings copies. `--native-session <id>` continues a
+session belonging to that provider and requires `--native-print`. Native print
+cannot be combined with `--launch-mode`, `--allow-docker`, `--plan`, `--yolo`, or
+`--auto`. Project and input mount permissions still follow the supplied overlays.
 
 `--overlay` accepts the same typed overlay expressions everywhere (CLI flags, `AWMAN_OVERLAYS`, repo/global config `overlays` array, and per-step `overlays` in workflow files): `dir(host:container[:ro|rw])`, `ssh()` (shorthand for `~/.ssh` read-only), `env(VAR_NAME)`, `skill(*)`, `skill(name)`. The legacy `--mount-ssh` flag has been removed; pass `--overlay ssh()` instead. See `docs/08-overlays.md` for the full reference.
 

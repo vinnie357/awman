@@ -59,6 +59,12 @@ pub struct AgentRunOptions {
     pub disallowed_tools: Vec<String>,
     pub initial_prompt: Option<String>,
     pub allow_docker: bool,
+    /// Use engine-owned writable settings copies for supported agents.
+    pub isolated_settings: bool,
+    /// Stream the selected provider's canonical one-shot print protocol.
+    pub native_print: bool,
+    /// Provider-owned session identifier, interpreted only in native mode.
+    pub native_session: Option<String>,
     pub non_interactive: bool,
     /// Optional explicit model name; if `None`, the engine emits no model flag.
     pub model: Option<String>,
@@ -218,6 +224,40 @@ impl AgentEngine {
         run: &AgentRunOptions,
         credentials: &AgentCredentials,
     ) -> Result<Vec<ContainerOption>, EngineError> {
+        if run.native_session.is_some() && !run.native_print {
+            return Err(EngineError::Config(
+                "--native-session requires --native-print".into(),
+            ));
+        }
+        let native = if run.native_print {
+            if !matches!(run.launch_mode, LaunchMode::Stdio)
+                || run.allow_docker
+                || matches!(run.yolo, Some(YoloMode::Enabled))
+                || matches!(
+                    run.auto,
+                    Some(crate::engine::container::options::AutoMode::Enabled)
+                )
+                || matches!(run.plan, Some(PlanMode::Enabled))
+                || !run.allowed_tools.is_empty()
+                || !run.disallowed_tools.is_empty()
+                || run.system_prompt.is_some()
+            {
+                return Err(EngineError::ConflictingOptions(
+                    "native print requires plain stdio without extra provider flags".into(),
+                ));
+            }
+            let request = agent_matrix::NativePrintRequest::new(
+                agent.as_str(),
+                run.model.as_deref(),
+                run.native_session.as_deref(),
+            )?;
+            let prompt = run.initial_prompt.as_deref().ok_or_else(|| {
+                EngineError::Config("native print requires an initial prompt".into())
+            })?;
+            Some(request.invocation(prompt))
+        } else {
+            None
+        };
         let orchestrated_identity = run
             .startup_gate
             .as_ref()
@@ -280,7 +320,9 @@ impl AgentEngine {
         // matrix lacks an `acp_entrypoint`, so `entrypoint_for_acp` cannot fail
         // here in practice — the `?` is defence-in-depth.
         let acp = matches!(run.launch_mode, LaunchMode::Acp);
-        let entrypoint = if acp {
+        let entrypoint = if let Some((entrypoint, _)) = &native {
+            entrypoint.clone()
+        } else if acp {
             agent_matrix::entrypoint_for_acp(&matrix)?
         } else {
             agent_matrix::entrypoint_for(&matrix, run.non_interactive)
@@ -289,13 +331,16 @@ impl AgentEngine {
         let mut options = vec![
             ContainerOption::Image(image),
             ContainerOption::Entrypoint(entrypoint),
-            ContainerOption::Interactive(!run.non_interactive),
+            ContainerOption::Interactive(!run.non_interactive && !run.native_print),
             ContainerOption::AllowDocker(run.allow_docker),
             ContainerOption::Label {
                 key: "awman.session".into(),
                 value: session.id().to_string(),
             },
         ];
+        if run.native_print {
+            options.push(ContainerOption::NativePrint(true));
+        }
         if let Some(identity) = orchestrated_identity {
             let token_digest = identity
                 .token_digest
@@ -374,11 +419,14 @@ impl AgentEngine {
             options.push(ContainerOption::AgentModeFlags(mode_flags));
         }
 
+        if let Some((_, Some(prompt))) = &native {
+            options.push(ContainerOption::SeededPrompt(prompt.clone()));
+        }
         // Initial prompt. In interactive mode most agents receive it as a
         // trailing positional arg; agents whose bare positional means something
         // else (opencode: a project dir) declare a delivery flag in the matrix.
         // Non-interactive runs pipe it over stdin regardless.
-        if let Some(prompt) = run.initial_prompt.as_ref() {
+        if let Some(prompt) = run.initial_prompt.as_ref().filter(|_| !run.native_print) {
             options.push(ContainerOption::SeededPrompt(prompt.clone()));
             if let agent_matrix::InteractiveSeedDelivery::Flag(flag) =
                 matrix.interactive_seed_delivery
@@ -388,7 +436,7 @@ impl AgentEngine {
         }
 
         // Model flag.
-        if let Some(model) = run.model.as_deref() {
+        if let Some(model) = run.model.as_deref().filter(|_| !run.native_print) {
             let flag = agent_matrix::model_flag_for(&matrix, model)?;
             options.push(ContainerOption::Model { flag });
         }
@@ -396,7 +444,7 @@ impl AgentEngine {
         // Non-interactive: also surface as a discrete option so backends that
         // need to know can react (display purposes etc.). The actual
         // entrypoint already encoded it.
-        if run.non_interactive {
+        if run.non_interactive && !run.native_print {
             if let Some(flag) = matrix.non_interactive_flag {
                 options.push(ContainerOption::NonInteractivePrintFlag(flag.to_string()));
             }
@@ -452,6 +500,7 @@ impl AgentEngine {
             container_home: container_home.clone(),
             context_overlays: run.context_overlays.clone(),
             materialize_credentials: false,
+            isolated_settings: run.isolated_settings || run.native_print,
         };
         let (overlays, staged_credentials) =
             if matches!(&credentials.delivery, CredentialDelivery::File(_)) {
@@ -536,6 +585,11 @@ impl AgentEngine {
                 backend: runtime.runtime_name().into(),
             });
         }
+        if run.native_print && runtime.capabilities().kit_declarative {
+            return Err(EngineError::NotImplemented(
+                "native print requires a container-class runtime",
+            ));
+        }
         if runtime.capabilities().kit_declarative {
             if run.startup_gate.is_some() {
                 return Err(EngineError::OptionNotSupportedByBackend {
@@ -576,6 +630,11 @@ impl AgentEngine {
         agent: &AgentName,
         run: &AgentRunOptions,
     ) -> Result<Vec<SandboxOption>, EngineError> {
+        if run.native_print || run.native_session.is_some() {
+            return Err(EngineError::NotImplemented(
+                "native print requires a container-class runtime",
+            ));
+        }
         let matrix = agent_matrix::matrix_for(agent.as_str())?;
 
         // Parity validation with the container path so a sandbox-configured user

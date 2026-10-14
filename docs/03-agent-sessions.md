@@ -26,6 +26,31 @@ Press **Ctrl+C** to exit the agent session when you're done.
 
 ---
 
+## Native print output
+
+Use `exec prompt --native-print` to stream a provider's own JSON protocol:
+
+```sh
+awman exec prompt --native-print --agent codex --model MODEL "Review the mounted input"
+awman exec prompt --native-print --agent agy --model MODEL --native-session SESSION_ID "Continue the review"
+```
+
+Select `claude`, `codex`, or `agy` explicitly and supply a non-empty model name.
+`--native-session` accepts the selected provider's session identifier. Each turn
+runs in a new container with private writable copies of the provider settings.
+The provider controls which session history it can resume from those settings.
+
+Native print uses piped stdio even when your terminal is interactive. Provider
+stdout stays unchanged, stderr remains separate, and the provider's exit status
+becomes the command's exit status. awman adds no stdout completion summary.
+
+The project remains writable. For a review, run from a disposable project and
+mount each input read-only with `--overlay 'dir(INPUT:/workspace/input-1:ro)'`.
+Native print does not change provider permission policy. It cannot be combined
+with `--launch-mode`, `--allow-docker`, `--plan`, `--yolo`, or `--auto`.
+
+---
+
 ## ACP launch mode
 
 ACP (Agent Client Protocol) mode gives awman a structured way to present an

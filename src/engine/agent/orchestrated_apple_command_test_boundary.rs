@@ -4,6 +4,7 @@ use super::orchestrated_apple_command_acceptance_test::{
     OwnershipObservation, PlannedLaunchIdentitySnapshot, QualificationFault, RetryFaultPoint,
     SecondInspectionRelease,
 };
+use crate::data::startup_gate::OrchestratedControlAuthority;
 use crate::engine::container::gated_launch::{
     canonical_inspection_revision, AbsenceObservation, AppleProviderState,
     CanonicalInspectionRevisionInput, CreateCliExitClass, CreateCliExitEvidence, DurableLaunchPlan,
@@ -21,7 +22,7 @@ use chrono::Utc;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const NONCE: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
@@ -42,6 +43,8 @@ struct TestBoundary {
     adapter: Arc<TestProviderAdapter>,
     _cli_dir: Option<tempfile::TempDir>,
     executable: &'static str,
+    guest_controls: OnceLock<Arc<OrchestratedControlAuthority>>,
+    provider_entry_observed: Mutex<bool>,
 }
 
 impl TestBoundary {
@@ -93,7 +96,20 @@ impl TestBoundary {
             adapter,
             _cli_dir: cli_dir,
             executable,
+            guest_controls: OnceLock::new(),
+            provider_entry_observed: Mutex::new(false),
         }
+    }
+
+    fn bind_guest_controls(
+        &self,
+        controls: &Arc<OrchestratedControlAuthority>,
+    ) -> Result<(), LaunchRetentionReason> {
+        let captured = self.guest_controls.get_or_init(|| Arc::clone(controls));
+        if !Arc::ptr_eq(captured, controls) {
+            return Err(LaunchRetentionReason::PostSpawnControlChanged);
+        }
+        Ok(())
     }
 }
 
@@ -146,6 +162,7 @@ impl OrchestratedAppleTestBoundary for TestBoundary {
         &self,
         plan: &DurableLaunchPlan,
     ) -> Result<(), LaunchRetentionReason> {
+        self.bind_guest_controls(&plan.controls)?;
         self.observer.observe_planned_launch_identity(
             TestProviderAdapter::planned_identity_snapshot(&plan.key),
         );
@@ -230,23 +247,6 @@ impl OrchestratedAppleTestBoundary for TestBoundary {
         plan.controls
             .publish_guest_record("ready.json", ".ready", &bytes)
             .map_err(|_| LaunchRetentionReason::PostSpawnControlChanged)?;
-        let controls = Arc::clone(&plan.controls);
-        let observer = self.observer.clone();
-        let _ = std::thread::Builder::new()
-            .name("awman-provider-entry-observer".into())
-            .spawn(move || {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-                while std::time::Instant::now() < deadline {
-                    match controls.read_guest_record("provider-entry.marker", 64) {
-                        Ok(Some(bytes)) if bytes == b"entered\n" => {
-                            observer.observe_provider_entry(false);
-                            return;
-                        }
-                        Ok(Some(_)) | Err(_) => return,
-                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                    }
-                }
-            });
         Ok(())
     }
 
@@ -376,6 +376,22 @@ impl OrchestratedAppleTestBoundary for TestBoundary {
     }
 
     fn observe_custody(&self, ownership: TestOwnershipObservation, legacy: bool) {
+        let mut observed = self
+            .provider_entry_observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !*observed {
+            let entered = self.guest_controls.get().is_some_and(|controls| {
+                matches!(
+                    controls.read_guest_record("provider-entry.marker", 64),
+                    Ok(Some(bytes)) if bytes == b"entered\n"
+                )
+            });
+            if entered {
+                self.observer.observe_provider_entry(false);
+                *observed = true;
+            }
+        }
         self.observer.observe_custody(
             OwnershipObservation {
                 exact_plan: ownership.exact_plan,
@@ -730,6 +746,142 @@ impl GatedProviderAdapter for TestProviderAdapter {
                 "injected remove response uncertainty".into(),
             ));
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod observer_regression_tests {
+    use super::*;
+    use crate::data::startup_gate::load_startup_gate;
+    use sha2::{Digest, Sha256};
+    use std::error::Error;
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+
+    fn owned_controls(
+    ) -> Result<(tempfile::TempDir, Arc<OrchestratedControlAuthority>), Box<dyn Error>> {
+        let root = tempfile::tempdir()?;
+        let parent = root.path().join("control-parent");
+        let guest = parent.join("guest-control");
+        std::fs::create_dir(&parent)?;
+        std::fs::create_dir(&guest)?;
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(&guest, std::fs::Permissions::from_mode(0o700))?;
+        let manifest = b"{\"version\":1,\"entries\":[]}\n";
+        let digest = Sha256::digest(manifest)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        write_private(&parent.join("workspace.manifest.json"), manifest)?;
+        write_private(
+            &parent.join("request.json"),
+            format!(
+                "{{\"version\":1,\"bindings\":[{{\"id\":\"workspace\",\"workspace_path\":\"/workspace\",\"manifest_id\":\"{digest}\",\"manifest_file\":\"workspace.manifest.json\",\"access\":\"read-only\"}}]}}\n"
+            )
+            .as_bytes(),
+        )?;
+        write_private(
+            &parent.join("launch-intent.json"),
+            format!(
+                    "{{\"version\":1,\"container_name\":\"awman-altana-observer-regression\",\"launch_token\":\"{NONCE}\"}}\n"
+            )
+            .as_bytes(),
+        )?;
+        let gate = load_startup_gate(&parent, Duration::from_secs(30))?;
+        let (controls, _) = gate
+            .control
+            .orchestrated_parts()
+            .ok_or("missing owned orchestrated controls")?;
+        Ok((root, Arc::clone(controls)))
+    }
+
+    fn boundary(observer: &AppleCommandObserver) -> TestBoundary {
+        TestBoundary::new(
+            AppleCommandExternalPlan::Normal,
+            observer.clone(),
+            AppleCommandEffects::new(),
+        )
+    }
+
+    #[test]
+    fn terminal_custody_immediately_records_the_exact_owned_provider_entry_once(
+    ) -> Result<(), Box<dyn Error>> {
+        let (_fixture, controls) = owned_controls()?;
+        controls
+            .publish_guest_record("provider-entry.marker", ".provider-entry", b"entered\n")
+            .map_err(|_| "could not publish exact provider marker")?;
+        let observer = AppleCommandObserver::new();
+        let boundary = boundary(&observer);
+        boundary
+            .bind_guest_controls(&controls)
+            .map_err(|_| "could not bind owned controls")?;
+        boundary.observe_custody(TestOwnershipObservation::default(), false);
+        let first = observer.snapshot_until(Instant::now());
+        assert_eq!(first.provider_entries_total, 1);
+        assert_eq!(first.provider_entries_before_release, 0);
+        boundary.observe_custody(TestOwnershipObservation::default(), false);
+        let repeated = observer.snapshot_until(Instant::now());
+        assert_eq!(repeated.provider_entries_total, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_custody_does_not_invent_absent_or_malformed_provider_entries(
+    ) -> Result<(), Box<dyn Error>> {
+        for marker in [
+            None,
+            Some(b"not-entered\n".as_slice()),
+            Some(b"entered\nentered\n".as_slice()),
+        ] {
+            let (_fixture, controls) = owned_controls()?;
+            if let Some(marker) = marker {
+                controls
+                    .publish_guest_record("provider-entry.marker", ".provider-entry", marker)
+                    .map_err(|_| "could not publish malformed provider marker")?;
+            }
+            let observer = AppleCommandObserver::new();
+            let boundary = boundary(&observer);
+            boundary
+                .bind_guest_controls(&controls)
+                .map_err(|_| "could not bind owned controls")?;
+            boundary.observe_custody(TestOwnershipObservation::default(), false);
+            let snapshot = observer.snapshot_until(Instant::now());
+            assert_eq!(snapshot.provider_entries_total, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_entry_observer_rejects_rebinding_to_other_owned_controls(
+    ) -> Result<(), Box<dyn Error>> {
+        let (_fixture, controls) = owned_controls()?;
+        let (_other_fixture, other_controls) = owned_controls()?;
+        let observer = AppleCommandObserver::new();
+        let boundary = boundary(&observer);
+        boundary
+            .bind_guest_controls(&controls)
+            .map_err(|_| "could not bind owned controls")?;
+        assert!(boundary.bind_guest_controls(&controls).is_ok());
+        assert!(boundary.bind_guest_controls(&other_controls).is_err());
+        controls
+            .publish_guest_record("provider-entry.marker", ".provider-entry", b"entered\n")
+            .map_err(|_| "could not publish exact provider marker")?;
+        boundary.observe_custody(TestOwnershipObservation::default(), false);
+        let snapshot = observer.snapshot_until(Instant::now());
+        assert_eq!(snapshot.provider_entries_total, 1);
         Ok(())
     }
 }

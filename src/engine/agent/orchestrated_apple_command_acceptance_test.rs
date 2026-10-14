@@ -246,7 +246,7 @@ pub(crate) struct AppleCommandEffects {
 }
 
 impl AppleCommandEffects {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             state: Arc::new((
                 Mutex::new(AppleCommandEffectState {
@@ -485,8 +485,8 @@ pub(crate) struct AppleCommandObservation {
     gated_provider_calls: usize,
     spawn_attempts: usize,
     child_starts: usize,
-    provider_entries_before_release: usize,
-    provider_entries_total: usize,
+    pub(super) provider_entries_before_release: usize,
+    pub(super) provider_entries_total: usize,
     protected_ready_transitions: usize,
     accepted_releases: usize,
     writable_mounts: Vec<MountObservation>,
@@ -525,7 +525,7 @@ pub(crate) struct AppleCommandObserver {
 }
 
 impl AppleCommandObserver {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             state: Arc::new((
                 Mutex::new(AppleCommandObservation::default()),
@@ -769,7 +769,7 @@ impl AppleCommandObserver {
         self.state.1.notify_all();
     }
 
-    fn snapshot_until(&self, deadline: Instant) -> AppleCommandObservation {
+    pub(super) fn snapshot_until(&self, deadline: Instant) -> AppleCommandObservation {
         let mut state = self.state.0.lock().unwrap_or_else(|p| p.into_inner());
         while !state.terminal_observed {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -1273,6 +1273,13 @@ pub(crate) fn exercise(scenario: AppleCommandScenario) -> AppleCommandReport {
 fn exercise_public_path(
     scenario: AppleCommandScenario,
 ) -> Result<AppleCommandReport, Box<dyn Error>> {
+    exercise_public_path_with_native(scenario, None)
+}
+
+fn exercise_public_path_with_native(
+    scenario: AppleCommandScenario,
+    native_agent: Option<&str>,
+) -> Result<AppleCommandReport, Box<dyn Error>> {
     let fixture = GateFixture::new(scenario)?;
     let expected_request = fixture.request_bytes.clone();
     let expected_manifests =
@@ -1299,7 +1306,7 @@ fn exercise_public_path(
     )?;
     let observer = AppleCommandObserver::new();
     let command_effects = AppleCommandEffects::new();
-    let runtime = Arc::new(match scenario {
+    let runtime = match scenario {
         AppleCommandScenario::Qualification(QualificationFault::DockerRuntime) => {
             ContainerRuntime::docker()
         }
@@ -1308,6 +1315,11 @@ fn exercise_public_path(
             observer.clone(),
             command_effects.clone(),
         ),
+    };
+    let runtime = Arc::new(if native_agent.is_some() {
+        runtime.with_image_home_dir_for_test("/root")
+    } else {
+        runtime
     });
     let overlay = OverlayEngine::with_auth_resolver(
         crate::data::fs::auth_paths::AuthPathResolver::at_home(home.path()),
@@ -1324,10 +1336,13 @@ fn exercise_public_path(
         if scenario == AppleCommandScenario::Qualification(QualificationFault::Acp) {
             "cline"
         } else {
-            "claude"
+            native_agent.unwrap_or("claude")
         },
     )?;
     let run = AgentRunOptions {
+        native_print: native_agent.is_some(),
+        initial_prompt: native_agent.map(|_| "review mounted input".to_string()),
+        model: native_agent.map(|_| "native-model".to_string()),
         startup_gate: Some(gate),
         launch_mode: if scenario == AppleCommandScenario::Qualification(QualificationFault::Acp) {
             LaunchMode::Acp
@@ -3013,4 +3028,51 @@ fn cancellation_before_ready_has_zero_entry_and_publishes_only_after_created_chi
         .runtime_id
         .as_str();
     assert_canonical_cleanup_record(&report, Some(runtime_id));
+}
+
+#[test]
+fn native_print_retains_actual_protected_launch_barrier_for_all_canonical_providers(
+) -> Result<(), Box<dyn Error>> {
+    for agent in ["claude", "codex", "agy"] {
+        let report =
+            exercise_public_path_with_native(AppleCommandScenario::ExternalRelease, Some(agent))?;
+        assert_full_orchestrated_spawn_path(&report);
+        assert_eq!(report.disposition, TestDisposition::Completed, "{agent}");
+        assert!(report.protected_receipt_observed, "{agent}");
+        assert!(report.release_absent_at_protected_receipt, "{agent}");
+        assert_eq!(report.actual_provider_entries_before_release, 0, "{agent}");
+        assert_eq!(report.released_acknowledgments, 1, "{agent}");
+        assert_eq!(report.actual_provider_entries_total, 1, "{agent}");
+        assert!(!report.second_spawn_attempted, "{agent}");
+        assert!(!report.name_only_cleanup_attempted, "{agent}");
+    }
+    Ok(())
+}
+
+#[test]
+fn native_print_invalid_ready_never_enters_provider_or_loses_custody() -> Result<(), Box<dyn Error>>
+{
+    for agent in ["claude", "codex", "agy"] {
+        let report = exercise_public_path_with_native(
+            AppleCommandScenario::GateV2(GateV2ReadyCase::WrongGuestCwd),
+            Some(agent),
+        )?;
+        assert_eq!(report.disposition, TestDisposition::Rejected, "{agent}");
+        assert_eq!(report.ready_rejections, 1, "{agent}");
+        assert!(!report.protected_receipt_observed, "{agent}");
+        assert_eq!(report.accepted_releases, 0, "{agent}");
+        assert_eq!(report.actual_provider_entries_total, 0, "{agent}");
+        assert!(
+            report.ownership.quiescence_proven
+                || (report.ownership.exact_plan
+                    && report.ownership.child
+                    && report.ownership.container
+                    && report.ownership.controls
+                    && report.ownership.staged_files
+                    && report.ownership.registry_ticket),
+            "{agent} lost custody"
+        );
+        assert!(!report.second_spawn_attempted, "{agent}");
+    }
+    Ok(())
 }

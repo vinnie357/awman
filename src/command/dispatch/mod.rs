@@ -1754,6 +1754,7 @@ mod tests {
         );
         assert_eq!(
             CommandOutcome::ExecPrompt(crate::command::commands::exec_prompt::ExecPromptOutcome {
+                native_print: false,
                 agent: None,
                 exit_code: Some(3)
             })
@@ -1779,4 +1780,6 @@ mod tests {
         assert_eq!(partial.exit_code(), 1);
         assert_eq!(CommandOutcome::Empty.exit_code(), 0);
     }
+
+    include!("isolated_settings_dispatch_test.rs");
 }

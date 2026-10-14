@@ -329,6 +329,55 @@ impl AgentFrontend for CliContainerProxy {
     }
 }
 
+pub(super) struct CliNativeContainerProxy {
+    pub writers: crate::frontend::cli::command_frontend::NativeOutputWriters,
+}
+
+impl UserMessageSink for CliNativeContainerProxy {
+    fn write_message(&mut self, _message: UserMessage) {}
+    fn replay_queued(&mut self) {}
+}
+
+#[async_trait]
+impl AgentFrontend for CliNativeContainerProxy {
+    fn report_status(&mut self, _status: AgentStatus) {}
+    fn report_progress(&mut self, _progress: AgentProgress) {}
+
+    fn take_io(&mut self) -> AgentIo {
+        let (stdout, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stderr, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let out = tokio::spawn(async move {
+            while let Some(bytes) = stdout_rx.recv().await {
+                let mut writer = std::io::stdout().lock();
+                writer.write_all(&bytes)?;
+                writer.flush()?;
+            }
+            Ok(())
+        });
+        let err = tokio::spawn(async move {
+            while let Some(bytes) = stderr_rx.recv().await {
+                let mut writer = std::io::stderr().lock();
+                writer.write_all(&bytes)?;
+                writer.flush()?;
+            }
+            Ok(())
+        });
+        self.writers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend([out, err]);
+        AgentIo {
+            stdout,
+            stderr,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        }
+    }
+}
+
 // ─── CliInteractiveContainerProxy ───────────────────────────────────────
 
 impl UserMessageSink for CliInteractiveContainerProxy {

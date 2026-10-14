@@ -1086,6 +1086,9 @@ impl AgentExecutionFactory for CommandLayerFactory {
             image_tag_override: Some(correct_tag),
             system_prompt,
             context_overlays,
+            isolated_settings: false,
+            native_print: false,
+            native_session: None,
         };
         // Resolve keychain credentials so the agent can reach its backend.
         // Mirrors the same step in `chat` and `exec_prompt`. The centralized
@@ -4196,6 +4199,7 @@ fn collect_single_entry_overlays(
         container_home,
         context_overlays: Vec::new(),
         materialize_credentials: false,
+        isolated_settings: false,
     };
     let overlay_specs = engines
         .overlay_engine

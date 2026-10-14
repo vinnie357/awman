@@ -66,6 +66,8 @@ pub struct ContainerRuntime {
     test_boundary: Option<Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>>,
     #[cfg(test)]
     test_provider_executable: Option<std::path::PathBuf>,
+    #[cfg(test)]
+    test_image_home_dir: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -178,6 +180,8 @@ impl ContainerRuntime {
             test_boundary: None,
             #[cfg(test)]
             test_provider_executable: None,
+            #[cfg(test)]
+            test_image_home_dir: None,
         }
     }
 
@@ -193,6 +197,8 @@ impl ContainerRuntime {
             test_boundary: None,
             #[cfg(test)]
             test_provider_executable: None,
+            #[cfg(test)]
+            test_image_home_dir: None,
         }
     }
 
@@ -204,6 +210,8 @@ impl ContainerRuntime {
             provider_cli_custody: ProviderCliCustodyRegistry::try_new(),
             test_boundary: None,
             test_provider_executable: Some(executable.to_path_buf()),
+            #[cfg(test)]
+            test_image_home_dir: None,
         }
     }
 
@@ -222,6 +230,8 @@ impl ContainerRuntime {
             provider_cli_custody: ProviderCliCustodyRegistry::try_new(),
             test_boundary: Some(boundary),
             test_provider_executable: None,
+            #[cfg(test)]
+            test_image_home_dir: None,
         }
     }
 
@@ -443,7 +453,17 @@ impl ContainerRuntime {
     /// Returns `None` when the image is missing or the runtime CLI is
     /// unreachable.
     pub fn image_home_dir(&self, tag: &str) -> Option<String> {
+        #[cfg(test)]
+        if let Some(home) = &self.test_image_home_dir {
+            return Some(home.clone());
+        }
         self.backend.image_home_dir(tag)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_image_home_dir_for_test(mut self, home: &str) -> Self {
+        self.test_image_home_dir = Some(home.to_string());
+        self
     }
 
     /// Best-effort check whether an image tag exists locally on the runtime.
@@ -888,3 +908,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "isolated_settings_runtime_test.rs"]
+mod isolated_settings_runtime_test;

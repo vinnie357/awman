@@ -16,6 +16,8 @@ pub mod daemon_process;
 pub mod data_paths;
 pub mod kit_paths;
 pub mod log_dirs;
+#[cfg(test)]
+pub(crate) mod native_sdk_state;
 pub mod overlay_paths;
 pub mod path_guard;
 pub mod skill_dirs;

@@ -507,7 +507,11 @@ impl AgentInstance for ContainerInstance {
         // implementation-defined.
         let grace_timeout = frontend.grace_timeout();
         let stuck_timeout = frontend.stuck_timeout();
-        let io = frontend.take_io();
+        let mut io = frontend.take_io();
+        if self.options.native_print {
+            io.initial_size = None;
+            io.resize = None;
+        }
 
         let prepared = prepared
             .ok_or_else(|| EngineError::Container("prepared launch custody unavailable".into()))?;
@@ -675,6 +679,8 @@ impl Drop for SpawnCustodyResources {
 }
 
 struct ExecutionResources {
+    output_readers: Vec<std::thread::JoinHandle<()>>,
+    drain_output: bool,
     post_wait: PostWaitHook,
     pty_master: Option<PtyMaster>,
     stdin_injector: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
@@ -769,6 +775,11 @@ impl Drop for ExecutionResources {
         (self.post_wait)();
         self.pty_master = None;
         drop(self.stdin_injector.take());
+        if self.drain_output {
+            for reader in self.output_readers.drain(..) {
+                let _ = reader.join();
+            }
+        }
         self.leases.clear();
         drop(self.gate_cleanup.take());
     }
@@ -779,6 +790,7 @@ fn bridge_piped_resources(
     io: AgentIo,
     bridge_cfg: BridgeConfig,
     keep_stdin_injector: bool,
+    drain_output: bool,
 ) -> Result<(ExecutionBridgeArtifacts, ExecutionResourceLoan), EngineError> {
     lifecycle.transform_resources::<LifecycleResources, _>(move |resources| {
         let LifecycleResources::Spawn(spawn) = resources else {
@@ -821,6 +833,7 @@ fn bridge_piped_resources(
         };
         let bridge = crate::engine::container::io_bridge::bridge_piped_io(io, pipes, bridge_cfg);
         let crate::engine::container::io_bridge::BridgeResult {
+            output_readers,
             stdin_injector,
             stuck_tx,
             output_tail,
@@ -828,6 +841,8 @@ fn bridge_piped_resources(
         let stdin_injector = keep_stdin_injector.then_some(stdin_injector);
         drop(attach_permit);
         *resources = LifecycleResources::Execution(ExecutionResources {
+            output_readers,
+            drain_output,
             post_wait,
             pty_master: None,
             stdin_injector,
@@ -1597,6 +1612,7 @@ pub(super) fn spawn_pty_bridged(
                     }
                 };
             let crate::engine::container::io_bridge::BridgeResult {
+                output_readers,
                 stdin_injector,
                 stuck_tx,
                 output_tail,
@@ -1616,6 +1632,8 @@ pub(super) fn spawn_pty_bridged(
                 }
             };
             *resources = LifecycleResources::Execution(ExecutionResources {
+                output_readers,
+                drain_output: false,
                 post_wait,
                 pty_master: Some(master_arc),
                 stdin_injector: Some(stdin_injector),
@@ -1874,21 +1892,29 @@ pub(super) fn spawn_piped(
     // Write seeded prompt into stdin channel before the writer task starts.
     if let Some(prompt) = seeded {
         let _ = io.stdin_tx.send(prompt.into_bytes());
-        let _ = io.stdin_tx.send(b"\n".to_vec());
+        if !instance.options.native_print {
+            let _ = io.stdin_tx.send(b"\n".to_vec());
+        }
     }
 
-    let (bridge, resource_loan) = bridge_piped_resources(&lifecycle, io, bridge_cfg, false)
-        .map_err(|source| {
-            after_cli_start(
-                &retention,
-                source,
-                RetainedExecution::Managed {
-                    execution: None,
-                    lifecycle: lifecycle.clone(),
-                },
-                LaunchRetentionReason::ChildStateUnknown,
-            )
-        })?;
+    let (bridge, resource_loan) = bridge_piped_resources(
+        &lifecycle,
+        io,
+        bridge_cfg,
+        false,
+        instance.options.native_print,
+    )
+    .map_err(|source| {
+        after_cli_start(
+            &retention,
+            source,
+            RetainedExecution::Managed {
+                execution: None,
+                lifecycle: lifecycle.clone(),
+            },
+            LaunchRetentionReason::ChildStateUnknown,
+        )
+    })?;
 
     // Non-interactive (piped) path does not retain the stdin injector, so the
     // writer task sees EOF after draining the seeded prompt and closes the
@@ -2163,18 +2189,18 @@ pub(super) fn spawn_piped_interactive(
         ));
     }
 
-    let (bridge, resource_loan) = bridge_piped_resources(&lifecycle, io, bridge_cfg, true)
+    let (bridge, resource_loan) = bridge_piped_resources(&lifecycle, io, bridge_cfg, true, false)
         .map_err(|source| {
-            after_cli_start(
-                &retention,
-                source,
-                RetainedExecution::Managed {
-                    execution: None,
-                    lifecycle: lifecycle.clone(),
-                },
-                LaunchRetentionReason::ChildStateUnknown,
-            )
-        })?;
+        after_cli_start(
+            &retention,
+            source,
+            RetainedExecution::Managed {
+                execution: None,
+                lifecycle: lifecycle.clone(),
+            },
+            LaunchRetentionReason::ChildStateUnknown,
+        )
+    })?;
 
     // Persistent-piped (ACP) path: KEEP the stdin_injector alive (do NOT drop
     // it, unlike `spawn_piped`). Retaining the sender both enables

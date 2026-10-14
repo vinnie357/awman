@@ -179,6 +179,9 @@ fn render_chat(o: &ChatOutcome) -> Option<String> {
 }
 
 fn render_exec_prompt(o: &ExecPromptOutcome) -> Option<String> {
+    if o.native_print {
+        return None;
+    }
     match o.exit_code {
         Some(0) | None => None,
         Some(code) => Some(format!("exec prompt ended with exit code {code}.")),
@@ -1060,6 +1063,7 @@ mod tests {
     #[test]
     fn render_exec_prompt_zero_exit_returns_none() {
         let o = ExecPromptOutcome {
+            native_print: false,
             agent: Some("claude".into()),
             exit_code: Some(0),
         };
@@ -1069,6 +1073,7 @@ mod tests {
     #[test]
     fn render_exec_prompt_nonzero_exit_returns_message() {
         let o = ExecPromptOutcome {
+            native_print: false,
             agent: None,
             exit_code: Some(3),
         };
