@@ -101,6 +101,16 @@ impl NativeSdkStateLease {
     }
 }
 
+#[cfg(unix)]
+impl Drop for NativeSdkStateLease {
+    fn drop(&mut self) {
+        // Fork-inherited descriptors can outlive this lease, so release its writer authority now.
+        if let Err(error) = self.writer_lock.unlock() {
+            tracing::warn!(%error, "cannot unlock native SDK state writer lease");
+        }
+    }
+}
+
 fn invalid(reason: &str) -> DataError {
     DataError::Other(format!("native SDK state: {reason}"))
 }
