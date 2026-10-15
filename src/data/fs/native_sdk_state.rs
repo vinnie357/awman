@@ -72,6 +72,7 @@ pub(crate) struct NativeSdkStateLease {
     owner_record: OwnerRecord,
     owner_path: PathBuf,
     state_path: PathBuf,
+    acquired_session: Option<String>,
     #[cfg(unix)]
     directories: Vec<std::sync::Arc<unix::PinnedDir>>,
     #[cfg(unix)]
@@ -81,6 +82,22 @@ pub(crate) struct NativeSdkStateLease {
 impl NativeSdkStateLease {
     pub(crate) fn state_path(&self) -> &Path {
         &self.state_path
+    }
+
+    pub(crate) fn validate_request(
+        &self,
+        provider: NativeSdkProvider,
+        model: &str,
+        session: Option<&str>,
+    ) -> Result<(), DataError> {
+        self.validate()?;
+        if self.owner_record.key.provider != provider
+            || self.owner_record.key.model != model
+            || self.acquired_session.as_deref() != session
+        {
+            return Err(invalid("request does not match the acquired state owner"));
+        }
+        Ok(())
     }
 }
 
@@ -403,6 +420,7 @@ mod unix {
                 owner_record,
                 owner_path,
                 state_path,
+                acquired_session: None,
                 directories,
                 writer_lock,
             };
@@ -454,6 +472,7 @@ mod unix {
                 owner_record: record,
                 owner_path,
                 state_path,
+                acquired_session: Some(session_id.into()),
                 directories,
                 writer_lock,
             };
@@ -475,6 +494,72 @@ mod unix {
     }
 
     impl NativeSdkStateLease {
+        pub(crate) fn publish_session(&self, session_id: &str) -> Result<(), DataError> {
+            validate_session_id(session_id)?;
+            self.validate()?;
+            if self
+                .acquired_session
+                .as_deref()
+                .is_some_and(|id| id != session_id)
+            {
+                return Err(invalid("acknowledged session changed during resume"));
+            }
+            let sessions = &self.directories[5];
+            let owner = &self.directories[6];
+            let name = format!("{}.json", hex(&Sha256::digest(session_id.as_bytes())));
+            let record = AssociationRecord {
+                schema_version: SCHEMA_VERSION,
+                session_id: session_id.into(),
+                owner: self.owner_record.clone(),
+            };
+            match open_relative(sessions, &name, OFlag::O_RDONLY) {
+                Ok(_) => {
+                    if read_record::<AssociationRecord>(sessions, &name)? != record {
+                        return Err(invalid("session already belongs to another state owner"));
+                    }
+                    return self.validate();
+                }
+                Err(DataError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let bytes = serde_json::to_vec(&record)
+                .map_err(|source| DataError::ConfigSerialize { source })?;
+            if bytes.len() as u64 > MAX_RECORD_BYTES {
+                return Err(invalid("session association exceeded its bound"));
+            }
+            let pending = format!("association-{}.pending", Uuid::new_v4());
+            let mut file = open_relative(
+                owner,
+                &pending,
+                OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
+            )?;
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| DataError::io(owner.path.join(&pending), error))?;
+            self.validate()?;
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            rustix::fs::renameat_with(
+                &owner.file,
+                pending.as_str(),
+                &sessions.file,
+                name.as_str(),
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(|error| DataError::io(sessions.path.join(&name), error.into()))?;
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            return Err(invalid("atomic native session publication is unsupported"));
+            sessions
+                .file
+                .sync_all()
+                .map_err(|error| DataError::io(&sessions.path, error))?;
+            self.validate()?;
+            if read_record::<AssociationRecord>(sessions, &name)? != record {
+                return Err(invalid("published association changed"));
+            }
+            Ok(())
+        }
+
         pub(crate) fn validate(&self) -> Result<(), DataError> {
             for directory in &self.directories {
                 directory.validate()?;
@@ -532,6 +617,12 @@ impl NativeSdkState {
 
 #[cfg(not(unix))]
 impl NativeSdkStateLease {
+    pub(crate) fn publish_session(&self, _: &str) -> Result<(), DataError> {
+        Err(invalid(
+            "native SDK state publication is unsupported on this platform",
+        ))
+    }
+
     pub(crate) fn validate(&self) -> Result<(), DataError> {
         Err(invalid(
             "native SDK state acquisition is unsupported on this platform",

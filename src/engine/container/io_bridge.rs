@@ -343,6 +343,16 @@ pub(crate) struct PipedChildIo {
     pub stderr: Option<std::process::ChildStderr>,
 }
 
+pub(crate) enum PipedReadEnd {
+    Eof,
+    ReadError,
+}
+
+pub(crate) trait PipedStdoutObserver: Send {
+    fn observe(&mut self, bytes: &[u8]);
+    fn finish(&mut self, end: PipedReadEnd);
+}
+
 impl PipedChildIo {
     pub(crate) fn empty() -> Self {
         Self {
@@ -375,8 +385,17 @@ pub(crate) fn bridge_piped(
 
 pub(crate) fn bridge_piped_io(
     io: AgentIo,
+    pipes: PipedChildIo,
+    config: BridgeConfig,
+) -> BridgeResult {
+    bridge_piped_io_observed(io, pipes, config, None)
+}
+
+pub(crate) fn bridge_piped_io_observed(
+    io: AgentIo,
     mut pipes: PipedChildIo,
     config: BridgeConfig,
+    mut observer: Option<Box<dyn PipedStdoutObserver>>,
 ) -> BridgeResult {
     let activity: SharedActivity = Arc::new(Mutex::new(None));
     let first_byte = Arc::new(AtomicBool::new(false));
@@ -399,10 +418,15 @@ pub(crate) fn bridge_piped_io(
             let mut reader = child_stdout;
             let mut buf = [0u8; 4096];
             let mut sink_open = true;
-            loop {
+            let end = loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break PipedReadEnd::Eof,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break PipedReadEnd::ReadError,
                     Ok(n) => {
+                        if let Some(observer) = observer.as_mut() {
+                            observer.observe(&buf[..n]);
+                        }
                         update_activity(&act, &fb);
                         tail.push_bytes(&buf[..n]);
                         if let Some(tx) = &broadcast {
@@ -415,8 +439,13 @@ pub(crate) fn bridge_piped_io(
                         }
                     }
                 }
+            };
+            if let Some(observer) = observer.as_mut() {
+                observer.finish(end);
             }
         }));
+    } else if let Some(observer) = observer.as_mut() {
+        observer.finish(PipedReadEnd::ReadError);
     }
 
     // stderr reader thread — same drain-after-sink-dies semantics as stdout.

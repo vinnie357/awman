@@ -609,6 +609,8 @@ struct SpawnCustodyResources {
     attach_store: Arc<PreallocatedAttachStore>,
     attach_permit: Option<AttachStorePermit>,
     #[cfg(test)]
+    native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
+    #[cfg(test)]
     custody_witness: Option<test_support::CustodyWitness>,
 }
 
@@ -634,6 +636,8 @@ struct SpawnExecutionParts {
     attach_store: Arc<PreallocatedAttachStore>,
     attach_permit: AttachStorePermit,
     #[cfg(test)]
+    native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
+    #[cfg(test)]
     custody_witness: Option<test_support::CustodyWitness>,
 }
 
@@ -651,6 +655,8 @@ impl SpawnCustodyResources {
             attach_store: Arc::clone(&self.attach_store),
             attach_permit: self.attach_permit.take()?,
             #[cfg(test)]
+            native: self.native.take(),
+            #[cfg(test)]
             custody_witness: self.custody_witness.take(),
         })
     }
@@ -662,6 +668,10 @@ impl SpawnCustodyResources {
         self.post_wait = parts.post_wait;
         self.attach_store = parts.attach_store;
         self.attach_permit = Some(parts.attach_permit);
+        #[cfg(test)]
+        {
+            self.native = parts.native;
+        }
         self.run_post_wait = true;
         #[cfg(test)]
         {
@@ -687,6 +697,8 @@ struct ExecutionResources {
     _attach_store: Arc<PreallocatedAttachStore>,
     leases: Vec<CredentialLease>,
     gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
+    #[cfg(test)]
+    native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
     #[cfg(test)]
     _custody_witness: Option<test_support::CustodyWitness>,
 }
@@ -777,11 +789,21 @@ impl Drop for ExecutionResources {
         drop(self.stdin_injector.take());
         if self.drain_output {
             for reader in self.output_readers.drain(..) {
-                let _ = reader.join();
+                let result = reader.join();
+                #[cfg(test)]
+                if result.is_err() {
+                    if let Some(native) = self.native.as_ref() {
+                        native.reader_failed();
+                    }
+                }
+                #[cfg(not(test))]
+                let _ = result;
             }
         }
         self.leases.clear();
         drop(self.gate_cleanup.take());
+        #[cfg(test)]
+        drop(self.native.take());
     }
 }
 
@@ -811,6 +833,8 @@ fn bridge_piped_resources(
             attach_store,
             attach_permit,
             #[cfg(test)]
+            native,
+            #[cfg(test)]
             custody_witness,
         } = parts;
         let pipes = match io_resources {
@@ -824,6 +848,8 @@ fn bridge_piped_resources(
                     attach_store,
                     attach_permit,
                     #[cfg(test)]
+                    native,
+                    #[cfg(test)]
                     custody_witness,
                 });
                 return Err(EngineError::Container(
@@ -831,7 +857,17 @@ fn bridge_piped_resources(
                 ));
             }
         };
+        #[cfg(not(test))]
         let bridge = crate::engine::container::io_bridge::bridge_piped_io(io, pipes, bridge_cfg);
+        #[cfg(test)]
+        let bridge = crate::engine::container::io_bridge::bridge_piped_io_observed(
+            io,
+            pipes,
+            bridge_cfg,
+            native.as_ref().map(|owner| owner.stdout_observer()),
+        );
+        #[cfg(test)]
+        let drain_output = drain_output || native.is_some();
         let crate::engine::container::io_bridge::BridgeResult {
             output_readers,
             stdin_injector,
@@ -849,6 +885,8 @@ fn bridge_piped_resources(
             _attach_store: attach_store,
             leases,
             gate_cleanup,
+            #[cfg(test)]
+            native,
             #[cfg(test)]
             _custody_witness: custody_witness,
         });
@@ -1355,6 +1393,8 @@ pub(super) fn spawn_pty_bridged(
         attach_store,
         attach_permit: Some(attach_permit),
         #[cfg(test)]
+        native: None,
+        #[cfg(test)]
         custody_witness: test_support::take_custody_witness(),
     }));
     let published_gate = PublishedSpawnGate::new(gated);
@@ -1559,6 +1599,8 @@ pub(super) fn spawn_pty_bridged(
                 attach_store,
                 attach_permit,
                 #[cfg(test)]
+                native,
+                #[cfg(test)]
                 custody_witness,
             } = parts;
             let pair = match io_resources {
@@ -1571,6 +1613,8 @@ pub(super) fn spawn_pty_bridged(
                         post_wait,
                         attach_store,
                         attach_permit,
+                        #[cfg(test)]
+                        native,
                         #[cfg(test)]
                         custody_witness,
                     });
@@ -1604,6 +1648,8 @@ pub(super) fn spawn_pty_bridged(
                                 run_post_wait: true,
                                 attach_store,
                                 attach_permit: Some(attach_permit),
+                                #[cfg(test)]
+                                native,
                                 #[cfg(test)]
                                 custody_witness,
                             },
@@ -1640,6 +1686,8 @@ pub(super) fn spawn_pty_bridged(
                 _attach_store: attach_store,
                 leases,
                 gate_cleanup,
+                #[cfg(test)]
+                native,
                 #[cfg(test)]
                 _custody_witness: custody_witness,
             });
@@ -1691,6 +1739,8 @@ pub(super) fn spawn_pty_bridged(
         resource_loan,
         gate_cancelled,
         #[cfg(test)]
+        native: None,
+        #[cfg(test)]
         test_boundary,
     };
     Ok(AgentExecution::new(
@@ -1706,9 +1756,30 @@ pub(super) fn spawn_pty_bridged(
 #[allow(clippy::result_large_err)]
 pub(super) fn spawn_piped(
     cli: ContainerCli,
-    mut instance: Box<ContainerInstance>,
+    instance: Box<ContainerInstance>,
     req: SpawnRequest,
 ) -> Result<AgentExecution, SpawnStageError> {
+    spawn_piped_owned(
+        cli,
+        instance,
+        req,
+        #[cfg(test)]
+        None,
+    )
+}
+
+// The frozen post-start error shape carries complete child and resource custody.
+#[allow(clippy::result_large_err)]
+fn spawn_piped_owned(
+    cli: ContainerCli,
+    mut instance: Box<ContainerInstance>,
+    req: SpawnRequest,
+    #[cfg(test)] native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
+) -> Result<AgentExecution, SpawnStageError> {
+    #[cfg(test)]
+    if let Some(native) = native.as_ref() {
+        native.validate().map_err(before_cli_start)?;
+    }
     let SpawnRequest {
         io,
         argv,
@@ -1747,6 +1818,8 @@ pub(super) fn spawn_piped(
         run_post_wait: true,
         attach_store,
         attach_permit: Some(attach_permit),
+        #[cfg(test)]
+        native: native.clone(),
         #[cfg(test)]
         custody_witness: test_support::take_custody_witness(),
     }));
@@ -1963,6 +2036,8 @@ pub(super) fn spawn_piped(
         resource_loan,
         gate_cancelled,
         #[cfg(test)]
+        native,
+        #[cfg(test)]
         test_boundary,
     };
     Ok(AgentExecution::new(
@@ -2039,6 +2114,8 @@ pub(super) fn spawn_piped_interactive(
         run_post_wait: true,
         attach_store,
         attach_permit: Some(attach_permit),
+        #[cfg(test)]
+        native: None,
         #[cfg(test)]
         custody_witness: test_support::take_custody_witness(),
     }));
@@ -2225,6 +2302,8 @@ pub(super) fn spawn_piped_interactive(
         resource_loan,
         gate_cancelled,
         #[cfg(test)]
+        native: None,
+        #[cfg(test)]
         test_boundary,
     };
     Ok(AgentExecution::new(
@@ -2269,6 +2348,8 @@ pub(super) struct ContainerExecution {
     container_name: String,
     resource_loan: Option<ExecutionResourceLoan>,
     gate_cancelled: Arc<AtomicBool>,
+    #[cfg(test)]
+    native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
     #[cfg(test)]
     test_boundary: Option<Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>>,
 }
@@ -2466,6 +2547,17 @@ impl ExecutionBackend for ContainerExecution {
             return Err(EngineError::Container(format!(
                 "orchestrated launch rejected: {reason:?}"
             )));
+        }
+        #[cfg(test)]
+        if let Some(native) = self.native.take() {
+            if !self.lifecycle.resources_are_released() {
+                return Err(EngineError::Container(
+                    "native SDK execution resources remain owned".into(),
+                ));
+            }
+            if info.exit_code == 0 {
+                native.publish_after_release()?;
+            }
         }
         Ok(info)
     }
@@ -3003,6 +3095,18 @@ pub(crate) mod test_support {
         spawn_fixture_with_gate_mode(spec, registry, FixtureGateMode::FullOwner)
     }
 
+    pub(crate) fn spawn_native_fixture(
+        spec: FixtureSpawnSpec,
+        registry: Arc<LaunchRetentionRegistry>,
+        request: crate::engine::agent::agent_matrix::NativePrintRequest,
+        lease: crate::data::fs::native_sdk_state::NativeSdkStateLease,
+    ) -> FixtureSpawnResult {
+        let native = Arc::new(super::super::native_sdk_execution::NativeSdkExecution::new(
+            request, lease,
+        ));
+        spawn_fixture_with_native(spec, registry, FixtureGateMode::FullOwner, Some(native))
+    }
+
     pub(crate) fn spawn_tuple_validation_fixture(
         spec: FixtureSpawnSpec,
         registry: Arc<LaunchRetentionRegistry>,
@@ -3014,6 +3118,15 @@ pub(crate) mod test_support {
         spec: FixtureSpawnSpec,
         registry: Arc<LaunchRetentionRegistry>,
         gate_mode: FixtureGateMode,
+    ) -> FixtureSpawnResult {
+        spawn_fixture_with_native(spec, registry, gate_mode, None)
+    }
+
+    fn spawn_fixture_with_native(
+        spec: FixtureSpawnSpec,
+        registry: Arc<LaunchRetentionRegistry>,
+        gate_mode: FixtureGateMode,
+        native: Option<Arc<super::super::native_sdk_execution::NativeSdkExecution>>,
     ) -> FixtureSpawnResult {
         let full_custody = FULL_CUSTODY_OVERRIDE.with(|custody| custody.borrow_mut().take());
         let prepared_override = PREPARED_OVERRIDE.with(|prepared| prepared.borrow_mut().take());
@@ -3079,6 +3192,7 @@ pub(crate) mod test_support {
             image: Some(image.clone()),
             seeded_prompt: spec.seeded_prompt.clone(),
             acp: spec.mode == FixtureIoMode::PersistentPiped,
+            native_print: native.is_some(),
             ..ResolvedContainerOptions::default()
         };
         let cli = ContainerCli {
@@ -3123,10 +3237,16 @@ pub(crate) mod test_support {
             fault: (spec.fault == Some(FixtureSpawnFault::AfterBindBeforeBridge))
                 .then_some(SpawnFault::AfterBindBeforeBridge),
         };
-        let result = match spec.mode {
-            FixtureIoMode::Pty { .. } => spawn_pty_bridged(cli, instance, request, None),
-            FixtureIoMode::Piped => spawn_piped(cli, instance, request),
-            FixtureIoMode::PersistentPiped => spawn_piped_interactive(cli, instance, request),
+        let result = if native.is_some() && spec.mode != FixtureIoMode::Piped {
+            Err(before_cli_start(EngineError::Config(
+                "native fixture requires piped execution".into(),
+            )))
+        } else {
+            match spec.mode {
+                FixtureIoMode::Pty { .. } => spawn_pty_bridged(cli, instance, request, None),
+                FixtureIoMode::Piped => spawn_piped_owned(cli, instance, request, native),
+                FixtureIoMode::PersistentPiped => spawn_piped_interactive(cli, instance, request),
+            }
         };
         FixtureSpawnResult {
             result,
