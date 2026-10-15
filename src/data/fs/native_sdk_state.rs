@@ -633,3 +633,7 @@ impl NativeSdkStateLease {
 #[cfg(test)]
 #[path = "native_sdk_state_test.rs"]
 mod tests;
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "native_sdk_writer_release_test.rs"]
+mod writer_release_tests;
