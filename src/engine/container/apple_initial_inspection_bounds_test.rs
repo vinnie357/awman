@@ -1,7 +1,9 @@
 use super::gated_launch::{MAX_PROVIDER_CUSTODY_SHUTDOWN, MAX_PROVIDER_STDOUT};
+use super::runtime::InitialInspectionOutcomeForTest;
 use super::{ContainerName, ContainerOption, ContainerRuntime, ImageRef};
 use crate::data::startup_gate::load_startup_gate;
 use crate::engine::container::options::ResolvedContainerOptions;
+use crate::engine::error::EngineError;
 use sha2::{Digest, Sha256};
 use std::error::Error;
 use std::fs::OpenOptions;
@@ -11,7 +13,7 @@ use std::os::fd::AsFd as _;
 use std::os::unix::fs::{symlink, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -288,7 +290,10 @@ fn exercise_public_initial_inspection(
     let gate = GateFixture::new()?;
     let options = gate.resolved_options(gate_timeout)?;
     let fixture = ProviderFixture::new(mode)?;
-    let runtime = ContainerRuntime::apple_with_provider_executable_for_test(&fixture.executable);
+    let receipt = Arc::new(Mutex::new(None));
+    let mut runtime =
+        ContainerRuntime::apple_with_provider_executable_for_test(&fixture.executable);
+    runtime.set_initial_inspection_receipt_for_test(Arc::clone(&receipt));
     let (sender, receiver) = mpsc::sync_channel(1);
     let build = std::thread::spawn(move || {
         let result = runtime.build(options).map(|_| ());
@@ -299,7 +304,42 @@ fn exercise_public_initial_inspection(
         control: None,
         build: Some(build),
     };
-    let control = run.fixture.accept_child()?;
+    let accept_started = Instant::now();
+    let control = match run.fixture.accept_child() {
+        Ok(control) => control,
+        Err(error) => {
+            let accept_wait_ms = accept_started.elapsed().as_millis();
+            let provider_outcome = match receipt.try_lock().ok().and_then(|held| *held) {
+                Some(InitialInspectionOutcomeForTest::CustodyUnavailable(reason)) => {
+                    format!("CustodyUnavailable({reason:?})")
+                }
+                Some(InitialInspectionOutcomeForTest::Completed(success)) => {
+                    format!("Completed({success})")
+                }
+                Some(InitialInspectionOutcomeForTest::NotStarted(reason)) => {
+                    format!("NotStarted({reason:?})")
+                }
+                Some(InitialInspectionOutcomeForTest::ReapedFailure(kind)) => {
+                    format!("ReapedFailure({kind:?})")
+                }
+                Some(InitialInspectionOutcomeForTest::RetainedFailure) => "RetainedFailure".into(),
+                None => "Unknown".into(),
+            };
+            let build_result = match receiver.try_recv() {
+                Ok(Ok(())) => "CompletedOk",
+                Ok(Err(EngineError::Container(_))) => "CompletedErr(Container)",
+                Ok(Err(EngineError::Config(_))) => "CompletedErr(Config)",
+                Ok(Err(_)) => "CompletedErr(Other)",
+                Err(mpsc::TryRecvError::Empty) => "Empty",
+                Err(mpsc::TryRecvError::Disconnected) => "Disconnected",
+            };
+            let build_finished = run.build.as_ref().map(JoinHandle::is_finished);
+            eprintln!(
+                "initial inspection accept failure: provider_outcome={provider_outcome} build_result={build_result} build_finished={build_finished:?} accept_wait_ms={accept_wait_ms}"
+            );
+            return Err(error);
+        }
+    };
     run.control = Some(control);
     let pid = run
         .control
@@ -327,15 +367,156 @@ fn exercise_public_initial_inspection(
     Ok(())
 }
 
-#[test]
-fn public_initial_image_inspection_deadline_cancels_and_reaps_before_latch_release(
-) -> Result<(), Box<dyn Error>> {
+fn exercise_public_absolute_inspection_deadline() -> Result<(), Box<dyn Error>> {
+    use super::gated_launch::{ProviderCliReapedFailureKind, ProviderCliStartFailure};
+    use super::runtime::InitialInspectionTerminalProofReceiptForTest;
+
     let gate_timeout = Duration::from_secs(1);
-    exercise_public_initial_inspection(
-        FixtureMode::Block,
-        gate_timeout,
-        gate_timeout + MAX_PROVIDER_CUSTODY_SHUTDOWN,
-    )
+    let response_bound = gate_timeout + MAX_PROVIDER_CUSTODY_SHUTDOWN;
+    let gate = GateFixture::new()?;
+    let options = gate.resolved_options(gate_timeout)?;
+    let fixture = ProviderFixture::new(FixtureMode::Block)?;
+    let receipt: InitialInspectionTerminalProofReceiptForTest = Arc::new(Mutex::new(None));
+    let mut runtime =
+        ContainerRuntime::apple_with_provider_executable_for_test(&fixture.executable);
+    runtime.set_initial_inspection_terminal_proof_for_test(Arc::clone(&receipt));
+    let (start_tx, start_rx) = mpsc::sync_channel(1);
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let build = std::thread::Builder::new().spawn(move || {
+        if start_rx.recv().is_ok() {
+            let result = runtime.build(options).map(|_| ());
+            let _ = sender.send(result);
+        }
+    })?;
+    let mut run = ProviderRun {
+        fixture,
+        control: None,
+        build: Some(build),
+    };
+    let invoked = Instant::now();
+    start_tx
+        .send(())
+        .map_err(|_| "public initial inspection worker did not receive invocation")?;
+    let result = receiver
+        .recv_timeout(response_bound.saturating_sub(invoked.elapsed()))
+        .map_err(|_| "public initial inspection exceeded its original total response allowance")?;
+    let response_elapsed = invoked.elapsed();
+    let proof = receipt
+        .try_lock()
+        .map_err(|_| "public initial inspection terminal proof is unavailable")?
+        .clone()
+        .ok_or("public initial inspection did not record its terminal proof")?;
+
+    assert!(response_elapsed <= response_bound);
+    assert!(
+        matches!(result, Err(EngineError::Container(_))),
+        "deadline failure must preserve the public Container error"
+    );
+    match proof.outcome {
+        InitialInspectionOutcomeForTest::NotStarted(ProviderCliStartFailure::DeadlineExpired) => {
+            assert!(
+                proof.reaped.is_none(),
+                "a no-child deadline terminal cannot carry actual-child proof"
+            );
+        }
+        InitialInspectionOutcomeForTest::ReapedFailure(
+            ProviderCliReapedFailureKind::DeadlineExceeded,
+        ) => {
+            let failure = proof
+                .reaped
+                .ok_or("a started deadline failure omitted its actual wait proof")?;
+            assert_eq!(failure.kind, ProviderCliReapedFailureKind::DeadlineExceeded);
+            assert_ne!(failure.child_pid, 0);
+            assert!(
+                !failure.status.success(),
+                "the unreleased provider child cannot complete successfully"
+            );
+            assert!(
+                process_is_reaped(failure.child_pid),
+                "public build returned before its actual Child PID was reaped"
+            );
+        }
+        outcome => panic!("unexpected public initial inspection terminal: {outcome:?}"),
+    }
+    run.release_and_join()?;
+    Ok(())
+}
+
+pub(super) struct StartedInspectionFixture {
+    _fixture: ProviderFixture,
+    control: Option<ChildLatch>,
+    child: Option<std::process::Child>,
+    pub(super) pid: u32,
+}
+
+impl StartedInspectionFixture {
+    pub(super) fn new() -> Result<Self, Box<dyn Error>> {
+        use std::process::{Command, Stdio};
+
+        let fixture = ProviderFixture::new(FixtureMode::Block)?;
+        let child = Command::new(&fixture.executable)
+            .args(["image", "inspect", IMAGE])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let pid = child.id();
+        let mut owned = Self {
+            _fixture: fixture,
+            control: None,
+            child: Some(child),
+            pid,
+        };
+        owned.control = Some(owned._fixture.accept_child()?);
+        let handshake_pid = owned
+            .control
+            .as_mut()
+            .ok_or("started fixture control is unavailable")?
+            .child_pid()?;
+        assert_eq!(handshake_pid, owned.pid);
+        let child = owned
+            .child
+            .as_mut()
+            .ok_or("started fixture Child is unavailable")?;
+        assert!(
+            child.try_wait()?.is_none(),
+            "fixture exited before ownership transfer"
+        );
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(i32::try_from(owned.pid)?), None),
+            Ok(()),
+            "handshaken fixture must be live before deadline supervision"
+        );
+        Ok(owned)
+    }
+
+    pub(super) fn take_child(&mut self) -> Result<std::process::Child, Box<dyn Error>> {
+        self.child
+            .take()
+            .ok_or_else(|| "started fixture Child was already transferred".into())
+    }
+}
+
+impl Drop for StartedInspectionFixture {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                if let Err(error) = child.kill() {
+                    eprintln!("started inspection fixture cleanup kill failed: {error}");
+                }
+                if let Err(error) = child.wait() {
+                    eprintln!("started inspection fixture cleanup wait failed: {error}");
+                }
+            }
+        }
+        self.control.take();
+    }
+}
+
+#[test]
+fn public_initial_image_inspection_absolute_deadline_preserves_terminal_custody(
+) -> Result<(), Box<dyn Error>> {
+    exercise_public_absolute_inspection_deadline()
 }
 
 #[test]

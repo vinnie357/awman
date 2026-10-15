@@ -810,3 +810,7 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         Err(poisoned) => poisoned.into_inner(),
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "provider_cli_started_child_test.rs"]
+mod started_child_test;
