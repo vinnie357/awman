@@ -35,7 +35,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Result<Self> {
-        let root = tempfile::tempdir()?;
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize()?)?;
         let project = root.path().join("project");
         let home = root.path().join("host-settings");
         let input = root.path().join("input");

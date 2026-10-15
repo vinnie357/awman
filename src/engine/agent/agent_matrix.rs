@@ -25,6 +25,121 @@ pub(crate) struct NativePrintRequest {
     session: Option<NativeSession>,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct NativeSdkAckFields {
+    pub(crate) event_type: Option<String>,
+    pub(crate) subtype: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) conversation_id: Option<String>,
+    pub(crate) is_error: Option<bool>,
+    pub(crate) provider_error_present: bool,
+}
+
+#[cfg(test)]
+impl NativeSdkAckFields {
+    pub(crate) fn retained_capacity_bytes(&self) -> usize {
+        [
+            &self.event_type,
+            &self.subtype,
+            &self.status,
+            &self.session_id,
+            &self.thread_id,
+            &self.conversation_id,
+        ]
+        .into_iter()
+        .filter_map(|value| value.as_ref())
+        .map(String::capacity)
+        .sum()
+    }
+}
+
+#[cfg(test)]
+pub(crate) enum NativeSdkAckEvent {
+    Session(String),
+    TurnStarted,
+    TurnCompleted,
+    CompletedSession(String),
+    Other,
+}
+
+#[cfg(test)]
+impl NativePrintRequest {
+    pub(crate) fn validate_state(
+        &self,
+        lease: &crate::data::fs::native_sdk_state::NativeSdkStateLease,
+    ) -> Result<(), EngineError> {
+        use crate::data::fs::native_sdk_state::NativeSdkProvider;
+        let provider = match self.provider {
+            NativeProvider::Claude => NativeSdkProvider::Claude,
+            NativeProvider::Codex => NativeSdkProvider::Codex,
+            NativeProvider::Agy => NativeSdkProvider::Agy,
+        };
+        let session = self.session.as_ref().map(|session| match session {
+            NativeSession::Claude(id) | NativeSession::Codex(id) | NativeSession::Agy(id) => {
+                id.as_str()
+            }
+        });
+        lease.validate_request(provider, &self.model, session)?;
+        Ok(())
+    }
+
+    pub(crate) fn sdk_ack_event(
+        &self,
+        fields: NativeSdkAckFields,
+    ) -> Result<NativeSdkAckEvent, EngineError> {
+        use NativeSdkAckEvent::*;
+        let invalid =
+            || EngineError::Container("invalid native SDK session acknowledgement".into());
+        let session = |id: Option<String>| -> Result<String, EngineError> {
+            let id = id.ok_or_else(invalid)?;
+            if id.is_empty()
+                || id.trim() != id
+                || id.len() > 1024
+                || id.chars().any(char::is_control)
+            {
+                return Err(invalid());
+            }
+            if self
+                .session
+                .as_ref()
+                .is_some_and(|expected| match expected {
+                    NativeSession::Claude(value)
+                    | NativeSession::Codex(value)
+                    | NativeSession::Agy(value) => value != &id,
+                })
+            {
+                return Err(invalid());
+            }
+            Ok(id)
+        };
+        match self.provider {
+            NativeProvider::Claude if fields.event_type.as_deref() == Some("result") => {
+                if fields.subtype.as_deref() != Some("success") || fields.is_error != Some(false) {
+                    return Err(invalid());
+                }
+                Ok(CompletedSession(session(fields.session_id)?))
+            }
+            NativeProvider::Codex => match fields.event_type.as_deref() {
+                Some("thread.started") => Ok(Session(session(fields.thread_id)?)),
+                Some("turn.started") => Ok(TurnStarted),
+                Some("turn.completed") => Ok(TurnCompleted),
+                Some("turn.failed" | "error") => Err(invalid()),
+                _ => Ok(Other),
+            },
+            NativeProvider::Agy if fields.status.is_some() => {
+                if fields.status.as_deref() != Some("SUCCESS") || fields.provider_error_present {
+                    return Err(invalid());
+                }
+                Ok(CompletedSession(session(fields.conversation_id)?))
+            }
+            _ => Ok(Other),
+        }
+    }
+}
+
 impl NativePrintRequest {
     pub(crate) fn new(
         agent: &str,

@@ -43,6 +43,10 @@ mod gated_launch_retention_quiescence_test;
 pub mod instance;
 pub mod io_bridge;
 pub mod naming;
+#[cfg(test)]
+mod native_sdk_execution;
+#[cfg(test)]
+mod native_sdk_execution_test;
 pub mod options;
 pub(crate) mod orchestrated_apple;
 mod process;
@@ -62,3 +66,5 @@ pub use runtime::ContainerRuntime;
 
 #[cfg(all(test, unix))]
 mod native_print_acceptance_test;
+#[cfg(all(test, unix))]
+mod native_sdk_state_publication_test;
