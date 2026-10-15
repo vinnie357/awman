@@ -68,3 +68,9 @@ pub use runtime::ContainerRuntime;
 mod native_print_acceptance_test;
 #[cfg(all(test, unix))]
 mod native_sdk_state_publication_test;
+
+#[cfg(all(test, unix))]
+mod native_sdk_stderr_publication_test;
+
+#[cfg(all(test, unix))]
+mod io_bridge_stderr_read_test;
