@@ -13,6 +13,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::data::session::{AgentHandle, Session};
@@ -27,6 +29,10 @@ use crate::engine::container::gated_launch::{
     provider_call_deadline, run_bounded_provider_cli, LaunchRetentionInitError,
     LaunchRetentionRegistry, ProviderCliCustodyRegistry, ProviderCliRunOutcome,
     ProviderCliStartFailure,
+};
+#[cfg(test)]
+use crate::engine::container::gated_launch::{
+    ProviderCliReapedFailure, ProviderCliReapedFailureKind,
 };
 use crate::engine::container::options::{OverlaySpec, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
@@ -58,6 +64,31 @@ static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
     session_label_supported: true,
 };
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(super) enum InitialInspectionOutcomeForTest {
+    CustodyUnavailable(ProviderCliStartFailure),
+    Completed(bool),
+    NotStarted(ProviderCliStartFailure),
+    ReapedFailure(ProviderCliReapedFailureKind),
+    RetainedFailure,
+}
+
+#[cfg(test)]
+pub(super) type InitialInspectionReceiptForTest =
+    Arc<Mutex<Option<InitialInspectionOutcomeForTest>>>;
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(super) struct InitialInspectionTerminalProofForTest {
+    pub outcome: InitialInspectionOutcomeForTest,
+    pub reaped: Option<ProviderCliReapedFailure>,
+}
+
+#[cfg(test)]
+pub(super) type InitialInspectionTerminalProofReceiptForTest =
+    Arc<Mutex<Option<InitialInspectionTerminalProofForTest>>>;
+
 pub struct ContainerRuntime {
     backend: Arc<dyn ContainerBackend>,
     launch_retention: Result<Arc<LaunchRetentionRegistry>, LaunchRetentionInitError>,
@@ -68,6 +99,10 @@ pub struct ContainerRuntime {
     test_provider_executable: Option<std::path::PathBuf>,
     #[cfg(test)]
     test_image_home_dir: Option<String>,
+    #[cfg(test)]
+    test_initial_inspection_receipt: Option<InitialInspectionReceiptForTest>,
+    #[cfg(test)]
+    test_initial_inspection_terminal_proof: Option<InitialInspectionTerminalProofReceiptForTest>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -170,6 +205,39 @@ fn valid_orchestrated_runtime_user(value: &str) -> bool {
 }
 
 impl ContainerRuntime {
+    #[cfg(test)]
+    pub(super) fn set_initial_inspection_receipt_for_test(
+        &mut self,
+        receipt: InitialInspectionReceiptForTest,
+    ) {
+        self.test_initial_inspection_receipt = Some(receipt);
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_initial_inspection_terminal_proof_for_test(
+        &mut self,
+        receipt: InitialInspectionTerminalProofReceiptForTest,
+    ) {
+        self.test_initial_inspection_terminal_proof = Some(receipt);
+    }
+
+    #[cfg(test)]
+    fn record_initial_inspection_outcome_for_test(
+        &self,
+        outcome: InitialInspectionOutcomeForTest,
+        reaped: Option<ProviderCliReapedFailure>,
+    ) {
+        if let Some(receipt) = &self.test_initial_inspection_receipt {
+            if let Ok(mut receipt) = receipt.try_lock() {
+                *receipt = Some(outcome);
+            }
+        }
+        if let Some(receipt) = &self.test_initial_inspection_terminal_proof {
+            if let Ok(mut receipt) = receipt.try_lock() {
+                *receipt = Some(InitialInspectionTerminalProofForTest { outcome, reaped });
+            }
+        }
+    }
     /// Construct with the Docker backend.
     pub fn docker() -> Self {
         Self {
@@ -182,6 +250,10 @@ impl ContainerRuntime {
             test_provider_executable: None,
             #[cfg(test)]
             test_image_home_dir: None,
+            #[cfg(test)]
+            test_initial_inspection_receipt: None,
+            #[cfg(test)]
+            test_initial_inspection_terminal_proof: None,
         }
     }
 
@@ -199,6 +271,10 @@ impl ContainerRuntime {
             test_provider_executable: None,
             #[cfg(test)]
             test_image_home_dir: None,
+            #[cfg(test)]
+            test_initial_inspection_receipt: None,
+            #[cfg(test)]
+            test_initial_inspection_terminal_proof: None,
         }
     }
 
@@ -212,6 +288,10 @@ impl ContainerRuntime {
             test_provider_executable: Some(executable.to_path_buf()),
             #[cfg(test)]
             test_image_home_dir: None,
+            #[cfg(test)]
+            test_initial_inspection_receipt: None,
+            #[cfg(test)]
+            test_initial_inspection_terminal_proof: None,
         }
     }
 
@@ -232,6 +312,10 @@ impl ContainerRuntime {
             test_provider_executable: None,
             #[cfg(test)]
             test_image_home_dir: None,
+            #[cfg(test)]
+            test_initial_inspection_receipt: None,
+            #[cfg(test)]
+            test_initial_inspection_terminal_proof: None,
         }
     }
 
@@ -338,12 +422,40 @@ impl ContainerRuntime {
             "apple-containers" => command.args(["image", "inspect", image]),
             _ => command.args(["image", "inspect", "--format", "{{json .Config}}", image]),
         };
+        #[cfg(test)]
+        if let Err(reason) = &self.provider_cli_custody {
+            self.record_initial_inspection_outcome_for_test(
+                InitialInspectionOutcomeForTest::CustodyUnavailable(*reason),
+                None,
+            );
+        }
         let custody = self
             .provider_cli_custody
             .as_ref()
             .map_err(|_| EngineError::Container("could not inspect startup-gate image".into()))?;
         let deadline = provider_call_deadline(Instant::now() + startup_gate_timeout);
-        let output = match run_bounded_provider_cli(command, deadline, custody) {
+        let outcome = run_bounded_provider_cli(command, deadline, custody);
+        #[cfg(test)]
+        {
+            let (terminal, reaped) = match &outcome {
+                ProviderCliRunOutcome::Completed(output) => (
+                    InitialInspectionOutcomeForTest::Completed(output.status.success()),
+                    None,
+                ),
+                ProviderCliRunOutcome::NotStarted(reason) => {
+                    (InitialInspectionOutcomeForTest::NotStarted(*reason), None)
+                }
+                ProviderCliRunOutcome::ReapedFailure(failure) => (
+                    InitialInspectionOutcomeForTest::ReapedFailure(failure.kind),
+                    Some(failure.clone()),
+                ),
+                ProviderCliRunOutcome::RetainedFailure(_) => {
+                    (InitialInspectionOutcomeForTest::RetainedFailure, None)
+                }
+            };
+            self.record_initial_inspection_outcome_for_test(terminal, reaped);
+        }
+        let output = match outcome {
             ProviderCliRunOutcome::Completed(output) => output,
             ProviderCliRunOutcome::RetainedFailure(retained) => {
                 let _ = retained.transfer();
