@@ -19,6 +19,8 @@ const PROVIDER_FAILURE_CLEANUP_GRACE: Duration = Duration::from_millis(250);
 
 #[allow(dead_code)] // Packet 1B seam; the later native-provider packet is its runtime consumer.
 pub(crate) struct BoundedProviderOutput {
+    #[cfg(test)]
+    pub child_pid: u32,
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -57,6 +59,8 @@ pub(crate) enum ProviderCliReapedFailureKind {
 #[allow(dead_code)] // Packet 1B seam; the later native-provider packet is its runtime consumer.
 pub(crate) struct ProviderCliReapedFailure {
     pub kind: ProviderCliReapedFailureKind,
+    #[cfg(test)]
+    pub child_pid: u32,
     pub status: ExitStatus,
 }
 
@@ -329,6 +333,8 @@ impl ActorControl {
                 ActorInitialResult::Completed(output) => {
                     shared.retained_reaped = Some(ProviderCliReapedFailure {
                         kind: ProviderCliReapedFailureKind::DeadlineExceeded,
+                        #[cfg(test)]
+                        child_pid: output.child_pid,
                         status: output.status,
                     });
                 }
@@ -699,6 +705,8 @@ fn supervise_child(
     stderr_receiver: mpsc::Receiver<DrainResult>,
     initial_failure: Option<ProviderCliReapedFailureKind>,
 ) {
+    #[cfg(test)]
+    let child_pid = child.id();
     let mut status = None;
     let mut stdout = None;
     let mut stderr = None;
@@ -779,7 +787,12 @@ fn supervise_child(
                 }
             }
             if let Some(status) = status {
-                actor.publish_reaped(ProviderCliReapedFailure { kind, status });
+                actor.publish_reaped(ProviderCliReapedFailure {
+                    kind,
+                    #[cfg(test)]
+                    child_pid,
+                    status,
+                });
                 return;
             }
             if !retained {
@@ -791,6 +804,8 @@ fn supervise_child(
                 (status.take(), stdout.take(), stderr.take())
             {
                 actor.publish_initial(ActorInitialResult::Completed(BoundedProviderOutput {
+                    #[cfg(test)]
+                    child_pid,
                     status,
                     stdout,
                     stderr,
