@@ -58,7 +58,7 @@ pub(crate) struct BridgeConfig {
 /// Bundle returned by `bridge_pty` / `bridge_piped` containing the artifacts
 /// the backend needs to store for the execution lifetime.
 pub(crate) struct BridgeResult {
-    pub output_readers: Vec<std::thread::JoinHandle<()>>,
+    pub output_readers: Vec<std::thread::JoinHandle<PipedReadEnd>>,
     /// Sender for `try_inject_stdin` — the engine retains a clone.
     pub stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// Broadcast sender for stuck events — stored in `AgentExecution`.
@@ -340,9 +340,10 @@ pub(crate) fn bridge_pty_owned(
 pub(crate) struct PipedChildIo {
     pub stdin: Option<std::process::ChildStdin>,
     pub stdout: Option<std::process::ChildStdout>,
-    pub stderr: Option<std::process::ChildStderr>,
+    pub stderr: Option<Box<dyn std::io::Read + Send>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PipedReadEnd {
     Eof,
     ReadError,
@@ -365,7 +366,10 @@ impl PipedChildIo {
     pub(crate) fn take_from(&mut self, child: &mut std::process::Child) {
         self.stdin = child.stdin.take();
         self.stdout = child.stdout.take();
-        self.stderr = child.stderr.take();
+        self.stderr = child
+            .stderr
+            .take()
+            .map(|stderr| Box::new(stderr) as Box<dyn std::io::Read + Send>);
     }
 
     pub(crate) fn take(child: &mut std::process::Child) -> Self {
@@ -443,6 +447,7 @@ pub(crate) fn bridge_piped_io_observed(
             if let Some(observer) = observer.as_mut() {
                 observer.finish(end);
             }
+            end
         }));
     } else if let Some(observer) = observer.as_mut() {
         observer.finish(PipedReadEnd::ReadError);
@@ -463,7 +468,9 @@ pub(crate) fn bridge_piped_io_observed(
             let mut sink_open = true;
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break PipedReadEnd::Eof,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break PipedReadEnd::ReadError,
                     Ok(n) => {
                         update_activity(&act, &fb);
                         tail.push_bytes(&buf[..n]);

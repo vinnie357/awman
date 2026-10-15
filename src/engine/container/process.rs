@@ -54,13 +54,17 @@ use crate::engine::container::gated_launch::{
     SpawnedCreateCli,
 };
 use crate::engine::container::instance::{handle_now, ContainerId};
-use crate::engine::container::io_bridge::{BridgeConfig, CancelFn};
+use crate::engine::container::io_bridge::{BridgeConfig, CancelFn, PipedReadEnd};
 use crate::engine::container::options::{ContainerName, ImageRef, ResolvedContainerOptions};
 use crate::engine::credential_refresh::CredentialLease;
 use crate::engine::error::EngineError;
 
 /// The `Arc<Mutex<…>>` the I/O bridge hands back for a PTY-bridged run.
 type PtyMaster = Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>;
+
+#[cfg(test)]
+type StderrReadAdapter =
+    Box<dyn FnOnce(Box<dyn std::io::Read + Send>) -> Option<Box<dyn std::io::Read + Send>> + Send>;
 
 // ─── Per-backend CLI description ────────────────────────────────────────────
 
@@ -689,7 +693,7 @@ impl Drop for SpawnCustodyResources {
 }
 
 struct ExecutionResources {
-    output_readers: Vec<std::thread::JoinHandle<()>>,
+    output_readers: Vec<std::thread::JoinHandle<PipedReadEnd>>,
     drain_output: bool,
     post_wait: PostWaitHook,
     pty_master: Option<PtyMaster>,
@@ -791,7 +795,7 @@ impl Drop for ExecutionResources {
             for reader in self.output_readers.drain(..) {
                 let result = reader.join();
                 #[cfg(test)]
-                if result.is_err() {
+                if matches!(result, Err(_) | Ok(PipedReadEnd::ReadError)) {
                     if let Some(native) = self.native.as_ref() {
                         native.reader_failed();
                     }
@@ -813,6 +817,7 @@ fn bridge_piped_resources(
     bridge_cfg: BridgeConfig,
     keep_stdin_injector: bool,
     drain_output: bool,
+    #[cfg(test)] stderr_read_adapter: Option<StderrReadAdapter>,
 ) -> Result<(ExecutionBridgeArtifacts, ExecutionResourceLoan), EngineError> {
     lifecycle.transform_resources::<LifecycleResources, _>(move |resources| {
         let LifecycleResources::Spawn(spawn) = resources else {
@@ -857,6 +862,18 @@ fn bridge_piped_resources(
                 ));
             }
         };
+        #[cfg(test)]
+        let mut pipes = pipes;
+        #[cfg(test)]
+        if let Some(adapter) = stderr_read_adapter {
+            pipes.stderr = pipes.stderr.take().and_then(adapter);
+        }
+        #[cfg(test)]
+        if pipes.stderr.is_none() {
+            if let Some(native) = native.as_ref() {
+                native.reader_failed();
+            }
+        }
         #[cfg(not(test))]
         let bridge = crate::engine::container::io_bridge::bridge_piped_io(io, pipes, bridge_cfg);
         #[cfg(test)]
@@ -1765,6 +1782,8 @@ pub(super) fn spawn_piped(
         req,
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        None,
     )
 }
 
@@ -1775,6 +1794,7 @@ fn spawn_piped_owned(
     mut instance: Box<ContainerInstance>,
     req: SpawnRequest,
     #[cfg(test)] native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
+    #[cfg(test)] stderr_read_adapter: Option<StderrReadAdapter>,
 ) -> Result<AgentExecution, SpawnStageError> {
     #[cfg(test)]
     if let Some(native) = native.as_ref() {
@@ -1976,6 +1996,8 @@ fn spawn_piped_owned(
         bridge_cfg,
         false,
         instance.options.native_print,
+        #[cfg(test)]
+        stderr_read_adapter,
     )
     .map_err(|source| {
         after_cli_start(
@@ -2266,8 +2288,16 @@ pub(super) fn spawn_piped_interactive(
         ));
     }
 
-    let (bridge, resource_loan) = bridge_piped_resources(&lifecycle, io, bridge_cfg, true, false)
-        .map_err(|source| {
+    let (bridge, resource_loan) = bridge_piped_resources(
+        &lifecycle,
+        io,
+        bridge_cfg,
+        true,
+        false,
+        #[cfg(test)]
+        None,
+    )
+    .map_err(|source| {
         after_cli_start(
             &retention,
             source,
@@ -3101,10 +3131,42 @@ pub(crate) mod test_support {
         request: crate::engine::agent::agent_matrix::NativePrintRequest,
         lease: crate::data::fs::native_sdk_state::NativeSdkStateLease,
     ) -> FixtureSpawnResult {
+        spawn_native_fixture_with_optional_stderr_read_adapter(spec, registry, request, lease, None)
+    }
+
+    pub(crate) fn spawn_native_fixture_with_stderr_read_adapter(
+        spec: FixtureSpawnSpec,
+        registry: Arc<LaunchRetentionRegistry>,
+        request: crate::engine::agent::agent_matrix::NativePrintRequest,
+        lease: crate::data::fs::native_sdk_state::NativeSdkStateLease,
+        adapter: StderrReadAdapter,
+    ) -> FixtureSpawnResult {
+        spawn_native_fixture_with_optional_stderr_read_adapter(
+            spec,
+            registry,
+            request,
+            lease,
+            Some(adapter),
+        )
+    }
+
+    fn spawn_native_fixture_with_optional_stderr_read_adapter(
+        spec: FixtureSpawnSpec,
+        registry: Arc<LaunchRetentionRegistry>,
+        request: crate::engine::agent::agent_matrix::NativePrintRequest,
+        lease: crate::data::fs::native_sdk_state::NativeSdkStateLease,
+        stderr_read_adapter: Option<StderrReadAdapter>,
+    ) -> FixtureSpawnResult {
         let native = Arc::new(super::super::native_sdk_execution::NativeSdkExecution::new(
             request, lease,
         ));
-        spawn_fixture_with_native(spec, registry, FixtureGateMode::FullOwner, Some(native))
+        spawn_fixture_with_native(
+            spec,
+            registry,
+            FixtureGateMode::FullOwner,
+            Some(native),
+            stderr_read_adapter,
+        )
     }
 
     pub(crate) fn spawn_tuple_validation_fixture(
@@ -3119,7 +3181,7 @@ pub(crate) mod test_support {
         registry: Arc<LaunchRetentionRegistry>,
         gate_mode: FixtureGateMode,
     ) -> FixtureSpawnResult {
-        spawn_fixture_with_native(spec, registry, gate_mode, None)
+        spawn_fixture_with_native(spec, registry, gate_mode, None, None)
     }
 
     fn spawn_fixture_with_native(
@@ -3127,6 +3189,7 @@ pub(crate) mod test_support {
         registry: Arc<LaunchRetentionRegistry>,
         gate_mode: FixtureGateMode,
         native: Option<Arc<super::super::native_sdk_execution::NativeSdkExecution>>,
+        stderr_read_adapter: Option<StderrReadAdapter>,
     ) -> FixtureSpawnResult {
         let full_custody = FULL_CUSTODY_OVERRIDE.with(|custody| custody.borrow_mut().take());
         let prepared_override = PREPARED_OVERRIDE.with(|prepared| prepared.borrow_mut().take());
@@ -3244,7 +3307,9 @@ pub(crate) mod test_support {
         } else {
             match spec.mode {
                 FixtureIoMode::Pty { .. } => spawn_pty_bridged(cli, instance, request, None),
-                FixtureIoMode::Piped => spawn_piped_owned(cli, instance, request, native),
+                FixtureIoMode::Piped => {
+                    spawn_piped_owned(cli, instance, request, native, stderr_read_adapter)
+                }
                 FixtureIoMode::PersistentPiped => spawn_piped_interactive(cli, instance, request),
             }
         };
