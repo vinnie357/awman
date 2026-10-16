@@ -169,7 +169,7 @@ fn tree_snapshot(base: &Path) -> TestResult<TreeSnapshot> {
 
 struct StableState {
     state_path: PathBuf,
-    identities: Vec<(PathBuf, Identity)>,
+    identities: Vec<(PathBuf, Identity, bool)>,
     owner_bytes: Vec<u8>,
     lock_bytes: Vec<u8>,
 }
@@ -197,7 +197,10 @@ impl StableState {
         ];
         let identities = paths
             .into_iter()
-            .map(|path| Ok((path.clone(), identity(&path)?)))
+            .map(|path| {
+                let is_directory = fs::symlink_metadata(&path)?.is_dir();
+                Ok((path.clone(), identity(&path)?, is_directory))
+            })
             .collect::<io::Result<_>>()?;
         Ok(Self {
             state_path: path.to_path_buf(),
@@ -209,13 +212,35 @@ impl StableState {
 
     fn assert_preserved(&self, path: &Path, mutation: &[u8]) -> TestResult {
         assert_eq!(path, self.state_path);
-        for (path, expected) in &self.identities {
+        for (path, expected, is_directory) in &self.identities {
+            let metadata = fs::symlink_metadata(path)?;
             assert_eq!(
-                &identity(path)?,
-                expected,
-                "physical owner changed: {}",
+                metadata.is_dir(),
+                *is_directory,
+                "physical owner kind changed: {}",
                 path.display()
             );
+            let actual = identity(path)?;
+            if *is_directory {
+                assert_eq!(
+                    (actual.0, actual.1, actual.2, actual.3),
+                    (expected.0, expected.1, expected.2, expected.3),
+                    "physical owner changed: {}",
+                    path.display()
+                );
+            } else {
+                assert!(
+                    metadata.is_file(),
+                    "expected regular owner file: {}",
+                    path.display()
+                );
+                assert_eq!(
+                    &actual,
+                    expected,
+                    "physical owner changed: {}",
+                    path.display()
+                );
+            }
         }
         let owner = owner_path(path)?;
         assert_eq!(fs::read(owner.join("owner.json"))?, self.owner_bytes);
