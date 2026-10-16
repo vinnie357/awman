@@ -113,6 +113,44 @@ pub(super) fn await_protected_release(
     enclosing: Instant,
     #[cfg(test)] boundary: Option<&dyn OrchestratedAppleTestBoundary>,
 ) -> Result<ProtectedGateRelease, LaunchRetentionReason> {
+    await_release_with_auth_owner(
+        plan,
+        adapter,
+        cancelled,
+        enclosing,
+        None,
+        #[cfg(test)]
+        boundary,
+    )
+}
+
+pub(super) fn await_native_auth_release(
+    plan: &DurableLaunchPlan,
+    adapter: &dyn GatedProviderAdapter,
+    cancelled: &AtomicBool,
+    enclosing: Instant,
+    auth: &crate::engine::agent::native_codex_preparation::AuthCustody,
+    #[cfg(test)] boundary: Option<&dyn OrchestratedAppleTestBoundary>,
+) -> Result<ProtectedGateRelease, LaunchRetentionReason> {
+    await_release_with_auth_owner(
+        plan,
+        adapter,
+        cancelled,
+        enclosing,
+        Some(auth),
+        #[cfg(test)]
+        boundary,
+    )
+}
+
+fn await_release_with_auth_owner(
+    plan: &DurableLaunchPlan,
+    adapter: &dyn GatedProviderAdapter,
+    cancelled: &AtomicBool,
+    enclosing: Instant,
+    auth: Option<&crate::engine::agent::native_codex_preparation::AuthCustody>,
+    #[cfg(test)] boundary: Option<&dyn OrchestratedAppleTestBoundary>,
+) -> Result<ProtectedGateRelease, LaunchRetentionReason> {
     #[cfg(test)]
     if let Some(boundary) = boundary {
         boundary.prepare_simulated_guest(plan)?;
@@ -210,6 +248,30 @@ pub(super) fn await_protected_release(
             }
             return Err(LaunchRetentionReason::ChildStateUnknown);
         }
+    }
+
+    if let Some(auth) = auth {
+        // Preparation is the caller for these private auth controls (ADR0002).
+        // External orchestration has no owner/capability and remains unchanged.
+        if !plan
+            .controls
+            .host_parent
+            .verify_launch_receipt(&pinned_receipt)
+        {
+            return Err(LaunchRetentionReason::PostSpawnControlChanged);
+        }
+        if Instant::now() >= enclosing {
+            return Err(LaunchRetentionReason::InspectionUnavailable);
+        }
+        let release_result = auth.release_after_verified_receipt(plan, &ready.nonce, cancelled);
+        #[cfg(all(test, unix))]
+        if let Some(observer) = auth.observer() {
+            // Original context, no owner/capability lock held, no recursive hook.
+            observer.after_auth_release_attempt(&release_result, || {
+                auth.release_after_verified_receipt(plan, &ready.nonce, cancelled)
+            });
+        }
+        release_result?;
     }
 
     loop {

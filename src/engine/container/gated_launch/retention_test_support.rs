@@ -310,6 +310,7 @@ impl RetentionProbe {
                 usize::from(custody.resource_loan.is_some())
             }
             Some(RetainedRegistryEnvelope::PendingPublication { .. }) => return None,
+            Some(RetainedRegistryEnvelope::UnresolvedAuthPreparation { .. }) => return None,
             Some(RetainedRegistryEnvelope::Gated(_) | RetainedRegistryEnvelope::Legacy(_)) => {
                 return None;
             }
@@ -370,6 +371,7 @@ impl RetentionProbe {
                 usize::from(custody.resource_loan.is_some())
             }
             Some(RetainedRegistryEnvelope::PendingPublication { .. }) => 0,
+            Some(RetainedRegistryEnvelope::UnresolvedAuthPreparation { .. }) => 0,
             Some(RetainedRegistryEnvelope::Gated(_) | RetainedRegistryEnvelope::Legacy(_))
             | None => 0,
         }

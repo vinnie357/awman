@@ -77,6 +77,10 @@ struct PinnedDirInner {
     fail_launch_plan_sync: Arc<AtomicBool>,
     #[cfg(test)]
     after_launch_plan_publication: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(all(test, unix))]
+    after_auth_release_rename: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(all(test, unix))]
+    auth_release_sync_fault: std::sync::Mutex<Option<Arc<AuthReleaseSyncFaultState>>>,
 }
 
 #[derive(Clone)]
@@ -128,6 +132,71 @@ pub(crate) fn after_launch_plan_native_publication(
         slot.replace(action).is_none(),
         "launch-plan publication action is already installed"
     );
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn after_auth_release_noreplace_rename(
+    controls: &Arc<OrchestratedControlAuthority>,
+    action: Box<dyn FnOnce() + Send>,
+) {
+    let mut slot = controls
+        .guest_control
+        .dir
+        .after_auth_release_rename
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        slot.replace(action).is_none(),
+        "auth release rename action is already installed"
+    );
+}
+
+#[cfg(all(test, unix))]
+struct AuthReleaseSyncFaultState {
+    armed: AtomicBool,
+    fired: AtomicBool,
+}
+
+#[cfg(all(test, unix))]
+pub(crate) struct AuthReleaseSyncFaultHandle {
+    state: Arc<AuthReleaseSyncFaultState>,
+}
+
+#[cfg(all(test, unix))]
+impl AuthReleaseSyncFaultHandle {
+    pub(crate) fn did_fire(&self) -> bool {
+        self.state.fired.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for AuthReleaseSyncFaultHandle {
+    fn drop(&mut self) {
+        self.state.armed.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn arm_auth_release_post_rename_sync_failure(
+    controls: &Arc<OrchestratedControlAuthority>,
+) -> AuthReleaseSyncFaultHandle {
+    let mut slot = controls
+        .guest_control
+        .dir
+        .auth_release_sync_fault
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        slot.as_ref()
+            .is_none_or(|state| !state.armed.load(Ordering::Acquire)),
+        "auth release sync fault is already armed for this control authority"
+    );
+    let state = Arc::new(AuthReleaseSyncFaultState {
+        armed: AtomicBool::new(true),
+        fired: AtomicBool::new(false),
+    });
+    *slot = Some(Arc::clone(&state));
+    AuthReleaseSyncFaultHandle { state }
 }
 
 impl PartialEq for PinnedControlDir {
@@ -279,6 +348,87 @@ pub(crate) struct OrchestratedControlAuthority {
 }
 
 impl OrchestratedControlAuthority {
+    // Fixed Layer0 persistence, not permission to release a launch. The sole
+    // production caller is the opaque auth destination, behind engine custody.
+    pub(in crate::data) fn publish_auth_release(&self, nonce: &str) -> Result<(), PlanFileError> {
+        if !hex64(nonce) {
+            return Err(PlanFileError::ExistingOrUnsafe);
+        }
+        revalidate_mount_source(self).map_err(|_| PlanFileError::ExistingOrUnsafe)?;
+        let bytes = serde_json::to_vec(&serde_json::json!({"version":1,"nonce":nonce}))
+            .map_err(|_| PlanFileError::PublicationFailed)?;
+        let dir = &self.guest_control.dir.dir;
+        let temp_name = format!(".auth-release.{}.tmp", uuid::Uuid::new_v4().simple());
+        let fd = nix::fcntl::openat(
+            dir,
+            temp_name.as_str(),
+            nix::fcntl::OFlag::O_RDWR
+                | nix::fcntl::OFlag::O_CREAT
+                | nix::fcntl::OFlag::O_EXCL
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )
+        .map_err(|_| PlanFileError::PublicationFailed)?;
+        let mut file = File::from(fd);
+        let original = validate_regular_metadata(
+            &file
+                .metadata()
+                .map_err(|_| PlanFileError::PublicationFailed)?,
+            0o600,
+            MAX_REQUEST,
+            self.guest_control.dir.identity.owner_uid,
+        )
+        .map_err(|_| PlanFileError::ExistingOrUnsafe)?;
+        file.write_all(&bytes)
+            .map_err(|_| PlanFileError::PublicationFailed)?;
+        file.sync_all()
+            .map_err(|_| PlanFileError::PublicationFailed)?;
+        revalidate_mount_source(self).map_err(|_| PlanFileError::ExistingOrUnsafe)?;
+        // The private temporary name must still designate our exact held file.
+        verify_auth_release_name(dir, &temp_name, &file, original, &bytes, false)?;
+        rename_noreplace(dir, &temp_name, "release.json")?;
+        #[cfg(all(test, unix))]
+        {
+            let action = {
+                self.guest_control
+                    .dir
+                    .after_auth_release_rename
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+            };
+            if let Some(action) = action {
+                action();
+            }
+        }
+        #[cfg(all(test, unix))]
+        {
+            let fault = {
+                self.guest_control
+                    .dir
+                    .auth_release_sync_fault
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+            };
+            if let Some(fault) = fault {
+                if fault.armed.swap(false, Ordering::AcqRel) {
+                    fault.fired.store(true, Ordering::Release);
+                    return Err(PlanFileError::PublicationFailed);
+                }
+            }
+        }
+        dir.sync_all()
+            .map_err(|_| PlanFileError::PublicationFailed)?;
+        // The real bootstrap may already have unlinked this permission. Only
+        // this held descriptor can validate it after consumption; the monitor
+        // still requires the actual matching guest ACK before proceeding.
+        verify_auth_release_name(dir, "release.json", &file, original, &bytes, true)?;
+        revalidate_mount_source(self).map_err(|_| PlanFileError::ExistingOrUnsafe)?;
+        Ok(())
+    }
+
     pub(crate) fn validated_manifests(&self) -> &BTreeMap<String, Vec<u8>> {
         self.validated_manifests.as_ref()
     }
@@ -510,6 +660,66 @@ fn validate_regular_metadata(
     Ok(identity(metadata))
 }
 
+// Auth permissions are consumed by unlink, unlike durable control records.
+// Keep that exception local: ordinary pinned records still require one link.
+fn validate_auth_release_fd(
+    file: &File,
+    original: NativeFileIdentity,
+    expected: &[u8],
+) -> Result<u64, PlanFileError> {
+    let check = |metadata: &std::fs::Metadata| {
+        if !metadata.file_type().is_file()
+            || identity(metadata) != original
+            || metadata.nlink() > 1
+            || usize::try_from(metadata.len()).ok() != Some(expected.len())
+        {
+            return Err(PlanFileError::ExistingOrUnsafe);
+        }
+        Ok(metadata.nlink())
+    };
+    let before = check(
+        &file
+            .metadata()
+            .map_err(|_| PlanFileError::PublicationFailed)?,
+    )?;
+    let actual = read_bounded_at(file, expected.len() as u64)
+        .map_err(|_| PlanFileError::PublicationFailed)?;
+    let after = check(
+        &file
+            .metadata()
+            .map_err(|_| PlanFileError::PublicationFailed)?,
+    )?;
+    if actual != expected || after > before {
+        return Err(PlanFileError::ExistingOrUnsafe);
+    }
+    Ok(after)
+}
+
+fn verify_auth_release_name(
+    dir: &File,
+    name: &str,
+    held: &File,
+    original: NativeFileIdentity,
+    expected: &[u8],
+    allow_consumed: bool,
+) -> Result<(), PlanFileError> {
+    // openat_readonly is NONBLOCK|NOFOLLOW; validate regular-file metadata
+    // before bounded reads so a substituted FIFO/device cannot block us.
+    let named_links = match openat_readonly(dir, name, false) {
+        Ok(named) => Some(validate_auth_release_fd(&named, original, expected)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(PlanFileError::ExistingOrUnsafe),
+    };
+    match validate_auth_release_fd(held, original, expected)? {
+        1 if named_links == Some(1) => Ok(()),
+        0 if allow_consumed => match openat_readonly(dir, name, false) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Ok(_) | Err(_) => Err(PlanFileError::ExistingOrUnsafe),
+        },
+        _ => Err(PlanFileError::ExistingOrUnsafe),
+    }
+}
+
 fn open_directory(path: &Path) -> Result<File, StartupGateError> {
     std::fs::OpenOptions::new()
         .read(true)
@@ -559,6 +769,10 @@ fn open_parent(control_dir: &Path) -> Result<(PinnedControlDir, PathBuf), Startu
             fail_launch_plan_sync: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             after_launch_plan_publication: std::sync::Mutex::new(None),
+            #[cfg(all(test, unix))]
+            after_auth_release_rename: std::sync::Mutex::new(None),
+            #[cfg(all(test, unix))]
+            auth_release_sync_fault: std::sync::Mutex::new(None),
         })),
         absolute,
     ))
@@ -580,6 +794,10 @@ fn open_child(parent: &PinnedControlDir) -> Result<PinnedGuestControl, StartupGa
             fail_launch_plan_sync: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             after_launch_plan_publication: std::sync::Mutex::new(None),
+            #[cfg(all(test, unix))]
+            after_auth_release_rename: std::sync::Mutex::new(None),
+            #[cfg(all(test, unix))]
+            auth_release_sync_fault: std::sync::Mutex::new(None),
         }),
         parent: parent.clone(),
         basename: GUEST_CONTROL,

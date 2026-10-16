@@ -5,7 +5,9 @@ mod native;
 
 #[cfg(all(test, unix))]
 pub(crate) use native::{
-    after_launch_plan_native_publication, arm_launch_plan_post_rename_sync_failure,
+    after_auth_release_noreplace_rename, after_launch_plan_native_publication,
+    arm_auth_release_post_rename_sync_failure, arm_launch_plan_post_rename_sync_failure,
+    AuthReleaseSyncFaultHandle,
 };
 pub use native::{
     load_startup_gate, StartupGateAccess, StartupGateBinding, StartupGateControlLayout,

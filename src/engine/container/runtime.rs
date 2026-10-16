@@ -347,8 +347,37 @@ impl ContainerRuntime {
     /// Build a fully-configured `AgentInstance` from pre-resolved options.
     pub fn build(
         &self,
-        mut options: ResolvedContainerOptions,
+        options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        let (options, launch_retention) = self.prepare_container_options(options)?;
+        self.backend
+            .build_with_launch_retention(options, launch_retention)
+    }
+
+    pub(crate) fn build_native_codex_auth(
+        &self,
+        options: ResolvedContainerOptions,
+        custody: Arc<crate::engine::agent::native_codex_preparation::AuthCustody>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        let (options, registry) = self.prepare_container_options(options)?;
+        let backend = AppleBackend::default();
+        #[cfg(test)]
+        let backend = self.test_boundary.as_ref().map_or(backend, |boundary| {
+            AppleBackend::with_test_boundary(Arc::clone(boundary))
+        });
+        backend.build_native_codex_auth(options, registry, custody)
+    }
+
+    fn prepare_container_options(
+        &self,
+        mut options: ResolvedContainerOptions,
+    ) -> Result<
+        (
+            ResolvedContainerOptions,
+            Option<Arc<LaunchRetentionRegistry>>,
+        ),
+        EngineError,
+    > {
         let orchestrated = options
             .startup_gate
             .as_ref()
@@ -392,8 +421,7 @@ impl ContainerRuntime {
                 ));
             }
         }
-        self.backend
-            .build_with_launch_retention(options, launch_retention)
+        Ok((options, launch_retention))
     }
 
     fn inspect_gate_image(

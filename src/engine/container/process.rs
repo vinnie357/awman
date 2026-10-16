@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use crate::data::session::AgentHandle;
+use crate::engine::agent::native_codex_preparation::AuthCustody;
 use crate::engine::agent_runtime::execution::{
     AgentExecution, AgentExitInfo, AgentHandlePreview, AgentInstance, ExecutionBackend,
 };
@@ -188,12 +189,14 @@ struct SpawnRetentionState {
 
 pub(super) struct SpawnRetentionContext {
     state: Mutex<SpawnRetentionState>,
+    auth: Mutex<Option<Arc<AuthCustody>>>,
 }
 
 impl SpawnRetentionContext {
     pub(super) fn new(plan: Option<DurableLaunchPlan>) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(SpawnRetentionState { plan, reason: None }),
+            auth: Mutex::new(None),
         })
     }
 
@@ -278,6 +281,7 @@ pub(super) struct ContainerInstance {
     /// brackets the child process exactly (this instance box is dropped before
     /// the spawn fn returns).
     pub leases: Vec<CredentialLease>,
+    pub native_auth: Option<Arc<AuthCustody>>,
     /// Backend hook for the PTY path. `Some` only for Apple, whose CLI has no
     /// native attach. See [`AttachHook`].
     pub post_bridge: Option<AttachHook>,
@@ -342,6 +346,7 @@ impl ContainerInstance {
             image,
             options,
             leases,
+            native_auth: None,
             post_bridge,
             gate_cleanup: None,
             launch_retention,
@@ -375,7 +380,7 @@ impl AgentInstance for ContainerInstance {
     ) -> Result<AgentExecution, EngineError> {
         let cli = self.cli;
         let post_bridge = self.post_bridge;
-        let mut prepared = Some(ChildLifecycleAuthority::prepare()?);
+        let prepared = ChildLifecycleAuthority::prepare()?;
         let mut gated = None;
         if let Some(spec) = self.options.startup_gate.clone() {
             let mut staged = match super::startup_gate::stage_startup_gate(&spec) {
@@ -453,21 +458,22 @@ impl AgentInstance for ContainerInstance {
                     Arc::clone(controls),
                     enclosing,
                 ) {
-                    Ok(plan) => plan,
+                    Ok(plan) => {
+                        if let Some(auth) = &self.native_auth {
+                            auth.no_child_and_plan.store(false, Ordering::Release);
+                        }
+                        plan
+                    }
                     Err(LaunchIdentityError::LaunchPlanPublicationUncertain(publication)) => {
-                        let Some(prepared) = prepared.take() else {
-                            return Err(EngineError::Container(
-                                "prepared launch custody unavailable".into(),
-                            ));
-                        };
                         let resources = Box::new(PendingPublicationResources {
+                            _auth: self.native_auth.clone(),
                             _leases: std::mem::take(&mut self.leases),
                             _gate_cleanup: Some(staged.cleanup),
                             post_wait: cli.post_wait,
                             #[cfg(test)]
                             _custody_witness: test_support::take_custody_witness(),
                         });
-                        let _ticket = registry.retain_pending_publication(
+                        let ticket = registry.retain_pending_publication(
                             publication,
                             prepared,
                             resources,
@@ -475,11 +481,38 @@ impl AgentInstance for ContainerInstance {
                             #[cfg(test)]
                             self.test_boundary.clone(),
                         );
+                        if let Some(auth) = &self.native_auth {
+                            auth.retained(ticket);
+                        }
                         return Err(EngineError::Container(
                             "launch plan publication failed".into(),
                         ));
                     }
-                    Err(error) => return Err(EngineError::Container(error.to_string())),
+                    Err(error) => {
+                        if matches!(error, LaunchIdentityError::ExistingPlanRecoveryRequired) {
+                            if let Some(auth) = &self.native_auth {
+                                auth.no_child_and_plan.store(false, Ordering::Release);
+                                let resources = Box::new(PendingPublicationResources {
+                                    _auth: Some(Arc::clone(auth)),
+                                    _leases: std::mem::take(&mut self.leases),
+                                    _gate_cleanup: Some(staged.cleanup),
+                                    post_wait: cli.post_wait,
+                                    #[cfg(test)]
+                                    _custody_witness: test_support::take_custody_witness(),
+                                });
+                                // Unknown existing bytes confer no cleanup or
+                                // reconciliation authority. Transfer custody
+                                // before the plain command error can be dropped.
+                                let ticket = registry.retain_unresolved_auth_preparation(
+                                    prepared,
+                                    resources,
+                                    Arc::clone(auth),
+                                );
+                                auth.retained(ticket);
+                            }
+                        }
+                        return Err(EngineError::Container(error.to_string()));
+                    }
                 };
                 staged.overlays.push(overlay);
                 gated = Some(GatedSpawnContext {
@@ -517,12 +550,18 @@ impl AgentInstance for ContainerInstance {
             io.resize = None;
         }
 
-        let prepared = prepared
-            .ok_or_else(|| EngineError::Container("prepared launch custody unavailable".into()))?;
         let slot = Arc::new(ChildLifecycleSlot::new());
         let retention =
             SpawnRetentionContext::new(gated.as_ref().map(|context| context.plan.clone()));
-        let bridge_cfg = bridge_config_for(cli, &self.name, grace_timeout, stuck_timeout);
+        *retention.auth.lock().unwrap_or_else(|p| p.into_inner()) = self.native_auth.clone();
+        let mut bridge_cfg = bridge_config_for(cli, &self.name, grace_timeout, stuck_timeout);
+        if self.native_auth.is_some() {
+            bridge_cfg.cancel_on_grace_expired = None;
+        }
+        #[cfg(all(test, unix))]
+        if let Some(observer) = self.native_auth.as_ref().and_then(|auth| auth.observer()) {
+            observer.observe_seeded_input(seeded.as_deref());
+        }
         let req = SpawnRequest {
             io,
             argv,
@@ -604,7 +643,25 @@ enum SpawnIoResources {
     Piped(crate::engine::container::io_bridge::PipedChildIo),
 }
 
+struct AuthResources {
+    custody: Arc<AuthCustody>,
+    #[cfg(all(test, unix))]
+    _guard: Option<Box<dyn std::any::Any + Send>>,
+}
+impl AuthResources {
+    fn new(custody: &Arc<AuthCustody>) -> Self {
+        Self {
+            custody: Arc::clone(custody),
+            #[cfg(all(test, unix))]
+            _guard: custody
+                .observer()
+                .and_then(|observer| observer.take_launch_resource()),
+        }
+    }
+}
+
 struct SpawnCustodyResources {
+    auth: Option<AuthResources>,
     io: Option<SpawnIoResources>,
     leases: Option<Vec<CredentialLease>>,
     gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
@@ -619,6 +676,7 @@ struct SpawnCustodyResources {
 }
 
 struct PendingPublicationResources {
+    _auth: Option<Arc<AuthCustody>>,
     _leases: Vec<CredentialLease>,
     _gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
     post_wait: PostWaitHook,
@@ -633,6 +691,7 @@ impl Drop for PendingPublicationResources {
 }
 
 struct SpawnExecutionParts {
+    auth: Option<AuthResources>,
     io: SpawnIoResources,
     leases: Vec<CredentialLease>,
     gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
@@ -652,6 +711,7 @@ impl SpawnCustodyResources {
         }
         self.run_post_wait = false;
         Some(SpawnExecutionParts {
+            auth: self.auth.take(),
             io: self.io.take()?,
             leases: self.leases.take()?,
             gate_cleanup: self.gate_cleanup.take(),
@@ -666,6 +726,7 @@ impl SpawnCustodyResources {
     }
 
     fn restore_execution_parts(&mut self, parts: SpawnExecutionParts) {
+        self.auth = parts.auth;
         self.io = Some(parts.io);
         self.leases = Some(parts.leases);
         self.gate_cleanup = parts.gate_cleanup;
@@ -693,6 +754,7 @@ impl Drop for SpawnCustodyResources {
 }
 
 struct ExecutionResources {
+    auth: Option<AuthResources>,
     output_readers: Vec<std::thread::JoinHandle<PipedReadEnd>>,
     drain_output: bool,
     post_wait: PostWaitHook,
@@ -764,6 +826,15 @@ struct AttachHookCtxOwned {
 }
 
 impl LifecycleResources {
+    fn auth_custody(&self) -> Option<Arc<AuthCustody>> {
+        match self {
+            Self::Spawn(resources) => resources.auth.as_ref(),
+            Self::Execution(resources) => resources.auth.as_ref(),
+            Self::FailedPty(resources) => resources._custody.auth.as_ref(),
+        }
+        .map(|auth| Arc::clone(&auth.custody))
+    }
+
     fn spawn(&self) -> Option<&SpawnCustodyResources> {
         match self {
             Self::Spawn(resources) => Some(resources),
@@ -794,6 +865,11 @@ impl Drop for ExecutionResources {
         if self.drain_output {
             for reader in self.output_readers.drain(..) {
                 let result = reader.join();
+                if matches!(result, Err(_) | Ok(PipedReadEnd::ReadError)) {
+                    if let Some(auth) = &self.auth {
+                        auth.custody.reader_failed.store(true, Ordering::Release);
+                    }
+                }
                 #[cfg(test)]
                 if matches!(result, Err(_) | Ok(PipedReadEnd::ReadError)) {
                     if let Some(native) = self.native.as_ref() {
@@ -804,6 +880,7 @@ impl Drop for ExecutionResources {
                 let _ = result;
             }
         }
+        drop(self.auth.take());
         self.leases.clear();
         drop(self.gate_cleanup.take());
         #[cfg(test)]
@@ -831,6 +908,7 @@ fn bridge_piped_resources(
             ));
         };
         let SpawnExecutionParts {
+            auth,
             io: io_resources,
             leases,
             gate_cleanup,
@@ -846,6 +924,7 @@ fn bridge_piped_resources(
             SpawnIoResources::Piped(pipes) => pipes,
             wrong_kind => {
                 spawn.restore_execution_parts(SpawnExecutionParts {
+                    auth,
                     io: wrong_kind,
                     leases,
                     gate_cleanup,
@@ -875,14 +954,41 @@ fn bridge_piped_resources(
             }
         }
         #[cfg(not(test))]
-        let bridge = crate::engine::container::io_bridge::bridge_piped_io(io, pipes, bridge_cfg);
+        let pipes = pipes;
+        #[cfg(all(test, unix))]
+        let mut pipes = pipes;
+        if let Some(auth) = &auth {
+            #[cfg(all(test, unix))]
+            if let Some(observer) = auth.custody.observer() {
+                observer.observe_output_routes(&bridge_cfg);
+                pipes.stderr = pipes
+                    .stderr
+                    .take()
+                    .and_then(|pipe| observer.adapt_stderr(pipe));
+            }
+            if pipes.stdout.is_none() || pipes.stderr.is_none() {
+                auth.custody.reader_failed.store(true, Ordering::Release);
+            }
+        }
+        let private_auth = auth.is_some();
+        #[cfg(not(test))]
+        let bridge = if private_auth {
+            crate::engine::container::io_bridge::bridge_private_auth_io(io, pipes, bridge_cfg)
+        } else {
+            crate::engine::container::io_bridge::bridge_piped_io(io, pipes, bridge_cfg)
+        };
         #[cfg(test)]
-        let bridge = crate::engine::container::io_bridge::bridge_piped_io_observed(
-            io,
-            pipes,
-            bridge_cfg,
-            native.as_ref().map(|owner| owner.stdout_observer()),
-        );
+        let bridge = if private_auth {
+            crate::engine::container::io_bridge::bridge_private_auth_io(io, pipes, bridge_cfg)
+        } else {
+            crate::engine::container::io_bridge::bridge_piped_io_observed(
+                io,
+                pipes,
+                bridge_cfg,
+                native.as_ref().map(|owner| owner.stdout_observer()),
+            )
+        };
+        let drain_output = drain_output || private_auth;
         #[cfg(test)]
         let drain_output = drain_output || native.is_some();
         let crate::engine::container::io_bridge::BridgeResult {
@@ -894,6 +1000,7 @@ fn bridge_piped_resources(
         let stdin_injector = keep_stdin_injector.then_some(stdin_injector);
         drop(attach_permit);
         *resources = LifecycleResources::Execution(ExecutionResources {
+            auth,
             output_readers,
             drain_output,
             post_wait,
@@ -927,15 +1034,23 @@ fn finish_spawn(
             let (plan, reason) = retention.take();
             let reason = reason.unwrap_or(LaunchRetentionReason::ChildStateUnknown);
             if let Some(registry) = registry {
-                if let Some(plan) = plan {
-                    let _ = registry.retain(RetainedAgentLaunch {
+                let ticket = if let Some(plan) = plan {
+                    registry.retain(RetainedAgentLaunch {
                         plan,
                         execution: Some(owned),
                         last_inspection: None,
                         reason,
-                    });
+                    })
                 } else {
-                    let _ = registry.retain_legacy(owned);
+                    registry.retain_legacy(owned)
+                };
+                if let Some(auth) = retention
+                    .auth
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_ref()
+                {
+                    auth.retained(ticket);
                 }
             } else {
                 retain_detached_after_error(owned);
@@ -1045,6 +1160,7 @@ impl ProtectedLaunchContext {
             registry,
             ..
         } = self;
+        let auth = resources.auth_custody();
         let lifecycle = match prepared.retain_never_created_resources(resources) {
             Ok(lifecycle) => lifecycle,
             Err(failure) => {
@@ -1055,7 +1171,10 @@ impl ProtectedLaunchContext {
                     #[cfg(test)]
                     boundary,
                 );
-                let _ticket = registry.retain_active_gated(custody);
+                let ticket = registry.retain_active_gated(custody);
+                if let Some(auth) = &auth {
+                    auth.retained(ticket);
+                }
                 return before_cli_start(source);
             }
         };
@@ -1071,7 +1190,17 @@ impl ProtectedLaunchContext {
             boundary.observe_never_created_proven();
         }
         let ticket = registry.retain_active_gated(custody);
-        let _ = registry.retry_active_gated(ticket, enclosing);
+        let retired = matches!(
+            registry.retry_active_gated(ticket, enclosing),
+            Ok(super::gated_launch::ActiveGatedRetryOutcome::Resolved)
+        );
+        if let Some(auth) = &auth {
+            if retired {
+                auth.no_child_and_plan.store(true, Ordering::Release);
+            } else {
+                auth.retained(ticket);
+            }
+        }
         before_cli_start(source)
     }
 }
@@ -1402,6 +1531,7 @@ pub(super) fn spawn_pty_bridged(
     assert_leases_before_spawn(&instance.options, &leases);
     let (attach_store, attach_permit) = PreallocatedAttachStore::pair();
     let mut custody = Box::new(LifecycleResources::Spawn(SpawnCustodyResources {
+        auth: instance.native_auth.as_ref().map(AuthResources::new),
         io: None,
         leases: Some(leases),
         gate_cleanup,
@@ -1609,6 +1739,7 @@ pub(super) fn spawn_pty_bridged(
                 ));
             };
             let SpawnExecutionParts {
+                auth,
                 io: io_resources,
                 leases,
                 gate_cleanup,
@@ -1624,6 +1755,7 @@ pub(super) fn spawn_pty_bridged(
                 SpawnIoResources::Pty(pair) => pair,
                 wrong_kind => {
                     spawn.restore_execution_parts(SpawnExecutionParts {
+                        auth,
                         io: wrong_kind,
                         leases,
                         gate_cleanup,
@@ -1658,6 +1790,7 @@ pub(super) fn spawn_pty_bridged(
                             _io: io,
                             _config: config,
                             _custody: SpawnCustodyResources {
+                                auth,
                                 io: None,
                                 leases: Some(leases),
                                 gate_cleanup,
@@ -1695,6 +1828,7 @@ pub(super) fn spawn_pty_bridged(
                 }
             };
             *resources = LifecycleResources::Execution(ExecutionResources {
+                auth,
                 output_readers,
                 drain_output: false,
                 post_wait,
@@ -1747,6 +1881,7 @@ pub(super) fn spawn_pty_bridged(
         test_boundary.clone(),
     );
     let backend = ContainerExecution {
+        native_auth: instance.native_auth.clone(),
         cli,
         lifecycle: lifecycle.clone(),
         slot,
@@ -1829,6 +1964,7 @@ fn spawn_piped_owned(
 
     let (attach_store, attach_permit) = PreallocatedAttachStore::pair();
     let mut custody = Box::new(LifecycleResources::Spawn(SpawnCustodyResources {
+        auth: instance.native_auth.as_ref().map(AuthResources::new),
         io: Some(SpawnIoResources::Piped(
             crate::engine::container::io_bridge::PipedChildIo::empty(),
         )),
@@ -1844,6 +1980,17 @@ fn spawn_piped_owned(
         custody_witness: test_support::take_custody_witness(),
     }));
     let published_gate = PublishedSpawnGate::new(gated);
+    if let Some(auth) = &instance.native_auth {
+        if let Err(error) = auth.validate() {
+            return Err(published_gate.reject_never_created(
+                prepared,
+                custody,
+                error,
+                #[cfg(test)]
+                test_boundary,
+            ));
+        }
+    }
 
     let prepared_gate = match published_gate.prepare() {
         Ok(prepared_gate) => prepared_gate,
@@ -1953,6 +2100,10 @@ fn spawn_piped_owned(
         instance.name.0.clone(),
         prepared_gate.is_orchestrated(),
     );
+    if instance.native_auth.is_some() {
+        // Device auth waits for the provider/user outcome, never quiet grace.
+        bridge_cfg.cancel_on_grace_expired = None;
+    }
     validate_after_spawn(
         prepared_gate.plan(),
         prepared_gate.adapter().map(|adapter| adapter.as_ref()),
@@ -2026,6 +2177,7 @@ fn spawn_piped_owned(
         prepared_gate.adapter(),
         prepared_gate.enclosing(),
         Arc::clone(&gate_cancelled),
+        instance.native_auth.clone(),
         #[cfg(test)]
         test_boundary.clone(),
     );
@@ -2038,6 +2190,7 @@ fn spawn_piped_owned(
             prepared_gate.adapter(),
             prepared_gate.enclosing(),
             Arc::clone(&gate_cancelled),
+            instance.native_auth.clone(),
             test_boundary.clone(),
         )
     };
@@ -2049,6 +2202,7 @@ fn spawn_piped_owned(
         test_boundary.clone(),
     );
     let backend = ContainerExecution {
+        native_auth: instance.native_auth.clone(),
         cli,
         lifecycle: lifecycle.clone(),
         slot,
@@ -2127,6 +2281,7 @@ pub(super) fn spawn_piped_interactive(
 
     let (attach_store, attach_permit) = PreallocatedAttachStore::pair();
     let mut custody = Box::new(LifecycleResources::Spawn(SpawnCustodyResources {
+        auth: instance.native_auth.as_ref().map(AuthResources::new),
         io: Some(SpawnIoResources::Piped(
             crate::engine::container::io_bridge::PipedChildIo::empty(),
         )),
@@ -2323,6 +2478,7 @@ pub(super) fn spawn_piped_interactive(
         test_boundary.clone(),
     );
     let backend = ContainerExecution {
+        native_auth: instance.native_auth.clone(),
         cli,
         lifecycle: lifecycle.clone(),
         slot,
@@ -2368,6 +2524,7 @@ pub(super) fn stop_and_remove(bin: &str, name: &str) {
 /// The running container. One type for every CLI-shaped backend; the only
 /// per-backend state is `cli`.
 pub(super) struct ContainerExecution {
+    native_auth: Option<Arc<AuthCustody>>,
     /// Which CLI owns this container — the binary `cancel` shells out to and
     /// the name that appears in this backend's error messages.
     cli: ContainerCli,
@@ -2409,6 +2566,7 @@ fn start_gate_monitor(
     adapter: Option<&Arc<dyn GatedProviderAdapter>>,
     enclosing: Option<Instant>,
     cancelled: Arc<AtomicBool>,
+    native_auth: Option<Arc<AuthCustody>>,
     #[cfg(test)] boundary: Option<
         Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
     >,
@@ -2420,15 +2578,26 @@ fn start_gate_monitor(
     let worker = std::thread::Builder::new()
         .name("awman-orchestrated-apple-gate".into())
         .spawn(move || {
-            super::orchestrated_apple::await_protected_release(
-                &plan,
-                adapter.as_ref(),
-                &cancelled,
-                enclosing,
-                #[cfg(test)]
-                boundary.as_deref(),
-            )
-            .map(|_| ())
+            let result = match native_auth.as_deref() {
+                Some(auth) => super::orchestrated_apple::await_native_auth_release(
+                    &plan,
+                    adapter.as_ref(),
+                    &cancelled,
+                    enclosing,
+                    auth,
+                    #[cfg(test)]
+                    boundary.as_deref(),
+                ),
+                None => super::orchestrated_apple::await_protected_release(
+                    &plan,
+                    adapter.as_ref(),
+                    &cancelled,
+                    enclosing,
+                    #[cfg(test)]
+                    boundary.as_deref(),
+                ),
+            };
+            result.map(|_| ())
         })
         .ok();
     Some(ActiveGateMonitor::new(monitor_cancelled, worker))
@@ -2436,9 +2605,9 @@ fn start_gate_monitor(
 
 impl Drop for ContainerExecution {
     fn drop(&mut self) {
-        if let Some(owner) = self.orchestrated_owner.as_mut() {
+        if self.orchestrated_owner.is_some() {
             self.gate_cancelled.store(true, Ordering::Release);
-            let _ticket = owner.retain(LaunchRetentionReason::ChildStateUnknown, None);
+            let _ = self.retain_uncertain(LaunchRetentionReason::ChildStateUnknown, None);
             return;
         }
         self.gate_cancelled.store(true, Ordering::Release);
@@ -2455,9 +2624,15 @@ impl ContainerExecution {
         let owner = self.orchestrated_owner.as_mut().ok_or_else(|| {
             EngineError::Container("orchestrated execution custody unavailable".into())
         })?;
-        let _ticket = owner.retain(reason, last_inspection).ok_or_else(|| {
+        if let Some(custody) = owner.custody.as_mut() {
+            custody.native_auth = self.native_auth.clone();
+        }
+        let ticket = owner.retain(reason, last_inspection).ok_or_else(|| {
             EngineError::Container("orchestrated execution custody unavailable".into())
         })?;
+        if let Some(auth) = &self.native_auth {
+            auth.retained(ticket);
+        }
         #[cfg(test)]
         if let Some(boundary) = &self.test_boundary {
             boundary.observe_custody(
@@ -2502,6 +2677,19 @@ impl ExecutionBackend for ContainerExecution {
         };
         let mut gate_rejection = None;
         let info = match gate_result {
+            Some(Err(reason))
+                if self
+                    .native_auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.auth_release_failed()) =>
+            {
+                // A spent failed release is retained even if the CLI happened
+                // to exit meanwhile; it grants no auth retry/retirement result.
+                self.retain_uncertain(reason, None)?;
+                return Err(EngineError::Container(
+                    "auth release retained for recovery".into(),
+                ));
+            }
             Some(Err(reason)) => match self.lifecycle.wait_actual_until(Instant::now()) {
                 Ok(Some(info)) => {
                     gate_rejection = Some(reason);
@@ -2555,6 +2743,16 @@ impl ExecutionBackend for ContainerExecution {
             if let Some(boundary) = custody.boundary.as_deref() {
                 boundary.observe_resource_loan_released();
             }
+            if self
+                .native_auth
+                .as_ref()
+                .is_some_and(|auth| auth.reader_failed.load(Ordering::Acquire))
+            {
+                self.retain_uncertain(LaunchRetentionReason::ChildStateUnknown, None)?;
+                return Err(EngineError::Container(
+                    "auth required reader failed; custody retained".into(),
+                ));
+            }
             self.orchestrated_owner = None;
         }
         if let Some(resource_loan) = self.resource_loan.take() {
@@ -2572,6 +2770,9 @@ impl ExecutionBackend for ContainerExecution {
                 },
                 false,
             );
+        }
+        if let Some(auth) = &self.native_auth {
+            auth.retired.store(true, Ordering::Release);
         }
         if let Some(reason) = gate_rejection {
             return Err(EngineError::Container(format!(

@@ -25,6 +25,7 @@ use crate::engine::step_status::StepStatus;
 pub mod agent_matrix;
 pub mod download;
 pub mod frontend;
+pub(crate) mod native_codex_preparation;
 
 #[cfg(all(test, unix))]
 mod orchestrated_apple_cleanup_authority_test;
@@ -96,6 +97,8 @@ pub struct AgentEngine {
     /// RAII guards so the files live as long as this engine instance and are
     /// removed on drop — no `/tmp` leakage.
     prompt_tempfiles: Arc<std::sync::Mutex<Vec<tempfile::NamedTempFile>>>,
+    #[cfg(all(test, unix))]
+    native_codex_auth_observer: Option<Arc<native_codex_auth_preparation_test::AuthObserver>>,
 }
 
 impl AgentEngine {
@@ -107,6 +110,8 @@ impl AgentEngine {
             overlay_engine,
             container_runtime,
             prompt_tempfiles: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(all(test, unix))]
+            native_codex_auth_observer: None,
         }
     }
 

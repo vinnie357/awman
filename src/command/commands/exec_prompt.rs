@@ -315,6 +315,64 @@ impl Command for ExecPromptCommand {
                 return Err(e);
             }
         };
+        if self.native_print && agent.as_str() == "codex" {
+            use crate::engine::agent::native_codex_preparation::{
+                AuthRetirement, AuthStartError, PreparationError,
+            };
+            let request = crate::engine::agent::agent_matrix::NativePrintRequest::new(
+                "codex",
+                self.flags.model.as_deref(),
+                self.native_session.as_deref(),
+            )?;
+            let preparation = match self
+                .engines
+                .agent_engine
+                .prepare_native_codex(&session, request)
+            {
+                Ok(preparation) => preparation,
+                Err(PreparationError::Rejected(error)) => return Err(error.into()),
+                Err(PreparationError::Activated { owner, error }) => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+            };
+            let auth = match preparation.start_auth(frontend.container_frontend()) {
+                Ok(auth) => auth,
+                Err(AuthStartError::NotStarted { preparation, error }) => {
+                    drop(preparation);
+                    return Err(error.into());
+                }
+                Err(AuthStartError::CustodyHeld { owner, error }) => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+                Err(AuthStartError::Retained { ticket, error }) => {
+                    tracing::debug!(?ticket, "native Codex authentication retained for recovery");
+                    return Err(error.into());
+                }
+            };
+            match auth.wait_auth_retired().await {
+                AuthRetirement::Authenticated(owner) => drop(owner),
+                AuthRetirement::Retryable(owner) => drop(owner),
+                AuthRetirement::Stopped { owner, error } => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+                AuthRetirement::Retained { ticket, error } => {
+                    tracing::debug!(?ticket, "native Codex authentication retained for recovery");
+                    return Err(error.into());
+                }
+                AuthRetirement::CustodyHeld { owner, error } => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+            }
+            return Err(crate::engine::error::EngineError::Config(
+                "native Codex main execution remains unqualified".into(),
+            )
+            .into());
+        }
+
         // Resolve ACP policy before overlays or container setup. A direct ACP
         // request is deliberately never eligible for fallback.
         let config = command_effective_config(&session, &self.flags);
@@ -691,3 +749,7 @@ mod native_print_result_test;
 #[cfg(all(test, unix))]
 #[path = "native_codex_auth_entry_test.rs"]
 mod native_codex_auth_entry_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_auth_retention_regression_test.rs"]
+mod native_codex_auth_retention_regression_test;

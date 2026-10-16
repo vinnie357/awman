@@ -89,7 +89,7 @@ impl crate::engine::acp::AcpFrontend for Frontend {
 #[async_trait::async_trait]
 impl ExecPromptCommandFrontend for Frontend {}
 
-fn command(f: &Fixture) -> ExecPromptCommand {
+pub(super) fn command(f: &Fixture) -> ExecPromptCommand {
     let observer = Arc::clone(&f.observer);
     // Named missing observer seam must fire at actual generic resolver entry.
     // auth=none in the synthetic repo prevents host lookup even on a wrong route.
@@ -134,7 +134,7 @@ fn command(f: &Fixture) -> ExecPromptCommand {
     command.native_print = true;
     command
 }
-fn frontend(f: &Fixture) -> (Box<dyn ExecPromptCommandFrontend>, UserOutput) {
+pub(super) fn frontend(f: &Fixture) -> (Box<dyn ExecPromptCommandFrontend>, UserOutput) {
     let (user, output) = f.frontend();
     (
         Box::new(Frontend {

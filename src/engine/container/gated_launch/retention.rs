@@ -114,10 +114,19 @@ enum RetainedRegistryEnvelope {
         boundary: Option<Arc<dyn OrchestratedAppleTestBoundary>>,
     },
     ActiveGated(Box<ActiveGatedCustody>),
+    // Original pre-spawn auth custody with an untrusted existing plan. This
+    // envelope deliberately has no promotion, cleanup or discharge operation.
+    UnresolvedAuthPreparation {
+        _prepared: PreparedChildLifecycle,
+        _resources: Box<dyn Any + Send>,
+        _auth: Arc<crate::engine::agent::native_codex_preparation::AuthCustody>,
+    },
     Legacy(Option<RetainedExecution>),
 }
 
 pub(crate) struct ActiveGatedCustody {
+    pub(in crate::engine::container) native_auth:
+        Option<Arc<crate::engine::agent::native_codex_preparation::AuthCustody>>,
     pub(in crate::engine::container) plan: DurableLaunchPlan,
     pub(in crate::engine::container) lifecycle: ChildLifecycleAuthority,
     pub(in crate::engine::container) resource_loan: Option<ExecutionResourceLoan>,
@@ -159,6 +168,7 @@ impl ActiveGatedCustody {
             gate_monitor,
             cleanup_phase:
                 crate::engine::container::orchestrated_apple::ExactCleanupPhase::NeedsCleanup,
+            native_auth: None,
             cleanup_lifecycle: CleanupLifecycleProvenance::Created,
             never_created_reconciliation: None,
             #[cfg(test)]
@@ -185,6 +195,7 @@ impl ActiveGatedCustody {
                 crate::engine::container::orchestrated_apple::ExactCleanupPhase::NeverCreatedNeedsAbsence {
                     proof,
                 },
+            native_auth: None,
             cleanup_lifecycle: CleanupLifecycleProvenance::NeverCreated,
             never_created_reconciliation: None,
             #[cfg(test)]
@@ -209,6 +220,7 @@ impl ActiveGatedCustody {
             gate_monitor: None,
             cleanup_phase:
                 crate::engine::container::orchestrated_apple::ExactCleanupPhase::NeedsCleanup,
+            native_auth: None,
             cleanup_lifecycle: CleanupLifecycleProvenance::NeverCreatedUncertain,
             never_created_reconciliation: Some(failure),
             #[cfg(test)]
@@ -359,6 +371,19 @@ impl LaunchRetentionRegistry {
             .entry(ticket)
             .or_insert(0);
         ticket
+    }
+
+    pub(in crate::engine::container) fn retain_unresolved_auth_preparation(
+        &self,
+        prepared: PreparedChildLifecycle,
+        resources: Box<dyn Any + Send>,
+        auth: Arc<crate::engine::agent::native_codex_preparation::AuthCustody>,
+    ) -> LaunchRetentionTicket {
+        self.retain_envelope(RetainedRegistryEnvelope::UnresolvedAuthPreparation {
+            _prepared: prepared,
+            _resources: resources,
+            _auth: auth,
+        })
     }
 
     pub(in crate::engine::container) fn retain_pending_publication(
@@ -512,6 +537,12 @@ fn retry_claimed_active_gated(
     entry: &mut RetainedEntry,
     deadline: Instant,
 ) -> Result<ActiveGatedRetryOutcome, EngineError> {
+    if matches!(
+        entry.launch,
+        RetainedRegistryEnvelope::UnresolvedAuthPreparation { .. }
+    ) {
+        return Ok(ActiveGatedRetryOutcome::Retained);
+    }
     if let RetainedRegistryEnvelope::PendingPublication {
         publication,
         prepared,
@@ -669,19 +700,24 @@ fn retry_claimed_active_gated(
         }
     }
 
-    let loan_released = custody
-        .resource_loan
-        .as_mut()
-        .is_some_and(|resource_loan| resource_loan.release_and_wait_until(deadline));
+    let already_released_auth = custody.native_auth.is_some()
+        && custody.resource_loan.is_none()
+        && custody.lifecycle.resources_are_released();
+    let loan_released = already_released_auth
+        || custody
+            .resource_loan
+            .as_mut()
+            .is_some_and(|resource_loan| resource_loan.release_and_wait_until(deadline));
     if !loan_released {
         return Ok(ActiveGatedRetryOutcome::Retained);
     }
 
-    let Some(_released_resource_loan) = custody.resource_loan.take() else {
+    let _released_resource_loan = custody.resource_loan.take();
+    if _released_resource_loan.is_none() && !already_released_auth {
         return Err(EngineError::Container(
             "retained execution resource loan unavailable".into(),
         ));
-    };
+    }
     #[cfg(test)]
     {
         let mut releases = shared
@@ -910,6 +946,8 @@ fn initially_owns_unreaped_child(launch: &RetainedRegistryEnvelope) -> bool {
     let execution = match launch {
         RetainedRegistryEnvelope::Gated(launch) => launch.execution.as_ref(),
         RetainedRegistryEnvelope::PendingPublication { .. } => return false,
+        // Only local non-start is known; this says nothing about the provider.
+        RetainedRegistryEnvelope::UnresolvedAuthPreparation { .. } => return false,
         RetainedRegistryEnvelope::ActiveGated(launch) => {
             return match launch.cleanup_lifecycle {
                 CleanupLifecycleProvenance::Created => {
@@ -983,6 +1021,10 @@ fn poll_retained_entry(
         }
         RetainedRegistryEnvelope::PendingPublication { .. } => RetainedEntryPoll {
             child_reaped: true,
+            resolved: false,
+        },
+        RetainedRegistryEnvelope::UnresolvedAuthPreparation { .. } => RetainedEntryPoll {
+            child_reaped: false,
             resolved: false,
         },
         RetainedRegistryEnvelope::ActiveGated(launch) => {

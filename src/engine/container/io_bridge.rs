@@ -397,9 +397,27 @@ pub(crate) fn bridge_piped_io(
 
 pub(crate) fn bridge_piped_io_observed(
     io: AgentIo,
+    pipes: PipedChildIo,
+    config: BridgeConfig,
+    observer: Option<Box<dyn PipedStdoutObserver>>,
+) -> BridgeResult {
+    bridge_piped_io_with_policy(io, pipes, config, observer, false)
+}
+
+pub(crate) fn bridge_private_auth_io(
+    io: AgentIo,
+    pipes: PipedChildIo,
+    config: BridgeConfig,
+) -> BridgeResult {
+    bridge_piped_io_with_policy(io, pipes, config, None, true)
+}
+
+fn bridge_piped_io_with_policy(
+    io: AgentIo,
     mut pipes: PipedChildIo,
     config: BridgeConfig,
     mut observer: Option<Box<dyn PipedStdoutObserver>>,
+    private: bool,
 ) -> BridgeResult {
     let activity: SharedActivity = Arc::new(Mutex::new(None));
     let first_byte = Arc::new(AtomicBool::new(false));
@@ -432,9 +450,11 @@ pub(crate) fn bridge_piped_io_observed(
                             observer.observe(&buf[..n]);
                         }
                         update_activity(&act, &fb);
-                        tail.push_bytes(&buf[..n]);
+                        if !private {
+                            tail.push_bytes(&buf[..n]);
+                        }
                         if let Some(tx) = &broadcast {
-                            if tx.receiver_count() > 0 {
+                            if !private && tx.receiver_count() > 0 {
                                 let _ = tx.send(buf[..n].to_vec());
                             }
                         }
@@ -473,9 +493,11 @@ pub(crate) fn bridge_piped_io_observed(
                     Err(_) => break PipedReadEnd::ReadError,
                     Ok(n) => {
                         update_activity(&act, &fb);
-                        tail.push_bytes(&buf[..n]);
+                        if !private {
+                            tail.push_bytes(&buf[..n]);
+                        }
                         if let Some(tx) = &broadcast {
-                            if tx.receiver_count() > 0 {
+                            if !private && tx.receiver_count() > 0 {
                                 let _ = tx.send(buf[..n].to_vec());
                             }
                         }
