@@ -454,14 +454,13 @@ impl NativeCodexAuthExecution {
         #[cfg(all(test, unix))]
         let observer = custody.observer();
         CancelHandle::new(move || {
+            custody.cancelled.store(true, Ordering::Release);
             let result = handle.cancel();
             #[cfg(all(test, unix))]
             if let Some(observer) = &observer {
                 observer.after_actual_auth_cancel_return();
             }
-            result?;
-            custody.cancelled.store(true, Ordering::Release);
-            Ok(())
+            result
         })
     }
     pub(crate) async fn wait_auth_retired(mut self) -> AuthRetirement {
