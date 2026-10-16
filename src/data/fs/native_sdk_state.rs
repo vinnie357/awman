@@ -79,6 +79,154 @@ pub(crate) struct NativeSdkStateLease {
     writer_lock: std::fs::File,
 }
 
+const ACTIVE_RUN: &str = "active-run.json";
+const COMPLETED_RUN: &str = "completed-run.json";
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActiveRunRecord {
+    schema_version: u32,
+    run_id: Uuid,
+    owner: OwnerRecord,
+    #[serde(deserialize_with = "required_requested_session")]
+    requested_session: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompletedRunRecord {
+    schema_version: u32,
+    run_id: Uuid,
+    owner: OwnerRecord,
+    #[serde(deserialize_with = "required_requested_session")]
+    requested_session: Option<String>,
+    session_id: String,
+}
+
+fn required_requested_session<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
+}
+
+impl ActiveRunRecord {
+    fn validate(&self, owner: &OwnerRecord) -> Result<(), DataError> {
+        if self.schema_version != SCHEMA_VERSION || self.owner != *owner {
+            return Err(invalid("active run does not match the acquired owner"));
+        }
+        if let Some(session) = &self.requested_session {
+            validate_session_id(session)?;
+        }
+        Ok(())
+    }
+}
+
+impl CompletedRunRecord {
+    fn new(active: &ActiveRunRecord, session: &str) -> Self {
+        Self {
+            schema_version: active.schema_version,
+            run_id: active.run_id,
+            owner: active.owner.clone(),
+            requested_session: active.requested_session.clone(),
+            session_id: session.into(),
+        }
+    }
+
+    fn validate(&self, owner: &OwnerRecord) -> Result<(), DataError> {
+        if self.schema_version != SCHEMA_VERSION || self.owner != *owner {
+            return Err(invalid("completed run does not match the acquired owner"));
+        }
+        validate_session_id(&self.session_id)?;
+        if let Some(session) = &self.requested_session {
+            validate_session_id(session)?;
+            if session != &self.session_id {
+                return Err(invalid(
+                    "completed acknowledgement differs from its request",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn matches(&self, active: &ActiveRunRecord) -> bool {
+        self.schema_version == active.schema_version
+            && self.run_id == active.run_id
+            && self.owner == active.owner
+            && self.requested_session == active.requested_session
+    }
+}
+
+enum NativeSdkRunPhase {
+    Active,
+    PublicationUncertain(Box<CompletedRunRecord>),
+    Completed,
+}
+
+pub(crate) struct NativeSdkRunLease {
+    lease: NativeSdkStateLease,
+    activation: ActiveRunRecord,
+    phase: NativeSdkRunPhase,
+}
+
+pub(crate) enum NativeSdkRunCompletion {
+    Completed,
+    CompletedPublicationUncertain(DataError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)] // The reviewed fault API names each post-operation boundary.
+pub(crate) enum NativeSdkRunFsFault {
+    AfterActivationRename,
+    AfterAssociationRename,
+    AfterCompletionRename,
+    AfterCompletionDirectorySync,
+}
+
+impl NativeSdkState {
+    pub(crate) fn acquire_first_run(
+        &self,
+        key: &NativeSdkStateKey,
+    ) -> Result<NativeSdkRunLease, DataError> {
+        self.acquire_first_run_with_fault(key, None)
+    }
+
+    pub(crate) fn acquire_resume_run(
+        &self,
+        key: &NativeSdkStateKey,
+        session: &str,
+    ) -> Result<NativeSdkRunLease, DataError> {
+        self.acquire_resume_run_with_fault(key, session, None)
+    }
+}
+
+impl NativeSdkRunLease {
+    pub(crate) fn state_path(&self) -> &Path {
+        self.lease.state_path()
+    }
+
+    pub(crate) fn validate_request(
+        &self,
+        provider: NativeSdkProvider,
+        model: &str,
+        session: Option<&str>,
+    ) -> Result<(), DataError> {
+        self.lease.validate_request(provider, model, session)?;
+        self.validate_active()
+    }
+
+    pub(crate) fn complete_run(
+        &mut self,
+        session: &str,
+    ) -> Result<NativeSdkRunCompletion, DataError> {
+        self.complete_run_with_fault(session, None)
+    }
+
+    pub(crate) fn reconcile_completed(&mut self) -> Result<NativeSdkRunCompletion, DataError> {
+        self.reconcile_completed_with_fault(None)
+    }
+}
+
 impl NativeSdkStateLease {
     pub(crate) fn state_path(&self) -> &Path {
         &self.state_path
@@ -491,6 +639,286 @@ mod unix {
         }
     }
 
+    fn run_fault(
+        fault: Option<NativeSdkRunFsFault>,
+        boundary: NativeSdkRunFsFault,
+        path: &Path,
+    ) -> Result<(), DataError> {
+        if fault == Some(boundary) {
+            return Err(DataError::io(
+                path,
+                std::io::Error::other(format!("injected native SDK run-state fault: {boundary:?}")),
+            ));
+        }
+        Ok(())
+    }
+
+    impl NativeSdkState {
+        pub(crate) fn acquire_first_run_with_fault(
+            &self,
+            key: &NativeSdkStateKey,
+            fault: Option<NativeSdkRunFsFault>,
+        ) -> Result<NativeSdkRunLease, DataError> {
+            NativeSdkRunLease::activate(self.acquire_first(key)?, fault)
+        }
+
+        pub(crate) fn acquire_resume_run_with_fault(
+            &self,
+            key: &NativeSdkStateKey,
+            session: &str,
+            fault: Option<NativeSdkRunFsFault>,
+        ) -> Result<NativeSdkRunLease, DataError> {
+            let lease = self.acquire_resume(key, session)?;
+            lease.read_run_proof(session)?;
+            NativeSdkRunLease::activate(lease, fault)
+        }
+    }
+
+    impl NativeSdkRunLease {
+        fn activate(
+            lease: NativeSdkStateLease,
+            fault: Option<NativeSdkRunFsFault>,
+        ) -> Result<Self, DataError> {
+            let activation = ActiveRunRecord {
+                schema_version: SCHEMA_VERSION,
+                run_id: Uuid::new_v4(),
+                owner: lease.owner_record.clone(),
+                requested_session: lease.acquired_session.clone(),
+            };
+            let run = Self {
+                lease,
+                activation,
+                phase: NativeSdkRunPhase::Active,
+            };
+            let (pending, file) = run.lease.prepare_run_record(ACTIVE_RUN, &run.activation)?;
+            run.lease.rename_run_record(&pending, &file, ACTIVE_RUN)?;
+            run_fault(
+                fault,
+                NativeSdkRunFsFault::AfterActivationRename,
+                &run.lease.owner_path,
+            )?;
+            run.lease.sync_run_directory()?;
+            run.validate_active()?;
+            Ok(run)
+        }
+
+        pub(super) fn validate_active(&self) -> Result<(), DataError> {
+            self.lease.validate()?;
+            let active: ActiveRunRecord = read_record(&self.lease.directories[6], ACTIVE_RUN)?;
+            active.validate(&self.lease.owner_record)?;
+            if active != self.activation
+                || self.activation.requested_session != self.lease.acquired_session
+            {
+                return Err(invalid("named activation differs from the acquired run"));
+            }
+            self.lease.validate()
+        }
+
+        fn validate_completed(&self, expected: &CompletedRunRecord) -> Result<(), DataError> {
+            let (active, completed) = self.lease.read_run_proof(&expected.session_id)?;
+            if active != self.activation || completed != *expected {
+                return Err(invalid("completed proof differs from the retained run"));
+            }
+            Ok(())
+        }
+
+        pub(crate) fn complete_run_with_fault(
+            &mut self,
+            session: &str,
+            fault: Option<NativeSdkRunFsFault>,
+        ) -> Result<NativeSdkRunCompletion, DataError> {
+            if !matches!(self.phase, NativeSdkRunPhase::Active) {
+                return Err(invalid("run completion is already published or uncertain"));
+            }
+            validate_session_id(session)?;
+            if self
+                .activation
+                .requested_session
+                .as_deref()
+                .is_some_and(|id| id != session)
+            {
+                return Err(invalid("acknowledged session changed during resume"));
+            }
+            self.validate_active()?;
+            self.lease.validate_run_destination(COMPLETED_RUN)?;
+            self.lease.publish_session_with_run_fault(session, fault)?;
+            self.validate_active()?;
+            self.lease.sync_session_directory()?;
+            self.lease.read_run_association(session)?;
+            self.validate_active()?;
+            let completed = CompletedRunRecord::new(&self.activation, session);
+            let (pending, file) = self.lease.prepare_run_record(COMPLETED_RUN, &completed)?;
+            self.validate_active()?;
+            self.lease
+                .rename_run_record(&pending, &file, COMPLETED_RUN)?;
+            // A visible completion must retain uncertainty before any later fallible operation.
+            self.phase = NativeSdkRunPhase::PublicationUncertain(Box::new(completed.clone()));
+            let result = (|| {
+                run_fault(
+                    fault,
+                    NativeSdkRunFsFault::AfterCompletionRename,
+                    &self.lease.owner_path,
+                )?;
+                self.lease.sync_run_directory()?;
+                run_fault(
+                    fault,
+                    NativeSdkRunFsFault::AfterCompletionDirectorySync,
+                    &self.lease.owner_path,
+                )?;
+                self.validate_completed(&completed)
+            })();
+            match result {
+                Ok(()) => {
+                    self.phase = NativeSdkRunPhase::Completed;
+                    Ok(NativeSdkRunCompletion::Completed)
+                }
+                Err(error) => Ok(NativeSdkRunCompletion::CompletedPublicationUncertain(error)),
+            }
+        }
+
+        pub(crate) fn reconcile_completed_with_fault(
+            &mut self,
+            fault: Option<NativeSdkRunFsFault>,
+        ) -> Result<NativeSdkRunCompletion, DataError> {
+            if fault.is_some_and(|fault| fault != NativeSdkRunFsFault::AfterCompletionDirectorySync)
+            {
+                return Err(invalid("reconciliation has no rename fault boundary"));
+            }
+            let expected = match &self.phase {
+                NativeSdkRunPhase::PublicationUncertain(expected) => expected.clone(),
+                NativeSdkRunPhase::Active | NativeSdkRunPhase::Completed => {
+                    return Err(invalid("run has no uncertain completion to reconcile"));
+                }
+            };
+            self.validate_completed(&expected)?;
+            self.lease.sync_session_directory()?;
+            self.lease.sync_run_directory()?;
+            run_fault(
+                fault,
+                NativeSdkRunFsFault::AfterCompletionDirectorySync,
+                &self.lease.owner_path,
+            )?;
+            self.validate_completed(&expected)?;
+            self.phase = NativeSdkRunPhase::Completed;
+            Ok(NativeSdkRunCompletion::Completed)
+        }
+    }
+
+    impl NativeSdkStateLease {
+        fn read_run_association(&self, session: &str) -> Result<(), DataError> {
+            validate_session_id(session)?;
+            let name = format!("{}.json", hex(&Sha256::digest(session.as_bytes())));
+            let record: AssociationRecord = read_record(&self.directories[5], &name)?;
+            if record.schema_version != SCHEMA_VERSION
+                || record.session_id != session
+                || record.owner != self.owner_record
+            {
+                return Err(invalid("association differs from the acquired run owner"));
+            }
+            Ok(())
+        }
+
+        fn read_run_proof(
+            &self,
+            session: &str,
+        ) -> Result<(ActiveRunRecord, CompletedRunRecord), DataError> {
+            self.validate()?;
+            self.read_run_association(session)?;
+            let active: ActiveRunRecord = read_record(&self.directories[6], ACTIVE_RUN)?;
+            let completed: CompletedRunRecord = read_record(&self.directories[6], COMPLETED_RUN)?;
+            active.validate(&self.owner_record)?;
+            completed.validate(&self.owner_record)?;
+            if !completed.matches(&active) || completed.session_id != session {
+                return Err(invalid(
+                    "latest activation has no exact matching completion",
+                ));
+            }
+            self.validate()?;
+            Ok((active, completed))
+        }
+
+        fn validate_run_destination(&self, name: &str) -> Result<(), DataError> {
+            let result = if name == ACTIVE_RUN {
+                read_record::<ActiveRunRecord>(&self.directories[6], name)
+                    .and_then(|record| record.validate(&self.owner_record))
+            } else {
+                read_record::<CompletedRunRecord>(&self.directories[6], name)
+                    .and_then(|record| record.validate(&self.owner_record))
+            };
+            match result {
+                Err(DataError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Ok(())
+                }
+                result => result,
+            }
+        }
+
+        fn prepare_run_record<T: Serialize>(
+            &self,
+            name: &str,
+            record: &T,
+        ) -> Result<(String, File), DataError> {
+            self.validate()?;
+            self.validate_run_destination(name)?;
+            let bytes = serde_json::to_vec(record)
+                .map_err(|source| DataError::ConfigSerialize { source })?;
+            if bytes.len() as u64 > MAX_RECORD_BYTES {
+                return Err(invalid("run record exceeded its bound"));
+            }
+            let owner = &self.directories[6];
+            let pending = format!("run-{}.pending", Uuid::new_v4());
+            let mut file = open_relative(
+                owner,
+                &pending,
+                OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
+            )?;
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| DataError::io(owner.path.join(&pending), error))?;
+            self.validate()?;
+            Ok((pending, file))
+        }
+
+        fn rename_run_record(
+            &self,
+            pending: &str,
+            file: &File,
+            name: &str,
+        ) -> Result<(), DataError> {
+            self.validate()?;
+            self.validate_run_destination(name)?;
+            let owner = &self.directories[6];
+            let named = open_relative(owner, pending, OFlag::O_RDONLY)?;
+            if regular_identity(file, &owner.path.join(pending))?
+                != regular_identity(&named, &owner.path.join(pending))?
+            {
+                return Err(invalid("pending run record identity changed"));
+            }
+            rustix::fs::renameat(&owner.file, pending, &owner.file, name)
+                .map_err(|error| DataError::io(owner.path.join(name), error.into()))
+        }
+
+        fn sync_session_directory(&self) -> Result<(), DataError> {
+            self.validate()?;
+            let sessions = &self.directories[5];
+            sessions
+                .file
+                .sync_all()
+                .map_err(|error| DataError::io(&sessions.path, error))
+        }
+
+        fn sync_run_directory(&self) -> Result<(), DataError> {
+            self.validate()?;
+            let owner = &self.directories[6];
+            owner
+                .file
+                .sync_all()
+                .map_err(|error| DataError::io(&owner.path, error))
+        }
+    }
+
     fn lock_writer(file: &File) -> Result<(), DataError> {
         match file.try_lock() {
             Ok(()) => Ok(()),
@@ -505,6 +933,14 @@ mod unix {
 
     impl NativeSdkStateLease {
         pub(crate) fn publish_session(&self, session_id: &str) -> Result<(), DataError> {
+            self.publish_session_with_run_fault(session_id, None)
+        }
+
+        fn publish_session_with_run_fault(
+            &self,
+            session_id: &str,
+            fault: Option<NativeSdkRunFsFault>,
+        ) -> Result<(), DataError> {
             validate_session_id(session_id)?;
             self.validate()?;
             if self
@@ -557,6 +993,12 @@ mod unix {
                 rustix::fs::RenameFlags::NOREPLACE,
             )
             .map_err(|error| DataError::io(sessions.path.join(&name), error.into()))?;
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            run_fault(
+                fault,
+                NativeSdkRunFsFault::AfterAssociationRename,
+                &sessions.path,
+            )?;
             #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             return Err(invalid("atomic native session publication is unsupported"));
             sessions
@@ -587,6 +1029,58 @@ mod unix {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(not(unix))]
+impl NativeSdkState {
+    pub(crate) fn acquire_first_run_with_fault(
+        &self,
+        _: &NativeSdkStateKey,
+        _: Option<NativeSdkRunFsFault>,
+    ) -> Result<NativeSdkRunLease, DataError> {
+        Err(invalid(
+            "native SDK run-state storage is unsupported on this platform",
+        ))
+    }
+
+    pub(crate) fn acquire_resume_run_with_fault(
+        &self,
+        _: &NativeSdkStateKey,
+        _: &str,
+        _: Option<NativeSdkRunFsFault>,
+    ) -> Result<NativeSdkRunLease, DataError> {
+        Err(invalid(
+            "native SDK run-state storage is unsupported on this platform",
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+impl NativeSdkRunLease {
+    fn validate_active(&self) -> Result<(), DataError> {
+        Err(invalid(
+            "native SDK run-state storage is unsupported on this platform",
+        ))
+    }
+
+    pub(crate) fn complete_run_with_fault(
+        &mut self,
+        _: &str,
+        _: Option<NativeSdkRunFsFault>,
+    ) -> Result<NativeSdkRunCompletion, DataError> {
+        Err(invalid(
+            "native SDK run-state storage is unsupported on this platform",
+        ))
+    }
+
+    pub(crate) fn reconcile_completed_with_fault(
+        &mut self,
+        _: Option<NativeSdkRunFsFault>,
+    ) -> Result<NativeSdkRunCompletion, DataError> {
+        Err(invalid(
+            "native SDK run-state storage is unsupported on this platform",
+        ))
     }
 }
 
@@ -647,3 +1141,7 @@ mod tests;
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 #[path = "native_sdk_writer_release_test.rs"]
 mod writer_release_tests;
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "native_sdk_run_state_test.rs"]
+mod run_state_tests;
