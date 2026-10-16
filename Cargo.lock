@@ -220,6 +220,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "async-trait",
+ "awman-test-spawn-barrier",
  "axum",
  "axum-server",
  "base64 0.23.1",
@@ -263,6 +264,13 @@ dependencies = [
  "which",
  "wiremock",
  "zeroize",
+]
+
+[[package]]
+name = "awman-test-spawn-barrier"
+version = "0.0.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

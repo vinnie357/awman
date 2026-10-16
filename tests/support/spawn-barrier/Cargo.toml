@@ -1,0 +1,9 @@
+[package]
+name = "awman-test-spawn-barrier"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.94.0"
+publish = false
+
+[dependencies]
+libc = "=0.2.189"
