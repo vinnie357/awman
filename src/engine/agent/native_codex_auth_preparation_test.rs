@@ -116,6 +116,8 @@ pub(crate) struct AuthObserver {
     pub pre_permission: Pause,
     pub hold_release: AtomicBool,
     pub hold_cleanup: AtomicBool,
+    pub hold_cancel_return: AtomicBool,
+    pub cancel_return: Pause,
     pub cleanup_unknown: AtomicBool,
     pub cleanup_unknown_after_reap: AtomicBool,
     auth_sync_fault: Mutex<Option<crate::data::startup_gate::AuthReleaseSyncFaultHandle>>,
@@ -137,6 +139,11 @@ pub(crate) struct AuthObserver {
     name: Mutex<Option<String>>,
 }
 impl AuthObserver {
+    pub(crate) fn after_actual_auth_cancel_return(&self) {
+        if self.hold_cancel_return.swap(false, Ordering::SeqCst) {
+            self.cancel_return.enter();
+        }
+    }
     pub(crate) fn event(&self, event: &'static str) {
         self.facts.lock().expect("facts").events.push(event);
         self.changed.notify_all();
@@ -421,6 +428,7 @@ impl AuthObserver {
         self.pre_permission.release();
         self.resource_drop.release();
         self.cleanup.release();
+        self.cancel_return.release();
         self.pipe_pause.release();
         self.cleanup_unknown.store(false, Ordering::SeqCst);
         let _ = fs::write(self.dir.join("child-release"), b"release");
@@ -871,6 +879,8 @@ exit "$code"
             pre_permission: Pause::default(),
             hold_release: AtomicBool::new(false),
             hold_cleanup: AtomicBool::new(false),
+            hold_cancel_return: AtomicBool::new(false),
+            cancel_return: Pause::default(),
             cleanup_unknown: AtomicBool::new(false),
             cleanup_unknown_after_reap: AtomicBool::new(false),
             auth_sync_fault: Mutex::new(None),
@@ -2543,4 +2553,84 @@ async fn exchanged_named_sdk_state_rejects_auth_and_spent_attempt_cannot_rearm()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exchanged_guest_control_child_rejects_auth_and_spent_attempt_cannot_rearm() -> TestResult {
     run_taken_final_auth_input_rejection(FinalAuthMutation::ControlChild).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_clean_cancellation_is_retryable_while_cancel_wrapper_is_paused() -> TestResult {
+    struct CancelCaller {
+        observer: Arc<AuthObserver>,
+        thread: Option<std::thread::JoinHandle<Result<(), EngineError>>>,
+    }
+    impl CancelCaller {
+        fn is_finished(&self) -> bool {
+            self.thread.as_ref().expect("cancel thread").is_finished()
+        }
+        fn finish(mut self) -> Result<(), EngineError> {
+            self.observer.cancel_return.release();
+            self.thread
+                .take()
+                .expect("cancel thread")
+                .join()
+                .expect("actual cancellation thread panicked")
+        }
+    }
+    impl Drop for CancelCaller {
+        fn drop(&mut self) {
+            self.observer.cancel_return.release();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    let f = Fixture::new(&[])?;
+    let (user, _output) = f.frontend();
+    f.observer.hold_cleanup.store(true, Ordering::SeqCst);
+    f.observer.hold_cancel_return.store(true, Ordering::SeqCst);
+    let exec = start(&f, user);
+    f.observer.wait_event("protected-release");
+    let activation = f.observer.activation();
+    let cancel = exec.cancel_handle();
+    let waiter = Waiter::new(exec, Arc::clone(&f.observer));
+    let caller = CancelCaller {
+        observer: Arc::clone(&f.observer),
+        thread: Some(std::thread::spawn(move || cancel.cancel())),
+    };
+    f.observer.cancel_return.wait_entered();
+    f.observer.cleanup.wait_entered();
+    assert!(!waiter.is_finished());
+    assert!(!caller.is_finished());
+    f.observer.assert_locked();
+    f.observer.assert_unpublished();
+    f.observer.cleanup.release();
+
+    let retirement = waiter.finish().await;
+    assert!(!caller.is_finished());
+    let AuthRetirement::Retryable(retry) = retirement else {
+        panic!("actual clean cancellation must be Retryable while its wrapper remains paused");
+    };
+    assert_eq!(f.observer.activation(), activation);
+    f.observer.assert_locked();
+    f.observer.assert_unpublished();
+    let facts = f.observer.facts.lock().expect("facts");
+    assert_eq!(facts.argv.len(), 1);
+    for event in [
+        "actual-reap",
+        "exact-remove",
+        "exact-absence",
+        "cleanup-published",
+        "resources-released",
+    ] {
+        assert!(facts.events.contains(&event), "retired without {event}");
+    }
+    drop(facts);
+    assert!(!f.observer.resource_live.load(Ordering::SeqCst));
+    let cancel_result = caller.finish();
+    assert!(
+        matches!(cancel_result, Ok(())),
+        "actual delegated cancellation failed: {cancel_result:?}"
+    );
+    drop(retry);
+    f.observer.assert_unlocked();
+    Ok(())
 }

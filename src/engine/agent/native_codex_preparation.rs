@@ -451,8 +451,15 @@ impl NativeCodexAuthExecution {
             .cancel_handle()
             .expect("managed auth has a real cancel handle");
         let custody = Arc::clone(&self.custody);
+        #[cfg(all(test, unix))]
+        let observer = custody.observer();
         CancelHandle::new(move || {
-            handle.cancel()?;
+            let result = handle.cancel();
+            #[cfg(all(test, unix))]
+            if let Some(observer) = &observer {
+                observer.after_actual_auth_cancel_return();
+            }
+            result?;
             custody.cancelled.store(true, Ordering::Release);
             Ok(())
         })
