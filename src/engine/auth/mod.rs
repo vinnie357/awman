@@ -4,6 +4,8 @@
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use ring::digest;
@@ -226,10 +228,22 @@ pub struct TlsMaterial {
     pub fingerprint_sha256_hex: String,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct AuthResolutionObserver(Arc<dyn Fn() + Send + Sync>);
+#[cfg(test)]
+impl std::fmt::Debug for AuthResolutionObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthResolutionObserver")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AuthEngine {
     auth_paths: AuthPathResolver,
     api_paths: ApiPaths,
+    #[cfg(test)]
+    resolution_observer: Option<AuthResolutionObserver>,
 }
 
 impl AuthEngine {
@@ -239,6 +253,8 @@ impl AuthEngine {
         Ok(Self {
             auth_paths,
             api_paths,
+            #[cfg(test)]
+            resolution_observer: None,
         })
     }
 
@@ -246,7 +262,18 @@ impl AuthEngine {
         Self {
             auth_paths,
             api_paths,
+            #[cfg(test)]
+            resolution_observer: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_agent_auth_resolution_observer(
+        mut self,
+        observer: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.resolution_observer = Some(AuthResolutionObserver(observer));
+        self
     }
 
     pub fn api_paths(&self) -> &ApiPaths {
@@ -379,6 +406,10 @@ impl AuthEngine {
         session: &Session,
         agent: &AgentName,
     ) -> Result<AgentCredentials, EngineError> {
+        #[cfg(test)]
+        if let Some(observer) = &self.resolution_observer {
+            (observer.0)();
+        }
         match session.effective_config().auth_mode() {
             AgentAuthMode::Keychain => {
                 if session.effective_config().auth_refresh().enabled {

@@ -181,6 +181,15 @@ impl NativePrintRequest {
         })
     }
 
+    pub(crate) fn fresh_codex_model(&self) -> Result<&str, EngineError> {
+        if !matches!(self.provider, NativeProvider::Codex) || self.session.is_some() {
+            return Err(EngineError::Config(
+                "contained auth requires a fresh Codex owner".into(),
+            ));
+        }
+        Ok(&self.model)
+    }
+
     pub(crate) fn invocation(&self, prompt: &str) -> (Entrypoint, Option<String>) {
         let (mut argv, stdin) = match self.provider {
             NativeProvider::Codex => (
