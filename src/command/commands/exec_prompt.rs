@@ -687,3 +687,7 @@ mod tests {
 #[cfg(test)]
 #[path = "native_print_result_test.rs"]
 mod native_print_result_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_auth_entry_test.rs"]
+mod native_codex_auth_entry_test;

@@ -2814,3 +2814,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+pub(crate) mod native_codex_auth_preparation_test;
