@@ -73,6 +73,9 @@ libproc = "=0.14.11"
 reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
 wiremock = "0.6"
 
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dev-dependencies]
+awman-test-spawn-barrier = { path = "tests/support/spawn-barrier" }
+
 # ── New architecture integration tests (WI 0073) ─────────────────────────────
 # autotests = false suppresses the legacy tests/; these explicit entries
 # target the new src/ API only.
