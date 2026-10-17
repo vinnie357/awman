@@ -211,7 +211,7 @@ class _OwnedObserverChildren:
             }
 
 
-def _observer_case_in_disposable_runner(case):
+def _observer_case_in_disposable_runner(case, identity):
     real_fork = os.fork
     real_kill = os.kill
     real_waitpid = os.waitpid
@@ -284,7 +284,6 @@ def _observer_case_in_disposable_runner(case):
             result["second_cleanup"] = children.result_fields()
             result["status"] = "guard-ok"
         else:
-            identity = bootstrap.resolve_runtime_identity(None)
             if case == "invalid_identity":
                 identity = bootstrap.RuntimeIdentity(-1, -1, (), True)
             patches = [
@@ -339,21 +338,49 @@ def _observer_case_in_disposable_runner(case):
     return result
 
 
+def _observer_case_worker(case, write_fd, identity_json):
+    try:
+        fields = json.loads(identity_json)
+        if (
+            not isinstance(fields, dict)
+            or set(fields) != {"uid", "gid", "groups", "drop"}
+            or type(fields["drop"]) is not bool
+            or not isinstance(fields["groups"], list)
+            or any(
+                type(value) is not int or value < 0
+                for value in [fields["uid"], fields["gid"], *fields["groups"]]
+            )
+        ):
+            raise ValueError("invalid observer worker runtime identity")
+        identity = bootstrap.RuntimeIdentity(
+            **{**fields, "groups": tuple(fields["groups"])}
+        )
+        payload = _observer_case_in_disposable_runner(case, identity)
+    except BaseException as error:
+        payload = {"status": "runner-error", "detail": repr(error)}
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
+    try:
+        os.write(write_fd, encoded)
+    finally:
+        os.close(write_fd)
+    os._exit(0)
+
+
 def _run_observer_case(case):
+    identity = bootstrap.resolve_runtime_identity(None)
+    identity_json = json.dumps(identity._asdict(), separators=(",", ":"))
     read_fd, write_fd = os.pipe()
-    runner_pid = os.fork()
-    if runner_pid == 0:
+    try:
+        runner = subprocess.Popen(
+            [sys.executable, *subprocess._args_from_interpreter_flags(),
+             str(Path(__file__).resolve()), "--observer-case-worker", case, str(write_fd),
+             identity_json],
+            close_fds=True, pass_fds=(write_fd,),
+        )
+    except BaseException:
         os.close(read_fd)
-        try:
-            payload = _observer_case_in_disposable_runner(case)
-        except BaseException as error:
-            payload = {"status": "runner-error", "detail": repr(error)}
-        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8") + b"\n"
-        try:
-            os.write(write_fd, encoded)
-        finally:
-            os.close(write_fd)
-        os._exit(0)
+        os.close(write_fd)
+        raise
 
     os.close(write_fd)
     data = b""
@@ -375,45 +402,33 @@ def _run_observer_case(case):
             data += chunk
             if len(data) >= 16 * 1024:
                 raise AssertionError("disposable observer runner result was oversized")
-        waited, status = os.waitpid(runner_pid, 0)
-        runner_reaped = waited == runner_pid
-        if not runner_reaped or status != 0:
+        try:
+            status = runner.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as error:
+            raise AssertionError("disposable observer runner did not exit") from error
+        runner_reaped = True
+        if status != 0:
             raise AssertionError(f"disposable observer runner failed: {status}")
         if b"\n" not in data:
             raise AssertionError("disposable observer runner returned no complete result")
         return json.loads(data.split(b"\n", 1)[0])
     finally:
-        if not runner_reaped:
-            try:
-                os.kill(runner_pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            cleanup_deadline = time.monotonic() + 1.0
-            while not pipe_eof:
-                remaining = cleanup_deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                readable, _, _ = select.select([read_fd], [], [], remaining)
-                if not readable:
-                    break
-                if not os.read(read_fd, 16 * 1024):
-                    pipe_eof = True
-            if pipe_eof:
-                try:
-                    waited, _ = os.waitpid(runner_pid, 0)
-                    runner_reaped = waited == runner_pid
-                except ChildProcessError:
-                    runner_reaped = True
+        try:
             if not runner_reaped:
                 try:
-                    os.kill(runner_pid, signal.SIGKILL)
+                    runner.terminate()
                 except ProcessLookupError:
                     pass
                 try:
-                    os.waitpid(runner_pid, 0)
-                except ChildProcessError:
-                    pass
-        os.close(read_fd)
+                    runner.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    try:
+                        runner.kill()
+                    except ProcessLookupError:
+                        pass
+                    runner.wait(timeout=1.0)
+        finally:
+            os.close(read_fd)
 
 
 class StartupGateBootstrapTest(unittest.TestCase):
@@ -2147,6 +2162,10 @@ class StartupGateRegressionTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--observer-case-worker"]:
+        if len(sys.argv) != 5:
+            raise SystemExit("invalid observer worker arguments")
+        _observer_case_worker(sys.argv[2], int(sys.argv[3]), sys.argv[4])
     unittest.main()
 class IdentityProbeCleanupRegressionTests(unittest.TestCase):
     def test_pipe_oserror_is_identity_probe_without_claiming_child_ownership(self):
