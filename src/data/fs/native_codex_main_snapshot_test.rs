@@ -117,8 +117,19 @@ fn unsafe_roots_links_special_files_and_invalid_names_are_rejected() -> TestResu
                 tree.clone()
             }
             "non-utf8" => {
-                fs::write(tree.join(OsString::from_vec(vec![0xff])), b"")?;
-                tree.clone()
+                let invalid_name = tree.join(OsString::from_vec(vec![0xff]));
+                match fs::write(&invalid_name, b"") {
+                    Ok(()) => tree.clone(),
+                    Err(error)
+                        if cfg!(target_os = "macos")
+                            && error.raw_os_error() == Some(nix::libc::EILSEQ) =>
+                    {
+                        // Some macOS filesystems reject non-UTF-8 entries before traversal.
+                        // This root-input rejection may come from the OS, without entry traversal.
+                        invalid_name
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
             "missing" => tree.join("absent"),
             "file-root" => {
