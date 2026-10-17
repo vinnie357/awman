@@ -38,23 +38,17 @@ pub(super) fn observe_sdk_chunks(
     })
 }
 
-pub(super) struct NativeSdkExecution {
+pub(super) struct NativeSdkObservation {
     request: NativePrintRequest,
-    lease: NativeSdkStateLease,
     observer: Mutex<Observer>,
 }
 
-impl NativeSdkExecution {
-    pub(super) fn new(request: NativePrintRequest, lease: NativeSdkStateLease) -> Self {
+impl NativeSdkObservation {
+    pub(super) fn new(request: NativePrintRequest) -> Self {
         Self {
             request,
-            lease,
             observer: Mutex::new(Observer::default()),
         }
-    }
-
-    pub(super) fn validate(&self) -> Result<(), EngineError> {
-        self.request.validate_state(&self.lease)
     }
 
     pub(super) fn stdout_observer(self: &Arc<Self>) -> Box<dyn PipedStdoutObserver> {
@@ -67,9 +61,43 @@ impl NativeSdkExecution {
         }
     }
 
+    pub(super) fn acknowledged_session(&self) -> Result<String, EngineError> {
+        let observer = self.observer.lock().map_err(|_| invalid())?;
+        if observer.invalid || !observer.eof || !observer.completed {
+            return Err(invalid());
+        }
+        observer.session.clone().ok_or_else(invalid)
+    }
+}
+
+pub(super) struct NativeSdkExecution {
+    lease: NativeSdkStateLease,
+    observation: Arc<NativeSdkObservation>,
+}
+
+impl NativeSdkExecution {
+    pub(super) fn new(request: NativePrintRequest, lease: NativeSdkStateLease) -> Self {
+        Self {
+            lease,
+            observation: Arc::new(NativeSdkObservation::new(request)),
+        }
+    }
+
+    pub(super) fn validate(&self) -> Result<(), EngineError> {
+        self.observation.request.validate_state(&self.lease)
+    }
+
+    pub(super) fn stdout_observer(self: &Arc<Self>) -> Box<dyn PipedStdoutObserver> {
+        Box::new(Arc::clone(self))
+    }
+
+    pub(super) fn reader_failed(&self) {
+        self.observation.reader_failed();
+    }
+
     pub(super) fn publish_after_release(&self) -> Result<(), EngineError> {
         self.validate()?;
-        let observer = self.observer.lock().map_err(|_| invalid())?;
+        let observer = self.observation.observer.lock().map_err(|_| invalid())?;
         if observer.invalid || !observer.eof {
             return Err(invalid());
         }
@@ -86,6 +114,18 @@ impl NativeSdkExecution {
 }
 
 impl PipedStdoutObserver for Arc<NativeSdkExecution> {
+    fn observe(&mut self, bytes: &[u8]) {
+        let mut observation = Arc::clone(&self.observation);
+        observation.observe(bytes);
+    }
+
+    fn finish(&mut self, end: PipedReadEnd) {
+        let mut observation = Arc::clone(&self.observation);
+        observation.finish(end);
+    }
+}
+
+impl PipedStdoutObserver for Arc<NativeSdkObservation> {
     fn observe(&mut self, bytes: &[u8]) {
         if let Ok(mut observer) = self.observer.lock() {
             if !observer.invalid && observer.feed(bytes, &self.request).is_err() {
