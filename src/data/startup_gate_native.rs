@@ -18,6 +18,8 @@ mod platform;
 
 pub use platform::load_startup_gate;
 #[cfg(all(test, unix))]
+pub(crate) use platform::NativeFileIdentity;
+#[cfg(all(test, unix))]
 pub(crate) use platform::{
     after_auth_release_noreplace_rename, after_launch_plan_native_publication,
     arm_auth_release_post_rename_sync_failure, arm_launch_plan_post_rename_sync_failure,

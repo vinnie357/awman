@@ -2,6 +2,8 @@
 
 #[path = "startup_gate_native.rs"]
 mod native;
+#[cfg(all(test, unix))]
+pub(crate) use native::NativeFileIdentity;
 
 #[cfg(all(test, unix))]
 pub(crate) use native::{
