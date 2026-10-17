@@ -47,6 +47,8 @@ pub mod naming;
 mod native_sdk_execution;
 #[cfg(test)]
 mod native_sdk_execution_test;
+#[cfg(test)]
+mod native_sdk_observation_test;
 pub mod options;
 pub(crate) mod orchestrated_apple;
 mod process;
