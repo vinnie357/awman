@@ -3668,11 +3668,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn spawn_piped_interactive_keeps_stdin_injector_after_seeded_write() {
-        let tmp = tempfile::tempdir().unwrap();
         // A stand-in for `<bin> run`: keep stdin open long enough for this test
         // to distinguish the persistent ACP path from the one-shot
         // `spawn_piped` path, which drops its injector after seeding.
-        let cli = fake_cli(&write_fake_cli(tmp.path(), "#!/bin/sh\nsleep 1\n"));
+        let cli = fake_cli(std::path::Path::new("/bin/sh"));
 
         let image = ImageRef::new("img:latest");
         let instance = test_instance(
@@ -3684,7 +3683,14 @@ mod tests {
             ],
         );
         let (req, _handle) = piped_test_request(
-            vec!["run".into(), "-i".into(), "img:latest".into()],
+            vec![
+                "-c".into(),
+                "sleep 1".into(),
+                "fake-cli".into(),
+                "run".into(),
+                "-i".into(),
+                "img:latest".into(),
+            ],
             // The optional seed is accepted for signature parity; a later
             // injection must still work in ACP mode.
             Some("seeded".into()),
