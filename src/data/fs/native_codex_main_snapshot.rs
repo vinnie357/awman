@@ -86,6 +86,10 @@ fn encode_manifest(entries: &[MainManifestEntry]) -> Result<Vec<u8>> {
     Ok(writer.0)
 }
 
+#[allow(
+    clippy::unnecessary_cast,
+    reason = "Stat field widths and signedness differ across Unix targets."
+)]
 fn stamp(info: &Stat) -> Stamp {
     (
         NativeFileIdentity {
