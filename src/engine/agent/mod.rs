@@ -99,9 +99,23 @@ pub struct AgentEngine {
     prompt_tempfiles: Arc<std::sync::Mutex<Vec<tempfile::NamedTempFile>>>,
     #[cfg(all(test, unix))]
     native_codex_auth_observer: Option<Arc<native_codex_auth_preparation_test::AuthObserver>>,
+    #[cfg(all(test, unix))]
+    native_codex_main_test_observer: Option<Arc<native_codex_auth_preparation_test::AuthObserver>>,
 }
 
 impl AgentEngine {
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_native_codex_main_test_observer(
+        mut self,
+        observer: Arc<native_codex_auth_preparation_test::AuthObserver>,
+    ) -> Self {
+        assert!(self
+            .native_codex_main_test_observer
+            .replace(observer)
+            .is_none());
+        self
+    }
+
     pub fn new(
         overlay_engine: Arc<OverlayEngine>,
         container_runtime: Arc<ContainerRuntime>,
@@ -112,6 +126,8 @@ impl AgentEngine {
             prompt_tempfiles: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(all(test, unix))]
             native_codex_auth_observer: None,
+            #[cfg(all(test, unix))]
+            native_codex_main_test_observer: None,
         }
     }
 
