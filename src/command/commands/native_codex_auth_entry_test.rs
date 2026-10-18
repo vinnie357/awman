@@ -87,7 +87,11 @@ impl crate::engine::acp::AcpFrontend for Frontend {
     }
 }
 #[async_trait::async_trait]
-impl ExecPromptCommandFrontend for Frontend {}
+impl ExecPromptCommandFrontend for Frontend {
+    fn native_auth_frontend(&mut self) -> Result<Box<dyn AgentFrontend>, CommandError> {
+        Ok(crate::command::commands::agent_setup::HasAgentFrontend::container_frontend(self))
+    }
+}
 
 pub(super) fn command(f: &Fixture) -> ExecPromptCommand {
     let observer = Arc::clone(&f.observer);

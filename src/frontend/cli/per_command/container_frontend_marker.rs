@@ -404,3 +404,7 @@ impl AgentFrontend for CliInteractiveContainerProxy {
             .expect("CliInteractiveContainerProxy::take_io called but no AgentIo available")
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_auth_terminal_test.rs"]
+mod native_codex_auth_terminal_test;

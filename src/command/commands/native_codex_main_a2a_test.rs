@@ -77,7 +77,11 @@ impl crate::engine::acp::AcpFrontend for TwoStreams {
     }
 }
 #[async_trait::async_trait]
-impl ExecPromptCommandFrontend for TwoStreams {}
+impl ExecPromptCommandFrontend for TwoStreams {
+    fn native_auth_frontend(&mut self) -> Result<Box<dyn AgentFrontend>, CommandError> {
+        Ok(crate::command::commands::agent_setup::HasAgentFrontend::container_frontend(self))
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_main_destructor_gates_command_and_strict_completion() -> TestResult {
