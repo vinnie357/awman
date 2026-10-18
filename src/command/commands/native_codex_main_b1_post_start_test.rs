@@ -19,6 +19,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -86,6 +87,15 @@ impl crate::engine::acp::AcpFrontend for TwoStreams {
 }
 #[async_trait::async_trait]
 impl ExecPromptCommandFrontend for TwoStreams {}
+
+struct ExpectedB1Retention {
+    _fixture: A2Fixture,
+    _registry: Arc<LaunchRetentionRegistry>,
+    _probe: retention_test_support::RetentionProbe,
+    _ticket: LaunchRetentionTicket,
+    _claims: retention_test_support::SupervisorActiveClaimBarrier,
+}
+static EXPECTED_B1_RETENTIONS: OnceLock<Mutex<Vec<ExpectedB1Retention>>> = OnceLock::new();
 
 struct PostStartFault {
     inner: Arc<ObservedBoundary>,
@@ -277,6 +287,23 @@ async fn post_start_local_reap_keeps_original_sdk_writer() -> TestResult {
     fixture.fixture.auth.observer.assert_unpublished();
     assert_eq!(probe.only_ticket(), Some(ticket));
     assert_eq!(probe.snapshot().retained, 1);
+    drop(snapshots);
     release.release();
+    assert_eq!(probe.only_ticket(), Some(ticket));
+    assert_eq!(probe.snapshot().retained, 1);
+    assert_eq!(probe.snapshot().unreaped, 0);
+    fixture.fixture.auth.observer.assert_locked();
+    fixture.fixture.auth.observer.assert_unpublished();
+    let mut expected = EXPECTED_B1_RETENTIONS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    expected.push(ExpectedB1Retention {
+        _fixture: fixture,
+        _registry: registry,
+        _probe: probe,
+        _ticket: ticket,
+        _claims,
+    });
     Ok(())
 }
