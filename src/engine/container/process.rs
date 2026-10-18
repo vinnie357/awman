@@ -671,6 +671,8 @@ struct SpawnCustodyResources {
     attach_permit: Option<AttachStorePermit>,
     #[cfg(test)]
     native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
+    #[cfg(all(test, unix))]
+    launch_resource: Option<Box<dyn std::any::Any + Send>>,
     #[cfg(test)]
     custody_witness: Option<test_support::CustodyWitness>,
 }
@@ -700,6 +702,8 @@ struct SpawnExecutionParts {
     attach_permit: AttachStorePermit,
     #[cfg(test)]
     native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
+    #[cfg(all(test, unix))]
+    launch_resource: Option<Box<dyn std::any::Any + Send>>,
     #[cfg(test)]
     custody_witness: Option<test_support::CustodyWitness>,
 }
@@ -720,12 +724,18 @@ impl SpawnCustodyResources {
             attach_permit: self.attach_permit.take()?,
             #[cfg(test)]
             native: self.native.take(),
+            #[cfg(all(test, unix))]
+            launch_resource: self.launch_resource.take(),
             #[cfg(test)]
             custody_witness: self.custody_witness.take(),
         })
     }
 
     fn restore_execution_parts(&mut self, parts: SpawnExecutionParts) {
+        #[cfg(all(test, unix))]
+        {
+            self.launch_resource = parts.launch_resource;
+        }
         self.auth = parts.auth;
         self.io = Some(parts.io);
         self.leases = Some(parts.leases);
@@ -765,6 +775,8 @@ struct ExecutionResources {
     gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
     #[cfg(test)]
     native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
+    #[cfg(all(test, unix))]
+    _launch_resource: Option<Box<dyn std::any::Any + Send>>,
     #[cfg(test)]
     _custody_witness: Option<test_support::CustodyWitness>,
 }
@@ -917,6 +929,8 @@ fn bridge_piped_resources(
             attach_permit,
             #[cfg(test)]
             native,
+            #[cfg(all(test, unix))]
+            launch_resource,
             #[cfg(test)]
             custody_witness,
         } = parts;
@@ -933,6 +947,8 @@ fn bridge_piped_resources(
                     attach_permit,
                     #[cfg(test)]
                     native,
+                    #[cfg(all(test, unix))]
+                    launch_resource,
                     #[cfg(test)]
                     custody_witness,
                 });
@@ -1011,6 +1027,8 @@ fn bridge_piped_resources(
             gate_cleanup,
             #[cfg(test)]
             native,
+            #[cfg(all(test, unix))]
+            _launch_resource: launch_resource,
             #[cfg(test)]
             _custody_witness: custody_witness,
         });
@@ -1541,6 +1559,8 @@ pub(super) fn spawn_pty_bridged(
         attach_permit: Some(attach_permit),
         #[cfg(test)]
         native: None,
+        #[cfg(all(test, unix))]
+        launch_resource: None,
         #[cfg(test)]
         custody_witness: test_support::take_custody_witness(),
     }));
@@ -1748,6 +1768,8 @@ pub(super) fn spawn_pty_bridged(
                 attach_permit,
                 #[cfg(test)]
                 native,
+                #[cfg(all(test, unix))]
+                launch_resource,
                 #[cfg(test)]
                 custody_witness,
             } = parts;
@@ -1764,6 +1786,8 @@ pub(super) fn spawn_pty_bridged(
                         attach_permit,
                         #[cfg(test)]
                         native,
+                        #[cfg(all(test, unix))]
+                        launch_resource,
                         #[cfg(test)]
                         custody_witness,
                     });
@@ -1800,6 +1824,8 @@ pub(super) fn spawn_pty_bridged(
                                 attach_permit: Some(attach_permit),
                                 #[cfg(test)]
                                 native,
+                                #[cfg(all(test, unix))]
+                                launch_resource,
                                 #[cfg(test)]
                                 custody_witness,
                             },
@@ -1839,6 +1865,8 @@ pub(super) fn spawn_pty_bridged(
                 gate_cleanup,
                 #[cfg(test)]
                 native,
+                #[cfg(all(test, unix))]
+                _launch_resource: launch_resource,
                 #[cfg(test)]
                 _custody_witness: custody_witness,
             });
@@ -1976,6 +2004,12 @@ fn spawn_piped_owned(
         attach_permit: Some(attach_permit),
         #[cfg(test)]
         native: native.clone(),
+        #[cfg(all(test, unix))]
+        launch_resource: gated.as_ref().and_then(|context| {
+            test_boundary.as_deref().and_then(|boundary| {
+                boundary.take_launch_resource(context.plan.key.container_name.as_str(), &argv)
+            })
+        }),
         #[cfg(test)]
         custody_witness: test_support::take_custody_witness(),
     }));
@@ -2293,6 +2327,8 @@ pub(super) fn spawn_piped_interactive(
         attach_permit: Some(attach_permit),
         #[cfg(test)]
         native: None,
+        #[cfg(all(test, unix))]
+        launch_resource: None,
         #[cfg(test)]
         custody_witness: test_support::take_custody_witness(),
     }));

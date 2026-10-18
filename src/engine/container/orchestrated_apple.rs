@@ -801,6 +801,14 @@ pub(crate) struct TestOwnershipObservation {
 
 #[cfg(test)]
 pub(crate) trait OrchestratedAppleTestBoundary: Send + Sync {
+    #[cfg(unix)]
+    fn take_launch_resource(
+        &self,
+        _exact_name: &str,
+        _actual_argv: &[String],
+    ) -> Option<Box<dyn std::any::Any + Send>> {
+        None
+    }
     fn retention_available(&self) -> bool;
     fn image_inspection(&self) -> Result<Vec<u8>, EngineError>;
     fn provider(&self) -> Arc<dyn GatedProviderAdapter>;
