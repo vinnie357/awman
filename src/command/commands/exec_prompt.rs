@@ -815,3 +815,7 @@ mod native_codex_main_a2m_freshness_test;
 #[cfg(all(test, unix))]
 #[path = "native_codex_main_b1_post_start_test.rs"]
 mod native_codex_main_b1_post_start_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_auth_terminal_test.rs"]
+mod native_codex_auth_terminal_test;

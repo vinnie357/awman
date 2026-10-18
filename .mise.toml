@@ -1,0 +1,3 @@
+[tasks."test:auth-terminal"]
+description = "Test private native Codex authentication output"
+run = "cargo test native_codex_auth_terminal -- --nocapture"
