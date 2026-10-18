@@ -1950,6 +1950,9 @@ fn exercise_public_path_with_native_and_cancel_driver_hook(
         execution_result
     });
     cancel_driver_hook(&mut cancel_driver_failure);
+    if let Some(failure) = cancel_driver_failure {
+        return Err(Box::new(failure));
+    }
     if matches!(
         scenario,
         AppleCommandScenario::CleanupUncertain(CleanupFault::PreRemoveRuntimeIdChanged)
