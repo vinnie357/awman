@@ -225,6 +225,11 @@ pub(crate) struct NativeCodexAuthExecution {
 }
 impl AgentEngine {
     #[cfg(all(test, unix))]
+    pub(crate) fn with_native_codex_main_test_opt_in(mut self) -> Self {
+        self.native_codex_main_test_opt_in = true;
+        self
+    }
+    #[cfg(all(test, unix))]
     pub(crate) fn with_native_codex_auth_test_observer(
         mut self,
         observer: Arc<super::native_codex_auth_preparation_test::AuthObserver>,

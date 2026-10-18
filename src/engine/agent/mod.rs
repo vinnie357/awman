@@ -99,6 +99,8 @@ pub struct AgentEngine {
     prompt_tempfiles: Arc<std::sync::Mutex<Vec<tempfile::NamedTempFile>>>,
     #[cfg(all(test, unix))]
     native_codex_auth_observer: Option<Arc<native_codex_auth_preparation_test::AuthObserver>>,
+    #[cfg(all(test, unix))]
+    native_codex_main_test_opt_in: bool,
 }
 
 impl AgentEngine {
@@ -112,6 +114,8 @@ impl AgentEngine {
             prompt_tempfiles: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(all(test, unix))]
             native_codex_auth_observer: None,
+            #[cfg(all(test, unix))]
+            native_codex_main_test_opt_in: false,
         }
     }
 
@@ -2822,3 +2826,6 @@ mod tests {
 
 #[cfg(all(test, unix))]
 pub(crate) mod native_codex_auth_preparation_test;
+
+#[cfg(all(test, unix))]
+pub(crate) mod native_codex_main_test_support;
