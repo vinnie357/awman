@@ -36,6 +36,9 @@ use sha2::{Digest, Sha256};
 
 use super::{AgentEngine, AgentRunOptions};
 
+#[path = "orchestrated_apple_command_driver_diagnostic_test.rs"]
+mod orchestrated_apple_command_driver_diagnostic_test;
+
 const NAME: &str = "awman-altana-command-apple";
 const MANIFEST_NAME: &str = "workspace.manifest.json";
 const RESERVED_LABEL: &str = "dev.awman.orchestrator-launch";
@@ -84,6 +87,12 @@ pub(crate) enum SealedMutation {
 pub(crate) enum CancellationPoint {
     BeforeReady,
     AfterReadyBeforeRelease,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CancelDriverFailure {
+    #[error("cancel fixture did not reach the requested production boundary: {0:?}")]
+    BoundaryNotObserved(CancellationPoint),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1280,6 +1289,14 @@ fn exercise_public_path_with_native(
     scenario: AppleCommandScenario,
     native_agent: Option<&str>,
 ) -> Result<AppleCommandReport, Box<dyn Error>> {
+    exercise_public_path_with_native_and_cancel_driver_hook(scenario, native_agent, |_| {})
+}
+
+fn exercise_public_path_with_native_and_cancel_driver_hook(
+    scenario: AppleCommandScenario,
+    native_agent: Option<&str>,
+    cancel_driver_hook: impl FnOnce(&mut Option<CancelDriverFailure>),
+) -> Result<AppleCommandReport, Box<dyn Error>> {
     let fixture = GateFixture::new(scenario)?;
     let expected_request = fixture.request_bytes.clone();
     let expected_manifests =
@@ -1507,6 +1524,7 @@ fn exercise_public_path_with_native(
     };
     let mut effects = DriverEffects::default();
     let mut external_release_boundary = ExternalReleaseBoundary::BeforeRunWithFrontend;
+    let mut cancel_driver_failure = None;
     let wait_result: Result<(), crate::engine::error::EngineError> = tokio.block_on(async {
         let mut execution = instance.run_with_frontend(Box::new(NullFrontend))?;
         if scenario == AppleCommandScenario::ExternalRelease {
@@ -1514,6 +1532,7 @@ fn exercise_public_path_with_native(
         }
         if let AppleCommandScenario::Cancel(point) = scenario {
             if !observer.wait_for_cancel_point(point, Instant::now() + Duration::from_secs(2)) {
+                cancel_driver_failure = Some(CancelDriverFailure::BoundaryNotObserved(point));
                 return Err(crate::engine::error::EngineError::Container(
                     "cancel fixture did not reach the requested production boundary".into(),
                 ));
@@ -1930,6 +1949,7 @@ fn exercise_public_path_with_native(
 
         execution_result
     });
+    cancel_driver_hook(&mut cancel_driver_failure);
     if matches!(
         scenario,
         AppleCommandScenario::CleanupUncertain(CleanupFault::PreRemoveRuntimeIdChanged)
