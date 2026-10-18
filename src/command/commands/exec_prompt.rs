@@ -761,3 +761,7 @@ mod native_codex_main_entry_test;
 #[cfg(all(test, unix))]
 #[path = "native_codex_main_a2a_test.rs"]
 mod native_codex_main_a2a_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_main_a2m_test.rs"]
+mod native_codex_main_a2m_test;

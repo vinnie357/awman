@@ -2832,3 +2832,6 @@ pub(crate) mod native_codex_main_test_support;
 
 #[cfg(all(test, unix))]
 pub(crate) mod native_codex_main_a2a_test_support;
+
+#[cfg(all(test, unix))]
+pub(crate) mod native_codex_main_a2m_test_support;
