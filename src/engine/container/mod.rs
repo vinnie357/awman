@@ -43,8 +43,7 @@ mod gated_launch_retention_quiescence_test;
 pub mod instance;
 pub mod io_bridge;
 pub mod naming;
-#[cfg(test)]
-mod native_sdk_execution;
+pub(crate) mod native_sdk_execution;
 #[cfg(test)]
 mod native_sdk_execution_test;
 #[cfg(test)]

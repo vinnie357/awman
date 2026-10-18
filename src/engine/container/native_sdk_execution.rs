@@ -1,21 +1,27 @@
-//! Prototype native publication; production seed and exact cleanup remain separate gates.
+//! Bounded SDK acknowledgement observation and strict post-retirement completion.
 
 use std::sync::{Arc, Mutex};
 
+use crate::data::fs::native_sdk_state::NativeSdkRunCompletion;
+#[cfg(test)]
 use crate::data::fs::native_sdk_state::NativeSdkStateLease;
 use crate::engine::agent::agent_matrix::{
     NativePrintRequest, NativeSdkAckEvent, NativeSdkAckFields,
 };
+use crate::engine::agent::native_codex_preparation::MainCustody;
 use crate::engine::error::EngineError;
+use std::sync::atomic::Ordering;
 
 use super::io_bridge::{PipedReadEnd, PipedStdoutObserver};
 
+#[cfg(test)]
 pub(super) struct Observation {
     pub(super) session: Option<String>,
     pub(super) completed: bool,
     pub(super) peak_retained_bytes: usize,
 }
 
+#[cfg(test)]
 pub(super) fn observe_sdk_chunks(
     agent: &str,
     resume: Option<&str>,
@@ -51,7 +57,8 @@ impl NativeSdkObservation {
         }
     }
 
-    pub(super) fn stdout_observer(self: &Arc<Self>) -> Box<dyn PipedStdoutObserver> {
+    #[cfg(test)]
+    pub(crate) fn stdout_observer(self: &Arc<Self>) -> Box<dyn PipedStdoutObserver> {
         Box::new(Arc::clone(self))
     }
 
@@ -70,32 +77,108 @@ impl NativeSdkObservation {
     }
 }
 
-pub(super) struct NativeSdkExecution {
-    lease: NativeSdkStateLease,
+pub(crate) struct NativeSdkExecution {
+    main: Option<Arc<MainCustody>>,
+    #[cfg(test)]
+    lease: Option<NativeSdkStateLease>,
     observation: Arc<NativeSdkObservation>,
 }
 
 impl NativeSdkExecution {
+    #[cfg(test)]
     pub(super) fn new(request: NativePrintRequest, lease: NativeSdkStateLease) -> Self {
         Self {
-            lease,
+            main: None,
+            lease: Some(lease),
             observation: Arc::new(NativeSdkObservation::new(request)),
         }
     }
 
-    pub(super) fn validate(&self) -> Result<(), EngineError> {
-        self.observation.request.validate_state(&self.lease)
+    pub(crate) fn new_main(request: NativePrintRequest, main: Arc<MainCustody>) -> Self {
+        Self {
+            main: Some(main),
+            #[cfg(test)]
+            lease: None,
+            observation: Arc::new(NativeSdkObservation::new(request)),
+        }
+    }
+    pub(crate) fn validate(&self) -> Result<(), EngineError> {
+        if let Some(main) = &self.main {
+            return main.validate();
+        }
+        #[cfg(test)]
+        if let Some(lease) = &self.lease {
+            return self.observation.request.validate_state(lease);
+        }
+        Err(invalid())
+    }
+    pub(crate) fn retained(&self, ticket: super::gated_launch::LaunchRetentionTicket) {
+        if let Some(main) = &self.main {
+            main.retained(ticket);
+        }
+    }
+    pub(crate) fn plan_created(&self) {
+        if let Some(main) = &self.main {
+            main.no_child_and_plan.store(false, Ordering::Release);
+        }
+    }
+    pub(crate) fn never_created_settled(&self) {
+        if let Some(main) = &self.main {
+            main.no_child_and_plan.store(true, Ordering::Release);
+        }
+    }
+    pub(crate) fn release_failed(&self) -> bool {
+        self.main.as_ref().is_some_and(|main| main.release_failed())
+    }
+    pub(crate) fn required_reader_failed(&self) -> bool {
+        self.main
+            .as_ref()
+            .is_some_and(|main| main.reader_failed.load(Ordering::Acquire))
+    }
+    pub(crate) fn release_after_verified_receipt(
+        &self,
+        plan: &super::gated_launch::DurableLaunchPlan,
+        nonce: &str,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), super::gated_launch::LaunchRetentionReason> {
+        self.main
+            .as_ref()
+            .ok_or(super::gated_launch::LaunchRetentionReason::PostSpawnControlChanged)?
+            .release_after_verified_receipt(plan, nonce, cancelled)
+    }
+    pub(crate) fn backend_retired(&self) {
+        if let Some(main) = &self.main {
+            main.retired.store(true, Ordering::Release);
+        }
+    }
+    pub(crate) fn complete_after_retirement(
+        &self,
+        info: &crate::engine::agent_runtime::AgentExitInfo,
+    ) -> Result<NativeSdkRunCompletion, EngineError> {
+        let main = self.main.as_ref().ok_or_else(invalid)?;
+        if info.exit_code != 0 {
+            return Err(invalid());
+        }
+        let session = self.observation.acknowledged_session()?;
+        main.complete_sdk(&session)
     }
 
-    pub(super) fn stdout_observer(self: &Arc<Self>) -> Box<dyn PipedStdoutObserver> {
+    pub(crate) fn stdout_observer(self: &Arc<Self>) -> Box<dyn PipedStdoutObserver> {
         Box::new(Arc::clone(self))
     }
 
-    pub(super) fn reader_failed(&self) {
+    pub(crate) fn reader_failed(&self) {
+        if let Some(main) = &self.main {
+            main.reader_failed.store(true, Ordering::Release);
+        }
         self.observation.reader_failed();
     }
 
+    #[cfg(test)]
     pub(super) fn publish_after_release(&self) -> Result<(), EngineError> {
+        if self.main.is_some() {
+            return Ok(());
+        }
         self.validate()?;
         let observer = self.observation.observer.lock().map_err(|_| invalid())?;
         if observer.invalid || !observer.eof {
@@ -106,7 +189,10 @@ impl NativeSdkExecution {
         }
         if observer.completed {
             let session = observer.session.as_deref().ok_or_else(invalid)?;
-            self.lease.publish_session(session)?;
+            self.lease
+                .as_ref()
+                .ok_or_else(invalid)?
+                .publish_session(session)?;
         }
         // Known quiescence releases the writer lock; failed state remains on disk.
         Ok(())

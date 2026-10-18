@@ -317,7 +317,7 @@ impl Command for ExecPromptCommand {
         };
         if self.native_print && agent.as_str() == "codex" {
             use crate::engine::agent::native_codex_preparation::{
-                AuthRetirement, AuthStartError, PreparationError,
+                AuthRetirement, AuthStartError, MainRetirement, MainStartError, PreparationError,
             };
             let request = crate::engine::agent::agent_matrix::NativePrintRequest::new(
                 "codex",
@@ -351,9 +351,15 @@ impl Command for ExecPromptCommand {
                     return Err(error.into());
                 }
             };
-            match auth.wait_auth_retired().await {
-                AuthRetirement::Authenticated(owner) => drop(owner),
-                AuthRetirement::Retryable(owner) => drop(owner),
+            let owner = match auth.wait_auth_retired().await {
+                AuthRetirement::Authenticated(owner) => owner,
+                AuthRetirement::Retryable(owner) => {
+                    drop(owner);
+                    return Err(crate::engine::error::EngineError::Config(
+                        "native Codex main execution remains unqualified".into(),
+                    )
+                    .into());
+                }
                 AuthRetirement::Stopped { owner, error } => {
                     drop(owner);
                     return Err(error.into());
@@ -366,11 +372,47 @@ impl Command for ExecPromptCommand {
                     drop(owner);
                     return Err(error.into());
                 }
-            }
-            return Err(crate::engine::error::EngineError::Config(
-                "native Codex main execution remains unqualified".into(),
-            )
-            .into());
+            };
+            let owner = match owner.require_main_profile() {
+                Ok(owner) => owner,
+                Err(MainStartError::NotStarted { owner, error }) => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+                Err(MainStartError::Retained { ticket, error }) => {
+                    tracing::debug!(?ticket, "native Codex main retained for recovery");
+                    return Err(error.into());
+                }
+            };
+            let main = match owner.start_main(
+                &session,
+                &final_prompt,
+                frontend.native_container_frontend(),
+            ) {
+                Ok(main) => main,
+                Err(MainStartError::NotStarted { owner, error }) => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+                Err(MainStartError::Retained { ticket, error }) => {
+                    tracing::debug!(?ticket, "native Codex main retained for recovery");
+                    return Err(error.into());
+                }
+            };
+            let info = match main.wait_main().await {
+                MainRetirement::Completed(info) => info,
+                MainRetirement::Stopped { owner, error } => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+                MainRetirement::Retained { ticket, error }
+                | MainRetirement::CompletedPublicationUncertain { ticket, error } => {
+                    tracing::debug!(?ticket, "native Codex main retained for recovery");
+                    return Err(error.into());
+                }
+            };
+            frontend.finish_native_output().await?;
+            return finish_exec_prompt(&agent, true, Ok(info));
         }
 
         // Resolve ACP policy before overlays or container setup. A direct ACP

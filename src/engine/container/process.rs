@@ -190,6 +190,7 @@ struct SpawnRetentionState {
 pub(super) struct SpawnRetentionContext {
     state: Mutex<SpawnRetentionState>,
     auth: Mutex<Option<Arc<AuthCustody>>>,
+    native: Mutex<Option<Arc<super::native_sdk_execution::NativeSdkExecution>>>,
 }
 
 impl SpawnRetentionContext {
@@ -197,6 +198,7 @@ impl SpawnRetentionContext {
         Arc::new(Self {
             state: Mutex::new(SpawnRetentionState { plan, reason: None }),
             auth: Mutex::new(None),
+            native: Mutex::new(None),
         })
     }
 
@@ -282,6 +284,7 @@ pub(super) struct ContainerInstance {
     /// the spawn fn returns).
     pub leases: Vec<CredentialLease>,
     pub native_auth: Option<Arc<AuthCustody>>,
+    pub native_main: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
     /// Backend hook for the PTY path. `Some` only for Apple, whose CLI has no
     /// native attach. See [`AttachHook`].
     pub post_bridge: Option<AttachHook>,
@@ -347,6 +350,7 @@ impl ContainerInstance {
             options,
             leases,
             native_auth: None,
+            native_main: None,
             post_bridge,
             gate_cleanup: None,
             launch_retention,
@@ -462,10 +466,14 @@ impl AgentInstance for ContainerInstance {
                         if let Some(auth) = &self.native_auth {
                             auth.no_child_and_plan.store(false, Ordering::Release);
                         }
+                        if let Some(main) = &self.native_main {
+                            main.plan_created();
+                        }
                         plan
                     }
                     Err(LaunchIdentityError::LaunchPlanPublicationUncertain(publication)) => {
                         let resources = Box::new(PendingPublicationResources {
+                            _native: self.native_main.clone(),
                             _auth: self.native_auth.clone(),
                             _leases: std::mem::take(&mut self.leases),
                             _gate_cleanup: Some(staged.cleanup),
@@ -484,15 +492,39 @@ impl AgentInstance for ContainerInstance {
                         if let Some(auth) = &self.native_auth {
                             auth.retained(ticket);
                         }
+                        if let Some(main) = &self.native_main {
+                            main.plan_created();
+                            main.retained(ticket);
+                        }
                         return Err(EngineError::Container(
                             "launch plan publication failed".into(),
                         ));
                     }
                     Err(error) => {
                         if matches!(error, LaunchIdentityError::ExistingPlanRecoveryRequired) {
+                            if let Some(main) = &self.native_main {
+                                main.plan_created();
+                                let resources = Box::new(PendingPublicationResources {
+                                    _native: Some(Arc::clone(main)),
+                                    _auth: None,
+                                    _leases: std::mem::take(&mut self.leases),
+                                    _gate_cleanup: Some(staged.cleanup),
+                                    post_wait: cli.post_wait,
+                                    #[cfg(test)]
+                                    _custody_witness: test_support::take_custody_witness(),
+                                });
+                                let ticket = registry.retain_unresolved_main_preparation(
+                                    prepared,
+                                    resources,
+                                    Arc::clone(main),
+                                );
+                                main.retained(ticket);
+                                return Err(EngineError::Container(error.to_string()));
+                            }
                             if let Some(auth) = &self.native_auth {
                                 auth.no_child_and_plan.store(false, Ordering::Release);
                                 let resources = Box::new(PendingPublicationResources {
+                                    _native: None,
                                     _auth: Some(Arc::clone(auth)),
                                     _leases: std::mem::take(&mut self.leases),
                                     _gate_cleanup: Some(staged.cleanup),
@@ -554,6 +586,7 @@ impl AgentInstance for ContainerInstance {
         let retention =
             SpawnRetentionContext::new(gated.as_ref().map(|context| context.plan.clone()));
         *retention.auth.lock().unwrap_or_else(|p| p.into_inner()) = self.native_auth.clone();
+        *retention.native.lock().unwrap_or_else(|p| p.into_inner()) = self.native_main.clone();
         let mut bridge_cfg = bridge_config_for(cli, &self.name, grace_timeout, stuck_timeout);
         if self.native_auth.is_some() {
             bridge_cfg.cancel_on_grace_expired = None;
@@ -669,7 +702,6 @@ struct SpawnCustodyResources {
     run_post_wait: bool,
     attach_store: Arc<PreallocatedAttachStore>,
     attach_permit: Option<AttachStorePermit>,
-    #[cfg(test)]
     native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
     #[cfg(all(test, unix))]
     launch_resource: Option<Box<dyn std::any::Any + Send>>,
@@ -678,6 +710,7 @@ struct SpawnCustodyResources {
 }
 
 struct PendingPublicationResources {
+    _native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
     _auth: Option<Arc<AuthCustody>>,
     _leases: Vec<CredentialLease>,
     _gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
@@ -700,7 +733,6 @@ struct SpawnExecutionParts {
     post_wait: PostWaitHook,
     attach_store: Arc<PreallocatedAttachStore>,
     attach_permit: AttachStorePermit,
-    #[cfg(test)]
     native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
     #[cfg(all(test, unix))]
     launch_resource: Option<Box<dyn std::any::Any + Send>>,
@@ -722,7 +754,6 @@ impl SpawnCustodyResources {
             post_wait: self.post_wait,
             attach_store: Arc::clone(&self.attach_store),
             attach_permit: self.attach_permit.take()?,
-            #[cfg(test)]
             native: self.native.take(),
             #[cfg(all(test, unix))]
             launch_resource: self.launch_resource.take(),
@@ -743,10 +774,7 @@ impl SpawnCustodyResources {
         self.post_wait = parts.post_wait;
         self.attach_store = parts.attach_store;
         self.attach_permit = Some(parts.attach_permit);
-        #[cfg(test)]
-        {
-            self.native = parts.native;
-        }
+        self.native = parts.native;
         self.run_post_wait = true;
         #[cfg(test)]
         {
@@ -773,7 +801,6 @@ struct ExecutionResources {
     _attach_store: Arc<PreallocatedAttachStore>,
     leases: Vec<CredentialLease>,
     gate_cleanup: Option<super::startup_gate::StartupGateCleanup>,
-    #[cfg(test)]
     native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
     #[cfg(all(test, unix))]
     _launch_resource: Option<Box<dyn std::any::Any + Send>>,
@@ -882,20 +909,16 @@ impl Drop for ExecutionResources {
                         auth.custody.reader_failed.store(true, Ordering::Release);
                     }
                 }
-                #[cfg(test)]
                 if matches!(result, Err(_) | Ok(PipedReadEnd::ReadError)) {
                     if let Some(native) = self.native.as_ref() {
                         native.reader_failed();
                     }
                 }
-                #[cfg(not(test))]
-                let _ = result;
             }
         }
         drop(self.auth.take());
         self.leases.clear();
         drop(self.gate_cleanup.take());
-        #[cfg(test)]
         drop(self.native.take());
     }
 }
@@ -927,7 +950,6 @@ fn bridge_piped_resources(
             post_wait,
             attach_store,
             attach_permit,
-            #[cfg(test)]
             native,
             #[cfg(all(test, unix))]
             launch_resource,
@@ -945,7 +967,6 @@ fn bridge_piped_resources(
                     post_wait,
                     attach_store,
                     attach_permit,
-                    #[cfg(test)]
                     native,
                     #[cfg(all(test, unix))]
                     launch_resource,
@@ -963,8 +984,7 @@ fn bridge_piped_resources(
         if let Some(adapter) = stderr_read_adapter {
             pipes.stderr = pipes.stderr.take().and_then(adapter);
         }
-        #[cfg(test)]
-        if pipes.stderr.is_none() {
+        if pipes.stdout.is_none() || pipes.stderr.is_none() {
             if let Some(native) = native.as_ref() {
                 native.reader_failed();
             }
@@ -987,13 +1007,6 @@ fn bridge_piped_resources(
             }
         }
         let private_auth = auth.is_some();
-        #[cfg(not(test))]
-        let bridge = if private_auth {
-            crate::engine::container::io_bridge::bridge_private_auth_io(io, pipes, bridge_cfg)
-        } else {
-            crate::engine::container::io_bridge::bridge_piped_io(io, pipes, bridge_cfg)
-        };
-        #[cfg(test)]
         let bridge = if private_auth {
             crate::engine::container::io_bridge::bridge_private_auth_io(io, pipes, bridge_cfg)
         } else {
@@ -1004,9 +1017,7 @@ fn bridge_piped_resources(
                 native.as_ref().map(|owner| owner.stdout_observer()),
             )
         };
-        let drain_output = drain_output || private_auth;
-        #[cfg(test)]
-        let drain_output = drain_output || native.is_some();
+        let drain_output = drain_output || private_auth || native.is_some();
         let crate::engine::container::io_bridge::BridgeResult {
             output_readers,
             stdin_injector,
@@ -1025,7 +1036,6 @@ fn bridge_piped_resources(
             _attach_store: attach_store,
             leases,
             gate_cleanup,
-            #[cfg(test)]
             native,
             #[cfg(all(test, unix))]
             _launch_resource: launch_resource,
@@ -1052,13 +1062,23 @@ fn finish_spawn(
             let (plan, reason) = retention.take();
             let reason = reason.unwrap_or(LaunchRetentionReason::ChildStateUnknown);
             if let Some(registry) = registry {
+                let main = retention
+                    .native
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
                 let ticket = if let Some(plan) = plan {
-                    registry.retain(RetainedAgentLaunch {
+                    let launch = RetainedAgentLaunch {
                         plan,
                         execution: Some(owned),
                         last_inspection: None,
                         reason,
-                    })
+                    };
+                    if let Some(main) = &main {
+                        registry.retain_native_main_after_start(launch, Arc::clone(main))
+                    } else {
+                        registry.retain(launch)
+                    }
                 } else {
                     registry.retain_legacy(owned)
                 };
@@ -1069,6 +1089,9 @@ fn finish_spawn(
                     .as_ref()
                 {
                     auth.retained(ticket);
+                }
+                if let Some(main) = main {
+                    main.retained(ticket);
                 }
             } else {
                 retain_detached_after_error(owned);
@@ -1179,6 +1202,11 @@ impl ProtectedLaunchContext {
             ..
         } = self;
         let auth = resources.auth_custody();
+        let main = match resources.as_ref() {
+            LifecycleResources::Spawn(r) => r.native.clone(),
+            LifecycleResources::Execution(r) => r.native.clone(),
+            LifecycleResources::FailedPty(r) => r._custody.native.clone(),
+        };
         let lifecycle = match prepared.retain_never_created_resources(resources) {
             Ok(lifecycle) => lifecycle,
             Err(failure) => {
@@ -1189,7 +1217,12 @@ impl ProtectedLaunchContext {
                     #[cfg(test)]
                     boundary,
                 );
+                let mut custody = custody;
+                custody.native_main = main.clone();
                 let ticket = registry.retain_active_gated(custody);
+                if let Some(main) = &main {
+                    main.retained(ticket);
+                }
                 if let Some(auth) = &auth {
                     auth.retained(ticket);
                 }
@@ -1207,11 +1240,20 @@ impl ProtectedLaunchContext {
         if let Some(boundary) = boundary {
             boundary.observe_never_created_proven();
         }
+        let mut custody = custody;
+        custody.native_main = main.clone();
         let ticket = registry.retain_active_gated(custody);
         let retired = matches!(
             registry.retry_active_gated(ticket, enclosing),
             Ok(super::gated_launch::ActiveGatedRetryOutcome::Resolved)
         );
+        if let Some(main) = &main {
+            if retired {
+                main.never_created_settled();
+            } else {
+                main.retained(ticket);
+            }
+        }
         if let Some(auth) = &auth {
             if retired {
                 auth.no_child_and_plan.store(true, Ordering::Release);
@@ -1557,7 +1599,6 @@ pub(super) fn spawn_pty_bridged(
         run_post_wait: true,
         attach_store,
         attach_permit: Some(attach_permit),
-        #[cfg(test)]
         native: None,
         #[cfg(all(test, unix))]
         launch_resource: None,
@@ -1766,7 +1807,6 @@ pub(super) fn spawn_pty_bridged(
                 post_wait,
                 attach_store,
                 attach_permit,
-                #[cfg(test)]
                 native,
                 #[cfg(all(test, unix))]
                 launch_resource,
@@ -1784,7 +1824,6 @@ pub(super) fn spawn_pty_bridged(
                         post_wait,
                         attach_store,
                         attach_permit,
-                        #[cfg(test)]
                         native,
                         #[cfg(all(test, unix))]
                         launch_resource,
@@ -1822,7 +1861,6 @@ pub(super) fn spawn_pty_bridged(
                                 run_post_wait: true,
                                 attach_store,
                                 attach_permit: Some(attach_permit),
-                                #[cfg(test)]
                                 native,
                                 #[cfg(all(test, unix))]
                                 launch_resource,
@@ -1863,7 +1901,6 @@ pub(super) fn spawn_pty_bridged(
                 _attach_store: attach_store,
                 leases,
                 gate_cleanup,
-                #[cfg(test)]
                 native,
                 #[cfg(all(test, unix))]
                 _launch_resource: launch_resource,
@@ -1918,7 +1955,6 @@ pub(super) fn spawn_pty_bridged(
         container_name: instance.name.0.clone(),
         resource_loan,
         gate_cancelled,
-        #[cfg(test)]
         native: None,
         #[cfg(test)]
         test_boundary,
@@ -1939,12 +1975,12 @@ pub(super) fn spawn_piped(
     instance: Box<ContainerInstance>,
     req: SpawnRequest,
 ) -> Result<AgentExecution, SpawnStageError> {
+    let native = instance.native_main.clone();
     spawn_piped_owned(
         cli,
         instance,
         req,
-        #[cfg(test)]
-        None,
+        native,
         #[cfg(test)]
         None,
     )
@@ -1956,13 +1992,9 @@ fn spawn_piped_owned(
     cli: ContainerCli,
     mut instance: Box<ContainerInstance>,
     req: SpawnRequest,
-    #[cfg(test)] native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
+    native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
     #[cfg(test)] stderr_read_adapter: Option<StderrReadAdapter>,
 ) -> Result<AgentExecution, SpawnStageError> {
-    #[cfg(test)]
-    if let Some(native) = native.as_ref() {
-        native.validate().map_err(before_cli_start)?;
-    }
     let SpawnRequest {
         io,
         argv,
@@ -2002,7 +2034,6 @@ fn spawn_piped_owned(
         run_post_wait: true,
         attach_store,
         attach_permit: Some(attach_permit),
-        #[cfg(test)]
         native: native.clone(),
         #[cfg(all(test, unix))]
         launch_resource: gated.as_ref().and_then(|context| {
@@ -2014,6 +2045,17 @@ fn spawn_piped_owned(
         custody_witness: test_support::take_custody_witness(),
     }));
     let published_gate = PublishedSpawnGate::new(gated);
+    if let Some(native) = &native {
+        if let Err(error) = native.validate() {
+            return Err(published_gate.reject_never_created(
+                prepared,
+                custody,
+                error,
+                #[cfg(test)]
+                test_boundary,
+            ));
+        }
+    }
     if let Some(auth) = &instance.native_auth {
         if let Err(error) = auth.validate() {
             return Err(published_gate.reject_never_created(
@@ -2212,6 +2254,7 @@ fn spawn_piped_owned(
         prepared_gate.enclosing(),
         Arc::clone(&gate_cancelled),
         instance.native_auth.clone(),
+        native.clone(),
         #[cfg(test)]
         test_boundary.clone(),
     );
@@ -2225,6 +2268,7 @@ fn spawn_piped_owned(
             prepared_gate.enclosing(),
             Arc::clone(&gate_cancelled),
             instance.native_auth.clone(),
+            native.clone(),
             test_boundary.clone(),
         )
     };
@@ -2245,7 +2289,6 @@ fn spawn_piped_owned(
         container_name: instance.name.0.clone(),
         resource_loan,
         gate_cancelled,
-        #[cfg(test)]
         native,
         #[cfg(test)]
         test_boundary,
@@ -2325,7 +2368,6 @@ pub(super) fn spawn_piped_interactive(
         run_post_wait: true,
         attach_store,
         attach_permit: Some(attach_permit),
-        #[cfg(test)]
         native: None,
         #[cfg(all(test, unix))]
         launch_resource: None,
@@ -2523,7 +2565,6 @@ pub(super) fn spawn_piped_interactive(
         container_name: instance.name.0.clone(),
         resource_loan,
         gate_cancelled,
-        #[cfg(test)]
         native: None,
         #[cfg(test)]
         test_boundary,
@@ -2571,7 +2612,6 @@ pub(super) struct ContainerExecution {
     container_name: String,
     resource_loan: Option<ExecutionResourceLoan>,
     gate_cancelled: Arc<AtomicBool>,
-    #[cfg(test)]
     native: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
     #[cfg(test)]
     test_boundary: Option<Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>>,
@@ -2603,6 +2643,7 @@ fn start_gate_monitor(
     enclosing: Option<Instant>,
     cancelled: Arc<AtomicBool>,
     native_auth: Option<Arc<AuthCustody>>,
+    native_main: Option<Arc<super::native_sdk_execution::NativeSdkExecution>>,
     #[cfg(test)] boundary: Option<
         Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
     >,
@@ -2614,8 +2655,17 @@ fn start_gate_monitor(
     let worker = std::thread::Builder::new()
         .name("awman-orchestrated-apple-gate".into())
         .spawn(move || {
-            let result = match native_auth.as_deref() {
-                Some(auth) => super::orchestrated_apple::await_native_auth_release(
+            let result = match (native_auth.as_deref(), native_main.as_deref()) {
+                (None, Some(main)) => super::orchestrated_apple::await_native_main_release(
+                    &plan,
+                    adapter.as_ref(),
+                    &cancelled,
+                    enclosing,
+                    main,
+                    #[cfg(test)]
+                    boundary.as_deref(),
+                ),
+                (Some(auth), _) => super::orchestrated_apple::await_native_auth_release(
                     &plan,
                     adapter.as_ref(),
                     &cancelled,
@@ -2624,7 +2674,7 @@ fn start_gate_monitor(
                     #[cfg(test)]
                     boundary.as_deref(),
                 ),
-                None => super::orchestrated_apple::await_protected_release(
+                (None, None) => super::orchestrated_apple::await_protected_release(
                     &plan,
                     adapter.as_ref(),
                     &cancelled,
@@ -2662,12 +2712,16 @@ impl ContainerExecution {
         })?;
         if let Some(custody) = owner.custody.as_mut() {
             custody.native_auth = self.native_auth.clone();
+            custody.native_main = self.native.clone();
         }
         let ticket = owner.retain(reason, last_inspection).ok_or_else(|| {
             EngineError::Container("orchestrated execution custody unavailable".into())
         })?;
         if let Some(auth) = &self.native_auth {
             auth.retained(ticket);
+        }
+        if let Some(main) = &self.native {
+            main.retained(ticket);
         }
         #[cfg(test)]
         if let Some(boundary) = &self.test_boundary {
@@ -2717,7 +2771,11 @@ impl ExecutionBackend for ContainerExecution {
                 if self
                     .native_auth
                     .as_ref()
-                    .is_some_and(|auth| auth.auth_release_failed()) =>
+                    .is_some_and(|auth| auth.auth_release_failed())
+                    || self
+                        .native
+                        .as_ref()
+                        .is_some_and(|main| main.release_failed()) =>
             {
                 // A spent failed release is retained even if the CLI happened
                 // to exit meanwhile; it grants no auth retry/retirement result.
@@ -2783,6 +2841,10 @@ impl ExecutionBackend for ContainerExecution {
                 .native_auth
                 .as_ref()
                 .is_some_and(|auth| auth.reader_failed.load(Ordering::Acquire))
+                || self
+                    .native
+                    .as_ref()
+                    .is_some_and(|main| main.required_reader_failed())
             {
                 self.retain_uncertain(LaunchRetentionReason::ChildStateUnknown, None)?;
                 return Err(EngineError::Container(
@@ -2809,6 +2871,9 @@ impl ExecutionBackend for ContainerExecution {
         }
         if let Some(auth) = &self.native_auth {
             auth.retired.store(true, Ordering::Release);
+        }
+        if let Some(native) = &self.native {
+            native.backend_retired();
         }
         if let Some(reason) = gate_rejection {
             return Err(EngineError::Container(format!(

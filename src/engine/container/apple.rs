@@ -744,7 +744,16 @@ impl AppleBackend {
         registry: Option<std::sync::Arc<LaunchRetentionRegistry>>,
         custody: std::sync::Arc<crate::engine::agent::native_codex_preparation::AuthCustody>,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
-        self.build_common(options, registry, Some(custody))
+        self.build_common(options, registry, Some(custody), None)
+    }
+
+    pub(super) fn build_native_codex_main(
+        &self,
+        options: ResolvedContainerOptions,
+        registry: Option<std::sync::Arc<LaunchRetentionRegistry>>,
+        main: std::sync::Arc<super::native_sdk_execution::NativeSdkExecution>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.build_common(options, registry, None, Some(main))
     }
 
     fn build_common(
@@ -754,6 +763,7 @@ impl AppleBackend {
         native_auth: Option<
             std::sync::Arc<crate::engine::agent::native_codex_preparation::AuthCustody>,
         >,
+        native_main: Option<std::sync::Arc<super::native_sdk_execution::NativeSdkExecution>>,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
         let orchestrated = options
             .startup_gate
@@ -802,6 +812,7 @@ impl AppleBackend {
             (launch_retention, gated_provider),
         );
         instance.native_auth = native_auth;
+        instance.native_main = native_main;
         #[cfg(test)]
         if let Some(boundary) = &self.test_boundary {
             instance.set_test_boundary(std::sync::Arc::clone(boundary));
@@ -823,7 +834,7 @@ impl ContainerBackend for AppleBackend {
         &self,
         options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
-        self.build_common(options, None, None)
+        self.build_common(options, None, None, None)
     }
 
     fn build_with_launch_retention(
@@ -831,7 +842,7 @@ impl ContainerBackend for AppleBackend {
         options: ResolvedContainerOptions,
         launch_retention: Option<std::sync::Arc<LaunchRetentionRegistry>>,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
-        self.build_common(options, launch_retention, None)
+        self.build_common(options, launch_retention, None, None)
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {

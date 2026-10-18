@@ -55,7 +55,6 @@ struct OwnerRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg(test)]
 struct AssociationRecord {
     schema_version: u32,
     session_id: String,
@@ -81,7 +80,6 @@ pub(crate) struct NativeSdkStateLease {
 }
 
 const ACTIVE_RUN: &str = "active-run.json";
-#[cfg(test)]
 const COMPLETED_RUN: &str = "completed-run.json";
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,7 +123,6 @@ impl ActiveRunRecord {
 }
 
 impl CompletedRunRecord {
-    #[cfg(test)]
     fn new(active: &ActiveRunRecord, session: &str) -> Self {
         Self {
             schema_version: active.schema_version,
@@ -152,7 +149,6 @@ impl CompletedRunRecord {
         Ok(())
     }
 
-    #[cfg(test)]
     fn matches(&self, active: &ActiveRunRecord) -> bool {
         self.schema_version == active.schema_version
             && self.run_id == active.run_id
@@ -161,7 +157,6 @@ impl CompletedRunRecord {
     }
 }
 
-#[cfg(test)]
 enum NativeSdkRunPhase {
     Active,
     PublicationUncertain(Box<CompletedRunRecord>),
@@ -171,11 +166,9 @@ enum NativeSdkRunPhase {
 pub(crate) struct NativeSdkRunLease {
     lease: NativeSdkStateLease,
     activation: ActiveRunRecord,
-    #[cfg(test)]
     phase: NativeSdkRunPhase,
 }
 
-#[cfg(test)]
 pub(crate) enum NativeSdkRunCompletion {
     Completed,
     CompletedPublicationUncertain(DataError),
@@ -185,11 +178,8 @@ pub(crate) enum NativeSdkRunCompletion {
 #[allow(clippy::enum_variant_names)] // The reviewed fault API names each post-operation boundary.
 pub(crate) enum NativeSdkRunFsFault {
     AfterActivationRename,
-    #[cfg(test)]
     AfterAssociationRename,
-    #[cfg(test)]
     AfterCompletionRename,
-    #[cfg(test)]
     AfterCompletionDirectorySync,
 }
 
@@ -226,7 +216,6 @@ impl NativeSdkRunLease {
         self.validate_active()
     }
 
-    #[cfg(test)]
     pub(crate) fn complete_run(
         &mut self,
         session: &str,
@@ -247,7 +236,6 @@ impl NativeSdkRunLease {
         Err(invalid("native Codex authentication requires Unix"))
     }
 
-    #[cfg(test)]
     pub(crate) fn reconcile_completed(&mut self) -> Result<NativeSdkRunCompletion, DataError> {
         self.reconcile_completed_with_fault(None)
     }
@@ -704,6 +692,30 @@ mod unix {
     }
 
     impl NativeSdkRunLease {
+        pub(crate) fn validate_main_selection(
+            &self,
+            project: &Path,
+            controls_root: &Path,
+        ) -> Result<PathBuf, DataError> {
+            self.validate_active()?;
+            let key = NativeSdkStateKey::new(
+                project,
+                NativeSdkProvider::Codex,
+                &self.activation.owner.key.model,
+            )?;
+            let root = PinnedDir::at(controls_root, false)?;
+            if key != self.activation.owner.key
+                || root.path != self.lease.directories[1].path
+                || root.identity != self.lease.owner_record.data_root
+                || root.path.starts_with(&key.project)
+                || self.lease.directories[2].path.starts_with(&key.project)
+                || key.project.starts_with(&self.lease.directories[2].path)
+            {
+                return Err(invalid("main selection differs from original owner"));
+            }
+            self.validate_active()?;
+            Ok(key.project)
+        }
         fn activate(
             lease: NativeSdkStateLease,
             fault: Option<NativeSdkRunFsFault>,
@@ -717,7 +729,6 @@ mod unix {
             let run = Self {
                 lease,
                 activation,
-                #[cfg(test)]
                 phase: NativeSdkRunPhase::Active,
             };
             let (pending, file) = run.lease.prepare_run_record(ACTIVE_RUN, &run.activation)?;
@@ -744,7 +755,6 @@ mod unix {
             self.lease.validate()
         }
 
-        #[cfg(test)]
         fn validate_completed(&self, expected: &CompletedRunRecord) -> Result<(), DataError> {
             let (active, completed) = self.lease.read_run_proof(&expected.session_id)?;
             if active != self.activation || completed != *expected {
@@ -753,7 +763,6 @@ mod unix {
             Ok(())
         }
 
-        #[cfg(test)]
         pub(crate) fn complete_run_with_fault(
             &mut self,
             session: &str,
@@ -808,7 +817,6 @@ mod unix {
             }
         }
 
-        #[cfg(test)]
         pub(crate) fn reconcile_completed_with_fault(
             &mut self,
             fault: Option<NativeSdkRunFsFault>,
@@ -861,7 +869,6 @@ mod unix {
             self.validate()
         }
 
-        #[cfg(test)]
         fn read_run_association(&self, session: &str) -> Result<(), DataError> {
             validate_session_id(session)?;
             let name = format!("{}.json", hex(&Sha256::digest(session.as_bytes())));
@@ -875,7 +882,6 @@ mod unix {
             Ok(())
         }
 
-        #[cfg(test)]
         fn read_run_proof(
             &self,
             session: &str,
@@ -958,7 +964,6 @@ mod unix {
                 .map_err(|error| DataError::io(owner.path.join(name), error.into()))
         }
 
-        #[cfg(test)]
         fn sync_session_directory(&self) -> Result<(), DataError> {
             self.validate()?;
             let sessions = &self.directories[5];
@@ -996,7 +1001,6 @@ mod unix {
             self.publish_session_with_run_fault(session_id, None)
         }
 
-        #[cfg(test)]
         fn publish_session_with_run_fault(
             &self,
             session_id: &str,
@@ -1120,13 +1124,15 @@ impl NativeSdkState {
 
 #[cfg(not(unix))]
 impl NativeSdkRunLease {
+    pub(crate) fn validate_main_selection(&self, _: &Path, _: &Path) -> Result<PathBuf, DataError> {
+        Err(invalid("native SDK main requires Unix"))
+    }
     fn validate_active(&self) -> Result<(), DataError> {
         Err(invalid(
             "native SDK run-state storage is unsupported on this platform",
         ))
     }
 
-    #[cfg(test)]
     pub(crate) fn complete_run_with_fault(
         &mut self,
         _: &str,
@@ -1137,7 +1143,6 @@ impl NativeSdkRunLease {
         ))
     }
 
-    #[cfg(test)]
     pub(crate) fn reconcile_completed_with_fault(
         &mut self,
         _: Option<NativeSdkRunFsFault>,

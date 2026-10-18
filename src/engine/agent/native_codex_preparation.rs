@@ -1,11 +1,11 @@
-//! First-owner contained auth; no main-launch or completion authority is exposed.
+//! One original strict owner moves from contained auth into protected main execution.
 use super::{agent_matrix::NativePrintRequest, AgentEngine};
 use crate::data::fs::data_paths::DataPaths;
 use crate::data::fs::native_codex_auth::{
     AuthReleaseDestination, CodexAuthLaunchFiles, GUEST_CODEX_HOME,
 };
 use crate::data::fs::native_sdk_state::{
-    NativeSdkProvider, NativeSdkRunLease, NativeSdkState, NativeSdkStateKey,
+    NativeSdkProvider, NativeSdkRunCompletion, NativeSdkRunLease, NativeSdkState, NativeSdkStateKey,
 };
 use crate::data::session::Session;
 use crate::data::startup_gate::StartupGateAccess;
@@ -27,6 +27,10 @@ use std::sync::{Arc, Mutex, Weak};
 
 struct Preparation {
     lease: NativeSdkRunLease,
+    key: NativeSdkStateKey,
+    main_files: Option<crate::data::fs::native_codex_main::CodexMainLaunchFiles>,
+    #[cfg(all(test, unix))]
+    main_opt_in: bool,
     runtime: Weak<ContainerRuntime>,
     data: DataPaths,
     model: String,
@@ -290,6 +294,10 @@ impl AgentEngine {
             .map_err(|e| PreparationError::Rejected(e.into()))?;
         let preparation = Box::new(Preparation {
             lease,
+            key,
+            main_files: None,
+            #[cfg(all(test, unix))]
+            main_opt_in: self.native_codex_main_test_opt_in,
             runtime: Arc::downgrade(&self.container_runtime),
             data,
             model,
@@ -502,6 +510,396 @@ impl NativeCodexAuthExecution {
                     "device authentication did not establish qualified success".into(),
                 ),
             }
+        }
+    }
+}
+
+pub(crate) struct StoppedMain {
+    _preparation: Box<Preparation>,
+}
+pub(crate) enum MainStartError {
+    NotStarted {
+        owner: RetiredAuth,
+        error: EngineError,
+    },
+    Retained {
+        ticket: LaunchRetentionTicket,
+        error: EngineError,
+    },
+}
+pub(crate) enum MainRetirement {
+    Completed(crate::engine::agent_runtime::AgentExitInfo),
+    Stopped {
+        owner: StoppedMain,
+        error: EngineError,
+    },
+    Retained {
+        ticket: LaunchRetentionTicket,
+        error: EngineError,
+    },
+    CompletedPublicationUncertain {
+        ticket: LaunchRetentionTicket,
+        error: EngineError,
+    },
+}
+#[allow(dead_code)]
+pub(crate) enum SdkCompletionReconcile {
+    Completed,
+    Retained {
+        ticket: LaunchRetentionTicket,
+        error: EngineError,
+    },
+}
+pub(crate) struct SdkCompletionCustody {
+    preparation: Box<Preparation>,
+}
+impl SdkCompletionCustody {
+    pub(crate) fn reconcile(&mut self) -> Result<(), EngineError> {
+        match self.preparation.lease.reconcile_completed()? {
+            NativeSdkRunCompletion::Completed => Ok(()),
+            NativeSdkRunCompletion::CompletedPublicationUncertain(error) => Err(error.into()),
+        }
+    }
+}
+pub(crate) struct MainCustody {
+    preparation: Mutex<Option<Box<Preparation>>>,
+    project: std::path::PathBuf,
+    root: std::path::PathBuf,
+    release: Mutex<Option<MainReleaseCapability>>,
+    release_failed: AtomicBool,
+    ticket: Mutex<Option<LaunchRetentionTicket>>,
+    pub(crate) no_child_and_plan: AtomicBool,
+    pub(crate) reader_failed: AtomicBool,
+    pub(crate) retired: AtomicBool,
+}
+struct MainReleaseCapability {
+    destination: crate::data::fs::native_codex_main::MainReleaseDestination,
+    container_name: String,
+    token_digest: [u8; 32],
+    request_digest: [u8; 32],
+}
+impl MainCustody {
+    pub(crate) fn validate(&self) -> Result<(), EngineError> {
+        let guard = self.preparation.lock().unwrap_or_else(|p| p.into_inner());
+        let prep = guard
+            .as_ref()
+            .ok_or_else(|| EngineError::Config("main owner unavailable".into()))?;
+        prep.lease
+            .validate_request(NativeSdkProvider::Codex, &prep.model, None)?;
+        if NativeSdkStateKey::new(&self.project, NativeSdkProvider::Codex, &prep.model)? != prep.key
+            || prep
+                .lease
+                .validate_main_selection(&self.project, &self.root)?
+                != self.project
+        {
+            return Err(EngineError::Config("main selection changed".into()));
+        }
+        let files = prep
+            .main_files
+            .as_ref()
+            .ok_or_else(|| EngineError::Config("main controls unavailable".into()))?;
+        let controls = files
+            .gate
+            .control
+            .orchestrated_parts()
+            .ok_or_else(|| EngineError::Config("main controls unavailable".into()))?
+            .0;
+        crate::data::startup_gate::revalidate_mount_source(controls)
+            .map_err(|e| EngineError::Config(e.to_string()))?;
+        Ok(())
+    }
+    pub(crate) fn retained(&self, ticket: LaunchRetentionTicket) {
+        *self.ticket.lock().unwrap_or_else(|p| p.into_inner()) = Some(ticket);
+    }
+    pub(crate) fn ticket(&self) -> Option<LaunchRetentionTicket> {
+        *self.ticket.lock().unwrap_or_else(|p| p.into_inner())
+    }
+    pub(crate) fn release_failed(&self) -> bool {
+        self.release_failed.load(Ordering::Acquire)
+    }
+    pub(crate) fn release_after_verified_receipt(
+        &self,
+        plan: &DurableLaunchPlan,
+        nonce: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<(), LaunchRetentionReason> {
+        let capability = self
+            .release
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let result = (|| {
+            let capability = capability.ok_or(LaunchRetentionReason::PostSpawnControlChanged)?;
+            let changed = LaunchRetentionReason::PostSpawnControlChanged;
+            let request = &plan.controls.request.request;
+            if !capability.destination.matches_controls(&plan.controls)
+                || plan.key.provider != ProviderKind::AppleContainers
+                || plan.key.container_name.as_str() != capability.container_name
+                || plan.key.token_digest != capability.token_digest
+                || plan.controls.request.request_digest != capability.request_digest
+                || request.version != 2
+                || request.guest_cwd.as_deref() != Some("/workspace")
+                || request.bindings.len() != 2
+                || !request.bindings.iter().any(|b| {
+                    b.workspace_path == GUEST_CODEX_HOME && b.access == StartupGateAccess::ReadWrite
+                })
+                || !request.bindings.iter().any(|b| {
+                    b.workspace_path == "/workspace" && b.access == StartupGateAccess::ReadOnly
+                })
+            {
+                return Err(changed);
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Err(LaunchRetentionReason::ChildStateUnknown);
+            }
+            self.validate().map_err(|_| changed)?;
+            revalidate_post_spawn(plan).map_err(|_| changed)?;
+            if cancelled.load(Ordering::Acquire) {
+                return Err(LaunchRetentionReason::ChildStateUnknown);
+            }
+            capability.destination.publish(nonce).map_err(|_| changed)?;
+            self.validate().map_err(|_| changed)?;
+            revalidate_post_spawn(plan).map_err(|_| changed)?;
+            if cancelled.load(Ordering::Acquire) {
+                return Err(LaunchRetentionReason::ChildStateUnknown);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.release_failed.store(true, Ordering::Release);
+        }
+        result
+    }
+    pub(crate) fn complete_sdk(
+        &self,
+        session: &str,
+    ) -> Result<NativeSdkRunCompletion, EngineError> {
+        if self.ticket().is_some()
+            || !self.retired.load(Ordering::Acquire)
+            || self.reader_failed.load(Ordering::Acquire)
+        {
+            return Err(EngineError::Container(
+                "main retirement is not proven".into(),
+            ));
+        }
+        let mut guard = self.preparation.lock().unwrap_or_else(|p| p.into_inner());
+        let prep = guard
+            .as_mut()
+            .ok_or_else(|| EngineError::Container("main owner unavailable".into()))?;
+        Ok(prep.lease.complete_run(session)?)
+    }
+    fn take(&self) -> Box<Preparation> {
+        self.preparation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .expect("single consuming main ownership transfer")
+    }
+}
+pub(crate) struct NativeCodexMainExecution {
+    execution: AgentExecution,
+    custody: Arc<MainCustody>,
+    native: Arc<crate::engine::container::native_sdk_execution::NativeSdkExecution>,
+    registry: Arc<crate::engine::container::gated_launch::LaunchRetentionRegistry>,
+}
+impl RetiredAuth {
+    pub(crate) fn require_main_profile(self) -> Result<Self, MainStartError> {
+        let allowed = false;
+        #[cfg(all(test, unix))]
+        let allowed = allowed || self._preparation.main_opt_in;
+        if allowed {
+            Ok(self)
+        } else {
+            Err(MainStartError::NotStarted {
+                owner: self,
+                error: EngineError::Config(
+                    "native Codex main execution remains unqualified".into(),
+                ),
+            })
+        }
+    }
+    pub(crate) fn start_main(
+        self,
+        session: &Session,
+        prompt: &str,
+        user: Box<dyn AgentFrontend>,
+    ) -> Result<NativeCodexMainExecution, MainStartError> {
+        let mut prep = self.require_main_profile()?._preparation;
+        let mut release = None;
+        let prepared = (|| -> Result<_, EngineError> {
+            let runtime = prep
+                .runtime
+                .upgrade()
+                .ok_or_else(|| EngineError::Config("native main runtime unavailable".into()))?;
+            let registry = runtime
+                .launch_retention()
+                .map_err(|e| EngineError::Container(e.to_string()))?;
+            let root = std::fs::canonicalize(prep.data.root())
+                .map_err(|e| EngineError::Config(e.to_string()))?;
+            let project = prep
+                .lease
+                .validate_main_selection(session.git_root(), &root)?;
+            if NativeSdkStateKey::new(&project, NativeSdkProvider::Codex, &prep.model)? != prep.key
+            {
+                return Err(EngineError::Config("main project changed".into()));
+            }
+            let request = NativePrintRequest::new("codex", Some(&prep.model), None)?;
+            prep.main_files = Some(
+                crate::data::fs::native_codex_main::CodexMainLaunchFiles::new(
+                    &root,
+                    prep.lease.state_path(),
+                    &project,
+                )?,
+            );
+            prep.lease.validate_main_selection(&project, &root)?;
+            let files = prep.main_files.as_mut().expect("assembled main controls");
+            let gate = files.gate.clone();
+            let (_, identity) = gate
+                .control
+                .orchestrated_parts()
+                .ok_or_else(|| EngineError::Config("main requires protected controls".into()))?;
+            let (entrypoint, seeded) = request.main_invocation(prompt);
+            let digest = identity
+                .token_digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            release = Some(MainReleaseCapability {
+                destination: files
+                    .take_release_destination()
+                    .ok_or_else(|| EngineError::Config("main release already consumed".into()))?,
+                container_name: identity.container_name.as_str().to_owned(),
+                token_digest: identity.token_digest,
+                request_digest: identity.request_digest,
+            });
+            let mut options = ResolvedContainerOptions::resolve([
+                ContainerOption::Image(ImageRef::new("awman-native-codex-qualified")),
+                ContainerOption::Entrypoint(entrypoint),
+                ContainerOption::Name(identity.container_name.clone()),
+                ContainerOption::Label {
+                    key: "dev.awman.orchestrator-launch".into(),
+                    value: digest,
+                },
+                ContainerOption::NativePrint(true),
+                ContainerOption::EnvLiteral(EnvLiteral {
+                    key: "CODEX_HOME".into(),
+                    value: GUEST_CODEX_HOME.into(),
+                }),
+                ContainerOption::Overlay(OverlaySpec {
+                    host_path: prep.lease.state_path().to_owned(),
+                    container_path: GUEST_CODEX_HOME.into(),
+                    permission: OverlayPermission::ReadWrite,
+                }),
+                ContainerOption::Overlay(OverlaySpec {
+                    host_path: project.clone(),
+                    container_path: "/workspace".into(),
+                    permission: OverlayPermission::ReadOnly,
+                }),
+            ])
+            .map_err(|e| EngineError::Config(e.to_string()))?;
+            options.seeded_prompt = seeded;
+            options.startup_gate = Some(Box::new(gate));
+            options.startup_gate_trusted_template = true;
+            options.remove_on_exit = false;
+            Ok((runtime, registry, request, options, root, project))
+        })();
+        let (runtime, registry, request, options, root, project) = match prepared {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(MainStartError::NotStarted {
+                    owner: RetiredAuth { _preparation: prep },
+                    error,
+                })
+            }
+        };
+        let custody = Arc::new(MainCustody {
+            preparation: Mutex::new(Some(prep)),
+            project,
+            root,
+            release: Mutex::new(release),
+            release_failed: AtomicBool::new(false),
+            ticket: Mutex::new(None),
+            no_child_and_plan: AtomicBool::new(true),
+            reader_failed: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+        });
+        let native = Arc::new(
+            crate::engine::container::native_sdk_execution::NativeSdkExecution::new_main(
+                request,
+                Arc::clone(&custody),
+            ),
+        );
+        match runtime
+            .build_native_codex_main(options, Arc::clone(&native))
+            .and_then(|instance| instance.run_with_frontend(user))
+        {
+            Ok(execution) => Ok(NativeCodexMainExecution {
+                execution,
+                custody,
+                native,
+                registry,
+            }),
+            Err(error) => match custody.ticket() {
+                Some(ticket) => Err(MainStartError::Retained { ticket, error }),
+                None => {
+                    assert!(
+                        custody.no_child_and_plan.load(Ordering::Acquire),
+                        "protected main failure must publish recovery custody"
+                    );
+                    Err(MainStartError::NotStarted {
+                        owner: RetiredAuth {
+                            _preparation: custody.take(),
+                        },
+                        error,
+                    })
+                }
+            },
+        }
+    }
+}
+impl NativeCodexMainExecution {
+    pub(crate) async fn wait_main(mut self) -> MainRetirement {
+        let result = self.execution.wait().await;
+        if let Some(ticket) = self.custody.ticket() {
+            return MainRetirement::Retained {
+                ticket,
+                error: EngineError::Container("main retained for recovery".into()),
+            };
+        }
+        assert!(
+            self.custody.retired.load(Ordering::Acquire),
+            "backend must retain unknown main retirement"
+        );
+        let info = match result {
+            Ok(info) if info.exit_code == 0 => info,
+            result => {
+                return MainRetirement::Stopped {
+                    owner: StoppedMain {
+                        _preparation: self.custody.take(),
+                    },
+                    error: result.err().unwrap_or_else(|| {
+                        EngineError::Container("native Codex main failed".into())
+                    }),
+                }
+            }
+        };
+        match self.native.complete_after_retirement(&info) {
+            Ok(NativeSdkRunCompletion::Completed) => MainRetirement::Completed(info),
+            Ok(NativeSdkRunCompletion::CompletedPublicationUncertain(error)) => {
+                let ticket = self.registry.retain_sdk_completion(SdkCompletionCustody {
+                    preparation: self.custody.take(),
+                });
+                MainRetirement::CompletedPublicationUncertain {
+                    ticket,
+                    error: error.into(),
+                }
+            }
+            Err(error) => MainRetirement::Stopped {
+                owner: StoppedMain {
+                    _preparation: self.custody.take(),
+                },
+                error,
+            },
         }
     }
 }

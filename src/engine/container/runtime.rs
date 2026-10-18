@@ -368,6 +368,20 @@ impl ContainerRuntime {
         backend.build_native_codex_auth(options, registry, custody)
     }
 
+    pub(crate) fn build_native_codex_main(
+        &self,
+        options: ResolvedContainerOptions,
+        main: Arc<super::native_sdk_execution::NativeSdkExecution>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        let (options, registry) = self.prepare_container_options(options)?;
+        let backend = AppleBackend::default();
+        #[cfg(test)]
+        let backend = self.test_boundary.as_ref().map_or(backend, |boundary| {
+            AppleBackend::with_test_boundary(Arc::clone(boundary))
+        });
+        backend.build_native_codex_main(options, registry, main)
+    }
+
     fn prepare_container_options(
         &self,
         mut options: ResolvedContainerOptions,
