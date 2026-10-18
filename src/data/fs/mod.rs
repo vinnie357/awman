@@ -17,6 +17,8 @@ pub mod data_paths;
 pub mod kit_paths;
 pub mod log_dirs;
 pub(crate) mod native_codex_auth;
+#[cfg(all(test, unix))]
+pub(crate) mod native_codex_main_snapshot;
 pub(crate) mod native_sdk_state;
 pub mod overlay_paths;
 pub mod path_guard;
