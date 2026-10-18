@@ -14,6 +14,7 @@ use super::child_lifecycle::{
 use super::{
     DurableLaunchPlan, GatedProviderAdapter, PendingPublication, ProviderLaunchInspection,
 };
+use crate::engine::container::native_sdk_execution::NativeSdkExecution;
 #[cfg(test)]
 use crate::engine::container::orchestrated_apple::OrchestratedAppleTestBoundary;
 use crate::engine::error::EngineError;
@@ -103,6 +104,8 @@ impl fmt::Debug for RetainedAgentLaunch {
     }
 }
 
+use crate::engine::agent::native_codex_preparation::SdkCompletionReconcile;
+
 enum RetainedRegistryEnvelope {
     Gated(Box<RetainedAgentLaunch>),
     PendingPublication {
@@ -121,10 +124,18 @@ enum RetainedRegistryEnvelope {
         _resources: Box<dyn Any + Send>,
         _auth: Arc<crate::engine::agent::native_codex_preparation::AuthCustody>,
     },
+    SdkCompletionUncertain(crate::engine::agent::native_codex_preparation::SdkCompletionCustody),
+    UnresolvedMainPreparation {
+        _prepared: PreparedChildLifecycle,
+        _resources: Box<dyn Any + Send>,
+        _main: Arc<super::super::native_sdk_execution::NativeSdkExecution>,
+    },
     Legacy(Option<RetainedExecution>),
 }
 
 pub(crate) struct ActiveGatedCustody {
+    pub(in crate::engine::container) native_main:
+        Option<Arc<super::super::native_sdk_execution::NativeSdkExecution>>,
     pub(in crate::engine::container) native_auth:
         Option<Arc<crate::engine::agent::native_codex_preparation::AuthCustody>>,
     pub(in crate::engine::container) plan: DurableLaunchPlan,
@@ -169,6 +180,7 @@ impl ActiveGatedCustody {
             cleanup_phase:
                 crate::engine::container::orchestrated_apple::ExactCleanupPhase::NeedsCleanup,
             native_auth: None,
+            native_main: None,
             cleanup_lifecycle: CleanupLifecycleProvenance::Created,
             never_created_reconciliation: None,
             #[cfg(test)]
@@ -196,6 +208,7 @@ impl ActiveGatedCustody {
                     proof,
                 },
             native_auth: None,
+            native_main: None,
             cleanup_lifecycle: CleanupLifecycleProvenance::NeverCreated,
             never_created_reconciliation: None,
             #[cfg(test)]
@@ -221,6 +234,7 @@ impl ActiveGatedCustody {
             cleanup_phase:
                 crate::engine::container::orchestrated_apple::ExactCleanupPhase::NeedsCleanup,
             native_auth: None,
+            native_main: None,
             cleanup_lifecycle: CleanupLifecycleProvenance::NeverCreatedUncertain,
             never_created_reconciliation: Some(failure),
             #[cfg(test)]
@@ -260,6 +274,8 @@ struct Shared {
 
 struct RetainedEntry {
     launch: RetainedRegistryEnvelope,
+    // Local CLI retirement cannot release unresolved main provider custody.
+    _native_main: Option<Arc<NativeSdkExecution>>,
     raw_custody: Option<RawCustodyCapability>,
     #[cfg_attr(not(test), allow(dead_code))]
     raw_counters: (usize, usize, usize, usize),
@@ -348,21 +364,35 @@ impl LaunchRetentionRegistry {
     }
 
     pub(crate) fn retain(&self, launch: RetainedAgentLaunch) -> LaunchRetentionTicket {
-        self.retain_envelope(RetainedRegistryEnvelope::Gated(Box::new(launch)))
+        self.retain_envelope(RetainedRegistryEnvelope::Gated(Box::new(launch)), None)
+    }
+
+    pub(in crate::engine::container) fn retain_native_main_after_start(
+        &self,
+        launch: RetainedAgentLaunch,
+        main: Arc<NativeSdkExecution>,
+    ) -> LaunchRetentionTicket {
+        self.retain_envelope(
+            RetainedRegistryEnvelope::Gated(Box::new(launch)),
+            Some(main),
+        )
     }
 
     pub(in crate::engine::container) fn retain_legacy(
         &self,
         execution: RetainedExecution,
     ) -> LaunchRetentionTicket {
-        self.retain_envelope(RetainedRegistryEnvelope::Legacy(Some(execution)))
+        self.retain_envelope(RetainedRegistryEnvelope::Legacy(Some(execution)), None)
     }
 
     pub(in crate::engine::container) fn retain_active_gated(
         &self,
         custody: ActiveGatedCustody,
     ) -> LaunchRetentionTicket {
-        let ticket = self.retain_envelope(RetainedRegistryEnvelope::ActiveGated(Box::new(custody)));
+        let ticket = self.retain_envelope(
+            RetainedRegistryEnvelope::ActiveGated(Box::new(custody)),
+            None,
+        );
         #[cfg(test)]
         self.shared
             .resource_loan_releases
@@ -379,11 +409,84 @@ impl LaunchRetentionRegistry {
         resources: Box<dyn Any + Send>,
         auth: Arc<crate::engine::agent::native_codex_preparation::AuthCustody>,
     ) -> LaunchRetentionTicket {
-        self.retain_envelope(RetainedRegistryEnvelope::UnresolvedAuthPreparation {
-            _prepared: prepared,
-            _resources: resources,
-            _auth: auth,
-        })
+        self.retain_envelope(
+            RetainedRegistryEnvelope::UnresolvedAuthPreparation {
+                _prepared: prepared,
+                _resources: resources,
+                _auth: auth,
+            },
+            None,
+        )
+    }
+
+    pub(in crate::engine) fn retain_sdk_completion(
+        &self,
+        owner: crate::engine::agent::native_codex_preparation::SdkCompletionCustody,
+    ) -> LaunchRetentionTicket {
+        self.retain_envelope(
+            RetainedRegistryEnvelope::SdkCompletionUncertain(owner),
+            None,
+        )
+    }
+    pub(in crate::engine::container) fn retain_unresolved_main_preparation(
+        &self,
+        prepared: PreparedChildLifecycle,
+        resources: Box<dyn Any + Send>,
+        main: Arc<super::super::native_sdk_execution::NativeSdkExecution>,
+    ) -> LaunchRetentionTicket {
+        self.retain_envelope(
+            RetainedRegistryEnvelope::UnresolvedMainPreparation {
+                _prepared: prepared,
+                _resources: resources,
+                _main: main,
+            },
+            None,
+        )
+    }
+    #[allow(dead_code)]
+    pub(crate) fn reconcile_sdk_completion(
+        &self,
+        ticket: LaunchRetentionTicket,
+        deadline: Instant,
+    ) -> Result<SdkCompletionReconcile, EngineError> {
+        let mut entry = match claim_outstanding_entry(&self.shared, ticket, deadline)? {
+            OutstandingEntryClaim::Claimed(entry) => *entry,
+            OutstandingEntryClaim::Resolved => {
+                return Err(EngineError::Container(
+                    "retained SDK completion ticket unavailable".into(),
+                ))
+            }
+            OutstandingEntryClaim::RetainedInFlight => {
+                return Ok(SdkCompletionReconcile::Retained {
+                    ticket,
+                    error: EngineError::Container("retained SDK completion busy".into()),
+                })
+            }
+        };
+        let RetainedRegistryEnvelope::SdkCompletionUncertain(owner) = &mut entry.launch else {
+            publish_retained_entry(&self.shared, ticket, entry);
+            return Err(EngineError::Container(
+                "ticket does not retain SDK completion".into(),
+            ));
+        };
+        match owner.reconcile() {
+            Ok(()) => {
+                record_poll_disposition(
+                    &self.shared,
+                    &mut entry,
+                    RetainedEntryPoll {
+                        child_reaped: false,
+                        resolved: true,
+                    },
+                );
+                publish_resolved_entry(&self.shared, ticket);
+                Ok(SdkCompletionReconcile::Completed)
+            }
+            Err(error) => {
+                publish_retained_entry(&self.shared, ticket, entry);
+                Ok(SdkCompletionReconcile::Retained { ticket, error })
+            }
+        }
     }
 
     pub(in crate::engine::container) fn retain_pending_publication(
@@ -394,14 +497,17 @@ impl LaunchRetentionRegistry {
         adapter: Arc<dyn GatedProviderAdapter>,
         #[cfg(test)] boundary: Option<Arc<dyn OrchestratedAppleTestBoundary>>,
     ) -> LaunchRetentionTicket {
-        let ticket = self.retain_envelope(RetainedRegistryEnvelope::PendingPublication {
-            publication: Some(publication),
-            prepared: Some(prepared),
-            resources: Some(resources),
-            adapter,
-            #[cfg(test)]
-            boundary,
-        });
+        let ticket = self.retain_envelope(
+            RetainedRegistryEnvelope::PendingPublication {
+                publication: Some(publication),
+                prepared: Some(prepared),
+                resources: Some(resources),
+                adapter,
+                #[cfg(test)]
+                boundary,
+            },
+            None,
+        );
         #[cfg(test)]
         self.shared
             .resource_loan_releases
@@ -442,7 +548,11 @@ impl LaunchRetentionRegistry {
         }
     }
 
-    fn retain_envelope(&self, launch: RetainedRegistryEnvelope) -> LaunchRetentionTicket {
+    fn retain_envelope(
+        &self,
+        launch: RetainedRegistryEnvelope,
+        native_main: Option<Arc<NativeSdkExecution>>,
+    ) -> LaunchRetentionTicket {
         // Classify custody before taking registry locks. A successful bind may
         // still be queued while the actor reports Prepared, so only an actual
         // published Exited state proves that managed custody is reaped.
@@ -456,6 +566,7 @@ impl LaunchRetentionRegistry {
             ticket,
             RetainedEntry {
                 launch,
+                _native_main: native_main,
                 raw_custody: None,
                 raw_counters: (0, 0, 0, 0),
                 signal_authorized: true,
@@ -540,6 +651,8 @@ fn retry_claimed_active_gated(
     if matches!(
         entry.launch,
         RetainedRegistryEnvelope::UnresolvedAuthPreparation { .. }
+            | RetainedRegistryEnvelope::UnresolvedMainPreparation { .. }
+            | RetainedRegistryEnvelope::SdkCompletionUncertain(_)
     ) {
         return Ok(ActiveGatedRetryOutcome::Retained);
     }
@@ -700,7 +813,7 @@ fn retry_claimed_active_gated(
         }
     }
 
-    let already_released_auth = custody.native_auth.is_some()
+    let already_released_auth = (custody.native_auth.is_some() || custody.native_main.is_some())
         && custody.resource_loan.is_none()
         && custody.lifecycle.resources_are_released();
     let loan_released = already_released_auth
@@ -947,7 +1060,9 @@ fn initially_owns_unreaped_child(launch: &RetainedRegistryEnvelope) -> bool {
         RetainedRegistryEnvelope::Gated(launch) => launch.execution.as_ref(),
         RetainedRegistryEnvelope::PendingPublication { .. } => return false,
         // Only local non-start is known; this says nothing about the provider.
-        RetainedRegistryEnvelope::UnresolvedAuthPreparation { .. } => return false,
+        RetainedRegistryEnvelope::UnresolvedAuthPreparation { .. }
+        | RetainedRegistryEnvelope::UnresolvedMainPreparation { .. }
+        | RetainedRegistryEnvelope::SdkCompletionUncertain(_) => return false,
         RetainedRegistryEnvelope::ActiveGated(launch) => {
             return match launch.cleanup_lifecycle {
                 CleanupLifecycleProvenance::Created => {
@@ -1023,7 +1138,9 @@ fn poll_retained_entry(
             child_reaped: true,
             resolved: false,
         },
-        RetainedRegistryEnvelope::UnresolvedAuthPreparation { .. } => RetainedEntryPoll {
+        RetainedRegistryEnvelope::UnresolvedAuthPreparation { .. }
+        | RetainedRegistryEnvelope::UnresolvedMainPreparation { .. }
+        | RetainedRegistryEnvelope::SdkCompletionUncertain(_) => RetainedEntryPoll {
             child_reaped: false,
             resolved: false,
         },

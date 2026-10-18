@@ -311,6 +311,8 @@ impl RetentionProbe {
             }
             Some(RetainedRegistryEnvelope::PendingPublication { .. }) => return None,
             Some(RetainedRegistryEnvelope::UnresolvedAuthPreparation { .. }) => return None,
+            Some(RetainedRegistryEnvelope::SdkCompletionUncertain(_)) => return None,
+            Some(RetainedRegistryEnvelope::UnresolvedMainPreparation { .. }) => return None,
             Some(RetainedRegistryEnvelope::Gated(_) | RetainedRegistryEnvelope::Legacy(_)) => {
                 return None;
             }
@@ -372,6 +374,8 @@ impl RetentionProbe {
             }
             Some(RetainedRegistryEnvelope::PendingPublication { .. }) => 0,
             Some(RetainedRegistryEnvelope::UnresolvedAuthPreparation { .. }) => 0,
+            Some(RetainedRegistryEnvelope::SdkCompletionUncertain(_)) => 0,
+            Some(RetainedRegistryEnvelope::UnresolvedMainPreparation { .. }) => 0,
             Some(RetainedRegistryEnvelope::Gated(_) | RetainedRegistryEnvelope::Legacy(_))
             | None => 0,
         }

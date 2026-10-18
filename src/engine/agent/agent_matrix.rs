@@ -25,7 +25,6 @@ pub(crate) struct NativePrintRequest {
     session: Option<NativeSession>,
 }
 
-#[cfg(test)]
 #[derive(Default)]
 pub(crate) struct NativeSdkAckFields {
     pub(crate) event_type: Option<String>,
@@ -38,7 +37,6 @@ pub(crate) struct NativeSdkAckFields {
     pub(crate) provider_error_present: bool,
 }
 
-#[cfg(test)]
 impl NativeSdkAckFields {
     pub(crate) fn retained_capacity_bytes(&self) -> usize {
         [
@@ -56,7 +54,6 @@ impl NativeSdkAckFields {
     }
 }
 
-#[cfg(test)]
 pub(crate) enum NativeSdkAckEvent {
     Session(String),
     TurnStarted,
@@ -65,8 +62,8 @@ pub(crate) enum NativeSdkAckEvent {
     Other,
 }
 
-#[cfg(test)]
 impl NativePrintRequest {
+    #[cfg(test)]
     pub(crate) fn validate_state(
         &self,
         lease: &crate::data::fs::native_sdk_state::NativeSdkStateLease,
@@ -188,6 +185,21 @@ impl NativePrintRequest {
             ));
         }
         Ok(&self.model)
+    }
+
+    pub(crate) fn main_invocation(&self, prompt: &str) -> (Entrypoint, Option<String>) {
+        (
+            Entrypoint(vec![
+                "codex".into(),
+                "exec".into(),
+                "--model".into(),
+                self.model.clone(),
+                "--json".into(),
+                "--skip-git-repo-check".into(),
+                "-".into(),
+            ]),
+            Some(prompt.into()),
+        )
     }
 
     pub(crate) fn invocation(&self, prompt: &str) -> (Entrypoint, Option<String>) {

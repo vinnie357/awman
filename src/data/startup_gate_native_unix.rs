@@ -348,9 +348,14 @@ pub(crate) struct OrchestratedControlAuthority {
 }
 
 impl OrchestratedControlAuthority {
-    // Fixed Layer0 persistence, not permission to release a launch. The sole
-    // production caller is the opaque auth destination, behind engine custody.
+    // Only distinct opaque auth/main destinations reach these fixed persistence mechanics.
     pub(in crate::data) fn publish_auth_release(&self, nonce: &str) -> Result<(), PlanFileError> {
+        self.publish_native_release(nonce, true)
+    }
+    pub(in crate::data) fn publish_main_release(&self, nonce: &str) -> Result<(), PlanFileError> {
+        self.publish_native_release(nonce, false)
+    }
+    fn publish_native_release(&self, nonce: &str, auth: bool) -> Result<(), PlanFileError> {
         if !hex64(nonce) {
             return Err(PlanFileError::ExistingOrUnsafe);
         }
@@ -358,7 +363,8 @@ impl OrchestratedControlAuthority {
         let bytes = serde_json::to_vec(&serde_json::json!({"version":1,"nonce":nonce}))
             .map_err(|_| PlanFileError::PublicationFailed)?;
         let dir = &self.guest_control.dir.dir;
-        let temp_name = format!(".auth-release.{}.tmp", uuid::Uuid::new_v4().simple());
+        let stage = if auth { "auth" } else { "main" };
+        let temp_name = format!(".{stage}-release.{}.tmp", uuid::Uuid::new_v4().simple());
         let fd = nix::fcntl::openat(
             dir,
             temp_name.as_str(),
@@ -389,7 +395,7 @@ impl OrchestratedControlAuthority {
         verify_auth_release_name(dir, &temp_name, &file, original, &bytes, false)?;
         rename_noreplace(dir, &temp_name, "release.json")?;
         #[cfg(all(test, unix))]
-        {
+        if auth {
             let action = {
                 self.guest_control
                     .dir
@@ -403,7 +409,7 @@ impl OrchestratedControlAuthority {
             }
         }
         #[cfg(all(test, unix))]
-        {
+        if auth {
             let fault = {
                 self.guest_control
                     .dir

@@ -119,6 +119,7 @@ pub(super) fn await_protected_release(
         cancelled,
         enclosing,
         None,
+        None,
         #[cfg(test)]
         boundary,
     )
@@ -138,6 +139,27 @@ pub(super) fn await_native_auth_release(
         cancelled,
         enclosing,
         Some(auth),
+        None,
+        #[cfg(test)]
+        boundary,
+    )
+}
+
+pub(super) fn await_native_main_release(
+    plan: &DurableLaunchPlan,
+    adapter: &dyn GatedProviderAdapter,
+    cancelled: &AtomicBool,
+    enclosing: Instant,
+    main: &super::native_sdk_execution::NativeSdkExecution,
+    #[cfg(test)] boundary: Option<&dyn OrchestratedAppleTestBoundary>,
+) -> Result<ProtectedGateRelease, LaunchRetentionReason> {
+    await_release_with_auth_owner(
+        plan,
+        adapter,
+        cancelled,
+        enclosing,
+        None,
+        Some(main),
         #[cfg(test)]
         boundary,
     )
@@ -149,6 +171,7 @@ fn await_release_with_auth_owner(
     cancelled: &AtomicBool,
     enclosing: Instant,
     auth: Option<&crate::engine::agent::native_codex_preparation::AuthCustody>,
+    main: Option<&super::native_sdk_execution::NativeSdkExecution>,
     #[cfg(test)] boundary: Option<&dyn OrchestratedAppleTestBoundary>,
 ) -> Result<ProtectedGateRelease, LaunchRetentionReason> {
     #[cfg(test)]
@@ -274,6 +297,19 @@ fn await_release_with_auth_owner(
         release_result?;
     }
 
+    if let Some(main) = main {
+        if !plan
+            .controls
+            .host_parent
+            .verify_launch_receipt(&pinned_receipt)
+        {
+            return Err(LaunchRetentionReason::PostSpawnControlChanged);
+        }
+        if Instant::now() >= enclosing {
+            return Err(LaunchRetentionReason::InspectionUnavailable);
+        }
+        main.release_after_verified_receipt(plan, &ready.nonce, cancelled)?;
+    }
     loop {
         if cancelled.load(Ordering::Acquire) {
             return Err(LaunchRetentionReason::ChildStateUnknown);
@@ -801,6 +837,14 @@ pub(crate) struct TestOwnershipObservation {
 
 #[cfg(test)]
 pub(crate) trait OrchestratedAppleTestBoundary: Send + Sync {
+    #[cfg(unix)]
+    fn take_launch_resource(
+        &self,
+        _exact_name: &str,
+        _actual_argv: &[String],
+    ) -> Option<Box<dyn std::any::Any + Send>> {
+        None
+    }
     fn retention_available(&self) -> bool;
     fn image_inspection(&self) -> Result<Vec<u8>, EngineError>;
     fn provider(&self) -> Arc<dyn GatedProviderAdapter>;

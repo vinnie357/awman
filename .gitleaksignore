@@ -10,3 +10,6 @@ b1f9d7404e688b74c6425c4e1d13dd7f490a5f00:docs/16-squad.md:generic-api-key:461
 
 # Historical amie documentation example.
 364c0bf515d450e47e89392b91a256bebbfceaee:docs/16-amie.md:generic-api-key:352
+
+# Reviewed historical documentation authority-reference false positive.
+965076cb462109e5c0f3d8da68867194d9321166:aspec/reviews/gated-launch-native-packet2-p2c-freeze.md:generic-api-key:20
