@@ -359,6 +359,7 @@ if phase == 'auth':
     print('https://device.invalid/SYNTHETIC_DEVICE_CHALLENGE', flush=True)
 else:
     print('{{"type":"thread.started","thread_id":"connected-main-fixture"}}', flush=True)
+    print('{{"type":"turn.started"}}', flush=True)
     print('{{"type":"turn.completed"}}', flush=True)
 "##
         );
