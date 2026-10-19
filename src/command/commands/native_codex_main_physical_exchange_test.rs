@@ -4,7 +4,9 @@ use super::native_codex_main_entry_marker_test::{prove_entry_control, two_stream
 use super::Command;
 use crate::command::error::CommandError;
 use crate::engine::agent::native_codex_auth_preparation_test::TestResult;
-use crate::engine::agent::native_codex_main_a2a_test_support::{is_main, A2Fixture};
+use crate::engine::agent::native_codex_main_a2a_test_support::{
+    is_main, A2Fixture, ObservedBoundary,
+};
 use crate::engine::agent::native_codex_main_a2m_test_support::instrument;
 use crate::engine::agent::native_codex_main_entry_marker_support::install;
 use crate::engine::container::gated_launch::*;
@@ -21,7 +23,7 @@ struct KeptExchange {
     _fixture: A2Fixture,
     _registry: Arc<LaunchRetentionRegistry>,
     _probe: retention_test_support::RetentionProbe,
-    _ticket: LaunchRetentionTicket,
+    _ticket: Option<LaunchRetentionTicket>,
     _claims: retention_test_support::SupervisorActiveClaimBarrier,
 }
 static KEPT: OnceLock<Mutex<Vec<KeptExchange>>> = OnceLock::new();
@@ -64,12 +66,49 @@ fn assert_original(e: &Original) -> TestResult {
     }
     let lock_path = e.owner.join("writer.lock");
     assert_eq!(identity(&lock_path)?, e.lock_identity);
-    let lock = OpenOptions::new().read(true).write(true).open(lock_path)?;
-    assert!(matches!(
-        lock.try_lock(),
-        Err(std::fs::TryLockError::WouldBlock)
-    ));
     Ok(())
+}
+fn assert_lock(e: &Original, retained: bool) -> TestResult {
+    let lock_path = e.owner.join("writer.lock");
+    assert_eq!(identity(&lock_path)?, e.lock_identity);
+    let lock = OpenOptions::new().read(true).write(true).open(lock_path)?;
+    let metadata = lock.metadata()?;
+    assert_eq!((metadata.dev(), metadata.ino()), e.lock_identity);
+    let result = lock.try_lock();
+    drop(lock);
+    if retained {
+        assert!(matches!(result, Err(std::fs::TryLockError::WouldBlock)));
+    } else {
+        assert!(
+            result.is_ok(),
+            "retired failed main still owns original writer lock"
+        );
+    }
+    Ok(())
+}
+fn resolved_main(
+    probe: &retention_test_support::RetentionProbe,
+    ticket: LaunchRetentionTicket,
+    boundary: &ObservedBoundary,
+) -> bool {
+    let snapshots = boundary.snapshots.lock().expect("actual main retirement");
+    let witnessed = snapshots
+        .last()
+        .is_some_and(|main| is_main(&main.argv) && main.reaped && main.cleaned && main.released);
+    let state = probe.snapshot();
+    witnessed
+        && probe.resource_loan_releases(ticket) == 1
+        && !probe.contains(ticket)
+        && probe.only_ticket().is_none()
+        && state.retained == 0
+        && state.unreaped == 0
+        && probe.active_gated_resource_loans(ticket) == 0
+}
+fn assert_retained(probe: &retention_test_support::RetentionProbe, ticket: LaunchRetentionTicket) {
+    assert!(probe.contains(ticket));
+    assert_eq!(probe.only_ticket(), Some(ticket));
+    assert_eq!(probe.snapshot().retained, 1);
+    assert_eq!(probe.snapshot().unreaped, 0);
 }
 async fn run_exchange(data_root: bool) -> TestResult {
     prove_entry_control().await?;
@@ -184,16 +223,38 @@ async fn run_exchange(data_root: bool) -> TestResult {
     assert!(probe.only_ticket().is_none());
     release.release();
     let (frontend, _outputs) = two_streams(&fixture.fixture.auth);
-    let result = tokio::time::timeout(
-        Duration::from_secs(15),
-        command(&fixture.fixture.auth).run_with_frontend(frontend),
-    )
-    .await?;
+    let command = command(&fixture.fixture.auth);
+    let boundary = Arc::clone(&fixture.boundary);
+    let keeper_index = {
+        let mut kept = KEPT
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let index = kept.len();
+        kept.push(KeptExchange {
+            _fixture: fixture,
+            _registry: Arc::clone(&registry),
+            _probe: probe.clone(),
+            _ticket: None,
+            _claims: claims,
+        });
+        index
+    };
+    let result =
+        tokio::time::timeout(Duration::from_secs(15), command.run_with_frontend(frontend)).await?;
+    let ticket = probe.only_ticket().ok_or("original main custody ticket")?;
+    {
+        let mut kept = KEPT
+            .get()
+            .expect("original fixture keeper")
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        kept[keeper_index]._ticket = Some(ticket);
+    }
     assert!(
         matches!(result, Err(CommandError::Engine(_))),
         "exchange did not reject: {result:?}"
     );
-    let ticket = probe.only_ticket().ok_or("original main custody ticket")?;
     let exited_before = saved
         .lock()
         .expect("actual exchange")
@@ -220,29 +281,39 @@ async fn run_exchange(data_root: bool) -> TestResult {
         assert_original(state.as_ref().ok_or("physical exchange never ran")?)?;
     }
     assert!(fs::read_dir(&entry.marker_dir)?.next().is_none());
-    assert_eq!(probe.only_ticket(), Some(ticket));
-    assert_eq!(probe.snapshot().retained, 1);
-    assert_eq!(probe.snapshot().unreaped, 0);
-    assert!(matches!(
-        registry.retry_active_gated(ticket, Instant::now() + Duration::from_secs(15)),
-        Ok(ActiveGatedRetryOutcome::Retained)
-    ));
-    assert!(probe.contains(ticket));
+    let resolved = !data_root && resolved_main(&probe, ticket, &boundary);
+    if !resolved {
+        assert_retained(&probe, ticket);
+        {
+            let state = saved.lock().expect("unresolved original authority");
+            assert_lock(state.as_ref().ok_or("unresolved physical source")?, true)?;
+        }
+        let retry = registry.retry_active_gated(ticket, Instant::now() + Duration::from_secs(15));
+        if !data_root && matches!(&retry, Ok(ActiveGatedRetryOutcome::Resolved)) {
+            assert!(resolved_main(&probe, ticket, &boundary));
+        } else {
+            let retained = match &retry {
+                Ok(ActiveGatedRetryOutcome::Retained) => true,
+                Err(EngineError::Container(message)) => {
+                    message == "retained launch ticket is not an active gated launch"
+                }
+                _ => false,
+            };
+            assert!(retained, "unexpected original-custody retry outcome");
+            assert_retained(&probe, ticket);
+        }
+    }
     {
-        let state = saved.lock().expect("retained original evidence");
-        assert_original(state.as_ref().ok_or("retained physical source")?)?;
+        let state = saved.lock().expect("post-disposition original evidence");
+        let original = state.as_ref().ok_or("original physical source")?;
+        assert_original(original)?;
+        let resolved = !data_root && resolved_main(&probe, ticket, &boundary);
+        if !resolved {
+            assert_retained(&probe, ticket);
+        }
+        assert_lock(original, !resolved)?;
     }
     assert!(fs::read_dir(&entry.marker_dir)?.next().is_none());
-    KEPT.get_or_init(|| Mutex::new(Vec::new()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .push(KeptExchange {
-            _fixture: fixture,
-            _registry: registry,
-            _probe: probe,
-            _ticket: ticket,
-            _claims: claims,
-        });
     Ok(())
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
