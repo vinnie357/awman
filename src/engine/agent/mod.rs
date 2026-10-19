@@ -2838,3 +2838,6 @@ pub(crate) mod native_codex_main_a2m_test_support;
 
 #[cfg(all(test, unix))]
 pub(crate) mod native_codex_main_a2m_freshness_test_support;
+
+#[cfg(all(test, unix))]
+pub(crate) mod native_codex_main_a2b_test_support;
