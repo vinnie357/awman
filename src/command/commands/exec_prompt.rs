@@ -836,6 +836,10 @@ mod native_codex_main_a2m_freshness_test;
 mod native_codex_main_a2b_test;
 
 #[cfg(all(test, unix))]
+#[path = "native_codex_main_entry_marker_test.rs"]
+pub(super) mod native_codex_main_entry_marker_test;
+
+#[cfg(all(test, unix))]
 #[path = "native_codex_main_b1_post_start_test.rs"]
 mod native_codex_main_b1_post_start_test;
 
