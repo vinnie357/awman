@@ -1,5 +1,6 @@
 [tools]
 rust = "1.94.0"
+python = "3.15.0"
 
 [env]
 _.path = ["${CARGO_HOME:-$HOME/.cargo}/bin"]
@@ -8,13 +9,17 @@ _.path = ["${CARGO_HOME:-$HOME/.cargo}/bin"]
 description = "Test private native Codex authentication output"
 run = "cargo test native_codex_auth_terminal -- --nocapture"
 
+[tasks."test:a2b-alias"]
+description = "Check canonical ancestor-alias main ownership"
+run = "cargo test native_codex_main_a2b_test -- --nocapture"
+
 [tasks.ci]
 description = "Run local architecture, formatting, lint and fast-test gates"
-run = [
-    "rustc --version",
-    "cargo --version",
-    "make architecture-lint",
-    "cargo fmt --check",
-    "cargo clippy --all-targets -- -D warnings",
-    "make test-fast",
-]
+run = '''export PATH={{ tools.python.path | quote }}/bin:{{ tools.rust.path | quote }}:"$PATH" RUSTUP_TOOLCHAIN=1.94.0 RUSTUP_AUTO_INSTALL=0; set -e
+python3 -c 'import sys; print(sys.executable, sys.version.split()[0]); sys.exit(0 if sys.version_info[:3] == (3, 15, 0) else 1)'
+rust_version="$(rustc --version)"; printf '%s\n' "$rust_version"; case "$rust_version" in 'rustc 1.94.0 '*) ;; *) exit 1 ;; esac
+cargo_version="$(cargo --version)"; printf '%s\n' "$cargo_version"; case "$cargo_version" in 'cargo 1.94.0 '*) ;; *) exit 1 ;; esac
+make architecture-lint
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+make test-fast'''
