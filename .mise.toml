@@ -13,6 +13,10 @@ run = "cargo test native_codex_auth_terminal -- --nocapture"
 description = "Check canonical ancestor-alias main ownership"
 run = "cargo test native_codex_main_a2b_test -- --nocapture"
 
+[tasks."test:main-entry-marker"]
+description = "Check actual connected fixture-main entry observation"
+run = 'export PATH={{ tools.python.path | quote }}/bin:{{ tools.rust.path | quote }}:"$PATH" RUSTUP_TOOLCHAIN=1.94.0 RUSTUP_AUTO_INSTALL=0; cargo test native_codex_main_entry_marker_test -- --nocapture'
+
 [tasks.ci]
 description = "Run local architecture, formatting, lint and fast-test gates"
 run = '''export PATH={{ tools.python.path | quote }}/bin:{{ tools.rust.path | quote }}:"$PATH" RUSTUP_TOOLCHAIN=1.94.0 RUSTUP_AUTO_INSTALL=0; set -e
