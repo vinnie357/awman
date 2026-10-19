@@ -44,6 +44,11 @@ Native print uses piped stdio even when your terminal is interactive. Provider
 stdout stays unchanged, stderr remains separate, and the provider's exit status
 becomes the command's exit status. awman adds no stdout completion summary.
 
+Contained native Codex authentication requires a writable controlling terminal.
+Login URLs and device codes go directly to that terminal, even when stdout or
+stderr is redirected. The production Codex native profile remains closed pending
+qualification.
+
 The project remains writable. For a review, run from a disposable project and
 mount each input read-only with `--overlay 'dir(INPUT:/workspace/input-1:ro)'`.
 Native print does not change provider permission policy. It cannot be combined

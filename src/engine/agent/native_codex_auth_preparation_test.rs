@@ -412,6 +412,35 @@ impl AuthObserver {
             .expect("positive control: exact writer is releasable");
         file.unlock().expect("unlock control descriptor");
     }
+    pub(crate) fn assert_auth_output_private(&self) {
+        let mut facts = self.facts.lock().expect("facts");
+        assert_eq!(facts.outputs.len(), 1, "expected actual auth bridge probe");
+        for probe in &mut facts.outputs {
+            assert!(
+                probe.tail.snapshot_text().is_empty(),
+                "auth reached generic output tail"
+            );
+            if let Some(receiver) = probe.broadcast.as_mut() {
+                assert!(
+                    matches!(
+                        receiver.try_recv(),
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty
+                            | tokio::sync::broadcast::error::TryRecvError::Closed)
+                    ),
+                    "auth reached generic broadcast"
+                );
+            }
+        }
+        for marker in [URL, "SYNTHETIC_STDERR_CHALLENGE"] {
+            assert!(
+                !facts
+                    .diagnostics
+                    .iter()
+                    .any(|message| message.contains(marker)),
+                "auth reached diagnostic messages"
+            );
+        }
+    }
     pub(crate) fn assert_unpublished(&self) {
         let state = self.state_path();
         let owner = state.parent().expect("owner");

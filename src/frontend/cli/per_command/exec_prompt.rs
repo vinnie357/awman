@@ -10,6 +10,30 @@ use crate::frontend::cli::command_frontend::CliFrontend;
 
 #[async_trait::async_trait]
 impl ExecPromptCommandFrontend for CliFrontend {
+    fn native_auth_frontend(
+        &mut self,
+    ) -> Result<
+        Box<dyn crate::engine::agent_runtime::AgentFrontend>,
+        crate::command::error::CommandError,
+    > {
+        let terminal = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .and_then(|terminal| {
+                super::container_frontend_marker::CliNativeAuthProxy::new(
+                    terminal,
+                    std::sync::Arc::clone(&self.native_output_writers),
+                )
+            })
+            .map_err(|_| {
+                crate::command::error::CommandError::Other(
+                    "native Codex authentication requires a writable controlling terminal; run this command from an interactive terminal".into(),
+                )
+            })?;
+        Ok(Box::new(terminal))
+    }
+
     fn native_container_frontend(
         &mut self,
     ) -> Box<dyn crate::engine::agent_runtime::AgentFrontend> {
