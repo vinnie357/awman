@@ -60,6 +60,16 @@ pub trait ExecPromptCommandFrontend:
     /// like the TUI).
     fn set_pty_active(&mut self, _active: bool) {}
 
+    /// Authentication challenges must stay outside ordinary output and diagnostics.
+    /// Acquisition failure must precede activation or access to owner material.
+    fn native_auth_frontend(
+        &mut self,
+    ) -> Result<Box<dyn crate::engine::agent_runtime::AgentFrontend>, CommandError> {
+        Err(CommandError::Other(
+            "native Codex authentication requires a writable controlling terminal; run this command from an interactive terminal".into(),
+        ))
+    }
+
     fn native_container_frontend(
         &mut self,
     ) -> Box<dyn crate::engine::agent_runtime::AgentFrontend> {
@@ -324,6 +334,7 @@ impl Command for ExecPromptCommand {
                 self.flags.model.as_deref(),
                 self.native_session.as_deref(),
             )?;
+            let auth_frontend = frontend.native_auth_frontend()?;
             let preparation = match self
                 .engines
                 .agent_engine
@@ -336,7 +347,7 @@ impl Command for ExecPromptCommand {
                     return Err(error.into());
                 }
             };
-            let auth = match preparation.start_auth(frontend.container_frontend()) {
+            let auth = match preparation.start_auth(auth_frontend) {
                 Ok(auth) => auth,
                 Err(AuthStartError::NotStarted { preparation, error }) => {
                     drop(preparation);
@@ -352,7 +363,15 @@ impl Command for ExecPromptCommand {
                 }
             };
             let owner = match auth.wait_auth_retired().await {
-                AuthRetirement::Authenticated(owner) => owner,
+                AuthRetirement::Authenticated(owner) => {
+                    if frontend.finish_native_output().await.is_err() {
+                        drop(owner);
+                        return Err(CommandError::Other(
+                            "native authentication output failed; restore a writable controlling terminal before continuing".into(),
+                        ));
+                    }
+                    owner
+                }
                 AuthRetirement::Retryable(owner) => {
                     drop(owner);
                     return Err(crate::engine::error::EngineError::Config(

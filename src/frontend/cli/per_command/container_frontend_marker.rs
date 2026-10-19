@@ -329,6 +329,68 @@ impl AgentFrontend for CliContainerProxy {
     }
 }
 
+pub(super) struct CliNativeAuthProxy {
+    terminal: Option<std::fs::File>,
+    writers: crate::frontend::cli::command_frontend::NativeOutputWriters,
+}
+
+impl CliNativeAuthProxy {
+    pub(super) fn new(
+        terminal: std::fs::File,
+        writers: crate::frontend::cli::command_frontend::NativeOutputWriters,
+    ) -> std::io::Result<Self> {
+        use std::io::IsTerminal;
+        if !terminal.is_terminal() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native authentication requires a controlling terminal",
+            ));
+        }
+        Ok(Self {
+            terminal: Some(terminal),
+            writers,
+        })
+    }
+}
+
+impl UserMessageSink for CliNativeAuthProxy {
+    fn write_message(&mut self, _message: UserMessage) {}
+    fn replay_queued(&mut self) {}
+}
+
+#[async_trait]
+impl AgentFrontend for CliNativeAuthProxy {
+    fn report_status(&mut self, _status: AgentStatus) {}
+    fn report_progress(&mut self, _progress: AgentProgress) {}
+
+    fn take_io(&mut self) -> AgentIo {
+        let terminal = self.terminal.take().expect("single auth channel transfer");
+        let (output, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut terminal = tokio::fs::File::from_std(terminal);
+            while let Some(bytes) = receiver.recv().await {
+                terminal.write_all(&bytes).await?;
+                terminal.flush().await?;
+            }
+            Ok(())
+        });
+        self.writers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(writer);
+        AgentIo {
+            stdout: output.clone(),
+            stderr: output,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        }
+    }
+}
+
 pub(super) struct CliNativeContainerProxy {
     pub writers: crate::frontend::cli::command_frontend::NativeOutputWriters,
 }

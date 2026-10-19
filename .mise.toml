@@ -1,3 +1,20 @@
+[tools]
+rust = "1.94.0"
+
+[env]
+_.path = ["${CARGO_HOME:-$HOME/.cargo}/bin"]
+
 [tasks."test:auth-terminal"]
 description = "Test private native Codex authentication output"
 run = "cargo test native_codex_auth_terminal -- --nocapture"
+
+[tasks.ci]
+description = "Run local architecture, formatting, lint and fast-test gates"
+run = [
+    "rustc --version",
+    "cargo --version",
+    "make architecture-lint",
+    "cargo fmt --check",
+    "cargo clippy --all-targets -- -D warnings",
+    "make test-fast",
+]
