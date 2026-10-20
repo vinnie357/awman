@@ -438,6 +438,7 @@ pub(crate) struct AppleCommandReport {
     pub resource_loan_releases_before_retry: usize,
     pub resource_loan_releases_after_retry: usize,
     pub retry_observation: Option<RetryObservation>,
+    pub retry_diagnostic: Option<retention_test_support::ActiveGatedRetryDiagnostic>,
     pub receipt_exists_while_second_inspection_blocked: Option<bool>,
     pub retry_tickets: Vec<LaunchRetentionTicket>,
     pub retry_observations: Vec<RetryObservation>,
@@ -476,6 +477,7 @@ struct DriverEffects {
     resource_loan_releases_before_retry: usize,
     resource_loan_releases_after_retry: usize,
     retry_observation: Option<RetryObservation>,
+    retry_diagnostic: Option<retention_test_support::ActiveGatedRetryDiagnostic>,
     receipt_exists_while_second_inspection_blocked: Option<bool>,
     retry_tickets: Vec<LaunchRetentionTicket>,
     retry_observations: Vec<RetryObservation>,
@@ -1257,6 +1259,7 @@ fn report_from_observation(
         resource_loan_releases_before_retry: effects.resource_loan_releases_before_retry,
         resource_loan_releases_after_retry: effects.resource_loan_releases_after_retry,
         retry_observation: effects.retry_observation,
+        retry_diagnostic: effects.retry_diagnostic,
         receipt_exists_while_second_inspection_blocked: effects
             .receipt_exists_while_second_inspection_blocked,
         retry_tickets: effects.retry_tickets,
@@ -1884,8 +1887,12 @@ fn exercise_public_path_with_native_and_cancel_driver_hook(
             effects.active_resource_loans_before_retry = probe.active_gated_resource_loans(ticket);
             effects.resource_loan_releases_before_retry = probe.resource_loan_releases(ticket);
 
-            let retry =
-                registry.retry_active_gated(ticket, Instant::now() + Duration::from_secs(2))?;
+            let (retry, diagnostic) = retention_test_support::retry_active_gated_with_diagnostic(
+                registry,
+                ticket,
+                Instant::now() + Duration::from_secs(2),
+            )?;
+            effects.retry_diagnostic = diagnostic;
             effects.retry_observation = Some(match retry {
                 ActiveGatedRetryOutcome::Resolved => RetryObservation::Resolved,
                 ActiveGatedRetryOutcome::Retained => RetryObservation::Retained,
@@ -2463,7 +2470,12 @@ fn retained_ticket_retry_converges_only_after_exact_cleanup() {
         let report = exercise(AppleCommandScenario::DropWithoutWait(fault));
 
         assert_full_orchestrated_spawn_path(&report);
-        assert_eq!(report.retry_observation, Some(expected_retry));
+        assert_eq!(
+            report.retry_observation,
+            Some(expected_retry),
+            "fault={fault:?}; synchronous retry diagnostic={:?}",
+            report.retry_diagnostic
+        );
         assert_eq!(report.retained_ticket_after_retry, retained);
         assert_eq!(report.active_resource_loans_after_retry, active_loans);
         assert_eq!(report.resource_loan_releases_after_retry, releases);

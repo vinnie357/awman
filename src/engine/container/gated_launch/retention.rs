@@ -525,14 +525,37 @@ impl LaunchRetentionRegistry {
         ticket: LaunchRetentionTicket,
         deadline: Instant,
     ) -> Result<ActiveGatedRetryOutcome, EngineError> {
+        self.retry_active_gated_inner(
+            ticket,
+            deadline,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn retry_active_gated_inner(
+        &self,
+        ticket: LaunchRetentionTicket,
+        deadline: Instant,
+        #[cfg(test)] diagnostic: Option<&mut Option<test_support::ActiveGatedRetryDiagnostic>>,
+    ) -> Result<ActiveGatedRetryOutcome, EngineError> {
         let mut entry = match claim_outstanding_entry(&self.shared, ticket, deadline)? {
             OutstandingEntryClaim::Claimed(entry) => *entry,
             OutstandingEntryClaim::Resolved => return Ok(ActiveGatedRetryOutcome::Resolved),
             OutstandingEntryClaim::RetainedInFlight => {
+                #[cfg(test)]
+                test_support::record_retry_diagnostic(diagnostic, "ClaimInFlight", None);
                 return Ok(ActiveGatedRetryOutcome::Retained);
             }
         };
-        match retry_claimed_active_gated(&self.shared, ticket, &mut entry, deadline) {
+        match retry_claimed_active_gated(
+            &self.shared,
+            ticket,
+            &mut entry,
+            deadline,
+            #[cfg(test)]
+            diagnostic,
+        ) {
             Ok(ActiveGatedRetryOutcome::Resolved) => {
                 publish_resolved_entry(&self.shared, ticket);
                 Ok(ActiveGatedRetryOutcome::Resolved)
@@ -647,6 +670,7 @@ fn retry_claimed_active_gated(
     _ticket: LaunchRetentionTicket,
     entry: &mut RetainedEntry,
     deadline: Instant,
+    #[cfg(test)] diagnostic: Option<&mut Option<test_support::ActiveGatedRetryDiagnostic>>,
 ) -> Result<ActiveGatedRetryOutcome, EngineError> {
     if matches!(
         entry.launch,
@@ -654,6 +678,8 @@ fn retry_claimed_active_gated(
             | RetainedRegistryEnvelope::UnresolvedMainPreparation { .. }
             | RetainedRegistryEnvelope::SdkCompletionUncertain(_)
     ) {
+        #[cfg(test)]
+        test_support::record_retry_diagnostic(diagnostic, "UnresolvedPreparation", None);
         return Ok(ActiveGatedRetryOutcome::Retained);
     }
     if let RetainedRegistryEnvelope::PendingPublication {
@@ -689,6 +715,8 @@ fn retry_claimed_active_gated(
                 *publication = Some(pending);
                 *prepared = Some(prepared_owner);
                 *resources = Some(resource_owner);
+                #[cfg(test)]
+                test_support::record_retry_diagnostic(diagnostic, "PublicationNotPromoted", None);
                 return Ok(ActiveGatedRetryOutcome::Retained);
             }
         };
@@ -717,6 +745,8 @@ fn retry_claimed_active_gated(
                 boundary,
             ),
         };
+        #[cfg(test)]
+        test_support::record_retry_diagnostic(diagnostic, "PublicationPromoted", Some(&custody));
         entry.launch = RetainedRegistryEnvelope::ActiveGated(Box::new(custody));
         return Ok(ActiveGatedRetryOutcome::Retained);
     }
@@ -739,6 +769,12 @@ fn retry_claimed_active_gated(
             Err(failure) => {
                 custody.never_created_reconciliation = Some(failure);
                 custody.reason = LaunchRetentionReason::ChildStateUnknown;
+                #[cfg(test)]
+                test_support::record_retry_diagnostic(
+                    diagnostic,
+                    "ReconciliationPending",
+                    Some(custody),
+                );
                 return Ok(ActiveGatedRetryOutcome::Retained);
             }
         };
@@ -755,6 +791,8 @@ fn retry_claimed_active_gated(
         if let Some(boundary) = custody.boundary.as_deref() {
             boundary.observe_never_created_proven();
         }
+        #[cfg(test)]
+        test_support::record_retry_diagnostic(diagnostic, "ReconciliationCompleted", Some(custody));
         return Ok(ActiveGatedRetryOutcome::Retained);
     }
 
@@ -771,12 +809,20 @@ fn retry_claimed_active_gated(
                     | crate::engine::container::orchestrated_apple::ExactCleanupPhase::Complete
             );
         if !positively_never_created {
+            #[cfg(test)]
+            test_support::record_retry_diagnostic(diagnostic, "PreparedChild", Some(custody));
             return Ok(ActiveGatedRetryOutcome::Retained);
         }
     }
 
     if let Some(monitor) = custody.gate_monitor.as_mut() {
         if !monitor.cancel_and_wait_until(deadline) {
+            #[cfg(test)]
+            test_support::record_retry_diagnostic(
+                diagnostic,
+                "GateMonitorNotJoined",
+                Some(custody),
+            );
             return Ok(ActiveGatedRetryOutcome::Retained);
         }
         custody.gate_monitor = None;
@@ -800,6 +846,8 @@ fn retry_claimed_active_gated(
             if last_inspection.is_some() {
                 custody.last_inspection = last_inspection;
             }
+            #[cfg(test)]
+            test_support::record_retry_diagnostic(diagnostic, "CleanupError", Some(custody));
             let child_reaped = custody.lifecycle.retained_child_is_actually_reaped();
             record_poll_disposition(
                 shared,
@@ -822,6 +870,8 @@ fn retry_claimed_active_gated(
             .as_mut()
             .is_some_and(|resource_loan| resource_loan.release_and_wait_until(deadline));
     if !loan_released {
+        #[cfg(test)]
+        test_support::record_retry_diagnostic(diagnostic, "ResourceLoanNotReleased", Some(custody));
         return Ok(ActiveGatedRetryOutcome::Retained);
     }
 
@@ -1025,7 +1075,14 @@ fn supervisor_iteration(
         return Ok(None);
     };
     let deadline = Instant::now() + SUPERVISOR_ACTIVE_RETRY_BOUND;
-    match retry_claimed_active_gated(shared, ticket, &mut entry, deadline) {
+    match retry_claimed_active_gated(
+        shared,
+        ticket,
+        &mut entry,
+        deadline,
+        #[cfg(test)]
+        None,
+    ) {
         Ok(ActiveGatedRetryOutcome::Resolved) => {
             publish_resolved_entry(shared, ticket);
             Ok(Some(ticket))

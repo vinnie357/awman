@@ -1,5 +1,58 @@
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ActiveGatedRetryDiagnostic {
+    pub branch: &'static str,
+    pub custody: Option<ActiveGatedRetryCustodyDiagnostic>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ActiveGatedRetryCustodyDiagnostic {
+    pub reason: LaunchRetentionReason,
+    pub cleanup_phase: &'static str,
+    pub resource_loan_present: bool,
+    pub gate_monitor_present: bool,
+}
+
+pub(crate) fn retry_active_gated_with_diagnostic(
+    registry: &LaunchRetentionRegistry,
+    ticket: LaunchRetentionTicket,
+    deadline: Instant,
+) -> Result<(ActiveGatedRetryOutcome, Option<ActiveGatedRetryDiagnostic>), EngineError> {
+    let mut diagnostic = None;
+    let outcome = registry.retry_active_gated_inner(ticket, deadline, Some(&mut diagnostic))?;
+    Ok((outcome, diagnostic))
+}
+
+pub(super) fn record_retry_diagnostic(
+    diagnostic: Option<&mut Option<ActiveGatedRetryDiagnostic>>,
+    branch: &'static str,
+    custody: Option<&ActiveGatedCustody>,
+) {
+    let Some(diagnostic) = diagnostic else {
+        return;
+    };
+    let custody = custody.map(|custody| {
+        use crate::engine::container::orchestrated_apple::ExactCleanupPhase;
+
+        let cleanup_phase = match &custody.cleanup_phase {
+            ExactCleanupPhase::NeedsCleanup => "NeedsCleanup",
+            ExactCleanupPhase::NeverCreatedNeedsAbsence { .. } => "NeverCreatedNeedsAbsence",
+            ExactCleanupPhase::ReapProvenNeedsCleanup => "ReapProvenNeedsCleanup",
+            ExactCleanupPhase::AwaitingAbsence { .. } => "AwaitingAbsence",
+            ExactCleanupPhase::PublicationPending { .. } => "PublicationPending",
+            ExactCleanupPhase::Complete => "Complete",
+        };
+        ActiveGatedRetryCustodyDiagnostic {
+            reason: custody.reason,
+            cleanup_phase,
+            resource_loan_present: custody.resource_loan.is_some(),
+            gate_monitor_present: custody.gate_monitor.is_some(),
+        }
+    });
+    *diagnostic = Some(ActiveGatedRetryDiagnostic { branch, custody });
+}
+
 #[derive(Clone)]
 pub(crate) struct RetentionProbe {
     shared: Arc<Shared>,
