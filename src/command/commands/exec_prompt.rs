@@ -840,6 +840,10 @@ mod native_codex_main_a2b_test;
 pub(super) mod native_codex_main_entry_marker_test;
 
 #[cfg(all(test, unix))]
+#[path = "native_codex_main_physical_exchange_test.rs"]
+mod native_codex_main_physical_exchange_test;
+
+#[cfg(all(test, unix))]
 #[path = "native_codex_main_b1_post_start_test.rs"]
 mod native_codex_main_b1_post_start_test;
 
