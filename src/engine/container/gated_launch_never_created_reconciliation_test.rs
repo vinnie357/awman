@@ -511,3 +511,63 @@ fn never_created_retention_failure_is_one_attempt_per_ticket_and_round_robin_fai
     drop(registry);
     Ok(())
 }
+
+#[test]
+fn retained_retry_diagnostic_matches_blocked_never_created_reconciliation(
+) -> Result<(), Box<dyn Error>> {
+    use super::gated_launch::retention_test_support::retry_active_gated_with_diagnostic;
+    use super::gated_launch::ActiveGatedRetryOutcome;
+
+    struct ReleaseGateOnExit<'a>(&'a NeverCreatedRetentionGate);
+    impl Drop for ReleaseGateOnExit<'_> {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    let registry = LaunchRetentionRegistry::try_new()?;
+    let probe = registry_probe(&registry);
+    let supervisor = probe.hold_supervisor_active_claims();
+    let fixture = spawn_uncertain(
+        Arc::clone(&registry),
+        &probe,
+        "awman-altana-retry-diagnostic-reconciliation",
+        "7171717171717171717171717171717171717171717171717171717171717171",
+    )?;
+    let release_gate = ReleaseGateOnExit(&fixture.gate);
+
+    assert_eq!(probe.only_ticket(), Some(fixture.ticket));
+    assert_blocked(&probe, &fixture);
+    let (outcome, diagnostic) = retry_active_gated_with_diagnostic(
+        &registry,
+        fixture.ticket,
+        Instant::now() + Duration::from_secs(2),
+    )?;
+    assert_eq!(outcome, ActiveGatedRetryOutcome::Retained);
+    let diagnostic = diagnostic.ok_or("retained retry omitted its actual branch diagnostic")?;
+    assert_eq!(diagnostic.branch, "ReconciliationPending");
+    let custody = diagnostic
+        .custody
+        .ok_or("reconciliation branch omitted its owned active custody")?;
+    assert_eq!(custody.reason, LaunchRetentionReason::ChildStateUnknown);
+    assert_eq!(custody.cleanup_phase, "NeedsCleanup");
+    assert!(!custody.resource_loan_present);
+    assert!(!custody.gate_monitor_present);
+    assert_eq!(probe.only_ticket(), Some(fixture.ticket));
+    assert_blocked(&probe, &fixture);
+
+    fixture.gate.release();
+    let reconciliation = probe.advance_one_supervisor_active_attempt()?;
+    assert_eq!(reconciliation, Some(fixture.ticket));
+    assert_eq!(probe.only_ticket(), Some(fixture.ticket));
+    assert_reconciled_before_cleanup(&probe, &fixture);
+    let cleanup = probe.advance_one_supervisor_active_attempt()?;
+    assert_eq!(cleanup, Some(fixture.ticket));
+    assert_resolved(&probe, &fixture);
+    assert_never_created_cleanup_record(&fixture)?;
+
+    drop(release_gate);
+    drop(supervisor);
+    drop(registry);
+    Ok(())
+}
