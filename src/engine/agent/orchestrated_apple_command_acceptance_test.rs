@@ -52,6 +52,7 @@ const AFTER_BIND_RETRY_DEADLINE: Duration = Duration::from_secs(3);
 // A retry that ignores its deadline returns long before this window closes.
 const AFTER_BIND_HELD_WINDOW: Duration = Duration::from_millis(500);
 const PAST_DEADLINE_RETRY: Duration = Duration::from_millis(300);
+const CANCEL_AFTER_RELEASE_BOUND: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AfterBindHold {
@@ -458,6 +459,7 @@ pub(crate) struct AppleCommandReport {
     pub retry_observation: Option<RetryObservation>,
     pub retry_diagnostic: Option<retention_test_support::ActiveGatedRetryDiagnostic>,
     pub actor_held_after_bind: Option<bool>,
+    pub cancel_outcome: Option<Result<(), String>>,
     pub receipt_exists_while_second_inspection_blocked: Option<bool>,
     pub retry_tickets: Vec<LaunchRetentionTicket>,
     pub retry_observations: Vec<RetryObservation>,
@@ -498,6 +500,7 @@ struct DriverEffects {
     retry_observation: Option<RetryObservation>,
     retry_diagnostic: Option<retention_test_support::ActiveGatedRetryDiagnostic>,
     actor_held_after_bind: Option<bool>,
+    cancel_outcome: Option<Result<(), String>>,
     receipt_exists_while_second_inspection_blocked: Option<bool>,
     retry_tickets: Vec<LaunchRetentionTicket>,
     retry_observations: Vec<RetryObservation>,
@@ -1281,6 +1284,7 @@ fn report_from_observation(
         retry_observation: effects.retry_observation,
         retry_diagnostic: effects.retry_diagnostic,
         actor_held_after_bind: effects.actor_held_after_bind,
+        cancel_outcome: effects.cancel_outcome,
         receipt_exists_while_second_inspection_blocked: effects
             .receipt_exists_while_second_inspection_blocked,
         retry_tickets: effects.retry_tickets,
@@ -1621,7 +1625,39 @@ fn exercise_public_path_with_native_and_cancel_driver_hook(
                     "cancel fixture did not reach the requested production boundary".into(),
                 ));
             }
-            execution.cancel()?;
+            match (after_bind_hold, after_bind_pause.take()) {
+                (Some(_), Some(pause)) => {
+                    effects.actor_held_after_bind =
+                        Some(pause.wait_until_paused(Instant::now() + Duration::from_secs(2)));
+                    let handle = execution.cancel_handle().ok_or_else(|| {
+                        crate::engine::error::EngineError::Container(
+                            "cancel handle unavailable".into(),
+                        )
+                    })?;
+                    let (done_tx, done) = std::sync::mpsc::channel();
+                    // Detached so a cancel that never returns cannot hang the driver.
+                    std::thread::spawn(move || {
+                        let _ = done_tx.send(handle.cancel());
+                    });
+                    let returned_while_held = done.recv_timeout(AFTER_BIND_HELD_WINDOW).ok();
+                    drop(pause);
+                    let cancelled = returned_while_held
+                        .or_else(|| done.recv_timeout(CANCEL_AFTER_RELEASE_BOUND).ok())
+                        .unwrap_or_else(|| {
+                            Err(crate::engine::error::EngineError::Container(
+                                "cancel did not return within its bound".into(),
+                            ))
+                        });
+                    effects.cancel_outcome = Some(
+                        cancelled
+                            .as_ref()
+                            .map(|_| ())
+                            .map_err(|error| error.to_string()),
+                    );
+                    cancelled?;
+                }
+                _ => execution.cancel()?,
+            }
         }
 
         if let AppleCommandScenario::GateV2(case) = scenario {
@@ -3167,6 +3203,33 @@ fn protected_plan_before_cli_start_uses_positive_never_created_proof() {
     assert!(no_plan.cleanup_record_bytes.is_none());
     assert_eq!(no_plan.cleanup_publication_attempts, 0);
     assert_eq!(no_plan.never_created_proofs, 0);
+}
+
+#[test]
+fn cancellation_before_ready_waits_for_unpublished_bind_and_reaps_created_child() {
+    AFTER_BIND_HOLD.with(|slot| slot.set(Some(AfterBindHold::ReleasedWithinDeadline)));
+    let report = exercise(AppleCommandScenario::Cancel(CancellationPoint::BeforeReady));
+    AFTER_BIND_HOLD.with(|slot| slot.set(None));
+
+    assert_eq!(report.actor_held_after_bind, Some(true));
+    assert_eq!(
+        report.cancel_outcome,
+        Some(Ok(())),
+        "cancel issued while the bind was unpublished must wait for Running; reaps={}",
+        report.actual_child_reaps
+    );
+    assert_eq!(report.actual_provider_entries_total, 0);
+    assert_eq!(report.actual_child_reaps, 1);
+    assert_eq!(report.cleanup_publication_successes, 1);
+    assert_eq!(
+        report.cleanup_custody_events,
+        vec![
+            CleanupCustodyEvent::ActualChildReaped,
+            CleanupCustodyEvent::ExactAbsenceProven,
+            CleanupCustodyEvent::CleanupPublicationAttemptSucceeded,
+            CleanupCustodyEvent::ResourceLoanReleased,
+        ]
+    );
 }
 
 #[test]
