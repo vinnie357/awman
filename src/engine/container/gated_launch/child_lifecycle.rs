@@ -669,7 +669,7 @@ impl ChildLifecycleAuthority {
                 "create CLI deadline exceeded".into(),
             ));
         }
-        match self.state() {
+        match self.state_after_bind_until(deadline) {
             Ok(ChildLifecycleState::Exited(info)) => {
                 return TerminateRequestOutcome::Exited(info);
             }
