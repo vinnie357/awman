@@ -586,6 +586,48 @@ fn bridge_piped_io_with_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const JOIN_MARGIN: Duration = Duration::from_millis(500);
+
+    #[test]
+    fn drain_join_until_returns_false_for_blocked_work_within_deadline_margin() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let drain = DrainThread::spawn(move || {
+            let _ = blocked.recv();
+        });
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        let joined = drain.join_until(deadline);
+        let elapsed = started.elapsed();
+        drop(release);
+        assert!(!joined, "blocked work must not report joined");
+        assert!(Instant::now() >= deadline, "returned before the deadline");
+        assert!(
+            elapsed < Duration::from_millis(100) + JOIN_MARGIN,
+            "join_until overran its deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn drain_join_until_returns_true_for_finished_work() {
+        let (ran_tx, ran) = std::sync::mpsc::channel::<()>();
+        let drain = DrainThread::spawn(move || {
+            let _ = ran_tx.send(());
+        });
+        let started = Instant::now();
+        assert!(drain.join_until(started + Duration::from_secs(2)));
+        assert!(started.elapsed() < JOIN_MARGIN);
+        assert!(ran.try_recv().is_ok(), "joined before the work ran");
+    }
+
+    #[test]
+    fn drain_join_until_returns_true_for_panicking_work() {
+        // resume_unwind skips the panic hook, so the test output stays clean.
+        let drain = DrainThread::spawn(|| std::panic::resume_unwind(Box::new("drain work")));
+        let started = Instant::now();
+        assert!(drain.join_until(started + Duration::from_secs(2)));
+        assert!(started.elapsed() < JOIN_MARGIN);
+    }
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
 

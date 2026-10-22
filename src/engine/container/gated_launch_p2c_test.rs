@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::backend::ContainerBackend;
 use super::gated_launch::child_lifecycle_test_support::{
-    lifecycle_probe, unbound_kind_and_started_at, CreateCliKind,
+    lifecycle_probe, pause_raw_reap_after_kill, unbound_kind_and_started_at, CreateCliKind,
 };
 use super::gated_launch::retention_test_support::{
     drop_last_owner_on_worker, registry_probe, registry_thread_start_failure,
@@ -28,8 +28,8 @@ use super::gated_launch::{
 };
 use super::options::{ContainerName, ImageRef, ResolvedContainerOptions};
 use super::process::test_support::{
-    spawn_tuple_validation_fixture, FixtureIoMode, FixtureSpawnFault, FixtureSpawnGate,
-    FixtureSpawnResult, FixtureSpawnSpec,
+    install_custody_witness, pty_master_held, spawn_tuple_validation_fixture, FixtureIoMode,
+    FixtureSpawnFault, FixtureSpawnGate, FixtureSpawnResult, FixtureSpawnSpec,
 };
 use crate::data::session::{AgentHandle, Session};
 use crate::data::startup_gate::load_startup_gate;
@@ -682,6 +682,375 @@ fn bind_failures_return_each_exact_raw_child_variant_for_synchronous_retention(
         }
     }
     Ok(())
+}
+
+// More than the macOS PTY output queue holds, so the child blocks on its unread master.
+#[cfg(unix)]
+const PTY_BACKLOG_BYTES: usize = 64 * 1024;
+#[cfg(unix)]
+const QUEUED_HEAD_BYTES: usize = 256;
+#[cfg(unix)]
+const PTY_REAP_BOUND: Duration = Duration::from_secs(3);
+// The head is queued before the marker, so a kill after the marker always meets unread output.
+#[cfg(unix)]
+const BACKLOG_SCRIPT: &[u8] = b"#!/bin/sh\nset -eu\nprintf '%s' \"$2\"\nprintf 'queued\\n' >> \"$1\"\nprintf '%s\\n' \"$3\"\n";
+
+#[cfg(unix)]
+struct BacklogInvocation {
+    _temp: tempfile::TempDir,
+    marker: PathBuf,
+    _controls: ControlFixture,
+    plan: DurableLaunchPlan,
+    adapter: Arc<ScriptedAdapter>,
+    registry: Arc<LaunchRetentionRegistry>,
+    spawned: FixtureSpawnResult,
+}
+
+#[cfg(unix)]
+fn process_stat(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!stat.is_empty()).then_some(stat)
+}
+
+#[cfg(unix)]
+fn queued(marker: &Path) -> bool {
+    std::fs::read_to_string(marker).is_ok_and(|text| text == "queued\n")
+}
+
+#[cfg(unix)]
+fn invoke_backlog(
+    mode: FixtureIoMode,
+    fault: FixtureSpawnFault,
+) -> Result<BacklogInvocation, Box<dyn Error>> {
+    invoke_script(
+        mode,
+        Some(fault),
+        BACKLOG_SCRIPT,
+        vec!["h".repeat(QUEUED_HEAD_BYTES), "x".repeat(PTY_BACKLOG_BYTES)],
+    )
+}
+
+// The script receives the marker path first, then `extra`.
+#[cfg(unix)]
+fn invoke_script(
+    mode: FixtureIoMode,
+    fault: Option<FixtureSpawnFault>,
+    body: &[u8],
+    extra: Vec<String>,
+) -> Result<BacklogInvocation, Box<dyn Error>> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir()?;
+    let script = temp.path().join("fixture-child.sh");
+    let marker = temp.path().join("queued.marker");
+    std::fs::write(&script, body)?;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))?;
+    let controls = ControlFixture::new()?;
+    let adapter = Arc::new(ScriptedAdapter::new(vec![
+        LaunchReply::Matching,
+        LaunchReply::Matching,
+    ]));
+    let plan = controls.plan(adapter.as_ref())?;
+    let registry = LaunchRetentionRegistry::try_new()
+        .map_err(|_| "launch retention registry failed to start")?;
+    let gate_adapter: Arc<dyn GatedProviderAdapter> = adapter.clone();
+    let spawned = spawn_tuple_validation_fixture(
+        FixtureSpawnSpec {
+            mode,
+            executable: SHELL,
+            args: [
+                script.to_string_lossy().into_owned(),
+                marker.to_string_lossy().into_owned(),
+            ]
+            .into_iter()
+            .chain(extra)
+            .collect(),
+            seeded_prompt: None,
+            grace_timeout: Duration::from_secs(2),
+            stuck_timeout: Duration::from_secs(2),
+            gate: Some(FixtureSpawnGate {
+                plan: plan.clone(),
+                adapter: gate_adapter,
+                enclosing: Instant::now() + Duration::from_secs(4),
+            }),
+            fault,
+        },
+        Arc::clone(&registry),
+    );
+    Ok(BacklogInvocation {
+        _temp: temp,
+        marker,
+        _controls: controls,
+        plan,
+        adapter,
+        registry,
+        spawned,
+    })
+}
+
+#[cfg(unix)]
+const PTY: FixtureIoMode = FixtureIoMode::Pty { cols: 80, rows: 24 };
+
+#[cfg(unix)]
+#[test]
+fn pty_raw_custody_reaps_killed_child_with_unread_output() -> Result<(), Box<dyn Error>> {
+    let witness = install_custody_witness();
+    let BacklogInvocation {
+        _temp,
+        marker,
+        _controls,
+        plan,
+        adapter,
+        registry,
+        spawned,
+    } = invoke_backlog(PTY, FixtureSpawnFault::BindDisconnected)?;
+    let (_, owned) = after_start(
+        spawned
+            .result
+            .err()
+            .ok_or("bind fault unexpectedly succeeded")?,
+    )?;
+    assert!(matches!(&owned, RetainedExecution::OwnedUnbound { .. }));
+    assert!(wait_until(Instant::now() + PTY_REAP_BOUND, || queued(
+        &marker
+    )));
+    let (reap_pause, pid) =
+        pause_raw_reap_after_kill(&owned).ok_or("raw custody pause unavailable")?;
+    let pid = pid.ok_or("raw child pid unavailable")?;
+
+    let probe = registry_probe(&registry);
+    let ticket = registry.retain(RetainedAgentLaunch {
+        plan,
+        execution: Some(owned),
+        last_inspection: None,
+        reason: LaunchRetentionReason::ChildStateUnknown,
+    });
+    assert!(probe.contains(ticket));
+    assert!(
+        reap_pause.wait_until_paused(Instant::now() + PTY_REAP_BOUND),
+        "raw custody never killed the blocked PTY child: {:?}",
+        probe.snapshot()
+    );
+    // With the reap held, only a released PTY lets the killed child finish exiting.
+    assert!(
+        wait_until(Instant::now() + PTY_REAP_BOUND, || {
+            process_stat(pid).is_some_and(|stat| stat.starts_with('Z'))
+        }),
+        "PTY custody was not released after the kill: child {pid} stat {:?}",
+        process_stat(pid)
+    );
+    assert_eq!(
+        witness.releases(),
+        0,
+        "non-PTY custody must stay held until the reap"
+    );
+    drop(reap_pause);
+    assert!(
+        wait_until(Instant::now() + PTY_REAP_BOUND, || {
+            probe.snapshot().unreaped == 0
+        }),
+        "killed PTY child was not reaped within the bound: {:?}",
+        probe.snapshot()
+    );
+    assert_eq!(witness.releases(), 1, "non-PTY custody drops at the reap");
+    assert_eq!(adapter.destructive_calls(), 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn non_pty_raw_custody_reaps_killed_child_with_unread_output() -> Result<(), Box<dyn Error>> {
+    for index in 1..3 {
+        let BacklogInvocation {
+            _temp,
+            marker,
+            _controls,
+            plan,
+            adapter,
+            registry,
+            spawned,
+        } = invoke_backlog(mode(index), FixtureSpawnFault::BindDisconnected)?;
+        let (_, owned) = after_start(
+            spawned
+                .result
+                .err()
+                .ok_or("bind fault unexpectedly succeeded")?,
+        )?;
+        assert!(matches!(&owned, RetainedExecution::OwnedUnbound { .. }));
+        assert!(wait_until(Instant::now() + PTY_REAP_BOUND, || queued(
+            &marker
+        )));
+        let probe = registry_probe(&registry);
+        let ticket = registry.retain(RetainedAgentLaunch {
+            plan,
+            execution: Some(owned),
+            last_inspection: None,
+            reason: LaunchRetentionReason::ChildStateUnknown,
+        });
+        assert!(probe.contains(ticket));
+        assert!(
+            wait_until(Instant::now() + PTY_REAP_BOUND, || {
+                probe.snapshot().unreaped == 0
+            }),
+            "{:?}: killed child was not reaped within the bound: {:?}",
+            kind(index),
+            probe.snapshot()
+        );
+        assert_eq!(adapter.destructive_calls(), 0);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assert_managed_pty_error_reaps_with_unread_output(
+    fault: FixtureSpawnFault,
+    message: &str,
+    reason: LaunchRetentionReason,
+) -> Result<(), Box<dyn Error>> {
+    let BacklogInvocation {
+        _temp,
+        marker,
+        _controls,
+        plan,
+        adapter,
+        registry,
+        spawned,
+    } = invoke_backlog(PTY, fault)?;
+    let (source, owned) = after_start(
+        spawned
+            .result
+            .err()
+            .ok_or("managed PTY fault unexpectedly succeeded")?,
+    )?;
+    assert!(
+        matches!(&source, EngineError::Container(text) if text == message),
+        "{fault:?}: {source}"
+    );
+    let authority = match &owned {
+        RetainedExecution::Managed {
+            execution: None,
+            lifecycle,
+        } => lifecycle.clone(),
+        _ => return Err(format!("{fault:?} did not return managed custody").into()),
+    };
+    assert!(wait_until(Instant::now() + PTY_REAP_BOUND, || queued(
+        &marker
+    )));
+    let lifecycle = lifecycle_probe(&authority);
+    let probe = registry_probe(&registry);
+    let ticket = registry.retain(RetainedAgentLaunch {
+        plan,
+        execution: Some(owned),
+        last_inspection: None,
+        reason,
+    });
+    assert!(probe.contains(ticket));
+    assert!(
+        wait_until(Instant::now() + PTY_REAP_BOUND, || {
+            lifecycle.snapshot().terminate_commands >= 1
+        }),
+        "{fault:?}: retention never terminated the blocked PTY child: {:?}",
+        lifecycle.snapshot()
+    );
+    assert!(
+        wait_until(Instant::now() + PTY_REAP_BOUND, || {
+            lifecycle.snapshot().native_reaps == 1 && probe.snapshot().unreaped == 0
+        }),
+        "{fault:?}: terminated PTY child was not reaped within the bound: {:?} {:?}",
+        lifecycle.snapshot(),
+        probe.snapshot()
+    );
+    assert!(
+        wait_until(Instant::now() + PTY_REAP_BOUND, || {
+            authority.resources_are_released()
+        }),
+        "{fault:?}: reaped child kept its resources: {:?}",
+        lifecycle.snapshot()
+    );
+    // Case 18: the exit is the actor's one native reap, never a synthesised code.
+    let exit = authority.wait_actual()?;
+    let snapshot = lifecycle.snapshot();
+    assert_eq!(snapshot.actual_exit.as_ref(), Some(&exit));
+    assert_eq!(snapshot.native_reaps, 1);
+    assert!(!snapshot.owns_unreaped_child);
+    assert_eq!(adapter.destructive_calls(), 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_slot_bind_failure_reaps_terminated_child_with_unread_output() -> Result<(), Box<dyn Error>> {
+    assert_managed_pty_error_reaps_with_unread_output(
+        FixtureSpawnFault::SlotOccupied,
+        "create CLI state unknown",
+        LaunchRetentionReason::ChildStateUnknown,
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_post_spawn_control_change_reaps_terminated_child_with_unread_output(
+) -> Result<(), Box<dyn Error>> {
+    assert_managed_pty_error_reaps_with_unread_output(
+        FixtureSpawnFault::PostSpawnControlChanged,
+        "post-spawn control changed",
+        LaunchRetentionReason::PostSpawnControlChanged,
+    )
+}
+
+#[cfg(unix)]
+const GUARD_SCRIPT: &[u8] = b"#!/bin/sh\nset -eu\nprintf 'guard-ready\\n'\nremaining=500\nwhile [ ! -f \"$1\" ] && [ \"$remaining\" -gt 0 ]; do\n  /bin/sleep 0.02\n  remaining=$((remaining - 1))\ndone\n";
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridged_pty_terminate_keeps_master_until_execution_releases_it(
+) -> Result<(), Box<dyn Error>> {
+    let BacklogInvocation {
+        _temp,
+        marker: _,
+        _controls,
+        plan: _,
+        adapter,
+        registry: _,
+        mut spawned,
+    } = invoke_script(PTY, None, GUARD_SCRIPT, vec![])?;
+    let mut execution = spawned.result.map_err(|_| "fixture spawn failed")?;
+    let authority = spawned.slot.authority().ok_or("missing lifecycle")?;
+    assert!(output_contains(&mut spawned.stdout, "guard-ready").await);
+    assert!(wait_until(Instant::now() + PTY_REAP_BOUND, || {
+        matches!(pty_master_held(&authority), Ok(true))
+    }));
+
+    let exit = authority.terminate_local_cli(Instant::now() + PTY_REAP_BOUND)?;
+    assert_eq!(lifecycle_probe(&authority).snapshot().native_reaps, 1);
+    assert!(
+        wait_until(Instant::now() + PTY_REAP_BOUND, || {
+            matches!(pty_master_held(&authority), Ok(true))
+        }),
+        "terminate released a bridged PTY before its execution did"
+    );
+    let waited = tokio::time::timeout(PTY_REAP_BOUND, execution.wait()).await??;
+    assert_eq!(waited.exit_code, exit.exit_code);
+    drop(execution);
+    assert!(wait_until(Instant::now() + PTY_REAP_BOUND, || {
+        authority.resources_are_released()
+    }));
+    assert_eq!(adapter.destructive_calls(), 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_failed_bridge_reaps_terminated_child_with_unread_output() -> Result<(), Box<dyn Error>> {
+    assert_managed_pty_error_reaps_with_unread_output(
+        FixtureSpawnFault::PtyBridgeFailed,
+        "create CLI PTY bridge failed",
+        LaunchRetentionReason::BridgeSetupFailed,
+    )
 }
 
 #[cfg(unix)]

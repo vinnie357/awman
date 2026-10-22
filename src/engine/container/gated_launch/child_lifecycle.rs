@@ -107,6 +107,8 @@ struct ResourceCustody {
     resource_retain_calls: AtomicUsize,
     #[cfg(test)]
     resource_handoffs_in_flight: AtomicUsize,
+    #[cfg(test)]
+    raw_reap_pause: Mutex<Option<Arc<PollPauseState>>>,
 }
 
 struct RawCustodyJob {
@@ -999,6 +1001,8 @@ fn prepare_inner(
         resource_retain_calls: AtomicUsize::new(0),
         #[cfg(test)]
         resource_handoffs_in_flight: AtomicUsize::new(0),
+        #[cfg(test)]
+        raw_reap_pause: Mutex::new(None),
     });
     let worker_custody = Arc::clone(&custody);
     let custody_worker = std::thread::Builder::new()
@@ -1230,6 +1234,25 @@ fn resource_custody_loop(custody: Arc<ResourceCustody>) {
                 && !custody.raw_kill_issued.swap(true, Ordering::AcqRel)
             {
                 let _ = native_kill(&mut job.child.child);
+                // Any release tied to the kill must happen before this pause.
+                #[cfg(test)]
+                {
+                    let pause = custody
+                        .raw_reap_pause
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    if pause.is_some() {
+                        drop(job);
+                        drop(changed);
+                        pause_on_request(pause);
+                        changed = custody
+                            .changed_state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        continue;
+                    }
+                }
             }
             let started_at = job.child.started_at;
             let poll = native_try_wait(&mut job.child.child, Some(started_at));
@@ -1677,6 +1700,32 @@ pub(crate) mod test_support {
         Pty,
         Piped,
         PersistentPiped,
+    }
+
+    /// Holds raw custody after its kill and before its first reap poll; returns the child pid.
+    pub(crate) fn pause_raw_reap_after_kill(
+        owned: &RetainedExecution,
+    ) -> Option<(PollPause, Option<u32>)> {
+        let RetainedExecution::OwnedUnbound { child, .. } = owned else {
+            return None;
+        };
+        let state = new_pause_state();
+        *child
+            .raw_permit
+            .custody
+            .raw_reap_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&state));
+        Some((PollPause { state }, process_id(&child.child)))
+    }
+
+    /// A slot already bound to an unrelated lifecycle, so the next bind is refused.
+    pub(crate) fn occupied_slot() -> Result<Arc<ChildLifecycleSlot>, EngineError> {
+        let occupant = prepare_inner(None, None, None)?;
+        let slot = Arc::new(ChildLifecycleSlot::new());
+        slot.bind(occupant.authority.clone())
+            .map_err(|_| EngineError::Container("fresh lifecycle slot refused bind".into()))?;
+        Ok(slot)
     }
 
     pub(crate) fn prepare_with_fault(

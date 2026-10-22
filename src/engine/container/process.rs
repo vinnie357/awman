@@ -231,6 +231,8 @@ impl SpawnRetentionContext {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SpawnFault {
     AfterBindBeforeBridge,
+    PostSpawnControlChanged,
+    PtyBridgeFailed,
 }
 
 // ─── Bridge configuration ───────────────────────────────────────────────────
@@ -1750,12 +1752,19 @@ pub(super) fn spawn_pty_bridged(
         instance.name.0.clone(),
         prepared_gate.is_orchestrated(),
     );
-    validate_after_spawn(
+    let validated = validate_after_spawn(
         prepared_gate.plan(),
         prepared_gate.adapter().map(|adapter| adapter.as_ref()),
         prepared_gate.enclosing(),
-    )
-    .map_err(|source| {
+    );
+    #[cfg(test)]
+    let validated = match fault {
+        Some(SpawnFault::PostSpawnControlChanged) => {
+            Err(EngineError::Container("post-spawn control changed".into()))
+        }
+        _ => validated,
+    };
+    validated.map_err(|source| {
         after_cli_start(
             &retention,
             source,
@@ -1843,42 +1852,57 @@ pub(super) fn spawn_pty_bridged(
                     ));
                 }
             };
-            let (master_arc, bridge) =
-                match crate::engine::container::io_bridge::bridge_pty_owned(io, pair, bridge_cfg) {
-                    Ok(bridge) => bridge,
-                    Err(failure) => {
-                        let crate::engine::container::io_bridge::PtyBridgeFailure {
-                            error,
-                            pair,
-                            reader,
-                            io,
-                            mut config,
-                        } = failure;
-                        config.cancel_on_grace_expired = None;
-                        *resources = LifecycleResources::FailedPty(FailedPtyBridgeResources {
-                            _pair: pair,
-                            _reader: reader,
-                            _io: io,
-                            _config: config,
-                            _custody: SpawnCustodyResources {
-                                auth,
-                                io: None,
-                                leases: Some(leases),
-                                gate_cleanup,
-                                post_wait,
-                                run_post_wait: true,
-                                attach_store,
-                                attach_permit: Some(attach_permit),
-                                native,
-                                #[cfg(all(test, unix))]
-                                launch_resource,
-                                #[cfg(test)]
-                                custody_witness,
-                            },
-                        });
-                        return Err(error);
-                    }
-                };
+            #[cfg(test)]
+            let bridged = match fault {
+                Some(SpawnFault::PtyBridgeFailed) => {
+                    Err(crate::engine::container::io_bridge::PtyBridgeFailure {
+                        error: EngineError::Container("create CLI PTY bridge failed".into()),
+                        pair,
+                        reader: None,
+                        io,
+                        config: bridge_cfg,
+                    })
+                }
+                _ => crate::engine::container::io_bridge::bridge_pty_owned(io, pair, bridge_cfg),
+            };
+            #[cfg(not(test))]
+            let bridged =
+                crate::engine::container::io_bridge::bridge_pty_owned(io, pair, bridge_cfg);
+            let (master_arc, bridge) = match bridged {
+                Ok(bridge) => bridge,
+                Err(failure) => {
+                    let crate::engine::container::io_bridge::PtyBridgeFailure {
+                        error,
+                        pair,
+                        reader,
+                        io,
+                        mut config,
+                    } = failure;
+                    config.cancel_on_grace_expired = None;
+                    *resources = LifecycleResources::FailedPty(FailedPtyBridgeResources {
+                        _pair: pair,
+                        _reader: reader,
+                        _io: io,
+                        _config: config,
+                        _custody: SpawnCustodyResources {
+                            auth,
+                            io: None,
+                            leases: Some(leases),
+                            gate_cleanup,
+                            post_wait,
+                            run_post_wait: true,
+                            attach_store,
+                            attach_permit: Some(attach_permit),
+                            native,
+                            #[cfg(all(test, unix))]
+                            launch_resource,
+                            #[cfg(test)]
+                            custody_witness,
+                        },
+                    });
+                    return Err(error);
+                }
+            };
             let crate::engine::container::io_bridge::BridgeResult {
                 output_readers,
                 pty_reader,
@@ -2961,8 +2985,8 @@ impl ExecutionBackend for ContainerExecution {
 pub(crate) mod test_support {
     use super::*;
     use crate::engine::container::gated_launch::child_lifecycle_test_support::{
-        prepare_with_fault, prepare_with_never_created_retention_blocked, prepare_with_pause,
-        ActorPausePoint, NeverCreatedRetentionGate, PollPause, PrepareFault,
+        occupied_slot, prepare_with_fault, prepare_with_never_created_retention_blocked,
+        prepare_with_pause, ActorPausePoint, NeverCreatedRetentionGate, PollPause, PrepareFault,
     };
     use crate::engine::container::gated_launch::PreparedChildLifecycle;
     use std::cell::RefCell;
@@ -3051,6 +3075,25 @@ pub(crate) mod test_support {
             },
             CustodyWitnessProbe { releases },
         )
+    }
+
+    /// Whether a bridged execution's slot still holds its PTY master.
+    pub(crate) fn pty_master_held(
+        authority: &ChildLifecycleAuthority,
+    ) -> Result<bool, EngineError> {
+        authority.with_execution_resources::<LifecycleResources, _>(|resources| {
+            matches!(
+                resources,
+                LifecycleResources::Execution(execution) if execution.pty_master.is_some()
+            )
+        })
+    }
+
+    /// Arms a custody witness for the next spawn on this thread.
+    pub(crate) fn install_custody_witness() -> CustodyWitnessProbe {
+        let (witness, probe) = custody_witness_pair();
+        CUSTODY_WITNESS.with(|slot| *slot.borrow_mut() = Some(witness));
+        probe
     }
 
     pub(crate) fn take_custody_witness() -> Option<CustodyWitness> {
@@ -3207,6 +3250,9 @@ pub(crate) mod test_support {
         BindDisconnected,
         BindFull,
         AfterBindBeforeBridge,
+        SlotOccupied,
+        PostSpawnControlChanged,
+        PtyBridgeFailed,
     }
 
     pub(crate) struct FixtureSpawnGate {
@@ -3508,7 +3554,12 @@ pub(crate) mod test_support {
         let slot = prepared_override
             .as_ref()
             .map(|(_, slot)| Arc::clone(slot))
-            .unwrap_or_else(|| Arc::new(ChildLifecycleSlot::new()));
+            .unwrap_or_else(|| match spec.fault {
+                Some(FixtureSpawnFault::SlotOccupied) => {
+                    occupied_slot().unwrap_or_else(|_| Arc::new(ChildLifecycleSlot::new()))
+                }
+                _ => Arc::new(ChildLifecycleSlot::new()),
+            });
         let retention = SpawnRetentionContext::new(None);
         let prepare_fault = match spec.fault {
             Some(FixtureSpawnFault::ActorThreadStart) => Some(PrepareFault::ThreadStart),
@@ -3609,8 +3660,16 @@ pub(crate) mod test_support {
             gated,
             retention: Arc::clone(&retention),
             test_boundary: None,
-            fault: (spec.fault == Some(FixtureSpawnFault::AfterBindBeforeBridge))
-                .then_some(SpawnFault::AfterBindBeforeBridge),
+            fault: match spec.fault {
+                Some(FixtureSpawnFault::AfterBindBeforeBridge) => {
+                    Some(SpawnFault::AfterBindBeforeBridge)
+                }
+                Some(FixtureSpawnFault::PostSpawnControlChanged) => {
+                    Some(SpawnFault::PostSpawnControlChanged)
+                }
+                Some(FixtureSpawnFault::PtyBridgeFailed) => Some(SpawnFault::PtyBridgeFailed),
+                _ => None,
+            },
         };
         let result = if native.is_some() && spec.mode != FixtureIoMode::Piped {
             Err(before_cli_start(EngineError::Config(
