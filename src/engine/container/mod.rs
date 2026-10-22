@@ -15,6 +15,8 @@ mod apple_initial_inspection_bounds_test;
 mod attach_socket;
 mod backend;
 pub mod background;
+#[cfg(all(test, unix))]
+mod child_lifecycle_deadline_test;
 pub mod display;
 mod docker;
 pub(crate) mod gated_launch;
