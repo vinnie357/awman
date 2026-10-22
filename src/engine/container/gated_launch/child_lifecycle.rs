@@ -544,6 +544,26 @@ impl ChildLifecycleAuthority {
         Ok(guard.state.clone())
     }
 
+    // Bind hands the child to the actor asynchronously; it leaves Prepared only once the actor publishes.
+    pub(crate) fn state_after_bind_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<ChildLifecycleState, EngineError> {
+        let mut guard = lock_state(&self.shared);
+        while matches!(guard.state, ChildLifecycleState::Prepared)
+            && self.shared.custody.may_have_child.load(Ordering::Acquire)
+        {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            if remaining.is_zero() {
+                break;
+            }
+            guard = wait_state_timeout(&self.shared, guard, remaining);
+        }
+        Ok(guard.state.clone())
+    }
+
     pub(super) fn retained_child_is_actually_reaped(&self) -> bool {
         matches!(
             &lock_state(&self.shared).state,

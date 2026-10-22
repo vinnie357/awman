@@ -796,7 +796,10 @@ fn retry_claimed_active_gated(
         return Ok(ActiveGatedRetryOutcome::Retained);
     }
 
-    if matches!(custody.lifecycle.state(), Ok(ChildLifecycleState::Prepared)) {
+    if matches!(
+        custody.lifecycle.state_after_bind_until(deadline),
+        Ok(ChildLifecycleState::Prepared)
+    ) {
         let positively_never_created = custody.cleanup_lifecycle
             == CleanupLifecycleProvenance::NeverCreated
             && matches!(
