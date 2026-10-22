@@ -85,13 +85,20 @@ That's it — you have an isolated agent working in your repo.
 | GitHub Releases | Download the asset for your platform, `chmod +x`, move onto `PATH` |
 | From source | `git clone https://github.com/prettysmartdev/awman.git && cd awman && make install` (Rust 1.94+) |
 
-## Altana startup-gate fork candidate
+## Altana startup-gate fork
 
 The upstream `0.12.0` release does not include the orchestrator startup gate.
-The `vinnie357/awman` fork identifies its reviewed candidate as `0.12.1`, based
-on upstream commit `c730732b`. This candidate has not been tagged or published;
-deployment records should retain both that upstream base and the exact fork
-commit used to build the binary.
+The `vinnie357/awman` fork publishes this work as `v0.11.3` in its own 0.11.x
+version line, based on upstream AWMan 0.12.0. Install the published fork with:
+
+```sh
+mise use -g github:vinnie357/awman@0.11.3
+awman --version
+```
+
+The binary must report `awman 0.11.3`. Retain the release tag's resolved source
+commit and the downloaded asset digest in deployment records. In a source
+checkout, resolve the source pin with `git rev-parse 'v0.11.3^{commit}'`.
 
 Callers should detect the extension from CLI metadata already exposed by awman:
 
@@ -102,16 +109,13 @@ awman exec workflow --help | grep -- --startup-gate-control
 ```
 
 All three checks must succeed before an orchestrator sends gate flags. They
-prove only that the binary exposes the startup-gate syntax. Do not infer
-split-control orchestrated Apple launch support from those checks or from
-`awman --version`: that profile also requires an exact source revision and
-artifact that passed the fork gates and a real Apple Containers qualification.
-The guarded `8fe0d4cc` revision is not such an artifact.
-
-After a reviewed `v0.12.1` tag and release assets exist, the intended fork
-installation form is `mise use -g github:vinnie357/awman@0.12.1`. Do not use
-that command as evidence that the unpublished candidate is available or that
-an unqualified build supports orchestrated Apple launch.
+prove only that the binary exposes the startup-gate syntax. External startup
+control, including split-control orchestrated Apple launch, is enabled as an
+experimental opt-in path. Its availability does not certify every runtime or
+provider combination; qualify the exact source revision and artifact in the
+intended environment. Launch, receipt, ownership and permission checks still
+apply. The separate native Codex auth and main-execution paths remain disabled
+in production pending qualification.
 
 Release assets: `awman-linux-amd64`, `awman-linux-arm64`, `awman-macos-amd64`, `awman-macos-arm64`, `awman-windows-amd64.exe`.
 
