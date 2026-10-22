@@ -26,9 +26,8 @@ existing `--help` output for `--startup-gate-control`; no new speculative API
 is required.
 
 The downstream fork carries package version `0.11.3`, which is distinct from
-upstream `0.12.0`. That version is fork metadata, not a claim
-that upstream has accepted the proposal or that a downstream tag or release
-asset has been published.
+upstream `0.12.0`. The fork's 0.11.3 release is fork metadata. It does not
+mean that upstream has accepted this proposal.
 
 ## Ownership across mount namespaces
 
