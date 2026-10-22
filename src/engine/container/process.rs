@@ -1895,15 +1895,25 @@ pub(super) fn spawn_pty_bridged(
             };
             #[cfg(test)]
             let bridged = match fault {
-                Some(SpawnFault::PtyBridgeFailed) => {
-                    Err(crate::engine::container::io_bridge::PtyBridgeFailure {
+                // Mirrors a take_writer failure, which already holds a master reader dup.
+                Some(SpawnFault::PtyBridgeFailed) => match pair.master.try_clone_reader() {
+                    Ok(reader) => Err(crate::engine::container::io_bridge::PtyBridgeFailure {
                         error: EngineError::Container("create CLI PTY bridge failed".into()),
+                        pair,
+                        reader: Some(reader),
+                        io,
+                        config: bridge_cfg,
+                    }),
+                    Err(error) => Err(crate::engine::container::io_bridge::PtyBridgeFailure {
+                        error: EngineError::Container(format!(
+                            "PTY bridge fault reader unavailable: {error}"
+                        )),
                         pair,
                         reader: None,
                         io,
                         config: bridge_cfg,
-                    })
-                }
+                    }),
+                },
                 _ => crate::engine::container::io_bridge::bridge_pty_owned(io, pair, bridge_cfg),
             };
             #[cfg(not(test))]
@@ -3593,16 +3603,30 @@ pub(crate) mod test_support {
     ) -> FixtureSpawnResult {
         let full_custody = FULL_CUSTODY_OVERRIDE.with(|custody| custody.borrow_mut().take());
         let prepared_override = PREPARED_OVERRIDE.with(|prepared| prepared.borrow_mut().take());
-        let slot = prepared_override
-            .as_ref()
-            .map(|(_, slot)| Arc::clone(slot))
-            .unwrap_or_else(|| match spec.fault {
-                Some(FixtureSpawnFault::SlotOccupied) => {
-                    occupied_slot().unwrap_or_else(|_| Arc::new(ChildLifecycleSlot::new()))
+        let mut slot_error = None;
+        let slot = match prepared_override.as_ref() {
+            Some((_, slot)) => Arc::clone(slot),
+            None if spec.fault == Some(FixtureSpawnFault::SlotOccupied) => match occupied_slot() {
+                Ok(slot) => slot,
+                Err(error) => {
+                    slot_error = Some(error);
+                    Arc::new(ChildLifecycleSlot::new())
                 }
-                _ => Arc::new(ChildLifecycleSlot::new()),
-            });
+            },
+            None => Arc::new(ChildLifecycleSlot::new()),
+        };
         let retention = SpawnRetentionContext::new(None);
+        if let Some(error) = slot_error {
+            let (_stdout_tx, stdout) = tokio::sync::mpsc::unbounded_channel();
+            let (_stderr_tx, stderr) = tokio::sync::mpsc::unbounded_channel();
+            return FixtureSpawnResult {
+                result: Err(before_cli_start(error)),
+                slot,
+                stdout,
+                stderr,
+                retention,
+            };
+        }
         let prepare_fault = match spec.fault {
             Some(FixtureSpawnFault::ActorThreadStart) => Some(PrepareFault::ThreadStart),
             Some(FixtureSpawnFault::BindDisconnected) => Some(PrepareFault::BindDisconnected),

@@ -68,6 +68,8 @@ struct LifecycleState {
     before_command_pause: Option<Arc<PollPauseState>>,
     #[cfg(test)]
     after_bind_pause: Option<Arc<PollPauseState>>,
+    #[cfg(test)]
+    after_kill_pause: Option<Arc<PollPauseState>>,
 }
 
 struct LifecycleShared {
@@ -1094,6 +1096,8 @@ fn prepare_inner(
             after_bind_pause: initial_pause
                 .filter(|point| *point == test_support::ActorPausePoint::AfterBind)
                 .map(|_| new_pause_state()),
+            #[cfg(test)]
+            after_kill_pause: None,
         }),
         changed: Condvar::new(),
         actor_thread: Mutex::new(None),
@@ -1157,6 +1161,8 @@ fn actor_loop(
     update_state(&shared, ChildLifecycleState::Running, true);
     let mut disconnected = false;
     loop {
+        #[cfg(test)]
+        let mut kill_accepted = false;
         let command = if disconnected {
             std::thread::sleep(ACTOR_POLL_INTERVAL);
             Err(mpsc::RecvTimeoutError::Disconnected)
@@ -1193,6 +1199,10 @@ fn actor_loop(
                             }
                         } else {
                             let _ = result.try_send(TerminateResult::Accepted);
+                            #[cfg(test)]
+                            {
+                                kill_accepted = true;
+                            }
                         }
                     } else {
                         let _ = result.try_send(TerminateResult::StateUnknown);
@@ -1214,6 +1224,10 @@ fn actor_loop(
                 break;
             }
             continue;
+        }
+        #[cfg(test)]
+        if kill_accepted {
+            pause_after_kill(&shared);
         }
         #[cfg(test)]
         pause_before_poll(&shared);
@@ -1689,6 +1703,12 @@ fn pause_after_bind(shared: &LifecycleShared) {
 }
 
 #[cfg(test)]
+fn pause_after_kill(shared: &LifecycleShared) {
+    let pause = lock_state(shared).after_kill_pause.take();
+    pause_on_request(pause);
+}
+
+#[cfg(test)]
 fn pause_before_poll(shared: &LifecycleShared) {
     let pause = lock_state(shared).pause.clone();
     pause_on_request(pause);
@@ -1957,6 +1977,13 @@ pub(crate) mod test_support {
         pub(crate) fn pause_before_next_poll(&self) -> PollPause {
             let state = new_pause_state();
             lock_state(&self.shared).pause = Some(Arc::clone(&state));
+            PollPause { state }
+        }
+
+        /// Holds the actor after its next accepted kill, before it polls for the reap.
+        pub(crate) fn pause_after_next_kill(&self) -> PollPause {
+            let state = new_pause_state();
+            lock_state(&self.shared).after_kill_pause = Some(Arc::clone(&state));
             PollPause { state }
         }
     }

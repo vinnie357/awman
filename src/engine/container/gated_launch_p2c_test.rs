@@ -19,11 +19,12 @@ use super::gated_launch::retention_test_support::{
 };
 use super::gated_launch::{
     canonical_inspection_revision, observe_started_create, AbsenceObservation,
-    CanonicalInspectionRevisionInput, ChildLifecycleState, DurableLaunchPlan, ExactInspection,
-    GatedProviderAdapter, ImmutableImageId, InspectionObservationKind, LaunchIdentityError,
-    LaunchRetentionInitError, LaunchRetentionReason, LaunchRetentionRegistry, NamePresence,
-    ProviderCallDeadline, ProviderKind, ProviderLaunchInspection, ProviderLaunchKey, ProviderState,
-    RetainedAgentLaunch, RetainedExecution, SanitizedProviderStateObservation, SpawnStageError,
+    CanonicalInspectionRevisionInput, ChildLifecycleAuthority, ChildLifecycleState,
+    DurableLaunchPlan, ExactInspection, GatedProviderAdapter, ImmutableImageId,
+    InspectionObservationKind, LaunchIdentityError, LaunchRetentionInitError,
+    LaunchRetentionReason, LaunchRetentionRegistry, NamePresence, ProviderCallDeadline,
+    ProviderKind, ProviderLaunchInspection, ProviderLaunchKey, ProviderState, RetainedAgentLaunch,
+    RetainedExecution, SanitizedProviderStateObservation, SpawnStageError,
     StartedCreateObservation, REGISTRY_SHUTDOWN_GRACE,
 };
 use super::options::{ContainerName, ImageRef, ResolvedContainerOptions};
@@ -906,11 +907,22 @@ fn non_pty_raw_custody_reaps_killed_child_with_unread_output() -> Result<(), Box
 }
 
 #[cfg(unix)]
+const HOLD_WINDOW: Duration = Duration::from_millis(200);
+#[cfg(unix)]
+const HOLD_TICK: Duration = Duration::from_millis(10);
+
+#[cfg(unix)]
+fn is_zombie(pid: u32) -> bool {
+    process_stat(pid).is_some_and(|stat| stat.starts_with('Z'))
+}
+
+#[cfg(unix)]
 fn assert_managed_pty_error_reaps_with_unread_output(
     fault: FixtureSpawnFault,
     message: &str,
     reason: LaunchRetentionReason,
 ) -> Result<(), Box<dyn Error>> {
+    let witness = install_custody_witness();
     let BacklogInvocation {
         _temp,
         marker,
@@ -941,6 +953,16 @@ fn assert_managed_pty_error_reaps_with_unread_output(
         &marker
     )));
     let lifecycle = lifecycle_probe(&authority);
+    let mut bound_pid = None;
+    assert!(wait_until(Instant::now() + PTY_REAP_BOUND, || {
+        bound_pid = lifecycle.snapshot().bound_pid;
+        bound_pid.is_some()
+    }));
+    let pid = bound_pid.ok_or("managed child pid unavailable")?;
+    // Hold the actor so retention's kill waits; the PTY must stay held until that kill.
+    let poll_pause = lifecycle.pause_before_next_poll();
+    assert!(poll_pause.wait_until_paused(Instant::now() + PTY_REAP_BOUND));
+    let kill_pause = lifecycle.pause_after_next_kill();
     let probe = registry_probe(&registry);
     let ticket = registry.retain(RetainedAgentLaunch {
         plan,
@@ -949,13 +971,34 @@ fn assert_managed_pty_error_reaps_with_unread_output(
         reason,
     });
     assert!(probe.contains(ticket));
+    let held_until = Instant::now() + HOLD_WINDOW;
+    while Instant::now() < held_until {
+        assert!(
+            !is_zombie(pid),
+            "{fault:?}: PTY custody was released before the kill"
+        );
+        std::thread::sleep(HOLD_TICK);
+    }
+    assert_eq!(lifecycle.snapshot().terminate_commands, 0);
+    drop(poll_pause);
+
     assert!(
-        wait_until(Instant::now() + PTY_REAP_BOUND, || {
-            lifecycle.snapshot().terminate_commands >= 1
-        }),
-        "{fault:?}: retention never terminated the blocked PTY child: {:?}",
+        kill_pause.wait_until_paused(Instant::now() + PTY_REAP_BOUND),
+        "{fault:?}: retention never killed the blocked PTY child: {:?}",
         lifecycle.snapshot()
     );
+    // With the reap held, only a released PTY lets the killed child finish exiting.
+    assert!(
+        wait_until(Instant::now() + PTY_REAP_BOUND, || is_zombie(pid)),
+        "{fault:?}: PTY custody was not released after the kill: child {pid} stat {:?}",
+        process_stat(pid)
+    );
+    assert_eq!(
+        witness.releases(),
+        0,
+        "{fault:?}: non-PTY custody must stay held until the reap"
+    );
+    drop(kill_pause);
     assert!(
         wait_until(Instant::now() + PTY_REAP_BOUND, || {
             lifecycle.snapshot().native_reaps == 1 && probe.snapshot().unreaped == 0
@@ -964,19 +1007,34 @@ fn assert_managed_pty_error_reaps_with_unread_output(
         lifecycle.snapshot(),
         probe.snapshot()
     );
+    // Case 18: one native reap of the killed child, never a synthesised success.
+    let exit = authority
+        .wait_actual_until(Instant::now() + PTY_REAP_BOUND)?
+        .ok_or("no actual exit published")?;
+    let snapshot = lifecycle.snapshot();
+    assert_eq!(snapshot.actual_exit.as_ref(), Some(&exit));
+    assert!(
+        exit.exit_code != 0 || exit.signal.is_some(),
+        "{fault:?}: killed child reported success: {exit:?}"
+    );
+    assert_eq!(snapshot.native_reaps, 1);
+    assert!(!snapshot.owns_unreaped_child);
+    // The rest of the bundle drops through the reaped-cleanup path once its owners let go.
+    drop(authority);
+    drop(spawned.slot);
+    drop(registry);
     assert!(
         wait_until(Instant::now() + PTY_REAP_BOUND, || {
-            authority.resources_are_released()
+            !lifecycle.snapshot().resources_present
         }),
         "{fault:?}: reaped child kept its resources: {:?}",
         lifecycle.snapshot()
     );
-    // Case 18: the exit is the actor's one native reap, never a synthesised code.
-    let exit = authority.wait_actual()?;
-    let snapshot = lifecycle.snapshot();
-    assert_eq!(snapshot.actual_exit.as_ref(), Some(&exit));
-    assert_eq!(snapshot.native_reaps, 1);
-    assert!(!snapshot.owns_unreaped_child);
+    assert_eq!(
+        witness.releases(),
+        1,
+        "{fault:?}: non-PTY custody drops after the reap"
+    );
     assert_eq!(adapter.destructive_calls(), 0);
     Ok(())
 }
@@ -1000,6 +1058,19 @@ fn pty_post_spawn_control_change_reaps_terminated_child_with_unread_output(
         "post-spawn control changed",
         LaunchRetentionReason::PostSpawnControlChanged,
     )
+}
+
+// The slot lock is try-locked, so a busy custody worker only delays the answer.
+#[cfg(unix)]
+fn master_held_now(authority: &ChildLifecycleAuthority) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(100);
+    loop {
+        match pty_master_held(authority) {
+            Ok(held) => return held,
+            Err(_) if Instant::now() < deadline => std::thread::yield_now(),
+            Err(_) => return false,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1027,11 +1098,19 @@ async fn bridged_pty_terminate_keeps_master_until_execution_releases_it(
 
     let exit = authority.terminate_local_cli(Instant::now() + PTY_REAP_BOUND)?;
     assert_eq!(lifecycle_probe(&authority).snapshot().native_reaps, 1);
+    // Sample on every custody poll for 200 ms; a success-path release is late, not absent.
+    let held_until = Instant::now() + HOLD_WINDOW;
+    while Instant::now() < held_until {
+        assert!(
+            master_held_now(&authority),
+            "terminate released a bridged PTY before its execution did"
+        );
+        std::thread::sleep(HOLD_TICK);
+    }
+    // wait() is the normal release path, so the last held sample sits right before it.
     assert!(
-        wait_until(Instant::now() + PTY_REAP_BOUND, || {
-            matches!(pty_master_held(&authority), Ok(true))
-        }),
-        "terminate released a bridged PTY before its execution did"
+        master_held_now(&authority),
+        "bridged PTY was released before its execution released it"
     );
     let waited = tokio::time::timeout(PTY_REAP_BOUND, execution.wait()).await??;
     assert_eq!(waited.exit_code, exit.exit_code);

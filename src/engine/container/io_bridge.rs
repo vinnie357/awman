@@ -593,7 +593,7 @@ mod tests {
     fn drain_join_until_returns_false_for_blocked_work_within_deadline_margin() {
         let (release, blocked) = std::sync::mpsc::channel::<()>();
         let drain = DrainThread::spawn(move || {
-            let _ = blocked.recv();
+            let _ = blocked.recv_timeout(Duration::from_secs(2));
         });
         let started = Instant::now();
         let deadline = started + Duration::from_millis(100);
