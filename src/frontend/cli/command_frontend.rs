@@ -52,10 +52,8 @@ impl PtyOutputDrains {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(drain);
     }
-}
 
-impl Drop for PtyOutputDrains {
-    fn drop(&mut self) {
+    pub(crate) fn join_all(&mut self) {
         let deadline =
             std::time::Instant::now() + crate::engine::container::io_bridge::OUTPUT_DRAIN_BOUND;
         let drains = self
@@ -65,6 +63,12 @@ impl Drop for PtyOutputDrains {
         for drain in drains.drain(..) {
             drain.join_until(deadline);
         }
+    }
+}
+
+impl Drop for PtyOutputDrains {
+    fn drop(&mut self) {
+        self.join_all();
     }
 }
 

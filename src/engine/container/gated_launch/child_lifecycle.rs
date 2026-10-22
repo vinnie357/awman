@@ -101,6 +101,8 @@ struct ResourceCustody {
     raw_pending: AtomicUsize,
     raw_errors: AtomicUsize,
     raw_reaped: AtomicUsize,
+    kill_attempted: AtomicBool,
+    release_after_kill: Mutex<Option<ReleaseAfterKill>>,
     changed: Condvar,
     changed_state: Mutex<()>,
     #[cfg(test)]
@@ -109,6 +111,35 @@ struct ResourceCustody {
     resource_handoffs_in_flight: AtomicUsize,
     #[cfg(test)]
     raw_reap_pause: Mutex<Option<Arc<PollPauseState>>>,
+}
+
+/// Splits the part of a resource bundle that must close once the child is killed.
+pub(in crate::engine::container) type ReleaseAfterKill =
+    fn(&mut (dyn Any + Send)) -> Option<Box<dyn Any + Send>>;
+
+// A PTY child cannot finish exiting while its master stays open and unread.
+fn register_release_after_kill(custody: &ResourceCustody, split: Option<ReleaseAfterKill>) {
+    *custody
+        .release_after_kill
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = split;
+    custody.changed.notify_all();
+}
+
+fn take_release_after_kill(custody: &ResourceCustody) -> Option<ReleaseAfterKill> {
+    custody
+        .release_after_kill
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+}
+
+fn release_after_kill_registered(custody: &ResourceCustody) -> bool {
+    custody
+        .release_after_kill
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some()
 }
 
 struct RawCustodyJob {
@@ -374,6 +405,10 @@ impl fmt::Debug for BindStartedChildError {
 }
 
 impl BindStartedChildError {
+    pub(in crate::engine::container) fn release_after_kill(&self, split: ReleaseAfterKill) {
+        register_release_after_kill(&self.unbound.raw_permit.custody, Some(split));
+    }
+
     pub(in crate::engine::container) fn into_retained(self) -> RetainedExecution {
         match self.resources {
             Some(resources) => RetainedExecution::OwnedUnbound {
@@ -564,6 +599,14 @@ impl ChildLifecycleAuthority {
             guard = wait_state_timeout(&self.shared, guard, remaining);
         }
         Ok(guard.state.clone())
+    }
+
+    pub(in crate::engine::container) fn release_after_kill(&self, split: ReleaseAfterKill) {
+        register_release_after_kill(&self.shared.custody, Some(split));
+    }
+
+    pub(in crate::engine::container) fn clear_release_after_kill(&self) {
+        register_release_after_kill(&self.shared.custody, None);
     }
 
     pub(super) fn retained_child_is_actually_reaped(&self) -> bool {
@@ -995,6 +1038,8 @@ fn prepare_inner(
         raw_pending: AtomicUsize::new(0),
         raw_errors: AtomicUsize::new(0),
         raw_reaped: AtomicUsize::new(0),
+        kill_attempted: AtomicBool::new(false),
+        release_after_kill: Mutex::new(None),
         changed: Condvar::new(),
         changed_state: Mutex::new(()),
         #[cfg(test)]
@@ -1124,7 +1169,10 @@ fn actor_loop(
                 record_terminate_command(&shared);
                 if shared.signal_authorized.load(Ordering::Acquire) {
                     if let Some(owned) = child.as_mut() {
-                        if native_kill(owned).is_err() {
+                        let killed = native_kill(owned);
+                        shared.custody.kill_attempted.store(true, Ordering::Release);
+                        shared.custody.changed.notify_all();
+                        if killed.is_err() {
                             let poll = native_try_wait(owned, Some(started_at));
                             #[cfg(test)]
                             record_native_poll(&shared, &poll);
@@ -1234,6 +1282,23 @@ fn resource_custody_loop(custody: Arc<ResourceCustody>) {
                 && !custody.raw_kill_issued.swap(true, Ordering::AcqRel)
             {
                 let _ = native_kill(&mut job.child.child);
+                let early = take_release_after_kill(&custody).and_then(|split| {
+                    job.resources
+                        .as_mut()
+                        .and_then(|resources| split(resources.as_mut()))
+                });
+                if early.is_some() {
+                    drop(job);
+                    drop(changed);
+                    drop(early);
+                    changed = custody
+                        .changed_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    job = job_slot
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
                 // Any release tied to the kill must happen before this pause.
                 #[cfg(test)]
                 {
@@ -1288,6 +1353,24 @@ fn resource_custody_loop(custody: Arc<ResourceCustody>) {
                         custody.raw_errno_present.store(false, Ordering::Release);
                     }
                     custody.raw_outcome.store(RAW_UNKNOWN, Ordering::Release);
+                }
+            }
+        }
+        if custody.kill_attempted.load(Ordering::Acquire) && release_after_kill_registered(&custody)
+        {
+            if let Ok(mut slot) = try_lock_resource_slot(&custody) {
+                let early = take_release_after_kill(&custody).and_then(|split| {
+                    slot.as_mut()
+                        .and_then(|resources| split(resources.as_mut()))
+                });
+                drop(slot);
+                if early.is_some() {
+                    drop(changed);
+                    drop(early);
+                    changed = custody
+                        .changed_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                 }
             }
         }

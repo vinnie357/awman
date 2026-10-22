@@ -222,6 +222,8 @@ impl WorkflowFrontend for CliFrontend {
                 if let Some(handle) = self.stdin_reader_handle.take() {
                     let _ = handle.join();
                 }
+                // The step container has exited; its final output lands while raw mode is still on.
+                self.pty_output_drains.join_all();
                 // Drop the raw mode guard before any status output is printed,
                 // restoring cooked mode for the next step or workflow summary.
                 self.raw_mode_guard.take();

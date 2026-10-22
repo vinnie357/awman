@@ -841,11 +841,49 @@ impl AttachStorePermit {
 }
 
 struct FailedPtyBridgeResources {
-    _pair: portable_pty::PtyPair,
+    _pair: Option<portable_pty::PtyPair>,
     _reader: Option<Box<dyn std::io::Read + Send>>,
     _io: AgentIo,
     _config: BridgeConfig,
     _custody: SpawnCustodyResources,
+}
+
+// Field order drops the reader dup and master before the slave; `PtyPair` drops the slave first.
+struct ReleasedPty {
+    _reader: Option<Box<dyn std::io::Read + Send>>,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    _slave: Box<dyn portable_pty::SlavePty + Send>,
+}
+
+impl ReleasedPty {
+    fn new(pair: portable_pty::PtyPair, reader: Option<Box<dyn std::io::Read + Send>>) -> Self {
+        let portable_pty::PtyPair { slave, master } = pair;
+        Self {
+            _reader: reader,
+            _master: master,
+            _slave: slave,
+        }
+    }
+}
+
+/// Registered only while a PTY child is not yet bridged; a bridged execution keeps its PTY.
+fn take_pty_on_kill(
+    resources: &mut (dyn std::any::Any + Send),
+) -> Option<Box<dyn std::any::Any + Send>> {
+    match resources.downcast_mut::<LifecycleResources>()? {
+        LifecycleResources::Spawn(spawn) => match spawn.io.take() {
+            Some(SpawnIoResources::Pty(pair)) => Some(Box::new(ReleasedPty::new(pair, None))),
+            other => {
+                spawn.io = other;
+                None
+            }
+        },
+        LifecycleResources::FailedPty(failed) => {
+            let pair = failed._pair.take()?;
+            Some(Box::new(ReleasedPty::new(pair, failed._reader.take())))
+        }
+        LifecycleResources::Execution(_) => None,
+    }
 }
 
 enum LifecycleResources {
@@ -1727,6 +1765,7 @@ pub(super) fn spawn_pty_bridged(
     let lifecycle = prepared
         .bind_started_child_with_resources(SpawnedCreateCli::Pty(child), started_at, custody)
         .map_err(|error| {
+            error.release_after_kill(take_pty_on_kill);
             after_cli_start(
                 &retention,
                 EngineError::Container("create CLI state unknown".into()),
@@ -1734,6 +1773,8 @@ pub(super) fn spawn_pty_bridged(
                 LaunchRetentionReason::ChildStateUnknown,
             )
         })?;
+    // Every failure before the bridge retains this unbridged PTY; success clears it below.
+    lifecycle.release_after_kill(take_pty_on_kill);
     slot.bind(lifecycle.clone()).map_err(|authority| {
         after_cli_start(
             &retention,
@@ -1880,7 +1921,7 @@ pub(super) fn spawn_pty_bridged(
                     } = failure;
                     config.cancel_on_grace_expired = None;
                     *resources = LifecycleResources::FailedPty(FailedPtyBridgeResources {
-                        _pair: pair,
+                        _pair: Some(pair),
                         _reader: reader,
                         _io: io,
                         _config: config,
@@ -1958,6 +1999,7 @@ pub(super) fn spawn_pty_bridged(
                 LaunchRetentionReason::BridgeSetupFailed,
             )
         })?;
+    lifecycle.clear_release_after_kill();
 
     if let (Some(hook), Some((permit, attach))) = (post_bridge, bridge.attach) {
         if let Some(guard) = hook(AttachHookCtx {
