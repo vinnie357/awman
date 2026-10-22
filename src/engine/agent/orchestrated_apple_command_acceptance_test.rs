@@ -25,8 +25,11 @@ use crate::data::startup_gate::{load_startup_gate, StartupGateSpec};
 use crate::engine::agent_runtime::frontend::{AgentIo, AgentProgress, AgentStatus};
 use crate::engine::agent_runtime::{AgentFrontend, AgentRuntimeEngine, ResolvedAgentOptions};
 use crate::engine::auth::AgentCredentials;
+use crate::engine::container::gated_launch::child_lifecycle_test_support::{
+    pause_next_prepare_on_this_thread, take_prepared_pause, ActorPausePoint, PollPause,
+};
 use crate::engine::container::gated_launch::{
-    retention_test_support, ActiveGatedRetryOutcome, LaunchRetentionTicket,
+    retention_test_support, ActiveGatedRetryOutcome, LaunchRetentionRegistry, LaunchRetentionTicket,
 };
 use crate::engine::container::options::{ContainerName, ContainerOption};
 use crate::engine::container::ContainerRuntime;
@@ -45,6 +48,21 @@ const RESERVED_LABEL: &str = "dev.awman.orchestrator-launch";
 const RUNTIME_USER: &str = "1000:1000";
 const CONTROL_PATH: &str = "/.awman/startup-gate/control";
 const PROVIDER_ENTRY_MARKER: &str = "provider-entry.marker";
+const AFTER_BIND_RETRY_DEADLINE: Duration = Duration::from_secs(3);
+// A retry that ignores its deadline returns long before this window closes.
+const AFTER_BIND_HELD_WINDOW: Duration = Duration::from_millis(500);
+const PAST_DEADLINE_RETRY: Duration = Duration::from_millis(300);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AfterBindHold {
+    ReleasedWithinDeadline,
+    HeldPastDeadline,
+}
+
+thread_local! {
+    static AFTER_BIND_HOLD: std::cell::Cell<Option<AfterBindHold>> =
+        const { std::cell::Cell::new(None) };
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QualificationFault {
@@ -439,6 +457,7 @@ pub(crate) struct AppleCommandReport {
     pub resource_loan_releases_after_retry: usize,
     pub retry_observation: Option<RetryObservation>,
     pub retry_diagnostic: Option<retention_test_support::ActiveGatedRetryDiagnostic>,
+    pub actor_held_after_bind: Option<bool>,
     pub receipt_exists_while_second_inspection_blocked: Option<bool>,
     pub retry_tickets: Vec<LaunchRetentionTicket>,
     pub retry_observations: Vec<RetryObservation>,
@@ -478,6 +497,7 @@ struct DriverEffects {
     resource_loan_releases_after_retry: usize,
     retry_observation: Option<RetryObservation>,
     retry_diagnostic: Option<retention_test_support::ActiveGatedRetryDiagnostic>,
+    actor_held_after_bind: Option<bool>,
     receipt_exists_while_second_inspection_blocked: Option<bool>,
     retry_tickets: Vec<LaunchRetentionTicket>,
     retry_observations: Vec<RetryObservation>,
@@ -1260,6 +1280,7 @@ fn report_from_observation(
         resource_loan_releases_after_retry: effects.resource_loan_releases_after_retry,
         retry_observation: effects.retry_observation,
         retry_diagnostic: effects.retry_diagnostic,
+        actor_held_after_bind: effects.actor_held_after_bind,
         receipt_exists_while_second_inspection_blocked: effects
             .receipt_exists_while_second_inspection_blocked,
         retry_tickets: effects.retry_tickets,
@@ -1280,6 +1301,58 @@ fn report_from_observation(
 pub(crate) fn exercise(scenario: AppleCommandScenario) -> AppleCommandReport {
     exercise_public_path(scenario)
         .unwrap_or_else(|error| panic!("orchestrated Apple public-path fixture failed: {error}"))
+}
+
+fn exercise_with_actor_held_after_bind(hold: AfterBindHold) -> AppleCommandReport {
+    AFTER_BIND_HOLD.with(|slot| slot.set(Some(hold)));
+    let report = exercise(AppleCommandScenario::DropWithoutWait(
+        RetentionRetryFault::None,
+    ));
+    AFTER_BIND_HOLD.with(|slot| slot.set(None));
+    report
+}
+
+fn retry_with_actor_held_after_bind(
+    registry: &LaunchRetentionRegistry,
+    ticket: LaunchRetentionTicket,
+    hold: AfterBindHold,
+    pause: PollPause,
+) -> Result<
+    (
+        ActiveGatedRetryOutcome,
+        Option<retention_test_support::ActiveGatedRetryDiagnostic>,
+    ),
+    crate::engine::error::EngineError,
+> {
+    if hold == AfterBindHold::HeldPastDeadline {
+        let retried = retention_test_support::retry_active_gated_with_diagnostic(
+            registry,
+            ticket,
+            Instant::now() + PAST_DEADLINE_RETRY,
+        );
+        drop(pause);
+        return retried;
+    }
+    std::thread::scope(|scope| {
+        let (done_tx, done) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let _ = done_tx.send(retention_test_support::retry_active_gated_with_diagnostic(
+                registry,
+                ticket,
+                Instant::now() + AFTER_BIND_RETRY_DEADLINE,
+            ));
+        });
+        let returned_while_held = done.recv_timeout(AFTER_BIND_HELD_WINDOW).ok();
+        drop(pause);
+        match returned_while_held {
+            Some(retried) => retried,
+            None => done.recv().unwrap_or_else(|_| {
+                Err(crate::engine::error::EngineError::Container(
+                    "after-bind retry ended without an outcome".into(),
+                ))
+            }),
+        }
+    })
 }
 
 fn exercise_public_path(
@@ -1528,8 +1601,16 @@ fn exercise_public_path_with_native_and_cancel_driver_hook(
     let mut effects = DriverEffects::default();
     let mut external_release_boundary = ExternalReleaseBoundary::BeforeRunWithFrontend;
     let mut cancel_driver_failure = None;
+    let after_bind_hold = AFTER_BIND_HOLD.with(|slot| slot.get());
+    if after_bind_hold.is_some() {
+        pause_next_prepare_on_this_thread(ActorPausePoint::AfterBind);
+    }
+    let mut after_bind_pause = None;
     let wait_result: Result<(), crate::engine::error::EngineError> = tokio.block_on(async {
         let mut execution = instance.run_with_frontend(Box::new(NullFrontend))?;
+        if after_bind_hold.is_some() {
+            after_bind_pause = take_prepared_pause();
+        }
         if scenario == AppleCommandScenario::ExternalRelease {
             external_release_boundary = ExternalReleaseBoundary::ExecutionCreated;
         }
@@ -1856,6 +1937,10 @@ fn exercise_public_path_with_native_and_cancel_driver_hook(
             effects.actual_provider_entries_before_release = fixture
                 .actual_provider_entries()
                 .map_err(|error| crate::engine::error::EngineError::Container(error.to_string()))?;
+            if let Some(pause) = after_bind_pause.as_ref() {
+                effects.actor_held_after_bind =
+                    Some(pause.wait_until_paused(Instant::now() + Duration::from_secs(2)));
+            }
 
             let drop_started = Instant::now();
             drop(execution);
@@ -1887,11 +1972,16 @@ fn exercise_public_path_with_native_and_cancel_driver_hook(
             effects.active_resource_loans_before_retry = probe.active_gated_resource_loans(ticket);
             effects.resource_loan_releases_before_retry = probe.resource_loan_releases(ticket);
 
-            let (retry, diagnostic) = retention_test_support::retry_active_gated_with_diagnostic(
-                registry,
-                ticket,
-                Instant::now() + Duration::from_secs(2),
-            )?;
+            let (retry, diagnostic) = match (after_bind_hold, after_bind_pause.take()) {
+                (Some(hold), Some(pause)) => {
+                    retry_with_actor_held_after_bind(registry, ticket, hold, pause)?
+                }
+                _ => retention_test_support::retry_active_gated_with_diagnostic(
+                    registry,
+                    ticket,
+                    Instant::now() + Duration::from_secs(2),
+                )?,
+            };
             effects.retry_diagnostic = diagnostic;
             effects.retry_observation = Some(match retry {
                 ActiveGatedRetryOutcome::Resolved => RetryObservation::Resolved,
@@ -2483,6 +2573,48 @@ fn retained_ticket_retry_converges_only_after_exact_cleanup() {
         assert!(!report.second_spawn_attempted);
         assert!(!report.name_only_cleanup_attempted);
     }
+}
+
+#[test]
+fn retained_retry_resolves_when_actor_publishes_running_within_deadline() {
+    let report = exercise_with_actor_held_after_bind(AfterBindHold::ReleasedWithinDeadline);
+
+    assert_full_orchestrated_spawn_path(&report);
+    assert_eq!(report.actor_held_after_bind, Some(true));
+    assert!(report.retained_ticket_before_retry);
+    assert_eq!(
+        report.retry_observation,
+        Some(RetryObservation::Resolved),
+        "actor released before the retry deadline; diagnostic={:?}",
+        report.retry_diagnostic
+    );
+    assert!(!report.retained_ticket_after_retry);
+    assert_eq!(report.active_resource_loans_after_retry, 0);
+    assert_eq!(report.resource_loan_releases_after_retry, 1);
+    assert_eq!(report.actual_provider_entries_total, 0);
+    assert!(!report.second_spawn_attempted);
+    assert!(!report.name_only_cleanup_attempted);
+}
+
+#[test]
+fn retained_retry_retains_while_actor_is_held_past_deadline() {
+    let report = exercise_with_actor_held_after_bind(AfterBindHold::HeldPastDeadline);
+
+    assert_full_orchestrated_spawn_path(&report);
+    assert_eq!(report.actor_held_after_bind, Some(true));
+    assert!(report.retained_ticket_before_retry);
+    assert_eq!(
+        report.retry_observation,
+        Some(RetryObservation::Retained),
+        "actor held past the retry deadline; diagnostic={:?}",
+        report.retry_diagnostic
+    );
+    assert!(report.retained_ticket_after_retry);
+    assert_eq!(report.active_resource_loans_after_retry, 1);
+    assert_eq!(report.resource_loan_releases_after_retry, 0);
+    assert_eq!(report.actual_provider_entries_total, 0);
+    assert!(!report.second_spawn_attempted);
+    assert!(!report.name_only_cleanup_attempted);
 }
 
 #[test]

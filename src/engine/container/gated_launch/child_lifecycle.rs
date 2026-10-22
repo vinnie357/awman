@@ -66,6 +66,8 @@ struct LifecycleState {
     pause: Option<Arc<PollPauseState>>,
     #[cfg(test)]
     before_command_pause: Option<Arc<PollPauseState>>,
+    #[cfg(test)]
+    after_bind_pause: Option<Arc<PollPauseState>>,
 }
 
 struct LifecycleShared {
@@ -527,14 +529,14 @@ impl RawCustodyCapability {
 
 impl ChildLifecycleAuthority {
     pub(crate) fn prepare() -> Result<PreparedChildLifecycle, EngineError> {
-        prepare_inner(
-            #[cfg(test)]
-            None,
-            #[cfg(test)]
-            None,
-            #[cfg(test)]
-            None,
-        )
+        #[cfg(test)]
+        {
+            test_support::prepare_with_thread_pause()
+        }
+        #[cfg(not(test))]
+        {
+            prepare_inner()
+        }
     }
 
     pub(crate) fn state(&self) -> Result<ChildLifecycleState, EngineError> {
@@ -1019,6 +1021,10 @@ fn prepare_inner(
             before_command_pause: initial_pause
                 .filter(|point| *point == test_support::ActorPausePoint::BeforeFirstCommand)
                 .map(|_| new_pause_state()),
+            #[cfg(test)]
+            after_bind_pause: initial_pause
+                .filter(|point| *point == test_support::ActorPausePoint::AfterBind)
+                .map(|_| new_pause_state()),
         }),
         changed: Condvar::new(),
         actor_thread: Mutex::new(None),
@@ -1076,6 +1082,8 @@ fn actor_loop(
     };
     #[cfg(test)]
     record_bound_custody(&shared, process_id(&bound), true);
+    #[cfg(test)]
+    pause_after_bind(&shared);
     let mut child = Some(bound);
     update_state(&shared, ChildLifecycleState::Running, true);
     let mut disconnected = false;
@@ -1549,6 +1557,12 @@ struct PollPauseFlags {
 }
 
 #[cfg(test)]
+fn pause_after_bind(shared: &LifecycleShared) {
+    let pause = lock_state(shared).after_bind_pause.clone();
+    pause_on_request(pause);
+}
+
+#[cfg(test)]
 fn pause_before_poll(shared: &LifecycleShared) {
     let pause = lock_state(shared).pause.clone();
     pause_on_request(pause);
@@ -1584,6 +1598,32 @@ pub(crate) mod test_support {
     pub(crate) enum ActorPausePoint {
         BeforeFirstCommand,
         BeforePoll,
+        AfterBind,
+    }
+
+    thread_local! {
+        static NEXT_PREPARE_PAUSE: std::cell::Cell<Option<ActorPausePoint>> =
+            const { std::cell::Cell::new(None) };
+        static PREPARED_PAUSE: std::cell::RefCell<Option<PollPause>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Makes the next `ChildLifecycleAuthority::prepare` on this thread hold its actor at `point`.
+    pub(crate) fn pause_next_prepare_on_this_thread(point: ActorPausePoint) {
+        NEXT_PREPARE_PAUSE.with(|next| next.set(Some(point)));
+    }
+
+    pub(crate) fn take_prepared_pause() -> Option<PollPause> {
+        PREPARED_PAUSE.with(|pause| pause.borrow_mut().take())
+    }
+
+    pub(super) fn prepare_with_thread_pause() -> Result<PreparedChildLifecycle, EngineError> {
+        let Some(point) = NEXT_PREPARE_PAUSE.with(|next| next.take()) else {
+            return prepare_inner(None, None, None);
+        };
+        let (prepared, pause) = prepare_with_pause(point)?;
+        PREPARED_PAUSE.with(|slot| *slot.borrow_mut() = Some(pause));
+        Ok(prepared)
     }
 
     pub(crate) struct NeverCreatedRetentionGate {
@@ -1634,6 +1674,7 @@ pub(crate) mod test_support {
             match point {
                 ActorPausePoint::BeforeFirstCommand => guard.before_command_pause.clone(),
                 ActorPausePoint::BeforePoll => guard.pause.clone(),
+                ActorPausePoint::AfterBind => guard.after_bind_pause.clone(),
             }
             .expect("initial lifecycle pause installed")
         };
