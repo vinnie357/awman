@@ -1211,7 +1211,13 @@ fn resource_custody_loop(custody: Arc<ResourceCustody>) {
                     custody.raw_reaped.fetch_add(1, Ordering::AcqRel);
                     custody.raw_errno_present.store(false, Ordering::Release);
                     let resources = job.resources.take();
+                    drop(job);
+                    drop(changed);
                     drop(resources);
+                    let _changed = custody
+                        .changed_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     custody.resources_present.store(false, Ordering::Release);
                     custody.raw_outcome.store(RAW_REAPED, Ordering::Release);
                     custody.changed.notify_all();
@@ -1243,7 +1249,12 @@ fn resource_custody_loop(custody: Arc<ResourceCustody>) {
             if let Ok(mut slot) = try_lock_resource_slot(&custody) {
                 let resources = slot.take();
                 drop(slot);
+                drop(changed);
                 drop(resources);
+                let _changed = custody
+                    .changed_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 custody.resources_present.store(false, Ordering::Release);
                 custody.changed.notify_all();
                 return;
@@ -1261,7 +1272,12 @@ fn resource_custody_loop(custody: Arc<ResourceCustody>) {
                 if let Ok(mut slot) = try_lock_resource_slot(&custody) {
                     let resources = slot.take();
                     drop(slot);
+                    drop(changed);
                     drop(resources);
+                    let _changed = custody
+                        .changed_state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     custody.resources_present.store(false, Ordering::Release);
                     custody.changed.notify_all();
                     return;
