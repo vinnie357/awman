@@ -9,6 +9,7 @@ use std::io::Write;
 
 use crate::data::message::{UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
+use crate::engine::container::io_bridge::DrainThread;
 
 use crate::frontend::cli::command_frontend::{CliFrontend, RawModeGuard};
 
@@ -82,23 +83,24 @@ impl CliFrontend {
 
         let initial_size = crossterm::terminal::size().ok();
 
-        // Drain stdout to host stdout (unbuffered for raw mode).
-        tokio::spawn(async move {
-            while let Some(bytes) = stdout_rx.recv().await {
+        // Drain stdout to host stdout (unbuffered for raw mode). Threads, not
+        // tasks, so teardown can join them after the runtime stops polling.
+        self.pty_output_drains.push(DrainThread::spawn(move || {
+            while let Some(bytes) = stdout_rx.blocking_recv() {
                 let mut out = std::io::stdout().lock();
                 let _ = out.write_all(&bytes);
                 let _ = out.flush();
             }
-        });
+        }));
 
         // Drain stderr to host stderr (unbuffered for raw mode).
-        tokio::spawn(async move {
-            while let Some(bytes) = stderr_rx.recv().await {
+        self.pty_output_drains.push(DrainThread::spawn(move || {
+            while let Some(bytes) = stderr_rx.blocking_recv() {
                 let mut err = std::io::stderr().lock();
                 let _ = err.write_all(&bytes);
                 let _ = err.flush();
             }
-        });
+        }));
 
         // Retain a sender clone so the workflow control board can rebind
         // stdio after temporarily releasing the terminal for a prompt.

@@ -59,6 +59,8 @@ pub(crate) struct BridgeConfig {
 /// the backend needs to store for the execution lifetime.
 pub(crate) struct BridgeResult {
     pub output_readers: Vec<std::thread::JoinHandle<PipedReadEnd>>,
+    /// PTY master reader; `None` on the piped path.
+    pub pty_reader: Option<DrainThread>,
     /// Sender for `try_inject_stdin` — the engine retains a clone.
     pub stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// Broadcast sender for stuck events — stored in `AgentExecution`.
@@ -66,6 +68,40 @@ pub(crate) struct BridgeResult {
     /// The rolling output tail the reader threads feed — stored in
     /// `AgentExecution` so the workflow engine can read it after `wait()`.
     pub output_tail: Arc<OutputTail>,
+}
+
+/// How long exec waits for output to drain after the child exits. A
+/// descendant still holding the PTY slave open must not hang exec forever.
+pub(crate) const OUTPUT_DRAIN_BOUND: Duration = Duration::from_secs(2);
+
+/// An output-forwarding thread whose end can be awaited for a bounded time.
+pub(crate) struct DrainThread {
+    handle: std::thread::JoinHandle<()>,
+    finished: std::sync::mpsc::Receiver<()>,
+}
+
+impl DrainThread {
+    pub(crate) fn spawn(work: impl FnOnce() + Send + 'static) -> Self {
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            // Dropped on return or unwind, which disconnects `finished`.
+            let _done = done;
+            work();
+        });
+        Self { handle, finished }
+    }
+
+    /// Join the thread if it ends by `deadline`; otherwise leave it running.
+    pub(crate) fn join_until(self, deadline: Instant) -> bool {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match self.finished.recv_timeout(remaining) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = self.handle.join();
+                true
+            }
+        }
+    }
 }
 
 fn update_activity(activity: &SharedActivity, first_byte: &Arc<AtomicBool>) {
@@ -248,7 +284,7 @@ pub(crate) fn bridge_pty_owned(
     let fb = Arc::clone(&first_byte);
     let tail = Arc::clone(&config.output_tail);
     let broadcast = config.output_broadcast.clone();
-    std::thread::spawn(move || {
+    let pty_reader = DrainThread::spawn(move || {
         use std::io::Read;
         let mut buf = [0u8; 4096];
         let mut sink_open = true;
@@ -322,6 +358,7 @@ pub(crate) fn bridge_pty_owned(
         master_arc,
         BridgeResult {
             output_readers: Vec::new(),
+            pty_reader: Some(pty_reader),
             stdin_injector: stdin_tx,
             stuck_tx,
             output_tail: config.output_tail,
@@ -539,6 +576,7 @@ fn bridge_piped_io_with_policy(
 
     BridgeResult {
         output_readers,
+        pty_reader: None,
         stdin_injector: stdin_tx,
         stuck_tx,
         output_tail: config.output_tail,

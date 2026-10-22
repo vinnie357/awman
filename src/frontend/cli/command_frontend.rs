@@ -38,6 +38,36 @@ use super::user_message::CliUserMessageQueue;
 pub(crate) type NativeOutputWriters =
     std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<std::io::Result<()>>>>>;
 
+/// Interactive PTY output drains, joined with a bound when the frontend drops.
+/// The `Mutex` satisfies the `Sync` bound on frontend traits.
+#[derive(Default)]
+pub(crate) struct PtyOutputDrains(
+    std::sync::Mutex<Vec<crate::engine::container::io_bridge::DrainThread>>,
+);
+
+impl PtyOutputDrains {
+    pub(crate) fn push(&mut self, drain: crate::engine::container::io_bridge::DrainThread) {
+        self.0
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(drain);
+    }
+}
+
+impl Drop for PtyOutputDrains {
+    fn drop(&mut self) {
+        let deadline =
+            std::time::Instant::now() + crate::engine::container::io_bridge::OUTPUT_DRAIN_BOUND;
+        let drains = self
+            .0
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for drain in drains.drain(..) {
+            drain.join_until(deadline);
+        }
+    }
+}
+
 pub struct CliFrontend {
     pub(crate) matches: ArgMatches,
     /// Cached canonical command path (resolved via `command_path_from_matches`).
@@ -55,6 +85,9 @@ pub struct CliFrontend {
     pub(crate) yolo_stdin_rx: Option<std::sync::Mutex<std::sync::mpsc::Receiver<String>>>,
     /// Throttle: last time a yolo countdown message was emitted to stderr.
     pub(crate) last_sink_message_time: Option<std::time::Instant>,
+    /// Declared before `raw_mode_guard` so the final output lands before
+    /// cooked mode returns.
+    pub(crate) pty_output_drains: PtyOutputDrains,
     /// RAII guard that restores cooked mode when dropped. Present while a
     /// full-screen interactive container owns the terminal.
     pub(crate) raw_mode_guard: Option<RawModeGuard>,
@@ -391,6 +424,7 @@ impl CliFrontend {
             native_output_writers: Default::default(),
             yolo_stdin_rx: None,
             last_sink_message_time: None,
+            pty_output_drains: PtyOutputDrains::default(),
             raw_mode_guard: None,
             stdin_reader_shutdown: None,
             stdin_reader_handle: None,

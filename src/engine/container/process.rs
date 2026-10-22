@@ -794,6 +794,7 @@ impl Drop for SpawnCustodyResources {
 struct ExecutionResources {
     auth: Option<AuthResources>,
     output_readers: Vec<std::thread::JoinHandle<PipedReadEnd>>,
+    pty_reader: Option<crate::engine::container::io_bridge::DrainThread>,
     drain_output: bool,
     post_wait: PostWaitHook,
     pty_master: Option<PtyMaster>,
@@ -901,6 +902,11 @@ impl Drop for ExecutionResources {
         (self.post_wait)();
         self.pty_master = None;
         drop(self.stdin_injector.take());
+        if let Some(reader) = self.pty_reader.take() {
+            reader.join_until(
+                Instant::now() + crate::engine::container::io_bridge::OUTPUT_DRAIN_BOUND,
+            );
+        }
         if self.drain_output {
             for reader in self.output_readers.drain(..) {
                 let result = reader.join();
@@ -1020,6 +1026,7 @@ fn bridge_piped_resources(
         let drain_output = drain_output || private_auth || native.is_some();
         let crate::engine::container::io_bridge::BridgeResult {
             output_readers,
+            pty_reader,
             stdin_injector,
             stuck_tx,
             output_tail,
@@ -1029,6 +1036,7 @@ fn bridge_piped_resources(
         *resources = LifecycleResources::Execution(ExecutionResources {
             auth,
             output_readers,
+            pty_reader,
             drain_output,
             post_wait,
             pty_master: None,
@@ -1873,6 +1881,7 @@ pub(super) fn spawn_pty_bridged(
                 };
             let crate::engine::container::io_bridge::BridgeResult {
                 output_readers,
+                pty_reader,
                 stdin_injector,
                 stuck_tx,
                 output_tail,
@@ -1894,6 +1903,7 @@ pub(super) fn spawn_pty_bridged(
             *resources = LifecycleResources::Execution(ExecutionResources {
                 auth,
                 output_readers,
+                pty_reader,
                 drain_output: false,
                 post_wait,
                 pty_master: Some(master_arc),
