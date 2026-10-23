@@ -822,6 +822,7 @@ fn pty_raw_custody_reaps_killed_child_with_unread_output() -> Result<(), Box<dyn
     let (reap_pause, pid) =
         pause_raw_reap_after_kill(&owned).ok_or("raw custody pause unavailable")?;
     let pid = pid.ok_or("raw child pid unavailable")?;
+    let pty = PtyReleaseProbe::open(pid)?;
 
     let probe = registry_probe(&registry);
     let ticket = registry.retain(RetainedAgentLaunch {
@@ -838,9 +839,7 @@ fn pty_raw_custody_reaps_killed_child_with_unread_output() -> Result<(), Box<dyn
     );
     // With the reap held, only a released PTY lets the killed child finish exiting.
     assert!(
-        wait_until(Instant::now() + PTY_REAP_BOUND, || {
-            process_stat(pid).is_some_and(|stat| stat.starts_with('Z'))
-        }),
+        wait_until(Instant::now() + PTY_REAP_BOUND, || pty.released()),
         "PTY custody was not released after the kill: child {pid} stat {:?}",
         process_stat(pid)
     );
@@ -911,9 +910,57 @@ const HOLD_WINDOW: Duration = Duration::from_millis(200);
 #[cfg(unix)]
 const HOLD_TICK: Duration = Duration::from_millis(10);
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn is_zombie(pid: u32) -> bool {
     process_stat(pid).is_some_and(|stat| stat.starts_with('Z'))
+}
+
+/// Observes whether the PTY a killed child wrote to has been released.
+///
+/// On macOS a child with unread PTY output cannot finish exiting while the
+/// master is open, so the zombie state is the release signal. Linux lets the
+/// child exit regardless, and portable-pty's kill reaps it within its SIGHUP
+/// grace, so there the probe holds the child's slave and waits for the hangup
+/// that only the master's close delivers.
+#[cfg(unix)]
+struct PtyReleaseProbe {
+    pid: u32,
+    #[cfg(target_os = "linux")]
+    slave: std::fs::File,
+}
+
+#[cfg(unix)]
+impl PtyReleaseProbe {
+    fn open(pid: u32) -> Result<Self, Box<dyn Error>> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let slave = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+                .open(format!("/proc/{pid}/fd/0"))?;
+            Ok(Self { pid, slave })
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok(Self { pid })
+    }
+
+    fn released(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+            use std::os::fd::AsFd;
+            let mut fds = [PollFd::new(self.slave.as_fd(), PollFlags::empty())];
+            let hung_up = poll(&mut fds, PollTimeout::ZERO).is_ok_and(|ready| ready == 1)
+                && fds[0]
+                    .revents()
+                    .is_some_and(|events| events.contains(PollFlags::POLLHUP));
+            hung_up && process_stat(self.pid).is_none_or(|stat| stat.starts_with('Z'))
+        }
+        #[cfg(not(target_os = "linux"))]
+        is_zombie(self.pid)
+    }
 }
 
 #[cfg(unix)]
@@ -959,6 +1006,7 @@ fn assert_managed_pty_error_reaps_with_unread_output(
         bound_pid.is_some()
     }));
     let pid = bound_pid.ok_or("managed child pid unavailable")?;
+    let pty = PtyReleaseProbe::open(pid)?;
     // Hold the actor so retention's kill waits; the PTY must stay held until that kill.
     let poll_pause = lifecycle.pause_before_next_poll();
     assert!(poll_pause.wait_until_paused(Instant::now() + PTY_REAP_BOUND));
@@ -974,7 +1022,7 @@ fn assert_managed_pty_error_reaps_with_unread_output(
     let held_until = Instant::now() + HOLD_WINDOW;
     while Instant::now() < held_until {
         assert!(
-            !is_zombie(pid),
+            !pty.released(),
             "{fault:?}: PTY custody was released before the kill"
         );
         std::thread::sleep(HOLD_TICK);
@@ -989,7 +1037,7 @@ fn assert_managed_pty_error_reaps_with_unread_output(
     );
     // With the reap held, only a released PTY lets the killed child finish exiting.
     assert!(
-        wait_until(Instant::now() + PTY_REAP_BOUND, || is_zombie(pid)),
+        wait_until(Instant::now() + PTY_REAP_BOUND, || pty.released()),
         "{fault:?}: PTY custody was not released after the kill: child {pid} stat {:?}",
         process_stat(pid)
     );
