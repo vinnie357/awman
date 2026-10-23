@@ -45,8 +45,22 @@ impl ReadySummary {
         }
     }
 
+    /// Required steps that ended `Failed`, as `(label, message)`. Skipped and
+    /// warned steps (e.g. the optional audit) do not make `ready` fail.
     pub fn failed_steps(&self) -> Vec<(&'static str, &str)> {
-        Vec::new()
+        [
+            ("Dockerfile", &self.dockerfile),
+            ("Base image", &self.base_image),
+            ("Agent image", &self.agent_image),
+            ("Local agent", &self.local_agent),
+            ("Image rebuild", &self.image_rebuild),
+        ]
+        .into_iter()
+        .filter_map(|(label, status)| match status {
+            StepStatus::Failed(msg) => Some((label, msg.as_str())),
+            _ => None,
+        })
+        .collect()
     }
 }
 
