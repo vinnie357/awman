@@ -65,8 +65,7 @@ fn build_clap_argument(spec: &ArgumentSpec) -> Arg {
             arg = arg
                 .required(!spec.optional)
                 .num_args(1..)
-                .trailing_var_arg(true)
-                .allow_hyphen_values(true);
+                .allow_negative_numbers(true);
         }
     }
     arg

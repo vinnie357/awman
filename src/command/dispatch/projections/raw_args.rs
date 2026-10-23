@@ -247,6 +247,12 @@ impl CommandCatalogue {
     }
 }
 
+/// A hyphen-prefixed token that is a value, not a flag: `-` or a number like
+/// `-5` / `-1.5`.
+fn is_positional_dash_word(arg: &str) -> bool {
+    arg == "-" || (arg.starts_with('-') && arg[1..].parse::<f64>().is_ok())
+}
+
 fn parse_against_spec(
     spec: &CommandSpec,
     path: &[&str],
@@ -256,28 +262,22 @@ fn parse_against_spec(
     let mut flags: BTreeMap<String, ParsedFlag> = BTreeMap::new();
     let mut positionals: Vec<String> = Vec::new();
 
-    // Whether the command's last positional is a greedy trailing var-arg, and
-    // how many fixed positionals precede it. Once positional collection reaches
-    // the trailing argument, remaining tokens (including hyphen-prefixed ones)
-    // are captured verbatim — matching clap's `trailing_var_arg` semantics.
+    // Whether the command's last positional is a trailing var-arg. Its tokens
+    // may interleave with flags (`exec prompt "<text>" --agent claude`), so
+    // flags after the prompt still parse as flags; negative numbers and a bare
+    // `-` are prompt words — matching clap's `allow_negative_numbers`.
     let trailing = spec
         .arguments
         .last()
         .is_some_and(|a| matches!(a.kind, ArgumentKind::TrailingVarArgs));
-    let fixed_arg_count = spec
-        .arguments
-        .iter()
-        .filter(|a| !matches!(a.kind, ArgumentKind::TrailingVarArgs))
-        .count();
 
-    let mut greedy = false;
     let mut after_double_dash = false;
 
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
 
-        if greedy || after_double_dash {
+        if after_double_dash || (trailing && is_positional_dash_word(arg)) {
             positionals.push(arg.clone());
             i += 1;
             continue;
@@ -313,11 +313,6 @@ fn parse_against_spec(
             i = apply_flag(flag_spec, None, args, i, path, &mut flags)?;
         } else {
             positionals.push(arg.clone());
-            // Begin greedy capture once we have started filling a trailing
-            // var-arg (i.e. once positionals exceed the fixed leading ones).
-            if trailing && positionals.len() > fixed_arg_count {
-                greedy = true;
-            }
             i += 1;
         }
     }
