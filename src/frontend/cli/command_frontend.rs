@@ -542,6 +542,12 @@ impl CommandFrontend for CliFrontend {
         {
             return Ok(None);
         }
+        // The frontend owns TTY detection: when it auto-detected
+        // non-interactive mode, the built command must agree, or it launches
+        // `run -it` over piped stdio and the runtime fails with ENOTTY.
+        if flag == "non-interactive" && self.non_interactive {
+            return Ok(Some(true));
+        }
         Ok(Some(m.get_flag(flag)))
     }
 
