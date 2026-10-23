@@ -40,33 +40,60 @@ fn env_for(api_root: &Path, squad_root: &Path) -> EnvSnapshot {
 }
 
 /// A real, live child process whose executable filename contains "awman", so
-/// `pid_is_awman` recognizes it the way it would a genuine daemon. Holds its
-/// own `TempDir` so the binary stays resolvable for as long as the child
-/// needs it.
+/// `pid_is_awman` recognizes it the way it would a genuine daemon.
 struct FakeAwmanProcess {
-    _dir: tempfile::TempDir,
     child: Child,
 }
 
-impl FakeAwmanProcess {
-    fn spawn(label: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let exe_path = dir.path().join(format!("awman-fake-{label}"));
-        std::fs::copy("/bin/sleep", &exe_path).expect("copy /bin/sleep for the fake daemon");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&exe_path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&exe_path, perms).unwrap();
+/// The one awman-named copy of this test harness every [`FakeAwmanProcess`]
+/// execs. Copy this harness, not `/bin/sleep`: macOS SIGKILLs a relocated
+/// Apple platform binary ("Code Signature Invalid") within milliseconds of
+/// exec. Copy it once, not once per fake: the harness is tens of MB, and each
+/// fresh executable pays macOS's first-launch assessment, which can stall for
+/// tens of seconds. The copy sits at a fixed path under `CARGO_TARGET_TMPDIR`
+/// and is reused until the harness is rebuilt; it is staged and renamed into
+/// place so a concurrent run never execs a half-written file.
+fn fake_awman_exe() -> &'static Path {
+    static EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| {
+        let source = std::env::current_exe().expect("current mutual-exclusion test binary");
+        let harness = source.file_name().unwrap().to_str().unwrap();
+        let exe_path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("awman-fake-{harness}"));
+        let source_meta = std::fs::metadata(&source).unwrap();
+        let current = std::fs::metadata(&exe_path).is_ok_and(|copy| {
+            copy.len() == source_meta.len()
+                && copy.modified().unwrap() >= source_meta.modified().unwrap()
+        });
+        if !current {
+            let staged = exe_path.with_extension(format!("{}.partial", std::process::id()));
+            std::fs::copy(&source, &staged).expect("copy test harness for the fake daemon");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&staged).unwrap().permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&staged, perms).unwrap();
+            }
+            std::fs::rename(&staged, &exe_path).expect("install the fake daemon executable");
         }
+        exe_path
+    })
+}
+
+impl FakeAwmanProcess {
+    fn spawn() -> Self {
+        let exe_path = fake_awman_exe();
         // Under `cargo test`'s default concurrent-test-function execution,
         // the kernel can transiently report a just-written, already-closed
         // executable as busy (`ETXTBSY`) for a moment before `execve`
         // succeeds. Retry briefly rather than require `--test-threads=1`.
         let mut attempt = 0;
         let child = loop {
-            match Command::new(&exe_path).arg("30").spawn() {
+            match Command::new(exe_path)
+                .args(["--exact", "fake_awman_process_stays_alive", "--nocapture"])
+                .env(FAKE_AWMAN_HOLDER, "1")
+                .spawn()
+            {
                 Ok(child) => break child,
                 Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 20 => {
                     attempt += 1;
@@ -91,7 +118,7 @@ impl FakeAwmanProcess {
         let pid = child.id();
         for _ in 0..500 {
             if awman::data::fs::daemon_process::pid_is_awman(pid) {
-                return Self { _dir: dir, child };
+                return Self { child };
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -112,6 +139,33 @@ impl Drop for FakeAwmanProcess {
     }
 }
 
+/// Set only in a [`FakeAwmanProcess`] child, so the harness copy idles in
+/// [`fake_awman_process_stays_alive`] instead of running the suite.
+const FAKE_AWMAN_HOLDER: &str = "AWMAN_MUTUAL_EXCLUSION_HOLDER";
+
+/// In a holder child, idle until the spawning test kills it. Exit on its own
+/// if that test process dies first (the child is reparented), and after 30s
+/// regardless, so a holder never outlives the run that started it.
+#[test]
+fn fake_awman_process_stays_alive() {
+    if std::env::var_os(FAKE_AWMAN_HOLDER).is_none() {
+        return;
+    }
+    #[cfg(unix)]
+    let parent_alive = {
+        let parent = std::os::unix::process::parent_id();
+        move || std::os::unix::process::parent_id() == parent
+    };
+    #[cfg(not(unix))]
+    let parent_alive = || true;
+    for _ in 0..300 {
+        if !parent_alive() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 // ─── Both directions ──────────────────────────────────────────────────────
 
 #[test]
@@ -120,7 +174,7 @@ fn squad_running_blocks_api_start() {
     let squad_root = tempfile::tempdir().unwrap();
     let env = env_for(api_root.path(), squad_root.path());
 
-    let fake_squad = FakeAwmanProcess::spawn("squad");
+    let fake_squad = FakeAwmanProcess::spawn();
     let squad_guard = DaemonGuard::for_daemon(DaemonKind::Squad, &env).unwrap();
     squad_guard.acquire(fake_squad.pid()).unwrap();
 
@@ -142,7 +196,7 @@ fn api_running_blocks_squad_start() {
     let squad_root = tempfile::tempdir().unwrap();
     let env = env_for(api_root.path(), squad_root.path());
 
-    let fake_api = FakeAwmanProcess::spawn("api");
+    let fake_api = FakeAwmanProcess::spawn();
     let api_guard = DaemonGuard::for_daemon(DaemonKind::Api, &env).unwrap();
     api_guard.acquire(fake_api.pid()).unwrap();
 
@@ -190,8 +244,8 @@ fn concurrent_start_race_produces_exactly_one_winner_every_time() {
         let squad_root = tempfile::tempdir().unwrap();
         let env = env_for(api_root.path(), squad_root.path());
 
-        let fake_api = FakeAwmanProcess::spawn(&format!("api-{attempt}"));
-        let fake_squad = FakeAwmanProcess::spawn(&format!("squad-{attempt}"));
+        let fake_api = FakeAwmanProcess::spawn();
+        let fake_squad = FakeAwmanProcess::spawn();
         let api_pid = fake_api.pid();
         let squad_pid = fake_squad.pid();
 
@@ -362,7 +416,7 @@ async fn a_live_api_daemon_stops_squad_startup_before_any_store_pidfile_or_port(
 
     // A live, awman-named process holding the API pidfile — what a running
     // `awman api` looks like to the guard.
-    let fake_api = FakeAwmanProcess::spawn("api-live");
+    let fake_api = FakeAwmanProcess::spawn();
     let env = env_for(&api_root, &squad_root);
     let api_guard = DaemonGuard::for_daemon(DaemonKind::Api, &env).unwrap();
     api_guard.acquire(fake_api.pid()).unwrap();
