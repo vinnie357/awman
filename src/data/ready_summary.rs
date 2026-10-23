@@ -44,4 +44,43 @@ impl ReadySummary {
             non_default_agent_images: Vec::new(),
         }
     }
+
+    pub fn failed_steps(&self) -> Vec<(&'static str, &str)> {
+        Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_steps_lists_required_failures_and_ignores_skipped_audit() {
+        let mut s = ReadySummary::new("apple-containers");
+        s.dockerfile = StepStatus::Done;
+        s.base_image = StepStatus::Failed("exited with code 64".into());
+        s.agent_image = StepStatus::Failed("base missing".into());
+        s.local_agent = StepStatus::Done;
+        s.audit = StepStatus::Skipped;
+        s.image_rebuild = StepStatus::Skipped;
+        assert_eq!(
+            s.failed_steps(),
+            vec![
+                ("Base image", "exited with code 64"),
+                ("Agent image", "base missing"),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_steps_empty_when_only_optional_steps_skipped_or_warn() {
+        let mut s = ReadySummary::new("docker");
+        s.dockerfile = StepStatus::Done;
+        s.base_image = StepStatus::Done;
+        s.agent_image = StepStatus::Warn("stale".into());
+        s.local_agent = StepStatus::Done;
+        s.audit = StepStatus::Skipped;
+        s.image_rebuild = StepStatus::Skipped;
+        assert!(s.failed_steps().is_empty());
+    }
 }
