@@ -287,6 +287,14 @@ pub trait TaskGateway: Send + Sync {
     async fn list(&self) -> Result<Vec<Task>, CommandError>;
     async fn get(&self, name: &str) -> Result<Task, CommandError>;
     async fn runs(&self, name: &str, limit: usize) -> Result<Vec<Run>, CommandError>;
+    /// The task and its recent runs as one snapshot, for `squad show`. The
+    /// default composes `get` and `runs`; a gateway over a live store
+    /// overrides it so a scheduler tick cannot land between the two reads.
+    async fn detail(&self, name: &str, limit: usize) -> Result<TaskDetail, CommandError> {
+        let task = self.get(name).await?;
+        let runs = self.runs(name, limit).await?;
+        Ok(TaskDetail { task, runs })
+    }
     async fn set_status(&self, name: &str, status: TaskStatus) -> Result<(), CommandError>;
     /// Ask for `name` to be evaluated on the next scheduler tick, whatever its
     /// interval and backoff would otherwise say.
@@ -345,6 +353,9 @@ impl TaskGateway for SharedTaskGateway {
     }
     async fn runs(&self, name: &str, limit: usize) -> Result<Vec<Run>, CommandError> {
         self.0.runs(name, limit).await
+    }
+    async fn detail(&self, name: &str, limit: usize) -> Result<TaskDetail, CommandError> {
+        self.0.detail(name, limit).await
     }
     async fn set_status(&self, name: &str, status: TaskStatus) -> Result<(), CommandError> {
         self.0.set_status(name, status).await
@@ -901,6 +912,17 @@ impl TaskGateway for LocalTaskGateway {
         Ok(self.store.runs_for(name, limit)?)
     }
 
+    async fn detail(&self, name: &str, limit: usize) -> Result<TaskDetail, CommandError> {
+        let (task, runs) = self
+            .store
+            .get_with_runs(name, limit)?
+            .ok_or_else(|| CommandError::Other(format!("task {name:?} was not found")))?;
+        Ok(TaskDetail {
+            task: self.with_unmet_env_one(task),
+            runs,
+        })
+    }
+
     async fn set_status(&self, name: &str, status: TaskStatus) -> Result<(), CommandError> {
         if self.store.set_status(name, status)? {
             tracing::info!(
@@ -1183,6 +1205,11 @@ impl TaskGateway for RemoteTaskGateway {
         let mut runs = detail.runs;
         runs.truncate(limit);
         Ok(runs)
+    }
+    async fn detail(&self, name: &str, limit: usize) -> Result<TaskDetail, CommandError> {
+        let mut detail: TaskDetail = self.command("squad show", vec![name.into()]).await?;
+        detail.runs.truncate(limit);
+        Ok(detail)
     }
     async fn set_status(&self, name: &str, status: TaskStatus) -> Result<(), CommandError> {
         let subcommand = match status {
