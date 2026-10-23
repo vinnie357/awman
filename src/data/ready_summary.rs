@@ -44,4 +44,57 @@ impl ReadySummary {
             non_default_agent_images: Vec::new(),
         }
     }
+
+    /// Required steps that ended `Failed`, as `(label, message)`. Skipped and
+    /// warned steps (e.g. the optional audit) do not make `ready` fail.
+    pub fn failed_steps(&self) -> Vec<(&'static str, &str)> {
+        [
+            ("Dockerfile", &self.dockerfile),
+            ("Base image", &self.base_image),
+            ("Agent image", &self.agent_image),
+            ("Local agent", &self.local_agent),
+            ("Image rebuild", &self.image_rebuild),
+        ]
+        .into_iter()
+        .filter_map(|(label, status)| match status {
+            StepStatus::Failed(msg) => Some((label, msg.as_str())),
+            _ => None,
+        })
+        .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_steps_lists_required_failures_and_ignores_skipped_audit() {
+        let mut s = ReadySummary::new("apple-containers");
+        s.dockerfile = StepStatus::Done;
+        s.base_image = StepStatus::Failed("exited with code 64".into());
+        s.agent_image = StepStatus::Failed("base missing".into());
+        s.local_agent = StepStatus::Done;
+        s.audit = StepStatus::Skipped;
+        s.image_rebuild = StepStatus::Skipped;
+        assert_eq!(
+            s.failed_steps(),
+            vec![
+                ("Base image", "exited with code 64"),
+                ("Agent image", "base missing"),
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_steps_empty_when_only_optional_steps_skipped_or_warn() {
+        let mut s = ReadySummary::new("docker");
+        s.dockerfile = StepStatus::Done;
+        s.base_image = StepStatus::Done;
+        s.agent_image = StepStatus::Warn("stale".into());
+        s.local_agent = StepStatus::Done;
+        s.audit = StepStatus::Skipped;
+        s.image_rebuild = StepStatus::Skipped;
+        assert!(s.failed_steps().is_empty());
+    }
 }

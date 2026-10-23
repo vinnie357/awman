@@ -9,6 +9,7 @@ use std::io::Write;
 
 use crate::data::message::{UserMessage, UserMessageSink};
 use crate::engine::agent_runtime::frontend::{AgentFrontend, AgentIo, AgentProgress, AgentStatus};
+use crate::engine::container::io_bridge::DrainThread;
 
 use crate::frontend::cli::command_frontend::{CliFrontend, RawModeGuard};
 
@@ -82,23 +83,24 @@ impl CliFrontend {
 
         let initial_size = crossterm::terminal::size().ok();
 
-        // Drain stdout to host stdout (unbuffered for raw mode).
-        tokio::spawn(async move {
-            while let Some(bytes) = stdout_rx.recv().await {
+        // Drain stdout to host stdout (unbuffered for raw mode). Threads, not
+        // tasks, so teardown can join them after the runtime stops polling.
+        self.pty_output_drains.push(DrainThread::spawn(move || {
+            while let Some(bytes) = stdout_rx.blocking_recv() {
                 let mut out = std::io::stdout().lock();
                 let _ = out.write_all(&bytes);
                 let _ = out.flush();
             }
-        });
+        }));
 
         // Drain stderr to host stderr (unbuffered for raw mode).
-        tokio::spawn(async move {
-            while let Some(bytes) = stderr_rx.recv().await {
+        self.pty_output_drains.push(DrainThread::spawn(move || {
+            while let Some(bytes) = stderr_rx.blocking_recv() {
                 let mut err = std::io::stderr().lock();
                 let _ = err.write_all(&bytes);
                 let _ = err.flush();
             }
-        });
+        }));
 
         // Retain a sender clone so the workflow control board can rebind
         // stdio after temporarily releasing the terminal for a prompt.
@@ -329,6 +331,117 @@ impl AgentFrontend for CliContainerProxy {
     }
 }
 
+pub(super) struct CliNativeAuthProxy {
+    terminal: Option<std::fs::File>,
+    writers: crate::frontend::cli::command_frontend::NativeOutputWriters,
+}
+
+impl CliNativeAuthProxy {
+    pub(super) fn new(
+        terminal: std::fs::File,
+        writers: crate::frontend::cli::command_frontend::NativeOutputWriters,
+    ) -> std::io::Result<Self> {
+        use std::io::IsTerminal;
+        if !terminal.is_terminal() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native authentication requires a controlling terminal",
+            ));
+        }
+        Ok(Self {
+            terminal: Some(terminal),
+            writers,
+        })
+    }
+}
+
+impl UserMessageSink for CliNativeAuthProxy {
+    fn write_message(&mut self, _message: UserMessage) {}
+    fn replay_queued(&mut self) {}
+}
+
+#[async_trait]
+impl AgentFrontend for CliNativeAuthProxy {
+    fn report_status(&mut self, _status: AgentStatus) {}
+    fn report_progress(&mut self, _progress: AgentProgress) {}
+
+    fn take_io(&mut self) -> AgentIo {
+        let terminal = self.terminal.take().expect("single auth channel transfer");
+        let (output, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let writer = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let mut terminal = tokio::fs::File::from_std(terminal);
+            while let Some(bytes) = receiver.recv().await {
+                terminal.write_all(&bytes).await?;
+                terminal.flush().await?;
+            }
+            Ok(())
+        });
+        self.writers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(writer);
+        AgentIo {
+            stdout: output.clone(),
+            stderr: output,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        }
+    }
+}
+
+pub(super) struct CliNativeContainerProxy {
+    pub writers: crate::frontend::cli::command_frontend::NativeOutputWriters,
+}
+
+impl UserMessageSink for CliNativeContainerProxy {
+    fn write_message(&mut self, _message: UserMessage) {}
+    fn replay_queued(&mut self) {}
+}
+
+#[async_trait]
+impl AgentFrontend for CliNativeContainerProxy {
+    fn report_status(&mut self, _status: AgentStatus) {}
+    fn report_progress(&mut self, _progress: AgentProgress) {}
+
+    fn take_io(&mut self) -> AgentIo {
+        let (stdout, mut stdout_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stderr, mut stderr_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let out = tokio::spawn(async move {
+            while let Some(bytes) = stdout_rx.recv().await {
+                let mut writer = std::io::stdout().lock();
+                writer.write_all(&bytes)?;
+                writer.flush()?;
+            }
+            Ok(())
+        });
+        let err = tokio::spawn(async move {
+            while let Some(bytes) = stderr_rx.recv().await {
+                let mut writer = std::io::stderr().lock();
+                writer.write_all(&bytes)?;
+                writer.flush()?;
+            }
+            Ok(())
+        });
+        self.writers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend([out, err]);
+        AgentIo {
+            stdout,
+            stderr,
+            stdin_tx,
+            stdin_rx,
+            resize: None,
+            initial_size: None,
+        }
+    }
+}
+
 // ─── CliInteractiveContainerProxy ───────────────────────────────────────
 
 impl UserMessageSink for CliInteractiveContainerProxy {
@@ -355,3 +468,7 @@ impl AgentFrontend for CliInteractiveContainerProxy {
             .expect("CliInteractiveContainerProxy::take_io called but no AgentIo available")
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_auth_terminal_test.rs"]
+mod native_codex_auth_terminal_test;

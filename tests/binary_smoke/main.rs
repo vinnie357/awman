@@ -21,5 +21,6 @@ mod context_overlay_0087;
 mod hardening_0098;
 mod headless_no_tty;
 mod overlay_0082;
+mod ready_command;
 mod rename_0077;
 mod skill_libraries;

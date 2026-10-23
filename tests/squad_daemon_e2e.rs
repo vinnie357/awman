@@ -219,6 +219,22 @@ async fn curl_drives_the_full_task_lifecycle_with_no_awman_frontend() {
     assert_eq!(status["running"], true);
     assert_eq!(status["task_count"], 0);
 
+    // The scheduler's first tick runs on its own spawned task. Under load it
+    // can land after `squad add`, see a never-run task as due and record a
+    // run before `squad show` reads it. Wait for that tick so the next one is
+    // a full tick interval away and the task stays never-evaluated.
+    let mut status = status;
+    let mut waited = Duration::ZERO;
+    while status["last_tick"].is_null() {
+        assert!(
+            waited < Duration::from_secs(10),
+            "the scheduler never completed its first tick: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        waited += Duration::from_millis(20);
+        status = curl_get(format!("{base}/v1/status")).await.1;
+    }
+
     // add
     let repo_str = repo.to_str().unwrap();
     let (code, created) = curl_command(

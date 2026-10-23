@@ -1,5 +1,7 @@
 FROM debian:bookworm-slim
 
+LABEL dev.awman.startup-gate="1"
+
 # Strict shell for every RUN: -e fails fast, -o pipefail propagates errors
 # through `curl | bash`-style pipelines so a partial download cannot silently
 # produce a "successful" build.
@@ -39,7 +41,10 @@ RUN rm -rf /var/lib/apt/lists/* \
         musl-tools \
         openssh-client \
         pkg-config \
+        python3-minimal \
     && rm -rf /var/lib/apt/lists/*
+
+RUN test -x /usr/bin/python3
 
 # ── GitHub CLI (must run as root — writes to /etc/apt) ────────────────────────
 # scripts/release.sh calls `gh auth status`, `gh release create`, etc.

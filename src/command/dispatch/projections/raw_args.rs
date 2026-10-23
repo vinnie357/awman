@@ -20,6 +20,7 @@ use std::path::PathBuf;
 
 use crate::command::dispatch::catalogue::{
     ArgumentKind, CommandCatalogue, CommandSpec, FlagDefault, FlagKind, FlagSpec, FrontendKind,
+    FrontendVisibility,
 };
 use crate::command::error::CommandError;
 
@@ -225,7 +226,7 @@ impl CommandCatalogue {
             .lookup_with_aliases(path)
             .ok_or_else(|| CommandError::unknown_command(path))?;
         let canonical = self.canonical_path(path);
-        parse_against_spec(spec, &canonical, args)
+        parse_against_spec(spec, &canonical, args, FrontendKind::Cli)
     }
 
     /// Like [`parse_raw_args`](Self::parse_raw_args) but additionally applies
@@ -240,42 +241,43 @@ impl CommandCatalogue {
             .lookup_with_aliases(path)
             .ok_or_else(|| CommandError::unknown_command(path))?;
         let canonical = self.canonical_path(path);
-        let mut parsed = parse_against_spec(spec, &canonical, args)?;
+        let mut parsed = parse_against_spec(spec, &canonical, args, frontend)?;
         apply_frontend_defaults(&mut parsed, spec, frontend);
         Ok(parsed)
     }
+}
+
+/// A hyphen-prefixed token that is a value, not a flag: `-` or a number like
+/// `-5` / `-1.5`.
+fn is_positional_dash_word(arg: &str) -> bool {
+    arg == "-" || (arg.starts_with('-') && arg[1..].parse::<f64>().is_ok())
 }
 
 fn parse_against_spec(
     spec: &CommandSpec,
     path: &[&str],
     args: &[String],
+    frontend: FrontendKind,
 ) -> Result<ParsedArgs, CommandError> {
     let mut flags: BTreeMap<String, ParsedFlag> = BTreeMap::new();
     let mut positionals: Vec<String> = Vec::new();
 
-    // Whether the command's last positional is a greedy trailing var-arg, and
-    // how many fixed positionals precede it. Once positional collection reaches
-    // the trailing argument, remaining tokens (including hyphen-prefixed ones)
-    // are captured verbatim — matching clap's `trailing_var_arg` semantics.
+    // Whether the command's last positional is a trailing var-arg. Its tokens
+    // may interleave with flags (`exec prompt "<text>" --agent claude`), so
+    // flags after the prompt still parse as flags; negative numbers and a bare
+    // `-` are prompt words — matching clap's `allow_negative_numbers`.
     let trailing = spec
         .arguments
         .last()
         .is_some_and(|a| matches!(a.kind, ArgumentKind::TrailingVarArgs));
-    let fixed_arg_count = spec
-        .arguments
-        .iter()
-        .filter(|a| !matches!(a.kind, ArgumentKind::TrailingVarArgs))
-        .count();
 
-    let mut greedy = false;
     let mut after_double_dash = false;
 
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
 
-        if greedy || after_double_dash {
+        if after_double_dash || (trailing && is_positional_dash_word(arg)) {
             positionals.push(arg.clone());
             i += 1;
             continue;
@@ -294,6 +296,7 @@ fn parse_against_spec(
             };
             let flag_spec = spec
                 .find_flag(name)
+                .filter(|flag| flag_visible_to_frontend(flag.frontends, frontend))
                 .ok_or_else(|| CommandError::unknown_flag(path, name))?;
             i = apply_flag(flag_spec, inline, args, i, path, &mut flags)?;
         } else if let Some(short) = arg.strip_prefix('-') {
@@ -305,16 +308,11 @@ fn parse_against_spec(
             let flag_spec = spec
                 .flags
                 .iter()
-                .find(|f| f.short == Some(ch))
+                .find(|f| f.short == Some(ch) && flag_visible_to_frontend(f.frontends, frontend))
                 .ok_or_else(|| CommandError::unknown_flag(path, format!("-{ch}")))?;
             i = apply_flag(flag_spec, None, args, i, path, &mut flags)?;
         } else {
             positionals.push(arg.clone());
-            // Begin greedy capture once we have started filling a trailing
-            // var-arg (i.e. once positionals exceed the fixed leading ones).
-            if trailing && positionals.len() > fixed_arg_count {
-                greedy = true;
-            }
             i += 1;
         }
     }
@@ -381,6 +379,20 @@ fn parse_against_spec(
         arguments,
         path_arguments,
     })
+}
+
+fn flag_visible_to_frontend(visibility: FrontendVisibility, frontend: FrontendKind) -> bool {
+    match frontend {
+        FrontendKind::Cli => matches!(
+            visibility,
+            FrontendVisibility::All | FrontendVisibility::CliOnly | FrontendVisibility::CliAndTui
+        ),
+        FrontendKind::Tui => matches!(
+            visibility,
+            FrontendVisibility::All | FrontendVisibility::TuiOnly | FrontendVisibility::CliAndTui
+        ),
+        FrontendKind::Api => matches!(visibility, FrontendVisibility::All),
+    }
 }
 
 /// Apply a single flag to the flag map, consuming a value from `args` when the
@@ -685,5 +697,39 @@ mod tests {
             .parse_raw_args_with_profile(&["exec", "prompt"], &argv(&["--yolo"]), FrontendKind::Api)
             .unwrap();
         assert_eq!(p.flag_bool("yolo"), Some(true));
+    }
+
+    #[test]
+    fn api_profile_rejects_cli_only_startup_gate_flags() {
+        for (path, tokens) in [
+            (
+                &["exec", "prompt"][..],
+                vec!["--startup-gate-control", "/orchestrator/gate", "review"],
+            ),
+            (
+                &["exec", "workflow"][..],
+                vec!["workflow.toml", "--startup-gate-timeout", "30"],
+            ),
+        ] {
+            let error = cat()
+                .parse_raw_args_with_profile(path, &argv(&tokens), FrontendKind::Api)
+                .expect_err("API must not accept a CLI-only startup-gate flag");
+            assert!(
+                matches!(error, CommandError::UnknownFlag { .. }),
+                "an API-invisible flag must behave as unavailable: {error:?}"
+            );
+        }
+
+        let cli = cat()
+            .parse_raw_args_with_profile(
+                &["exec", "prompt"],
+                &argv(&["--startup-gate-control", "/orchestrator/gate", "review"]),
+                FrontendKind::Cli,
+            )
+            .expect("CLI retains startup-gate support");
+        assert_eq!(
+            cli.flag_path("startup-gate-control").as_deref(),
+            Some(std::path::Path::new("/orchestrator/gate"))
+        );
     }
 }

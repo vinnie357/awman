@@ -41,9 +41,14 @@ impl RepoDockerfilePaths {
 
     /// `<git_root>/.awman/Dockerfile.<agent>` — per-agent layered Dockerfile.
     pub fn agent_dockerfile(&self, agent: &str) -> PathBuf {
+        let asset_name = if matches!(agent, "agy" | "antigravity") {
+            "antigravity"
+        } else {
+            agent
+        };
         self.git_root
             .join(".awman")
-            .join(format!("Dockerfile.{agent}"))
+            .join(format!("Dockerfile.{asset_name}"))
     }
 
     /// `<git_root>/aspec/` — spec and work-items directory.
@@ -113,5 +118,14 @@ mod tests {
             p.agent_dockerfile("claude"),
             Path::new("/r/.awman/Dockerfile.claude")
         );
+    }
+
+    #[test]
+    fn agy_and_legacy_alias_resolve_the_existing_dockerfile_path() {
+        let p = RepoDockerfilePaths::new("/r");
+        let expected = Path::new("/r/.awman/Dockerfile.antigravity");
+
+        assert_eq!(p.agent_dockerfile("agy"), expected);
+        assert_eq!(p.agent_dockerfile("antigravity"), expected);
     }
 }

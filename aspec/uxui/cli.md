@@ -94,8 +94,17 @@ Initialize the current Git repo for use with awman.
 
 | Subcommand | Arguments | Flags |
 |---|---|---|
-| `prompt <prompt>` | `<prompt>` | `-n/--non-interactive`, `--plan`, `--allow-docker`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--launch-mode <stdio\|acp>`, `--overlay <spec>` (repeatable). |
+| `prompt <prompt>` | `<prompt>` | `--native-print`, `--native-session <id>`, `--isolated-settings`, `-n/--non-interactive`, `--plan`, `--allow-docker`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--launch-mode <stdio\|acp>`, `--overlay <spec>` (repeatable). |
 | `workflow <path>` (alias `wf`) | `<path>` | `--work-item <num>`, `-n/--non-interactive`, `--plan`, `--allow-docker`, `--worktree`, `--yolo`, `--auto`, `--agent <name>`, `--model <name>`, `--launch-mode <stdio\|acp>`, `--overlay <spec>` (repeatable). `--yolo`/`--auto` imply `--worktree`. ACP is not yet driven for workflow steps; a step that resolves to `acp` is rejected pre-flight (see `docs/17-acp-mode.md`). |
+
+`exec prompt --native-print` requires an explicit canonical `--agent claude`,
+`--agent codex`, or `--agent agy`, plus a non-empty `--model`. It streams the
+provider's native JSON output on stdout, preserves provider stderr and exit status,
+and adds no stdout summary. It always uses one-shot stdio without a PTY and
+engine-owned writable settings copies. `--native-session <id>` continues a
+session belonging to that provider and requires `--native-print`. Native print
+cannot be combined with `--launch-mode`, `--allow-docker`, `--plan`, `--yolo`, or
+`--auto`. Project and input mount permissions still follow the supplied overlays.
 
 `--overlay` accepts the same typed overlay expressions everywhere (CLI flags, `AWMAN_OVERLAYS`, repo/global config `overlays` array, and per-step `overlays` in workflow files): `dir(host:container[:ro|rw])`, `ssh()` (shorthand for `~/.ssh` read-only), `env(VAR_NAME)`, `skill(*)`, `skill(name)`. The legacy `--mount-ssh` flag has been removed; pass `--overlay ssh()` instead. See `docs/08-overlays.md` for the full reference.
 
@@ -172,3 +181,90 @@ belong to `awman squad` itself; pass them before a subcommand when using one:
 - Environment overrides: `AWMAN_*` variables (notably `AWMAN_OVERLAYS`, `AWMAN_API_KEY`, `AWMAN_SQUAD_KEY`, `AWMAN_API_ROOT`).
 
 Precedence (highest to lowest): CLI flag → environment variable → repo config → global config → built-in default.
+# Orchestrator startup-gate flags
+
+`chat` and `exec prompt` accept CLI-only `--startup-gate-control <DIR>` and
+`--startup-gate-timeout <SECONDS>` flags. Timeout defaults to 120 seconds and
+must be in `1..=3600`; specifying it without a control directory is a usage
+error. These flags are unavailable to API, remote, squad, TUI, ACP, and
+sandbox-class launches.
+
+This fork's first `exec workflow` integration accepts a single agent step and
+no setup, teardown, or dynamic leader. It rejects other workflow shapes before
+agent dispatch because one control directory is single-use.
+
+`exec workflow` derives its engine retry policy from the startup-gate flag at
+the shared `execute_prepared` boundary. A startup-gated workflow uses
+`SingleAttempt`: after the initial container has finished its normal wait,
+trusted-stop, and cleanup bookkeeping, any failed agent step becomes terminal
+before credential refresh, remediation, a retry countdown, or another
+container launch. Retrying requires a fresh control directory and invocation.
+Workflows without a startup gate retain the existing interactive recovery and
+unattended one-retry behavior through the legacy engine constructors.
+
+### Validated host snapshot
+
+The host loader returns the parsed request together with the exact manifest
+bytes that passed the bounded file, digest, and schema checks. The owned
+contract is:
+
+```rust
+pub struct StartupGateSpec {
+    pub control_dir: PathBuf,
+    pub request: StartupGateRequest,
+    pub timeout: Duration,
+    pub validated_manifests: BTreeMap<String, Vec<u8>>,
+}
+```
+
+Before launch, staging reloads the control directory and rejects a changed
+request or manifest. It writes each staged manifest from the second loader
+result's `validated_manifests`; it does not reopen a caller manifest after
+validation. Request and manifest inputs must be regular, current-user-owned,
+mode-`0600`, single-link files beneath a current-user-owned mode-`0700`
+control directory. Reads are bounded and do not follow symlinks.
+
+### Readiness and credential-refresh latch
+
+`ready.json` is bounded to 64 KiB and contains `version`, a 64-character
+lowercase hexadecimal `nonce`, the authoritative `container_name`, and the
+verified `bindings`. Each ready binding contains `id`, `workspace_path`,
+`manifest_id`, and `access`, and must match the current request. After the
+orchestrator's matching `release.json` is consumed, the bootstrap writes the
+two-field receipt `.released` containing exactly `version` and `nonce`;
+that receipt is bounded to 4 KiB. Status records use the same protected-file
+rules as request inputs.
+
+The credential-refresh registry releases a pending lease only when the ready
+container equals the container registered for that lease, the binding identity
+matches the current request, the receipt nonce matches, and no
+`failure.json` is present. A successful release is latched for that lease
+generation. Until then, the monitor neither refreshes the host credential nor
+rewrites the staged credential.
+
+### Startup-gated image inspection
+
+Image inspection normalizes both runtime formats through this internal
+contract:
+
+```rust
+#[derive(Debug, Eq, PartialEq)]
+struct GateImageConfig {
+    user: String,
+    env: Vec<String>,
+    entrypoint: Vec<String>,
+    trusted: bool,
+}
+
+fn parse_gate_image_config(
+    runtime_name: &str,
+    raw: &[u8],
+) -> Result<GateImageConfig, EngineError>
+```
+
+Docker supplies the formatted image Config object. Apple Containers supplies
+its inspection array with the first variant's nested `config.config` object.
+A missing, null, or empty image `Entrypoint` normalizes to an empty vector.
+Malformed security fields, any nonempty image entrypoint, and image variables
+`PYTHONHOME`, `PYTHONPATH`, `LD_*`, or `DYLD_*` are rejected before
+container launch even when the image has the trusted capability label.

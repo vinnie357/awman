@@ -20,6 +20,8 @@ use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 
 #[derive(Debug, Clone)]
 pub struct ChatCommandFlags {
+    pub startup_gate_control: Option<std::path::PathBuf>,
+    pub startup_gate_timeout: u64,
     pub non_interactive: bool,
     pub plan: bool,
     pub allow_docker: bool,
@@ -66,6 +68,7 @@ pub struct ChatCommand {
     flags: ChatCommandFlags,
     engines: Engines,
     session: Session,
+    startup_gate: Option<crate::data::startup_gate::StartupGateSpec>,
 }
 
 impl ChatCommand {
@@ -74,13 +77,32 @@ impl ChatCommand {
             flags,
             engines,
             session,
+            startup_gate: None,
         }
     }
 
     /// Construct from the catalogue-resolved input (WI 0113 F-10).
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
-        Ok(Self::new(
+        if ctx.flags.supplied("startup-gate-timeout") && !ctx.flags.supplied("startup-gate-control")
+        {
+            return Err(CommandError::Other(
+                "chat: --startup-gate-timeout requires --startup-gate-control".into(),
+            ));
+        }
+        let command = Self::new(
             ChatCommandFlags {
+                startup_gate_control: ctx.flags.path("startup-gate-control"),
+                startup_gate_timeout: ctx
+                    .flags
+                    .string("startup-gate-timeout")
+                    .as_deref()
+                    .unwrap_or("120")
+                    .parse()
+                    .map_err(|_| {
+                        CommandError::Other(
+                            "chat: --startup-gate-timeout must be an integer in 1..=3600".into(),
+                        )
+                    })?,
                 non_interactive: ctx.flags.bool("non-interactive"),
                 plan: ctx.flags.bool("plan"),
                 allow_docker: ctx.flags.bool("allow-docker"),
@@ -96,11 +118,26 @@ impl ChatCommand {
             },
             ctx.engines.clone(),
             ctx.session.clone(),
-        ))
+        );
+        let startup_gate = crate::command::commands::preflight_startup_gate(
+            "chat",
+            command.flags.startup_gate_control.as_deref(),
+            command.flags.startup_gate_timeout,
+            command.flags.allow_docker,
+        )?;
+        Ok(Self {
+            startup_gate,
+            ..command
+        })
     }
 
     pub fn flags(&self) -> &ChatCommandFlags {
         &self.flags
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_gate(&self) -> Option<&crate::data::startup_gate::StartupGateSpec> {
+        self.startup_gate.as_ref()
     }
 }
 
@@ -113,6 +150,15 @@ impl Command for ChatCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        let startup_gate = match self.startup_gate.clone() {
+            Some(gate) => Some(gate),
+            None => crate::command::commands::preflight_startup_gate(
+                "chat",
+                self.flags.startup_gate_control.as_deref(),
+                self.flags.startup_gate_timeout,
+                self.flags.allow_docker,
+            )?,
+        };
         // 1. Resolve the agent: --agent flag wins over the repo / global default.
         let session = self.session;
         let agent = match resolve_agent(&self.flags.agent, &session) {
@@ -286,6 +332,7 @@ impl Command for ChatCommand {
 
         // 6. Build the run options from flags + credentials.
         let run_opts = AgentRunOptions {
+            startup_gate,
             yolo: self.flags.yolo.then_some(YoloMode::Enabled),
             auto: self.flags.auto.then_some(AutoMode::Enabled),
             plan: self.flags.plan.then_some(PlanMode::Enabled),

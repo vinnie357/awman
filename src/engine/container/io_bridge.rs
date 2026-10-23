@@ -58,6 +58,9 @@ pub(crate) struct BridgeConfig {
 /// Bundle returned by `bridge_pty` / `bridge_piped` containing the artifacts
 /// the backend needs to store for the execution lifetime.
 pub(crate) struct BridgeResult {
+    pub output_readers: Vec<std::thread::JoinHandle<PipedReadEnd>>,
+    /// PTY master reader; `None` on the piped path.
+    pub pty_reader: Option<DrainThread>,
     /// Sender for `try_inject_stdin` — the engine retains a clone.
     pub stdin_injector: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// Broadcast sender for stuck events — stored in `AgentExecution`.
@@ -65,6 +68,40 @@ pub(crate) struct BridgeResult {
     /// The rolling output tail the reader threads feed — stored in
     /// `AgentExecution` so the workflow engine can read it after `wait()`.
     pub output_tail: Arc<OutputTail>,
+}
+
+/// How long exec waits for output to drain after the child exits. A
+/// descendant still holding the PTY slave open must not hang exec forever.
+pub(crate) const OUTPUT_DRAIN_BOUND: Duration = Duration::from_secs(2);
+
+/// An output-forwarding thread whose end can be awaited for a bounded time.
+pub(crate) struct DrainThread {
+    handle: std::thread::JoinHandle<()>,
+    finished: std::sync::mpsc::Receiver<()>,
+}
+
+impl DrainThread {
+    pub(crate) fn spawn(work: impl FnOnce() + Send + 'static) -> Self {
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            // Dropped on return or unwind, which disconnects `finished`.
+            let _done = done;
+            work();
+        });
+        Self { handle, finished }
+    }
+
+    /// Join the thread if it ends by `deadline`; otherwise leave it running.
+    pub(crate) fn join_until(self, deadline: Instant) -> bool {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match self.finished.recv_timeout(remaining) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = self.handle.join();
+                true
+            }
+        }
+    }
 }
 
 fn update_activity(activity: &SharedActivity, first_byte: &Arc<AtomicBool>) {
@@ -183,19 +220,53 @@ pub(crate) fn spawn_stuck_detector(
 /// the `BridgeResult`.
 type PtyMaster = Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>;
 
+pub(crate) struct PtyBridgeFailure {
+    pub error: EngineError,
+    pub pair: portable_pty::PtyPair,
+    pub reader: Option<Box<dyn std::io::Read + Send>>,
+    pub io: AgentIo,
+    pub config: BridgeConfig,
+}
+
 pub(crate) fn bridge_pty(
     io: AgentIo,
     pair: portable_pty::PtyPair,
     config: BridgeConfig,
 ) -> Result<(PtyMaster, BridgeResult), EngineError> {
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| EngineError::Container(format!("clone pty reader: {e}")))?;
-    let mut writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| EngineError::Container(format!("take pty writer: {e}")))?;
+    bridge_pty_owned(io, pair, config).map_err(|failure| failure.error)
+}
+
+// The direct error preserves all post-spawn PTY custody without another allocation.
+#[allow(clippy::result_large_err)]
+pub(crate) fn bridge_pty_owned(
+    io: AgentIo,
+    pair: portable_pty::PtyPair,
+    config: BridgeConfig,
+) -> Result<(PtyMaster, BridgeResult), PtyBridgeFailure> {
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            return Err(PtyBridgeFailure {
+                error: EngineError::Container(format!("clone pty reader: {error}")),
+                pair,
+                reader: None,
+                io,
+                config,
+            });
+        }
+    };
+    let mut writer = match pair.master.take_writer() {
+        Ok(writer) => writer,
+        Err(error) => {
+            return Err(PtyBridgeFailure {
+                error: EngineError::Container(format!("take pty writer: {error}")),
+                pair,
+                reader: Some(reader),
+                io,
+                config,
+            });
+        }
+    };
 
     let activity: SharedActivity = Arc::new(Mutex::new(None));
     let first_byte = Arc::new(AtomicBool::new(false));
@@ -213,7 +284,7 @@ pub(crate) fn bridge_pty(
     let fb = Arc::clone(&first_byte);
     let tail = Arc::clone(&config.output_tail);
     let broadcast = config.output_broadcast.clone();
-    std::thread::spawn(move || {
+    let pty_reader = DrainThread::spawn(move || {
         use std::io::Read;
         let mut buf = [0u8; 4096];
         let mut sink_open = true;
@@ -286,6 +357,8 @@ pub(crate) fn bridge_pty(
     Ok((
         master_arc,
         BridgeResult {
+            output_readers: Vec::new(),
+            pty_reader: Some(pty_reader),
             stdin_injector: stdin_tx,
             stuck_tx,
             output_tail: config.output_tail,
@@ -301,39 +374,124 @@ pub(crate) fn bridge_pty(
 /// - Writer task: `io.stdin_rx` → child stdin
 ///
 /// The child's stdout/stderr/stdin pipes are taken from the `Child`.
+pub(crate) struct PipedChildIo {
+    pub stdin: Option<std::process::ChildStdin>,
+    pub stdout: Option<std::process::ChildStdout>,
+    pub stderr: Option<Box<dyn std::io::Read + Send>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PipedReadEnd {
+    Eof,
+    ReadError,
+}
+
+pub(crate) trait PipedStdoutObserver: Send {
+    fn observe(&mut self, bytes: &[u8]);
+    fn finish(&mut self, end: PipedReadEnd);
+}
+
+impl PipedChildIo {
+    pub(crate) fn empty() -> Self {
+        Self {
+            stdin: None,
+            stdout: None,
+            stderr: None,
+        }
+    }
+
+    pub(crate) fn take_from(&mut self, child: &mut std::process::Child) {
+        self.stdin = child.stdin.take();
+        self.stdout = child.stdout.take();
+        self.stderr = child
+            .stderr
+            .take()
+            .map(|stderr| Box::new(stderr) as Box<dyn std::io::Read + Send>);
+    }
+
+    pub(crate) fn take(child: &mut std::process::Child) -> Self {
+        let mut pipes = Self::empty();
+        pipes.take_from(child);
+        pipes
+    }
+}
+
 pub(crate) fn bridge_piped(
     io: AgentIo,
     child: &mut std::process::Child,
     config: BridgeConfig,
 ) -> BridgeResult {
+    bridge_piped_io(io, PipedChildIo::take(child), config)
+}
+
+pub(crate) fn bridge_piped_io(
+    io: AgentIo,
+    pipes: PipedChildIo,
+    config: BridgeConfig,
+) -> BridgeResult {
+    bridge_piped_io_observed(io, pipes, config, None)
+}
+
+pub(crate) fn bridge_piped_io_observed(
+    io: AgentIo,
+    pipes: PipedChildIo,
+    config: BridgeConfig,
+    observer: Option<Box<dyn PipedStdoutObserver>>,
+) -> BridgeResult {
+    bridge_piped_io_with_policy(io, pipes, config, observer, false)
+}
+
+pub(crate) fn bridge_private_auth_io(
+    io: AgentIo,
+    pipes: PipedChildIo,
+    config: BridgeConfig,
+) -> BridgeResult {
+    bridge_piped_io_with_policy(io, pipes, config, None, true)
+}
+
+fn bridge_piped_io_with_policy(
+    io: AgentIo,
+    mut pipes: PipedChildIo,
+    config: BridgeConfig,
+    mut observer: Option<Box<dyn PipedStdoutObserver>>,
+    private: bool,
+) -> BridgeResult {
     let activity: SharedActivity = Arc::new(Mutex::new(None));
     let first_byte = Arc::new(AtomicBool::new(false));
 
+    let mut output_readers = Vec::new();
     // stdout reader thread.
     //
     // If the frontend's sink dies, keep draining the pipe but discard bytes —
     // a piped child will block on stdout if we stop reading. Activity
     // tracking continues unconditionally so the stuck detector reflects what
     // the container actually produces.
-    if let Some(child_stdout) = child.stdout.take() {
+    if let Some(child_stdout) = pipes.stdout.take() {
         let stdout_tx = io.stdout;
         let act = Arc::clone(&activity);
         let fb = Arc::clone(&first_byte);
         let tail = Arc::clone(&config.output_tail);
         let broadcast = config.output_broadcast.clone();
-        std::thread::spawn(move || {
+        output_readers.push(std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stdout;
             let mut buf = [0u8; 4096];
             let mut sink_open = true;
-            loop {
+            let end = loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break PipedReadEnd::Eof,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break PipedReadEnd::ReadError,
                     Ok(n) => {
+                        if let Some(observer) = observer.as_mut() {
+                            observer.observe(&buf[..n]);
+                        }
                         update_activity(&act, &fb);
-                        tail.push_bytes(&buf[..n]);
+                        if !private {
+                            tail.push_bytes(&buf[..n]);
+                        }
                         if let Some(tx) = &broadcast {
-                            if tx.receiver_count() > 0 {
+                            if !private && tx.receiver_count() > 0 {
                                 let _ = tx.send(buf[..n].to_vec());
                             }
                         }
@@ -342,31 +500,41 @@ pub(crate) fn bridge_piped(
                         }
                     }
                 }
+            };
+            if let Some(observer) = observer.as_mut() {
+                observer.finish(end);
             }
-        });
+            end
+        }));
+    } else if let Some(observer) = observer.as_mut() {
+        observer.finish(PipedReadEnd::ReadError);
     }
 
     // stderr reader thread — same drain-after-sink-dies semantics as stdout.
     // Feeds the same tail as stdout so the buffer holds combined output.
-    if let Some(child_stderr) = child.stderr.take() {
+    if let Some(child_stderr) = pipes.stderr.take() {
         let stderr_tx = io.stderr;
         let act = Arc::clone(&activity);
         let fb = Arc::clone(&first_byte);
         let tail = Arc::clone(&config.output_tail);
         let broadcast = config.output_broadcast.clone();
-        std::thread::spawn(move || {
+        output_readers.push(std::thread::spawn(move || {
             use std::io::Read;
             let mut reader = child_stderr;
             let mut buf = [0u8; 4096];
             let mut sink_open = true;
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break PipedReadEnd::Eof,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break PipedReadEnd::ReadError,
                     Ok(n) => {
                         update_activity(&act, &fb);
-                        tail.push_bytes(&buf[..n]);
+                        if !private {
+                            tail.push_bytes(&buf[..n]);
+                        }
                         if let Some(tx) = &broadcast {
-                            if tx.receiver_count() > 0 {
+                            if !private && tx.receiver_count() > 0 {
                                 let _ = tx.send(buf[..n].to_vec());
                             }
                         }
@@ -376,12 +544,12 @@ pub(crate) fn bridge_piped(
                     }
                 }
             }
-        });
+        }));
     }
 
     // stdin writer task
     let stdin_tx = io.stdin_tx;
-    if let Some(child_stdin) = child.stdin.take() {
+    if let Some(child_stdin) = pipes.stdin.take() {
         let mut stdin_rx = io.stdin_rx;
         tokio::spawn(async move {
             use std::io::Write;
@@ -407,6 +575,8 @@ pub(crate) fn bridge_piped(
     );
 
     BridgeResult {
+        output_readers,
+        pty_reader: None,
         stdin_injector: stdin_tx,
         stuck_tx,
         output_tail: config.output_tail,
@@ -416,6 +586,48 @@ pub(crate) fn bridge_piped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const JOIN_MARGIN: Duration = Duration::from_millis(500);
+
+    #[test]
+    fn drain_join_until_returns_false_for_blocked_work_within_deadline_margin() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let drain = DrainThread::spawn(move || {
+            let _ = blocked.recv_timeout(Duration::from_secs(2));
+        });
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        let joined = drain.join_until(deadline);
+        let elapsed = started.elapsed();
+        drop(release);
+        assert!(!joined, "blocked work must not report joined");
+        assert!(Instant::now() >= deadline, "returned before the deadline");
+        assert!(
+            elapsed < Duration::from_millis(100) + JOIN_MARGIN,
+            "join_until overran its deadline: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn drain_join_until_returns_true_for_finished_work() {
+        let (ran_tx, ran) = std::sync::mpsc::channel::<()>();
+        let drain = DrainThread::spawn(move || {
+            let _ = ran_tx.send(());
+        });
+        let started = Instant::now();
+        assert!(drain.join_until(started + Duration::from_secs(2)));
+        assert!(started.elapsed() < JOIN_MARGIN);
+        assert!(ran.try_recv().is_ok(), "joined before the work ran");
+    }
+
+    #[test]
+    fn drain_join_until_returns_true_for_panicking_work() {
+        // resume_unwind skips the panic hook, so the test output stays clean.
+        let drain = DrainThread::spawn(|| std::panic::resume_unwind(Box::new("drain work")));
+        let started = Instant::now();
+        assert!(drain.join_until(started + Duration::from_secs(2)));
+        assert!(started.elapsed() < JOIN_MARGIN);
+    }
     use std::time::{Duration, Instant};
     use tokio::sync::mpsc;
 

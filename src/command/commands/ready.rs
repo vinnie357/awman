@@ -289,6 +289,11 @@ impl Command for ReadyCommand {
             }
         };
         frontend.replay_queued();
+        let failed: Vec<String> = summary
+            .failed_steps()
+            .iter()
+            .map(|(label, msg)| format!("{label}: {msg}"))
+            .collect();
         let mut outcome: ReadyOutcome = summary.into();
         outcome.json_requested = self.flags.json;
         outcome.refresh_requested = self.flags.refresh;
@@ -304,6 +309,14 @@ impl Command for ReadyCommand {
                 outcome.local_agent,
             ),
         });
+
+        // `--json` keeps exit 0 and reports `"ready": false` in its payload.
+        if !failed.is_empty() && !self.flags.json {
+            return Err(CommandError::Other(format!(
+                "ready: failed — {}. Fix the error above, then re-run `awman ready --build` (add `--no-cache` to force a clean rebuild).",
+                failed.join("; ")
+            )));
+        }
 
         Ok(outcome)
     }

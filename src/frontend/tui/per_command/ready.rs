@@ -117,7 +117,9 @@ impl ReadyFrontend for TuiCommandFrontend {
             );
         }
 
-        self.messages.success("awman is ready.".to_string());
+        if summary.failed_steps().is_empty() {
+            self.messages.success("awman is ready.".to_string());
+        }
     }
 }
 

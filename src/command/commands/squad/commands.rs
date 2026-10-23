@@ -704,9 +704,8 @@ impl Command for SquadCommand {
                         // One response shape for both gateways: the task
                         // and its recent runs travel together, so the remote
                         // façade never has to guess which type came back.
-                        let task = gateway.get(&name).await?;
-                        let runs = gateway.runs(&name, DEFAULT_RUN_HISTORY_LIMIT).await?;
-                        Ok(SquadOutcome::Detail(TaskDetail { task, runs }))
+                        let detail = gateway.detail(&name, DEFAULT_RUN_HISTORY_LIMIT).await?;
+                        Ok(SquadOutcome::Detail(detail))
                     }
                     SquadSubcommand::Remove { name, yes } => {
                         gateway.delete(&name).await?;

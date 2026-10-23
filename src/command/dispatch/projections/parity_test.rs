@@ -402,6 +402,42 @@ fn edge_greedy_trailing_positional_parity() {
     assert_eq!(clap_prompt, vec!["fix", "the", "bug"]);
 }
 
+/// Flags written AFTER the prompt (`exec prompt "<text>" --agent claude ...`,
+/// the shape altana sends) are parsed as flags, never joined into the prompt.
+/// Joining them sent awman's own argv tail to the agent, which echoed it into
+/// its response on stdout.
+#[test]
+fn edge_flags_after_prompt_are_not_absorbed_parity() {
+    let cat = CommandCatalogue::get();
+    let path = ["exec", "prompt"];
+    let argv = [
+        "say hi",
+        "--agent",
+        "claude",
+        "--overlay",
+        "env(FOO)",
+        "--non-interactive",
+    ];
+
+    let parsed = cat.parse_raw_args(&path, &to_vec(&argv)).unwrap();
+    assert_eq!(parsed.argument("prompt").as_deref(), Some("say hi"));
+    assert_eq!(parsed.flag_string("agent").as_deref(), Some("claude"));
+    assert_eq!(parsed.flag_strings("overlay"), vec!["env(FOO)"]);
+    assert_eq!(parsed.flag_bool("non-interactive"), Some(true));
+
+    let m = clap_leaf(cat, &path, &argv);
+    let clap_prompt: Vec<String> = m
+        .get_many::<String>("prompt")
+        .map(|v| v.cloned().collect())
+        .unwrap_or_default();
+    assert_eq!(clap_prompt, vec!["say hi".to_string()]);
+    assert_eq!(
+        m.get_one::<String>("agent").map(String::as_str),
+        Some("claude")
+    );
+    assert!(m.get_flag("non-interactive"));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Type-coercion errors: raw_args rejects exactly where clap rejects
 // ═══════════════════════════════════════════════════════════════════════════
@@ -528,6 +564,102 @@ fn api_profile_yolo_is_overridable_non_interactive_is_forced() {
     assert_eq!(with_plan.flag_bool("plan"), Some(true));
     assert_eq!(with_plan.flag_bool("non-interactive"), Some(true));
     assert_eq!(with_plan.flag_bool("yolo"), None);
+}
+
+#[test]
+fn gated_allow_docker_is_rejected_by_cli_grammar_before_dispatch() {
+    let cat = CommandCatalogue::get();
+    let cases = [
+        (
+            &["chat"][..],
+            vec![
+                "--startup-gate-control",
+                "/orchestrator/gate",
+                "--allow-docker",
+            ],
+            vec![
+                "awman",
+                "chat",
+                "--startup-gate-control",
+                "/orchestrator/gate",
+                "--allow-docker",
+            ],
+        ),
+        (
+            &["exec", "prompt"][..],
+            vec![
+                "--startup-gate-control",
+                "/orchestrator/gate",
+                "--allow-docker",
+                "review",
+            ],
+            vec![
+                "awman",
+                "exec",
+                "prompt",
+                "--startup-gate-control",
+                "/orchestrator/gate",
+                "--allow-docker",
+                "review",
+            ],
+        ),
+        (
+            &["exec", "workflow"][..],
+            vec![
+                "workflow.toml",
+                "--startup-gate-control",
+                "/orchestrator/gate",
+                "--allow-docker",
+            ],
+            vec![
+                "awman",
+                "exec",
+                "workflow",
+                "workflow.toml",
+                "--startup-gate-control",
+                "/orchestrator/gate",
+                "--allow-docker",
+            ],
+        ),
+    ];
+
+    for (path, raw, cli) in cases {
+        let error = cat
+            .parse_raw_args_with_profile(path, &to_vec(&raw), FrontendKind::Cli)
+            .expect_err("gated --allow-docker must fail during argument resolution");
+        let (flag, reason) = match error {
+            CommandError::InvalidFlagValue { flag, reason, .. } => (flag, reason),
+            other => panic!("unexpected gated --allow-docker error: {other:?}"),
+        };
+        assert!(matches!(
+            (flag.as_str(), reason.as_str()),
+            (
+                "allow-docker",
+                "--allow-docker conflicts with --startup-gate-control"
+            ) | (
+                "startup-gate-control",
+                "--startup-gate-control conflicts with --allow-docker"
+            )
+        ));
+        assert!(
+            cat.build_clap_command().try_get_matches_from(cli).is_err(),
+            "the CLI must reject the combination before command construction"
+        );
+    }
+
+    assert!(cat
+        .build_clap_command()
+        .try_get_matches_from(["awman", "chat", "--allow-docker"])
+        .is_ok());
+    assert!(cat
+        .build_clap_command()
+        .try_get_matches_from([
+            "awman",
+            "chat",
+            "--startup-gate-control",
+            "/orchestrator/gate",
+        ])
+        .is_ok());
 }
 
 // ─── WI 0113 F-10: the catalogue owns defaults and implications ─────────────

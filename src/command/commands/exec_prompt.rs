@@ -19,10 +19,13 @@ use crate::engine::container::options::{AutoMode, PlanMode, YoloMode};
 
 #[derive(Debug, Clone)]
 pub struct ExecPromptCommandFlags {
+    pub startup_gate_control: Option<std::path::PathBuf>,
+    pub startup_gate_timeout: u64,
     pub prompt: Option<String>,
     pub non_interactive: bool,
     pub plan: bool,
     pub allow_docker: bool,
+    pub isolated_settings: bool,
     pub yolo: bool,
     pub auto: bool,
     pub agent: Option<String>,
@@ -36,8 +39,10 @@ pub struct ExecPromptCommandFlags {
 pub struct ExecPromptOutcome {
     pub agent: Option<String>,
     pub exit_code: Option<i32>,
+    pub native_print: bool,
 }
 
+#[async_trait]
 pub trait ExecPromptCommandFrontend:
     UserMessageSink
     + MountScopeFrontend
@@ -54,6 +59,26 @@ pub trait ExecPromptCommandFrontend:
     /// releases stdio. Default impl: no-op (suitable for non-blocking sinks
     /// like the TUI).
     fn set_pty_active(&mut self, _active: bool) {}
+
+    /// Authentication challenges must stay outside ordinary output and diagnostics.
+    /// Acquisition failure must precede activation or access to owner material.
+    fn native_auth_frontend(
+        &mut self,
+    ) -> Result<Box<dyn crate::engine::agent_runtime::AgentFrontend>, CommandError> {
+        Err(CommandError::Other(
+            "native Codex authentication requires a writable controlling terminal; run this command from an interactive terminal".into(),
+        ))
+    }
+
+    fn native_container_frontend(
+        &mut self,
+    ) -> Box<dyn crate::engine::agent_runtime::AgentFrontend> {
+        self.container_frontend()
+    }
+
+    async fn finish_native_output(&mut self) -> Result<(), CommandError> {
+        Ok(())
+    }
 
     /// Called after the agent container launches. The sender is the broadcast
     /// channel from the container's stuck detector; the TUI stores it so the
@@ -101,10 +126,26 @@ pub(crate) fn build_prompt_string(
     }
 }
 
+fn exec_prompt_base_run_options(flags: &ExecPromptCommandFlags) -> AgentRunOptions {
+    AgentRunOptions {
+        yolo: flags.yolo.then_some(YoloMode::Enabled),
+        auto: flags.auto.then_some(AutoMode::Enabled),
+        plan: flags.plan.then_some(PlanMode::Enabled),
+        allow_docker: flags.allow_docker,
+        isolated_settings: flags.isolated_settings,
+        non_interactive: flags.non_interactive,
+        model: flags.model.clone(),
+        ..Default::default()
+    }
+}
+
 pub struct ExecPromptCommand {
     flags: ExecPromptCommandFlags,
     engines: Engines,
     session: Session,
+    startup_gate: Option<crate::data::startup_gate::StartupGateSpec>,
+    native_print: bool,
+    native_session: Option<String>,
 }
 
 impl ExecPromptCommand {
@@ -113,6 +154,9 @@ impl ExecPromptCommand {
             flags,
             engines,
             session,
+            startup_gate: None,
+            native_print: false,
+            native_session: None,
         }
     }
 
@@ -121,16 +165,36 @@ impl ExecPromptCommand {
     /// prompt-or-issue requirement is checked at run time, where `--issue`
     /// can still supply the text.
     pub fn from_input(ctx: &BuildContext) -> Result<Self, CommandError> {
+        if ctx.flags.supplied("startup-gate-timeout") && !ctx.flags.supplied("startup-gate-control")
+        {
+            return Err(CommandError::Other(
+                "exec prompt: --startup-gate-timeout requires --startup-gate-control".into(),
+            ));
+        }
         let prompt = match ctx.args.get("prompt") {
             Some(prompt) if prompt.trim().is_empty() => None,
             other => other.map(str::to_string),
         };
-        Ok(Self::new(
+        let mut command = Self::new(
             ExecPromptCommandFlags {
+                startup_gate_control: ctx.flags.path("startup-gate-control"),
+                startup_gate_timeout: ctx
+                    .flags
+                    .string("startup-gate-timeout")
+                    .as_deref()
+                    .unwrap_or("120")
+                    .parse()
+                    .map_err(|_| {
+                        CommandError::Other(
+                            "exec prompt: --startup-gate-timeout must be an integer in 1..=3600"
+                                .into(),
+                        )
+                    })?,
                 prompt,
                 non_interactive: ctx.flags.bool("non-interactive"),
                 plan: ctx.flags.bool("plan"),
                 allow_docker: ctx.flags.bool("allow-docker"),
+                isolated_settings: ctx.flags.bool("isolated-settings"),
                 yolo: ctx.flags.bool("yolo"),
                 auto: ctx.flags.bool("auto"),
                 agent: ctx.flags.string("agent"),
@@ -146,7 +210,44 @@ impl ExecPromptCommand {
             },
             ctx.engines.clone(),
             ctx.session.clone(),
-        ))
+        );
+        command.native_print = ctx.flags.bool("native-print");
+        command.native_session = ctx.flags.string("native-session");
+        if command.native_print {
+            let agent = command.flags.agent.as_deref().ok_or_else(|| {
+                CommandError::Other("exec prompt: --native-print requires explicit --agent".into())
+            })?;
+            crate::engine::agent::agent_matrix::NativePrintRequest::new(
+                agent,
+                command.flags.model.as_deref(),
+                command.native_session.as_deref(),
+            )?;
+            if command.flags.launch_mode == Some(crate::data::config::repo::LaunchMode::Acp)
+                || command.flags.allow_docker
+                || command.flags.yolo
+                || command.flags.auto
+                || command.flags.plan
+            {
+                return Err(CommandError::Other(
+                    "exec prompt: native print requires plain stdio without extra provider flags"
+                        .into(),
+                ));
+            }
+        } else if command.native_session.is_some() {
+            return Err(CommandError::Other(
+                "exec prompt: --native-session requires --native-print".into(),
+            ));
+        }
+        let startup_gate = crate::command::commands::preflight_startup_gate(
+            "exec prompt",
+            command.flags.startup_gate_control.as_deref(),
+            command.flags.startup_gate_timeout,
+            command.flags.allow_docker,
+        )?;
+        Ok(Self {
+            startup_gate,
+            ..command
+        })
     }
 
     pub fn flags(&self) -> &ExecPromptCommandFlags {
@@ -163,6 +264,15 @@ impl Command for ExecPromptCommand {
         self,
         mut frontend: Self::Frontend,
     ) -> Result<Self::Outcome, CommandError> {
+        let startup_gate = match self.startup_gate.clone() {
+            Some(gate) => Some(gate),
+            None => crate::command::commands::preflight_startup_gate(
+                "exec prompt",
+                self.flags.startup_gate_control.as_deref(),
+                self.flags.startup_gate_timeout,
+                self.flags.allow_docker,
+            )?,
+        };
         let session = self.session;
 
         // Validate that at least one of prompt and --issue is provided.
@@ -215,6 +325,115 @@ impl Command for ExecPromptCommand {
                 return Err(e);
             }
         };
+        if self.native_print && agent.as_str() == "codex" {
+            use crate::engine::agent::native_codex_preparation::{
+                AuthRetirement, AuthStartError, MainRetirement, MainStartError, PreparationError,
+            };
+            let request = crate::engine::agent::agent_matrix::NativePrintRequest::new(
+                "codex",
+                self.flags.model.as_deref(),
+                self.native_session.as_deref(),
+            )?;
+            let auth_frontend = frontend.native_auth_frontend()?;
+            let preparation = match self
+                .engines
+                .agent_engine
+                .prepare_native_codex(&session, request)
+            {
+                Ok(preparation) => preparation,
+                Err(PreparationError::Rejected(error)) => return Err(error.into()),
+                Err(PreparationError::Activated { owner, error }) => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+            };
+            let auth = match preparation.start_auth(auth_frontend) {
+                Ok(auth) => auth,
+                Err(AuthStartError::NotStarted { preparation, error }) => {
+                    drop(preparation);
+                    return Err(error.into());
+                }
+                Err(AuthStartError::CustodyHeld { owner, error }) => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+                Err(AuthStartError::Retained { ticket, error }) => {
+                    tracing::debug!(?ticket, "native Codex authentication retained for recovery");
+                    return Err(error.into());
+                }
+            };
+            let owner = match auth.wait_auth_retired().await {
+                AuthRetirement::Authenticated(owner) => {
+                    if frontend.finish_native_output().await.is_err() {
+                        drop(owner);
+                        return Err(CommandError::Other(
+                            "native authentication output failed; restore a writable controlling terminal before continuing".into(),
+                        ));
+                    }
+                    owner
+                }
+                AuthRetirement::Retryable(owner) => {
+                    drop(owner);
+                    return Err(crate::engine::error::EngineError::Config(
+                        "native Codex main execution remains unqualified".into(),
+                    )
+                    .into());
+                }
+                AuthRetirement::Stopped { owner, error } => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+                AuthRetirement::Retained { ticket, error } => {
+                    tracing::debug!(?ticket, "native Codex authentication retained for recovery");
+                    return Err(error.into());
+                }
+                AuthRetirement::CustodyHeld { owner, error } => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+            };
+            let owner = match owner.require_main_profile() {
+                Ok(owner) => owner,
+                Err(MainStartError::NotStarted { owner, error }) => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+                Err(MainStartError::Retained { ticket, error }) => {
+                    tracing::debug!(?ticket, "native Codex main retained for recovery");
+                    return Err(error.into());
+                }
+            };
+            let main = match owner.start_main(
+                &session,
+                &final_prompt,
+                frontend.native_container_frontend(),
+            ) {
+                Ok(main) => main,
+                Err(MainStartError::NotStarted { owner, error }) => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+                Err(MainStartError::Retained { ticket, error }) => {
+                    tracing::debug!(?ticket, "native Codex main retained for recovery");
+                    return Err(error.into());
+                }
+            };
+            let info = match main.wait_main().await {
+                MainRetirement::Completed(info) => info,
+                MainRetirement::Stopped { owner, error } => {
+                    drop(owner);
+                    return Err(error.into());
+                }
+                MainRetirement::Retained { ticket, error }
+                | MainRetirement::CompletedPublicationUncertain { ticket, error } => {
+                    tracing::debug!(?ticket, "native Codex main retained for recovery");
+                    return Err(error.into());
+                }
+            };
+            frontend.finish_native_output().await?;
+            return finish_exec_prompt(&agent, true, Ok(info));
+        }
+
         // Resolve ACP policy before overlays or container setup. A direct ACP
         // request is deliberately never eligible for fallback.
         let config = command_effective_config(&session, &self.flags);
@@ -224,11 +443,14 @@ impl Command for ExecPromptCommand {
                 && session.repo_config().agent.is_some()
                 && session.repo_config().launch_mode
                     == Some(crate::data::config::repo::LaunchMode::Acp));
-        let launch_decision =
+        let launch_decision = if self.native_print {
+            crate::command::commands::LaunchModeDecision::Stdio
+        } else {
             match crate::command::commands::resolve_launch_mode(&config, &agent, explicit_acp) {
                 Ok(decision) => decision,
                 Err(e) => return Err(CommandError::from(e)),
-            };
+            }
+        };
         if launch_decision == crate::command::commands::LaunchModeDecision::StdioWithFallbackWarning
         {
             frontend.write_message(UserMessage {
@@ -348,12 +570,11 @@ impl Command for ExecPromptCommand {
         )?;
 
         let run_opts = AgentRunOptions {
-            yolo: self.flags.yolo.then_some(YoloMode::Enabled),
-            auto: self.flags.auto.then_some(AutoMode::Enabled),
-            plan: self.flags.plan.then_some(PlanMode::Enabled),
-            allow_docker: self.flags.allow_docker,
-            non_interactive: self.flags.non_interactive,
-            model: self.flags.model.clone(),
+            startup_gate,
+            native_print: self.native_print,
+            native_session: self.native_session.clone(),
+            isolated_settings: self.flags.isolated_settings || self.native_print,
+            non_interactive: self.flags.non_interactive || self.native_print,
             // ACP sends its initial turn after the initialize/session-new
             // handshake; stdio retains the existing seeded-launch behavior.
             initial_prompt: (launch_decision != crate::command::commands::LaunchModeDecision::Acp)
@@ -374,7 +595,7 @@ impl Command for ExecPromptCommand {
                 }
                 _ => crate::data::config::repo::LaunchMode::Stdio,
             },
-            ..Default::default()
+            ..exec_prompt_base_run_options(&self.flags)
         };
 
         let resolved = match self.engines.agent_engine.resolve_agent_options(
@@ -441,7 +662,11 @@ impl Command for ExecPromptCommand {
                 .await
         } else {
             frontend.set_pty_active(true);
-            let container_frontend = frontend.container_frontend_for_pty();
+            let container_frontend = if self.native_print {
+                frontend.native_container_frontend()
+            } else {
+                frontend.container_frontend_for_pty()
+            };
             let mut execution = match instance.run_with_frontend(container_frontend) {
                 Ok(e) => e,
                 Err(e) => {
@@ -461,14 +686,31 @@ impl Command for ExecPromptCommand {
             exit
         };
 
+        // Uncertain waits retain execution custody and may keep output channels open.
+        if self.native_print && exit.is_ok() {
+            frontend.finish_native_output().await?;
+        }
         crate::command::commands::report_session_end(frontend.as_mut(), "exec prompt", &exit);
 
-        let exit_code = exit.map(|e| e.exit_code).ok();
-        Ok(ExecPromptOutcome {
-            agent: Some(agent.as_str().to_string()),
-            exit_code,
-        })
+        finish_exec_prompt(&agent, self.native_print, exit)
     }
+}
+
+fn finish_exec_prompt(
+    agent: &AgentName,
+    native_print: bool,
+    exit: Result<crate::engine::agent_runtime::AgentExitInfo, crate::engine::error::EngineError>,
+) -> Result<ExecPromptOutcome, CommandError> {
+    let exit_code = if native_print {
+        Some(exit?.exit_code)
+    } else {
+        exit.map(|info| info.exit_code).ok()
+    };
+    Ok(ExecPromptOutcome {
+        agent: Some(agent.as_str().into()),
+        exit_code,
+        native_print,
+    })
 }
 
 fn command_effective_config(
@@ -557,4 +799,54 @@ mod tests {
         let alone = build_prompt_string(None, Some(&md));
         assert_eq!(alone, Some("# Title Only".to_string()));
     }
+
+    include!("exec_prompt_isolated_settings_test.rs");
 }
+
+#[cfg(test)]
+#[path = "native_print_result_test.rs"]
+mod native_print_result_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_auth_entry_test.rs"]
+mod native_codex_auth_entry_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_auth_retention_regression_test.rs"]
+mod native_codex_auth_retention_regression_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_main_entry_test.rs"]
+mod native_codex_main_entry_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_main_a2a_test.rs"]
+mod native_codex_main_a2a_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_main_a2m_test.rs"]
+mod native_codex_main_a2m_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_main_a2m_freshness_test.rs"]
+mod native_codex_main_a2m_freshness_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_main_a2b_test.rs"]
+mod native_codex_main_a2b_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_main_entry_marker_test.rs"]
+pub(super) mod native_codex_main_entry_marker_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_main_physical_exchange_test.rs"]
+mod native_codex_main_physical_exchange_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_main_b1_post_start_test.rs"]
+mod native_codex_main_b1_post_start_test;
+
+#[cfg(all(test, unix))]
+#[path = "native_codex_auth_terminal_test.rs"]
+mod native_codex_auth_terminal_test;

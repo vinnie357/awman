@@ -167,6 +167,20 @@ impl CredentialRefreshMonitor {
         lease
     }
 
+    pub fn register_gate_pending(
+        self: &Arc<Self>,
+        delivery: &RefreshableCredentialDelivery,
+        container: &str,
+        control_dir: std::path::PathBuf,
+    ) -> CredentialLease {
+        self.seed_state(delivery);
+        let lease = self
+            .registry
+            .register_pending(delivery, container, Some(control_dir));
+        self.ensure_thread();
+        lease
+    }
+
     /// Synchronous, bounded refresh — the §5 pre-step guard. Triggers the
     /// descriptor's host refresh, waits at most `timeout`, rewrites live leases
     /// if the snapshot changed, and reports what happened. NEVER fatal.
@@ -175,6 +189,18 @@ impl CredentialRefreshMonitor {
         agent: &AgentName,
         timeout: Duration,
     ) -> RefreshOutcome {
+        let snapshots: Vec<_> = self
+            .registry
+            .snapshot()
+            .into_iter()
+            .filter(|lease| &lease.agent == agent)
+            .collect();
+        if !snapshots.is_empty() && snapshots.iter().all(|lease| lease.gate_pending) {
+            tracing::debug!(agent = %agent, "credential refresh skipped while startup gate is pending");
+            return RefreshOutcome::NotNeeded {
+                expires_in: Duration::MAX,
+            };
+        }
         match tokio::time::timeout(timeout, self.refresh_agent(agent)).await {
             Ok(outcome) => outcome,
             Err(_elapsed) => {
@@ -258,6 +284,9 @@ impl CredentialRefreshMonitor {
     async fn tick(self: &Arc<Self>) {
         let mut agents: Vec<AgentName> = Vec::new();
         for lease in self.registry.snapshot() {
+            if lease.gate_pending {
+                continue;
+            }
             if !agents.contains(&lease.agent) {
                 agents.push(lease.agent.clone());
             }
@@ -455,6 +484,9 @@ impl CredentialRefreshMonitor {
         let mut written = 0;
         let mut failures = 0;
         for lease in self.registry.snapshot() {
+            if lease.gate_pending {
+                continue;
+            }
             if &lease.agent != agent {
                 continue;
             }

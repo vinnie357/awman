@@ -7,7 +7,7 @@
 //! envelopes against the daemon's wire responses.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,7 +17,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use awman::command::commands::squad::commands::SquadServeConfig;
 use awman::command::commands::squad::daemon_runtime::SquadDaemonHandles;
-use awman::command::commands::squad::gateway::{CreateTask, DaemonStatus, TaskGateway, UpdateTask};
+use awman::command::commands::squad::gateway::{
+    CreateTask, DaemonStatus, TaskDetail, TaskGateway, UpdateTask,
+};
 use awman::command::dispatch::catalogue::CommandCatalogue;
 use awman::command::dispatch::parsed_input::parse as parse_command_box;
 use awman::command::dispatch::{BuiltCommand, Dispatch, Engines};
@@ -161,6 +163,14 @@ impl TaskGateway for RecordingGateway {
             reason: None,
             unmet_env: Vec::new(),
         }])
+    }
+
+    async fn detail(&self, name: &str, limit: usize) -> Result<TaskDetail, CommandError> {
+        self.push(format!("detail:{name}:{limit}"));
+        Ok(TaskDetail {
+            task: task(name),
+            runs: Vec::new(),
+        })
     }
 
     async fn set_status(&self, name: &str, status: TaskStatus) -> Result<(), CommandError> {
@@ -333,11 +343,12 @@ async fn cli_crud_uses_exactly_one_gateway_call_and_no_frontend_validation() {
             vec!["create:not a slug".to_string()],
         ),
         ("squad list", vec!["list".to_string()]),
-        // `show` is the contract-pinned exception: Layer 2 combines the
-        // task and its history with one `get` plus one `runs` call.
+        // `show` is one `detail` call: the task and its history must come
+        // from one snapshot, or a scheduler tick landing between two reads
+        // tears them apart (a run listed that the task does not know about).
         (
             "squad show recorded",
-            vec!["get:recorded".to_string(), "runs:recorded:20".to_string()],
+            vec!["detail:recorded:20".to_string()],
         ),
         // WI 0110: a scripted edit is one `update` call, exactly like the
         // other CRUD verbs, with no frontend-side validation of its own.
@@ -668,6 +679,45 @@ fn init_repo(path: &Path) {
 }
 
 #[cfg(unix)]
+const AWMAN_SQUAD_GATEWAY_HOLDER_CHILD: &str = "AWMAN_SQUAD_GATEWAY_HOLDER_CHILD";
+
+#[cfg(unix)]
+const AWMAN_SQUAD_GATEWAY_HOLDER_PROOF: &str = "AWMAN_SQUAD_GATEWAY_HOLDER_PROOF";
+
+#[cfg(unix)]
+#[test]
+fn fake_awman_process_holder_child() {
+    if std::env::var_os(AWMAN_SQUAD_GATEWAY_HOLDER_CHILD).as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return;
+    }
+
+    let proof_path = std::env::var_os(AWMAN_SQUAD_GATEWAY_HOLDER_PROOF);
+    let proof_path = proof_path.map(std::path::PathBuf::from);
+    let record_proof = |event: &str| {
+        if let Some(path) = &proof_path {
+            std::fs::write(path, event).expect("holder child proof must be written");
+        }
+    };
+    record_proof("entered\n");
+
+    use std::io::Read;
+    let mut stdin = std::io::stdin().lock();
+    let mut buffer = [0_u8; 256];
+    loop {
+        match stdin.read(&mut buffer) {
+            Ok(0) => {
+                record_proof("eof\n");
+                return;
+            }
+            Ok(_) => record_proof("stdin-consumed\n"),
+            Err(error) => panic!("holder child must read stdin until EOF: {error}"),
+        }
+    }
+}
+
+#[cfg(unix)]
 struct FakeAwmanProcess {
     _dir: tempfile::TempDir,
     child: std::process::Child,
@@ -679,9 +729,8 @@ impl FakeAwmanProcess {
     fn spawn() -> Self {
         let dir = tempfile::tempdir().expect("fake awman process directory");
         let executable = dir.path().join("awman-squad-test-holder");
-        // `cat` blocks on this fixture's pipe until its owning guard closes
-        // stdin, so the holder has no independent wall-clock expiry.
-        std::fs::copy("/bin/cat", &executable).expect("copy pipe-held process");
+        let test_binary = std::env::current_exe().expect("current squad gateway test binary");
+        std::fs::copy(test_binary, &executable).expect("copy squad gateway test holder");
         use std::os::unix::fs::PermissionsExt;
         let mut permissions = std::fs::metadata(&executable)
             .expect("holder metadata")
@@ -716,9 +765,15 @@ impl FakeAwmanProcess {
         let mut attempt = 0;
         let mut child = loop {
             match Command::new(&executable)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
+                .args(["--exact", "fake_awman_process_holder_child", "--nocapture"])
+                .env(AWMAN_SQUAD_GATEWAY_HOLDER_CHILD, "1")
+                .env(
+                    AWMAN_SQUAD_GATEWAY_HOLDER_PROOF,
+                    dir.path().join("holder-child-proof"),
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .spawn()
             {
                 Ok(child) => break child,
@@ -729,7 +784,7 @@ impl FakeAwmanProcess {
                 Err(e) => panic!("awman-named holder must start: {e}"),
             }
         };
-        let stdin = child.stdin.take().expect("holder stdin pipe");
+        let stdin = child.stdin.take().expect("holder child stdin");
 
         // `spawn` returns once the child *exists*, not once it has finished
         // `execve`. Until that exec lands, the child's command name is still
@@ -762,9 +817,10 @@ impl FakeAwmanProcess {
 #[cfg(unix)]
 impl Drop for FakeAwmanProcess {
     fn drop(&mut self) {
-        // Close the ownership event before the fallback kill-and-reap path.
         drop(self.stdin.take());
-        let _ = self.child.kill();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
     }
 }
@@ -789,6 +845,72 @@ fn fake_awman_process_lives_until_its_owner_is_dropped() {
         !awman::data::fs::daemon_process::is_process_alive(pid),
         "dropping the owning guard must close and reap the holder"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn fake_awman_process_holder_child_enters_reads_stdin_and_exits_on_eof() {
+    use std::io::Write;
+
+    let mut holder = FakeAwmanProcess::spawn();
+    let proof_path = holder._dir.path().join("holder-child-proof");
+    let wait_for_proof = |expected: &[u8]| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if std::fs::read(&proof_path).ok().as_deref() == Some(expected) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "holder child must record {:?} in its owned proof file",
+                String::from_utf8_lossy(expected)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+
+    wait_for_proof(b"entered\n");
+    assert!(
+        holder
+            .child
+            .try_wait()
+            .expect("holder entry status")
+            .is_none(),
+        "entered child must remain alive while its owner retains stdin"
+    );
+    holder
+        .stdin
+        .as_mut()
+        .expect("holder stdin must remain owned")
+        .write_all(b"holder child input proof\n")
+        .expect("holder child must accept input");
+    wait_for_proof(b"stdin-consumed\n");
+    assert!(
+        holder
+            .child
+            .try_wait()
+            .expect("holder input status")
+            .is_none(),
+        "child must consume input and remain alive until EOF"
+    );
+
+    drop(holder.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = holder.child.try_wait().expect("holder EOF status") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "holder child must exit after its owner closes stdin"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        status.success(),
+        "holder child must exit successfully on EOF"
+    );
+    wait_for_proof(b"eof\n");
 }
 
 #[cfg(unix)]
@@ -988,7 +1110,7 @@ fn newest_real_cli_deps_binary(top_level: &Path) -> Option<std::path::PathBuf> {
         let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         candidates.push((mtime, entry.path()));
     }
-    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     candidates
         .into_iter()
         .map(|(_, path)| path)
@@ -1051,6 +1173,34 @@ async fn daemon_command(base: &str, subcommand: &str, args: &[&str]) -> Value {
         .expect("daemon command JSON")
 }
 
+/// Run a CLI `--json` command bracketed by two daemon reads of the same
+/// command, returning `(cli_payload, daemon_payload)` from a round in which the
+/// daemon's answer did not change. The live scheduler may evaluate the task at
+/// any tick; a round it lands in is retried rather than compared, so a
+/// mismatch is a real CLI/daemon divergence and never a tick race.
+async fn cli_payload_against_settled_daemon(
+    root: &Path,
+    cwd: &Path,
+    cli_args: &[&str],
+    base: &str,
+    subcommand: &str,
+    args: &[&str],
+) -> (Value, Value) {
+    for _ in 0..5 {
+        let before = daemon_command(base, subcommand, args).await;
+        let cli = stdout_json(&run_binary(root, cwd, cli_args));
+        let after = daemon_command(base, subcommand, args).await;
+        if before == after {
+            let payload = cli
+                .get("payload")
+                .cloned()
+                .expect("CLI JSON must contain a payload");
+            return (payload, after);
+        }
+    }
+    panic!("daemon state for {subcommand} never settled across five rounds");
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_crud_round_trip_and_json_payloads_match_the_live_daemon() {
@@ -1087,30 +1237,32 @@ async fn cli_crud_round_trip_and_json_payloads_match_the_live_daemon() {
         String::from_utf8_lossy(&add.stderr)
     );
 
-    let list_json = stdout_json(&run_binary(
+    let list_payload = cli_payload_against_settled_daemon(
         root.path(),
         &repo,
         &["squad", "list", "--json"],
-    ));
-    let list_payload = list_json
-        .get("payload")
-        .expect("CLI list JSON must contain a payload");
+        &base,
+        "squad list",
+        &[],
+    )
+    .await;
     assert_eq!(
-        list_payload,
-        &daemon_command(&base, "squad list", &[]).await
+        list_payload.0, list_payload.1,
+        "CLI list must match the daemon"
     );
 
-    let show_json = stdout_json(&run_binary(
+    let show_payload = cli_payload_against_settled_daemon(
         root.path(),
         &repo,
         &["squad", "show", "cli-roundtrip", "--json"],
-    ));
-    let show_payload = show_json
-        .get("payload")
-        .expect("CLI show JSON must contain a payload");
+        &base,
+        "squad show",
+        &["cli-roundtrip"],
+    )
+    .await;
     assert_eq!(
-        show_payload,
-        &daemon_command(&base, "squad show", &["cli-roundtrip"]).await
+        show_payload.0, show_payload.1,
+        "CLI show must match the daemon"
     );
 
     let pause = run_binary(root.path(), &repo, &["squad", "pause", "cli-roundtrip"]);

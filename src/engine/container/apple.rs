@@ -8,10 +8,553 @@ use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::execution::{AgentInstance, AgentStats};
 use crate::engine::container::attach_socket::AttachSocketGuard;
 use crate::engine::container::backend::ContainerBackend;
+use crate::engine::container::gated_launch::{
+    canonical_inspection_revision, parse_lower_hex_32, run_bounded_provider_cli,
+    AbsenceObservation, AppleProviderState, BoundedProviderOutput,
+    CanonicalInspectionRevisionInput, CreateCliExitClass, CreateCliExitEvidence, ExactInspection,
+    GatedProviderAdapter, ImmutableImageId, InspectionObservationKind, LaunchIdentityError,
+    LaunchRetentionRegistry, NamePresence, ProviderCallDeadline, ProviderCliCustodyRegistry,
+    ProviderCliRunOutcome, ProviderCliStartFailure, ProviderKind, ProviderLaunchInspection,
+    ProviderLaunchKey, ProviderState, SanitizedProviderStateObservation,
+};
 use crate::engine::container::options::{ContainerName, ResolvedContainerOptions};
 use crate::engine::container::process::{AttachHookCtx, ContainerCli, ContainerInstance};
 use crate::engine::credential_refresh::register_container_leases;
 use crate::engine::error::EngineError;
+
+#[derive(Debug, thiserror::Error)]
+enum AppleProviderError {
+    #[error("invalid Apple provider inspection")]
+    InvalidInspection,
+}
+
+#[derive(serde::Deserialize)]
+struct AppleDescriptor {
+    digest: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AppleImageConfiguration {
+    descriptor: AppleDescriptor,
+}
+
+#[derive(serde::Deserialize)]
+struct AppleImageInspection {
+    configuration: AppleImageConfiguration,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum AppleImageInspectionEnvelope {
+    One(AppleImageInspection),
+    Many(Vec<AppleImageInspection>),
+}
+
+#[derive(serde::Deserialize)]
+struct AppleContainerImage {
+    descriptor: AppleDescriptor,
+}
+
+struct UniqueLabels(std::collections::BTreeMap<String, String>);
+
+impl<'de> serde::Deserialize<'de> for UniqueLabels {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct LabelsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for LabelsVisitor {
+            type Value = UniqueLabels;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a provider label object")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                use serde::de::Error as _;
+
+                let mut labels = std::collections::BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, String>()? {
+                    if labels.insert(key, value).is_some() {
+                        return Err(M::Error::custom("duplicate provider label"));
+                    }
+                }
+                Ok(UniqueLabels(labels))
+            }
+        }
+
+        deserializer.deserialize_map(LabelsVisitor)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct AppleContainerConfiguration {
+    id: String,
+    labels: UniqueLabels,
+    image: AppleContainerImage,
+    #[serde(rename = "creationDate")]
+    creation_date: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AppleContainerStatus {
+    state: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AppleContainerInspection {
+    id: String,
+    configuration: AppleContainerConfiguration,
+    status: AppleContainerStatus,
+}
+
+#[allow(dead_code)]
+fn parse_gated_image_inspection(bytes: &[u8]) -> Result<ImmutableImageId, AppleProviderError> {
+    let envelope: AppleImageInspectionEnvelope =
+        serde_json::from_slice(bytes).map_err(|_| AppleProviderError::InvalidInspection)?;
+    let inspection = match envelope {
+        AppleImageInspectionEnvelope::One(inspection) => inspection,
+        AppleImageInspectionEnvelope::Many(mut inspections) if inspections.len() == 1 => {
+            inspections
+                .pop()
+                .ok_or(AppleProviderError::InvalidInspection)?
+        }
+        AppleImageInspectionEnvelope::Many(_) => return Err(AppleProviderError::InvalidInspection),
+    };
+    ImmutableImageId::new(inspection.configuration.descriptor.digest)
+        .map_err(|_| AppleProviderError::InvalidInspection)
+}
+
+#[allow(dead_code)]
+fn parse_gated_launch_inspection(bytes: &[u8], key: &ProviderLaunchKey) -> ExactInspection {
+    if key.provider != ProviderKind::AppleContainers {
+        return ExactInspection::ForeignOrAmbiguous;
+    }
+    let parsed: AppleContainerInspection = match serde_json::from_slice(bytes) {
+        Ok(parsed) => parsed,
+        Err(_) => return ExactInspection::ForeignOrAmbiguous,
+    };
+    if parsed.id != key.container_name.as_str()
+        || parsed.configuration.id != key.container_name.as_str()
+    {
+        return ExactInspection::ForeignOrAmbiguous;
+    }
+    let token_digest = match parsed
+        .configuration
+        .labels
+        .0
+        .get("dev.awman.orchestrator-launch")
+        .and_then(|value| parse_lower_hex_32(value))
+    {
+        Some(digest) if digest == key.token_digest => digest,
+        _ => return ExactInspection::ForeignOrAmbiguous,
+    };
+    let immutable_image_id =
+        match ImmutableImageId::new(parsed.configuration.image.descriptor.digest) {
+            Ok(image) if image == key.immutable_image_id => image,
+            _ => return ExactInspection::ForeignOrAmbiguous,
+        };
+    let created_at = match chrono::DateTime::parse_from_rfc3339(&parsed.configuration.creation_date)
+    {
+        Ok(created)
+            if created.offset().local_minus_utc() == 0
+                && chrono::Timelike::nanosecond(&created) == 0 =>
+        {
+            created.with_timezone(&chrono::Utc)
+        }
+        _ => return ExactInspection::ForeignOrAmbiguous,
+    };
+    if created_at < key.created_not_before {
+        return ExactInspection::ForeignOrAmbiguous;
+    }
+    let state = match parsed.status.state.as_str() {
+        "running" => ProviderState::Apple(AppleProviderState::Running),
+        "stopped" => ProviderState::Apple(AppleProviderState::Stopped),
+        _ => return ExactInspection::ForeignOrAmbiguous,
+    };
+    let revision = canonical_inspection_revision(CanonicalInspectionRevisionInput {
+        kind: InspectionObservationKind::Matching,
+        provider: ProviderKind::AppleContainers,
+        exact_name: &key.container_name,
+        runtime_id: Some(&parsed.configuration.id),
+        token_digest: Some(token_digest),
+        immutable_image_id: Some(&immutable_image_id),
+        created_at: Some(created_at),
+        state: SanitizedProviderStateObservation::Known(state.clone()),
+    });
+    let inspection = ProviderLaunchInspection {
+        provider: ProviderKind::AppleContainers,
+        runtime_id: parsed.configuration.id,
+        exact_name: key.container_name.clone(),
+        token_digest,
+        immutable_image_id,
+        created_at,
+        state,
+        revision,
+    };
+    ExactInspection::Matching(inspection)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppleListValueContext {
+    Row,
+    Configuration,
+}
+
+struct DecodedAppleListValue {
+    value: serde_json::Value,
+    duplicate_identity: bool,
+}
+
+fn deserialize_apple_list_value<'de, D>(
+    deserializer: D,
+    context: AppleListValueContext,
+) -> Result<DecodedAppleListValue, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct AppleListValueVisitor {
+        context: AppleListValueContext,
+    }
+
+    impl AppleListValueVisitor {
+        fn decoded(value: serde_json::Value) -> DecodedAppleListValue {
+            DecodedAppleListValue {
+                value,
+                duplicate_identity: false,
+            }
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for AppleListValueVisitor {
+        type Value = DecodedAppleListValue;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an Apple container list row")
+        }
+
+        fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+            Ok(Self::decoded(serde_json::Value::Bool(value)))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(Self::decoded(serde_json::Value::Number(value.into())))
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(Self::decoded(serde_json::Value::Number(value.into())))
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            let number = serde_json::Number::from_f64(value)
+                .ok_or_else(|| E::custom("invalid JSON number"))?;
+            Ok(Self::decoded(serde_json::Value::Number(number)))
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            self.visit_string(value.to_owned())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+            Ok(Self::decoded(serde_json::Value::String(value)))
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(Self::decoded(serde_json::Value::Null))
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(Self::decoded(serde_json::Value::Null))
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut values = Vec::new();
+            while let Some(value) = sequence.next_element()? {
+                values.push(value);
+            }
+            Ok(Self::decoded(serde_json::Value::Array(values)))
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            let mut values = serde_json::Map::new();
+            let mut duplicate_identity = false;
+            while let Some(key) = map.next_key::<String>()? {
+                let identity_key = match self.context {
+                    AppleListValueContext::Row => {
+                        matches!(key.as_str(), "configuration" | "Name" | "name" | "Names")
+                    }
+                    AppleListValueContext::Configuration => key == "id",
+                };
+                if identity_key && values.contains_key(&key) {
+                    duplicate_identity = true;
+                }
+                let decoded =
+                    if self.context == AppleListValueContext::Row && key == "configuration" {
+                        map.next_value::<AppleListConfigurationValue>()?.0
+                    } else {
+                        Self::decoded(map.next_value()?)
+                    };
+                duplicate_identity |= decoded.duplicate_identity;
+                values.insert(key, decoded.value);
+            }
+            Ok(DecodedAppleListValue {
+                value: serde_json::Value::Object(values),
+                duplicate_identity,
+            })
+        }
+    }
+
+    deserializer.deserialize_any(AppleListValueVisitor { context })
+}
+
+struct AppleListConfigurationValue(DecodedAppleListValue);
+
+impl<'de> serde::Deserialize<'de> for AppleListConfigurationValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_apple_list_value(deserializer, AppleListValueContext::Configuration).map(Self)
+    }
+}
+
+struct AppleListRow(DecodedAppleListValue);
+
+impl<'de> serde::Deserialize<'de> for AppleListRow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_apple_list_value(deserializer, AppleListValueContext::Row).map(Self)
+    }
+}
+
+struct AppleGatedProviderAdapter {
+    custody: std::sync::Arc<ProviderCliCustodyRegistry>,
+    #[cfg(test)]
+    executable: std::path::PathBuf,
+}
+
+impl AppleGatedProviderAdapter {
+    fn try_new() -> Result<std::sync::Arc<Self>, ProviderCliStartFailure> {
+        Ok(std::sync::Arc::new(Self {
+            custody: ProviderCliCustodyRegistry::try_new()?,
+            #[cfg(test)]
+            executable: std::path::PathBuf::from("container"),
+        }))
+    }
+
+    #[cfg(test)]
+    fn try_new_with_executable(
+        executable: &std::path::Path,
+    ) -> Result<std::sync::Arc<Self>, ProviderCliStartFailure> {
+        Ok(std::sync::Arc::new(Self {
+            custody: ProviderCliCustodyRegistry::try_new()?,
+            executable: executable.to_path_buf(),
+        }))
+    }
+
+    fn run(&self, args: &[&str], deadline: ProviderCallDeadline) -> Option<BoundedProviderOutput> {
+        #[cfg(test)]
+        let mut command = Command::new(&self.executable);
+        #[cfg(not(test))]
+        let mut command = Command::new("container");
+        command.args(args);
+        match run_bounded_provider_cli(command, deadline, &self.custody) {
+            ProviderCliRunOutcome::Completed(output) => Some(output),
+            ProviderCliRunOutcome::NotStarted(_)
+            | ProviderCliRunOutcome::ReapedFailure(_)
+            | ProviderCliRunOutcome::RetainedFailure(_) => None,
+        }
+    }
+
+    fn list_rows(&self, deadline: ProviderCallDeadline) -> Option<Vec<AppleListRow>> {
+        let output = self.run(&["list", "--all", "--format", "json"], deadline)?;
+        if !output.status.success() {
+            return None;
+        }
+        serde_json::from_slice::<Vec<AppleListRow>>(&output.stdout)
+            .ok()
+            .or_else(|| {
+                let mut rows = Vec::new();
+                let mut saw_row = false;
+                for line in output.stdout.split(|byte| *byte == b'\n') {
+                    if line.iter().all(|byte| byte.is_ascii_whitespace()) {
+                        continue;
+                    }
+                    saw_row = true;
+                    rows.push(serde_json::from_slice(line).ok()?);
+                }
+                saw_row.then_some(rows)
+            })
+    }
+}
+
+fn set_strict_apple_list_name<'a>(
+    candidate: &mut Option<&'a str>,
+    value: &'a serde_json::Value,
+    trim_leading_slashes: bool,
+) -> Option<()> {
+    let raw = value.as_str()?;
+    if !trim_leading_slashes && raw.starts_with('/') {
+        return None;
+    }
+    let name = if trim_leading_slashes {
+        raw.trim_start_matches('/')
+    } else {
+        raw
+    };
+    if name.is_empty() || name.chars().any(char::is_whitespace) || candidate.is_some() {
+        return None;
+    }
+    *candidate = Some(name);
+    Some(())
+}
+
+fn strict_apple_list_row_name(row: &AppleListRow) -> Option<&str> {
+    if row.0.duplicate_identity {
+        return None;
+    }
+    let row = &row.0.value;
+    if !row.is_object() {
+        return None;
+    }
+    let mut candidate = None;
+    if let Some(configuration) = row.get("configuration") {
+        let id = configuration.as_object()?.get("id")?;
+        set_strict_apple_list_name(&mut candidate, id, false)?;
+    }
+    for key in ["Name", "name"] {
+        if let Some(value) = row.get(key) {
+            set_strict_apple_list_name(&mut candidate, value, true)?;
+        }
+    }
+    if let Some(value) = row.get("Names") {
+        let names = value.as_array()?;
+        if names.len() != 1 {
+            return None;
+        }
+        set_strict_apple_list_name(&mut candidate, &names[0], true)?;
+    }
+    candidate
+}
+
+impl GatedProviderAdapter for AppleGatedProviderAdapter {
+    fn provider(&self) -> ProviderKind {
+        ProviderKind::AppleContainers
+    }
+
+    fn resolve_image_identity(
+        &self,
+        image: &crate::engine::container::options::ImageRef,
+        deadline: ProviderCallDeadline,
+    ) -> Result<ImmutableImageId, LaunchIdentityError> {
+        let output = self
+            .run(&["image", "inspect", image.as_str()], deadline)
+            .filter(|output| output.status.success())
+            .ok_or(LaunchIdentityError::ProviderInspectionUnavailable)?;
+        parse_gated_image_inspection(&output.stdout)
+            .map_err(|_| LaunchIdentityError::ImageIdentityMismatch)
+    }
+
+    fn inspect_name_absence(
+        &self,
+        name: &ContainerName,
+        deadline: ProviderCallDeadline,
+    ) -> Result<AbsenceObservation, NamePresence> {
+        let rows = self.list_rows(deadline).ok_or(NamePresence::Unavailable)?;
+        let mut present = false;
+        for row in &rows {
+            let row_name = strict_apple_list_row_name(row).ok_or(NamePresence::Ambiguous)?;
+            present |= row_name == name.as_str();
+        }
+        if present {
+            return Err(NamePresence::Present);
+        }
+        let checked_at = chrono::Utc::now();
+        Ok(AbsenceObservation {
+            provider: ProviderKind::AppleContainers,
+            exact_name: name.clone(),
+            checked_at,
+            revision: canonical_inspection_revision(CanonicalInspectionRevisionInput {
+                kind: InspectionObservationKind::Absent,
+                provider: ProviderKind::AppleContainers,
+                exact_name: name,
+                runtime_id: None,
+                token_digest: None,
+                immutable_image_id: None,
+                created_at: None,
+                state: SanitizedProviderStateObservation::Absent,
+            }),
+        })
+    }
+
+    fn inspect_launch(
+        &self,
+        key: &ProviderLaunchKey,
+        deadline: ProviderCallDeadline,
+    ) -> ExactInspection {
+        let Some(output) = self.run(&["inspect", key.container_name.as_str()], deadline) else {
+            return ExactInspection::Unavailable;
+        };
+        if !output.status.success() {
+            return ExactInspection::Unavailable;
+        }
+        parse_gated_launch_inspection(&output.stdout, key)
+    }
+
+    fn classify_create_exit(&self, _exit: &CreateCliExitEvidence) -> CreateCliExitClass {
+        CreateCliExitClass::Other
+    }
+
+    fn stop_inspected(
+        &self,
+        inspection: &ProviderLaunchInspection,
+        deadline: ProviderCallDeadline,
+    ) -> Result<(), EngineError> {
+        let output = self
+            .run(&["stop", inspection.exact_name.as_str()], deadline)
+            .ok_or_else(|| EngineError::Container("Apple container stop unavailable".into()))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(EngineError::Container("Apple container stop failed".into()))
+        }
+    }
+
+    fn remove_inspected(
+        &self,
+        inspection: &ProviderLaunchInspection,
+        deadline: ProviderCallDeadline,
+    ) -> Result<(), EngineError> {
+        let output = self
+            .run(&["rm", inspection.exact_name.as_str()], deadline)
+            .ok_or_else(|| EngineError::Container("Apple container remove unavailable".into()))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(EngineError::Container(
+                "Apple container remove failed".into(),
+            ))
+        }
+    }
+}
 
 /// Extract the container name from an Apple Containers JSON row.
 ///
@@ -165,34 +708,141 @@ fn parse_apple_list_output(stdout: &str, name_prefix: Option<&str>) -> Vec<Agent
     handles
 }
 
-#[derive(Debug, Default)]
-pub(super) struct AppleBackend;
+pub(super) struct AppleBackend {
+    gated_provider: std::sync::OnceLock<
+        Result<std::sync::Arc<dyn GatedProviderAdapter>, ProviderCliStartFailure>,
+    >,
+    #[cfg(test)]
+    test_boundary:
+        Option<std::sync::Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>>,
+}
 
-impl ContainerBackend for AppleBackend {
-    fn build(
+impl Default for AppleBackend {
+    fn default() -> Self {
+        Self {
+            gated_provider: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            test_boundary: None,
+        }
+    }
+}
+
+impl AppleBackend {
+    #[cfg(test)]
+    pub(super) fn with_test_boundary(
+        boundary: std::sync::Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
+    ) -> Self {
+        Self {
+            gated_provider: std::sync::OnceLock::from(Ok(boundary.provider())),
+            test_boundary: Some(boundary),
+        }
+    }
+
+    pub(super) fn build_native_codex_auth(
         &self,
         options: ResolvedContainerOptions,
+        registry: Option<std::sync::Arc<LaunchRetentionRegistry>>,
+        custody: std::sync::Arc<crate::engine::agent::native_codex_preparation::AuthCustody>,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.build_common(options, registry, Some(custody), None)
+    }
+
+    pub(super) fn build_native_codex_main(
+        &self,
+        options: ResolvedContainerOptions,
+        registry: Option<std::sync::Arc<LaunchRetentionRegistry>>,
+        main: std::sync::Arc<super::native_sdk_execution::NativeSdkExecution>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.build_common(options, registry, None, Some(main))
+    }
+
+    fn build_common(
+        &self,
+        options: ResolvedContainerOptions,
+        launch_retention: Option<std::sync::Arc<LaunchRetentionRegistry>>,
+        native_auth: Option<
+            std::sync::Arc<crate::engine::agent::native_codex_preparation::AuthCustody>,
+        >,
+        native_main: Option<std::sync::Arc<super::native_sdk_execution::NativeSdkExecution>>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        let orchestrated = options
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some());
+        if orchestrated && launch_retention.is_none() {
+            return Err(EngineError::Config(
+                "orchestrated launch retention is unavailable".into(),
+            ));
+        }
+        let gated_provider = if orchestrated {
+            Some(
+                self.gated_provider
+                    .get_or_init(|| {
+                        AppleGatedProviderAdapter::try_new()
+                            .map(|adapter| adapter as std::sync::Arc<dyn GatedProviderAdapter>)
+                    })
+                    .clone()
+                    .map_err(|_| {
+                        EngineError::Config("Apple provider custody is unavailable".into())
+                    })?,
+            )
+        } else {
+            None
+        };
         let image = options.image.clone().ok_or_else(|| {
             EngineError::ConflictingOptions("missing required Image option".into())
         })?;
         let name = options.name.clone().unwrap_or_else(|| {
             ContainerName::new(crate::engine::container::naming::generate_container_name())
         });
-        // Register a refresh lease for every file-delivered credential BEFORE
-        // the container is built and its child spawned — the single choke point
-        // (INV-6). No-op for every launch that carries no such credential.
         let leases = register_container_leases(&options, &name.0);
-        // Apple's CLI has no `attach` verb, so the launching process must
-        // serve the container's PTY itself; `serve_attach_socket` is that hook.
-        Ok(Box::new(ContainerInstance::new(
-            ContainerCli::APPLE,
+        let cli = ContainerCli::APPLE;
+        #[cfg(test)]
+        let cli = self
+            .test_boundary
+            .as_ref()
+            .map_or(cli, |boundary| cli.with_bin(boundary.executable()));
+        let mut instance = ContainerInstance::new_with_orchestrated_launch(
+            cli,
             image,
             name,
             options,
             leases,
             Some(serve_attach_socket),
-        )))
+            (launch_retention, gated_provider),
+        );
+        instance.native_auth = native_auth;
+        instance.native_main = native_main;
+        #[cfg(test)]
+        if let Some(boundary) = &self.test_boundary {
+            instance.set_test_boundary(std::sync::Arc::clone(boundary));
+        }
+        Ok(Box::new(instance))
+    }
+}
+
+#[cfg(test)]
+#[allow(non_upper_case_globals)]
+#[allow(clippy::declare_interior_mutable_const)]
+const AppleBackend: AppleBackend = AppleBackend {
+    gated_provider: std::sync::OnceLock::new(),
+    test_boundary: None,
+};
+
+impl ContainerBackend for AppleBackend {
+    fn build(
+        &self,
+        options: ResolvedContainerOptions,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.build_common(options, None, None, None)
+    }
+
+    fn build_with_launch_retention(
+        &self,
+        options: ResolvedContainerOptions,
+        launch_retention: Option<std::sync::Arc<LaunchRetentionRegistry>>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        self.build_common(options, launch_retention, None, None)
     }
 
     fn list_running(&self, _session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
@@ -465,6 +1115,14 @@ fn serve_attach_socket(ctx: AttachHookCtx<'_>) -> Option<AttachSocketGuard> {
     })
     .ok()
 }
+
+#[cfg(all(test, unix))]
+#[path = "apple_cleanup_authority_test.rs"]
+mod cleanup_authority_test;
+
+#[cfg(test)]
+#[path = "apple_gated_p2_test.rs"]
+mod gated_p2;
 
 #[cfg(test)]
 mod apple_tests {

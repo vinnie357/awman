@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use awman::data::fs::auth_paths::AuthPathResolver;
 use awman::data::message::{UserMessage, UserMessageSink};
@@ -401,6 +401,95 @@ fn integration_monitor_rewrites_only_live_leases_and_skips_dropped() {
     drop(live_lease);
 }
 
+#[cfg(unix)]
+#[test]
+fn integration_gate_pending_skips_host_refresh_and_staged_rewrite() {
+    if !child_env() {
+        run_fixture_child(
+            "credential_refresh_integration::integration_gate_pending_skips_host_refresh_and_staged_rewrite",
+            "success",
+        );
+        return;
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = PathBuf::from(std::env::var_os("HOME").expect("fixture HOME"));
+    std::fs::create_dir_all(home.join(".claude")).expect("credential directory");
+    std::fs::write(
+        host_file(&home),
+        payload(
+            "fixture-access-token-expiring",
+            SystemTime::now() + Duration::from_secs(10),
+        ),
+    )
+    .expect("host credential");
+    let staged = tempfile::tempdir().expect("staged credential root");
+    let delivery = materialized_delivery(&home, staged.path());
+    let before = std::fs::read(&delivery.staged_path).expect("staged credential");
+
+    let control = tempfile::tempdir().expect("gate control");
+    std::fs::set_permissions(control.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("gate control mode");
+    let manifest_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let request = serde_json::json!({
+        "version": 1,
+        "bindings": [{
+            "id": "review-input",
+            "workspace_path": "/review/input",
+            "manifest_id": manifest_id,
+            "manifest_file": "review.manifest.json",
+            "access": "read-only"
+        }]
+    });
+    let ready = serde_json::json!({
+        "version": 1,
+        "nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container_name": "awman-pending",
+        "bindings": [{
+            "id": "review-input",
+            "workspace_path": "/review/input",
+            "manifest_id": manifest_id,
+            "access": "read-only"
+        }]
+    });
+    for (name, value) in [("request.json", request), ("ready.json", ready)] {
+        let path = control.path().join(name);
+        std::fs::write(&path, serde_json::to_vec(&value).expect("gate JSON")).expect("gate record");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("gate record mode");
+    }
+
+    let monitor = monitor();
+    let lease =
+        monitor.register_gate_pending(&delivery, "awman-pending", control.path().to_path_buf());
+    let outcome = tokio::runtime::Runtime::new()
+        .expect("runtime")
+        .block_on(monitor.refresh_now(
+            &AgentName::new("claude").expect("agent"),
+            Duration::from_secs(2),
+        ));
+    assert!(
+        matches!(
+            outcome,
+            RefreshOutcome::NotNeeded { expires_in } if expires_in == Duration::MAX
+        ),
+        "pending gate must suppress host refresh: {outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read(&delivery.staged_path).expect("staged credential"),
+        before,
+        "pending gate must suppress staged credential rewrites"
+    );
+    assert!(
+        std::fs::read(std::env::var_os("AWMAN_0107_REFRESH_LOG").expect("refresh log path"))
+            .unwrap_or_default()
+            .is_empty(),
+        "pending gate must not invoke the host refresh program"
+    );
+    drop(lease);
+}
+
 #[test]
 fn integration_monitor_refreshes_near_expiry_and_advances_expiry() {
     if !child_env() {
@@ -422,13 +511,28 @@ fn integration_monitor_refreshes_near_expiry_and_advances_expiry() {
     let delivery = materialized_delivery(&home, staged.path());
     let monitor = monitor();
     let lease = monitor.register(&delivery, "awman-expiring");
-    let _outcome = tokio::runtime::Runtime::new()
+    let started = Instant::now();
+    let outcome = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(monitor.refresh_now(&AgentName::new("claude").unwrap(), Duration::from_secs(2)));
+    let elapsed = started.elapsed();
+    let outcome_variant = match &outcome {
+        RefreshOutcome::NotNeeded { .. } => "NotNeeded",
+        RefreshOutcome::Refreshed { .. } => "Refreshed",
+        RefreshOutcome::Stale { .. } => "Stale",
+        RefreshOutcome::Unavailable { .. } => "Unavailable",
+    };
     let refreshed = std::fs::read_to_string(&delivery.staged_path).unwrap();
-    assert!(refreshed.contains("fixture-access-token-refreshed"));
-    let status = monitor
-        .status()
+    let monitor_status = monitor.status();
+    let refresh_log_bytes =
+        std::fs::read(std::env::var_os("AWMAN_0107_REFRESH_LOG").expect("refresh log path"))
+            .unwrap_or_default()
+            .len();
+    assert!(
+        refreshed.contains("fixture-access-token-refreshed"),
+        "staged credential must contain refreshed fixture token: outcome={outcome_variant}, elapsed={elapsed:?}, monitor_status={monitor_status:?}, refresh_log_bytes={refresh_log_bytes}"
+    );
+    let status = monitor_status
         .into_iter()
         .find(|s| s.agent.as_str() == "claude")
         .unwrap();

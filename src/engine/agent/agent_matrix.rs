@@ -4,18 +4,257 @@
 use crate::engine::container::options::{Entrypoint, ModelFlagForm};
 use crate::engine::error::EngineError;
 
+#[derive(Debug, Clone, Copy)]
+enum NativeProvider {
+    Claude,
+    Codex,
+    Agy,
+}
+
+#[derive(Debug, Clone)]
+enum NativeSession {
+    Claude(String),
+    Codex(String),
+    Agy(String),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativePrintRequest {
+    provider: NativeProvider,
+    model: String,
+    session: Option<NativeSession>,
+}
+
+#[derive(Default)]
+pub(crate) struct NativeSdkAckFields {
+    pub(crate) event_type: Option<String>,
+    pub(crate) subtype: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) session_id: Option<String>,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) conversation_id: Option<String>,
+    pub(crate) is_error: Option<bool>,
+    pub(crate) provider_error_present: bool,
+}
+
+impl NativeSdkAckFields {
+    pub(crate) fn retained_capacity_bytes(&self) -> usize {
+        [
+            &self.event_type,
+            &self.subtype,
+            &self.status,
+            &self.session_id,
+            &self.thread_id,
+            &self.conversation_id,
+        ]
+        .into_iter()
+        .filter_map(|value| value.as_ref())
+        .map(String::capacity)
+        .sum()
+    }
+}
+
+pub(crate) enum NativeSdkAckEvent {
+    Session(String),
+    TurnStarted,
+    TurnCompleted,
+    CompletedSession(String),
+    Other,
+}
+
+impl NativePrintRequest {
+    #[cfg(test)]
+    pub(crate) fn validate_state(
+        &self,
+        lease: &crate::data::fs::native_sdk_state::NativeSdkStateLease,
+    ) -> Result<(), EngineError> {
+        use crate::data::fs::native_sdk_state::NativeSdkProvider;
+        let provider = match self.provider {
+            NativeProvider::Claude => NativeSdkProvider::Claude,
+            NativeProvider::Codex => NativeSdkProvider::Codex,
+            NativeProvider::Agy => NativeSdkProvider::Agy,
+        };
+        let session = self.session.as_ref().map(|session| match session {
+            NativeSession::Claude(id) | NativeSession::Codex(id) | NativeSession::Agy(id) => {
+                id.as_str()
+            }
+        });
+        lease.validate_request(provider, &self.model, session)?;
+        Ok(())
+    }
+
+    pub(crate) fn sdk_ack_event(
+        &self,
+        fields: NativeSdkAckFields,
+    ) -> Result<NativeSdkAckEvent, EngineError> {
+        use NativeSdkAckEvent::*;
+        let invalid =
+            || EngineError::Container("invalid native SDK session acknowledgement".into());
+        let session = |id: Option<String>| -> Result<String, EngineError> {
+            let id = id.ok_or_else(invalid)?;
+            if id.is_empty()
+                || id.trim() != id
+                || id.len() > 1024
+                || id.chars().any(char::is_control)
+            {
+                return Err(invalid());
+            }
+            if self
+                .session
+                .as_ref()
+                .is_some_and(|expected| match expected {
+                    NativeSession::Claude(value)
+                    | NativeSession::Codex(value)
+                    | NativeSession::Agy(value) => value != &id,
+                })
+            {
+                return Err(invalid());
+            }
+            Ok(id)
+        };
+        match self.provider {
+            NativeProvider::Claude if fields.event_type.as_deref() == Some("result") => {
+                if fields.subtype.as_deref() != Some("success") || fields.is_error != Some(false) {
+                    return Err(invalid());
+                }
+                Ok(CompletedSession(session(fields.session_id)?))
+            }
+            NativeProvider::Codex => match fields.event_type.as_deref() {
+                Some("thread.started") => Ok(Session(session(fields.thread_id)?)),
+                Some("turn.started") => Ok(TurnStarted),
+                Some("turn.completed") => Ok(TurnCompleted),
+                Some("turn.failed" | "error") => Err(invalid()),
+                _ => Ok(Other),
+            },
+            NativeProvider::Agy if fields.status.is_some() => {
+                if fields.status.as_deref() != Some("SUCCESS") || fields.provider_error_present {
+                    return Err(invalid());
+                }
+                Ok(CompletedSession(session(fields.conversation_id)?))
+            }
+            _ => Ok(Other),
+        }
+    }
+}
+
+impl NativePrintRequest {
+    pub(crate) fn new(
+        agent: &str,
+        model: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<Self, EngineError> {
+        let provider = match agent {
+            "claude" => NativeProvider::Claude,
+            "codex" => NativeProvider::Codex,
+            "agy" => NativeProvider::Agy,
+            _ => {
+                return Err(EngineError::Config(
+                    "native print requires canonical --agent claude, codex or agy".into(),
+                ))
+            }
+        };
+        let model = model
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                EngineError::Config("native print requires a non-empty explicit --model".into())
+            })?;
+        let session = match session {
+            Some(value) if value.trim().is_empty() => {
+                return Err(EngineError::Config(
+                    "native print requires a non-empty --native-session".into(),
+                ))
+            }
+            Some(value) => Some(match provider {
+                NativeProvider::Claude => NativeSession::Claude(value.into()),
+                NativeProvider::Codex => NativeSession::Codex(value.into()),
+                NativeProvider::Agy => NativeSession::Agy(value.into()),
+            }),
+            None => None,
+        };
+        Ok(Self {
+            provider,
+            model: model.into(),
+            session,
+        })
+    }
+
+    pub(crate) fn fresh_codex_model(&self) -> Result<&str, EngineError> {
+        if !matches!(self.provider, NativeProvider::Codex) || self.session.is_some() {
+            return Err(EngineError::Config(
+                "contained auth requires a fresh Codex owner".into(),
+            ));
+        }
+        Ok(&self.model)
+    }
+
+    pub(crate) fn main_invocation(&self, prompt: &str) -> (Entrypoint, Option<String>) {
+        (
+            Entrypoint(vec![
+                "codex".into(),
+                "exec".into(),
+                "--model".into(),
+                self.model.clone(),
+                "--json".into(),
+                "--skip-git-repo-check".into(),
+                "-".into(),
+            ]),
+            Some(prompt.into()),
+        )
+    }
+
+    pub(crate) fn invocation(&self, prompt: &str) -> (Entrypoint, Option<String>) {
+        let (mut argv, stdin) = match self.provider {
+            NativeProvider::Codex => (
+                vec![
+                    "codex".into(),
+                    "exec".into(),
+                    "--model".into(),
+                    self.model.clone(),
+                    "--json".into(),
+                    "--output-last-message".into(),
+                    "/workspace/awman-native-last-message.txt".into(),
+                    "--skip-git-repo-check".into(),
+                ],
+                Some(prompt.into()),
+            ),
+            NativeProvider::Claude | NativeProvider::Agy => {
+                let agent = match self.provider {
+                    NativeProvider::Claude => "claude",
+                    _ => "agy",
+                };
+                (
+                    vec![
+                        agent.into(),
+                        "-p".into(),
+                        prompt.into(),
+                        "--model".into(),
+                        self.model.clone(),
+                        "--output-format".into(),
+                        "json".into(),
+                    ],
+                    None,
+                )
+            }
+        };
+        if let Some(session) = &self.session {
+            let (flag, id) = match session {
+                NativeSession::Claude(id) => ("--resume", id),
+                NativeSession::Codex(id) => ("resume", id),
+                NativeSession::Agy(id) => ("--conversation", id),
+            };
+            argv.extend([flag.into(), id.clone()]);
+        }
+        if matches!(self.provider, NativeProvider::Codex) {
+            argv.push("-".into());
+        }
+        (Entrypoint(argv), stdin)
+    }
+}
+
 /// Supported agent names — derived from the legacy `Agent` enum in
 /// `oldsrc/cli.rs`.
 pub const SUPPORTED_AGENTS: &[&str] = &[
-    "claude",
-    "codex",
-    "opencode",
-    "maki",
-    "gemini",
-    "copilot",
-    "crush",
-    "cline",
-    "antigravity",
+    "claude", "codex", "opencode", "maki", "gemini", "copilot", "crush", "cline", "agy",
 ];
 
 /// How awman injects the combined context system prompt into an agent.
@@ -304,7 +543,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             system_prompt_flag: Some("--system"),
             sbx_kit_kind: SbxKitKind::Agent,
         },
-        "antigravity" => AgentMatrix {
+        "agy" | "antigravity" => AgentMatrix {
             // Verified against `agy --help` (v1.0.x). Flags actually accepted:
             //   --print / -p / --prompt           (non-interactive)
             //   --prompt-interactive / -i         (interactive seed)
@@ -319,7 +558,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             // Don't emit them; the binary just dumps `--help` and treats the
             // prompt as the agy executable name. Leaving plan/auto as `None`
             // keeps non-yolo modes a silent no-op (matches opencode/maki).
-            agent: "antigravity",
+            agent: "agy",
             interactive_entrypoint: vec!["agy"],
             non_interactive_flag: Some("--print"),
             plan_flag: None,
@@ -327,7 +566,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             auto_flag: None,
             disallowed_tools_flag: None,
             allowed_tools_flag: None,
-            model_flag: ModelFlagDelivery::Unsupported,
+            model_flag: ModelFlagDelivery::SpaceArg,
             // agy accepts `--prompt-interactive`/`-i` for an interactive seed,
             // but awman has always seeded it positionally; keep that behavior
             // until the flag form is verified end-to-end.
@@ -344,7 +583,7 @@ pub fn matrix_for(agent: &str) -> Result<AgentMatrix, EngineError> {
             return Err(EngineError::Other(format!(
                 "unknown agent '{other}'; supported: {}",
                 SUPPORTED_AGENTS.join(", ")
-            )))
+            )));
         }
     })
 }
@@ -445,6 +684,40 @@ mod tests {
     }
 
     #[test]
+    fn agy_is_the_canonical_matrix_identity_and_antigravity_is_an_input_alias() {
+        assert!(SUPPORTED_AGENTS.contains(&"agy"));
+        assert!(!SUPPORTED_AGENTS.contains(&"antigravity"));
+
+        for input in ["agy", "antigravity"] {
+            let matrix =
+                matrix_for(input).expect("canonical name and migration alias must resolve");
+            assert_eq!(matrix.agent, "agy", "input {input} must canonicalize");
+            assert_eq!(matrix.interactive_entrypoint, vec!["agy"]);
+            assert_eq!(matrix.non_interactive_flag, Some("--print"));
+            assert_eq!(
+                model_flag_for(&matrix, "gemini-3.5-pro").unwrap(),
+                ModelFlagForm::Argument("gemini-3.5-pro".to_string()),
+                "input {input} must deliver the explicit model as `--model MODEL`"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_agent_error_lists_only_the_canonical_agy_name() {
+        let message = matrix_for("actualagy").unwrap_err().to_string();
+        assert!(message.contains("unknown agent 'actualagy'"), "{message}");
+        let supported = message
+            .split_once("supported: ")
+            .expect("unknown-agent error must carry the supported catalogue")
+            .1;
+        assert!(supported.split(", ").any(|name| name == "agy"), "{message}");
+        assert!(
+            !supported.split(", ").any(|name| name == "antigravity"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn opencode_plan_unsupported() {
         let m = matrix_for("opencode").unwrap();
         assert!(m.plan_flag.is_none());
@@ -521,21 +794,13 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_model_flag_unsupported_returns_err() {
+    fn legacy_antigravity_alias_delivers_model_as_space_argument() {
         let m = matrix_for("antigravity").unwrap();
-        let result = model_flag_for(&m, "gemini-3.5-flash");
-        assert!(
-            result.is_err(),
-            "model_flag_for antigravity must return Err (Unsupported); got {result:?}"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("antigravity"),
-            "error must name the agent; got: {msg}"
-        );
-        assert!(
-            msg.contains("does not support a model flag"),
-            "error must say 'does not support a model flag'; got: {msg}"
+        assert_eq!(m.agent, "agy");
+        assert_eq!(
+            model_flag_for(&m, "gemini-3.5-flash").unwrap(),
+            ModelFlagForm::Argument("gemini-3.5-flash".to_string()),
+            "the migration alias must retain an explicit model through canonical agy SpaceArg delivery"
         );
     }
 

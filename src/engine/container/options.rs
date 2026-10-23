@@ -4,9 +4,12 @@
 //! becomes one variant here. Adding a new option is one variant + one branch
 //! in `ResolvedContainerOptions::ingest`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::data::startup_gate::StartupGateSpec;
 use crate::engine::auth::RefreshableCredentialDelivery;
+
+pub use crate::data::container::ContainerName;
 
 /// A reference to a container image (e.g. `awman-myproj-claude:latest`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,19 +32,6 @@ pub struct Entrypoint(pub Vec<String>);
 impl Entrypoint {
     pub fn new(parts: impl IntoIterator<Item = impl Into<String>>) -> Self {
         Self(parts.into_iter().map(Into::into).collect())
-    }
-}
-
-/// Stable name for a container (e.g. `awman-abc123`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ContainerName(pub String);
-
-impl ContainerName {
-    pub fn new(s: impl Into<String>) -> Self {
-        Self(s.into())
-    }
-    pub fn as_str(&self) -> &str {
-        &self.0
     }
 }
 
@@ -173,6 +163,8 @@ pub enum ContainerOption {
         flag: ModelFlagForm,
     },
     NonInteractivePrintFlag(String),
+    /// Exact one-shot native stdin and output completion semantics.
+    NativePrint(bool),
     /// Container-side `$HOME` remapped from `/root` when a non-root `USER`
     /// directive is detected in the agent's Dockerfile.
     DockerfileUser(String),
@@ -218,6 +210,8 @@ pub enum ContainerOption {
         flag: String,
         container_path: PathBuf,
     },
+    StartupGate(StartupGateSpec),
+    StartupGateTrustedTemplate,
 }
 
 /// Injection-time dedup: drop any entry from `agent_credentials` whose
@@ -409,6 +403,7 @@ pub struct ResolvedContainerOptions {
     pub env_passthrough: Vec<EnvVar>,
     pub env_literal: Vec<EnvLiteral>,
     pub seeded_prompt: Option<String>,
+    pub native_print: bool,
     /// Flag used to deliver `seeded_prompt` in interactive mode. When `None`,
     /// the prompt is appended as a trailing positional argv arg. When `Some`,
     /// it is delivered as `<flag> <text>` (e.g. opencode `--prompt <text>`,
@@ -447,6 +442,9 @@ pub struct ResolvedContainerOptions {
     pub system_prompt_env_file: Option<(String, PathBuf, PathBuf)>,
     pub system_prompt_inline: Option<(String, String)>,
     pub agent_add_dirs: Vec<(String, PathBuf)>,
+    pub startup_gate: Option<Box<StartupGateSpec>>,
+    pub startup_gate_trusted_template: bool,
+    pub startup_gate_runtime_user: Option<String>,
 }
 
 impl ResolvedContainerOptions {
@@ -491,6 +489,7 @@ impl ResolvedContainerOptions {
             ContainerOption::EnvPassthrough(v) => self.env_passthrough.push(v),
             ContainerOption::EnvLiteral(v) => self.env_literal.push(v),
             ContainerOption::SeededPrompt(v) => self.seeded_prompt = Some(v),
+            ContainerOption::NativePrint(v) => self.native_print = v,
             ContainerOption::InteractiveSeedFlag(v) => self.interactive_seed_flag = Some(v),
             ContainerOption::Interactive(v) => self.interactive = v,
             ContainerOption::Acp(v) => self.acp = v,
@@ -499,7 +498,11 @@ impl ResolvedContainerOptions {
             ContainerOption::Auto(v) => self.auto = v,
             ContainerOption::Plan(v) => self.plan = v,
             ContainerOption::WorkingDir(v) => self.working_dir = Some(v),
-            ContainerOption::Name(v) => self.name = Some(v),
+            ContainerOption::Name(v) => {
+                if self.name.replace(v).is_some() {
+                    return Err(ResolveError::Conflict("duplicate container name".into()));
+                }
+            }
             ContainerOption::Cpu(v) => self.cpu = Some(v),
             ContainerOption::Memory(v) => self.memory = Some(v),
             ContainerOption::AgentSettingsPassthrough(v) => self.agent_settings = Some(v),
@@ -542,6 +545,14 @@ impl ResolvedContainerOptions {
             } => {
                 self.agent_add_dirs.push((flag, container_path));
             }
+            ContainerOption::StartupGate(v) => {
+                if self.startup_gate.replace(Box::new(v)).is_some() {
+                    return Err(ResolveError::Conflict("duplicate startup gate".into()));
+                }
+            }
+            ContainerOption::StartupGateTrustedTemplate => {
+                self.startup_gate_trusted_template = true
+            }
         }
         Ok(())
     }
@@ -554,8 +565,140 @@ impl ResolvedContainerOptions {
                 "yolo and plan modes are mutually exclusive".into(),
             ));
         }
+        if let Some(gate) = &self.startup_gate {
+            if let Some((_, identity)) = gate.control.orchestrated_parts() {
+                if self.name.as_ref() != Some(&identity.container_name) {
+                    return Err(ResolveError::Conflict(
+                        "orchestrated startup gate requires its validated container name".into(),
+                    ));
+                }
+                let expected_digest: String = identity
+                    .token_digest
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect();
+                let reserved_labels = self
+                    .labels
+                    .iter()
+                    .filter(|(key, _)| key == "dev.awman.orchestrator-launch")
+                    .collect::<Vec<_>>();
+                if reserved_labels.len() != 1
+                    || reserved_labels[0].1.as_str() != expected_digest.as_str()
+                {
+                    return Err(ResolveError::Conflict(
+                        "orchestrated startup gate requires its validated launch label".into(),
+                    ));
+                }
+                if self.remove_on_exit {
+                    return Err(ResolveError::Conflict(
+                        "orchestrated startup gate requires retained container ownership".into(),
+                    ));
+                }
+            }
+            if self.acp {
+                return Err(ResolveError::Conflict(
+                    "startup gate does not support ACP".into(),
+                ));
+            }
+            for binding in &gate.request.bindings {
+                let path = PathBuf::from(&binding.workspace_path);
+                let allowed = ["/workspace", "/review", "/work", "/data", "/mnt", "/output"];
+                if !allowed
+                    .iter()
+                    .any(|root| path == PathBuf::from(root) || path.starts_with(root))
+                {
+                    return Err(ResolveError::Conflict(format!(
+                        "startup gate binding is outside allowed roots: {}",
+                        binding.workspace_path
+                    )));
+                }
+            }
+            let forbidden = [
+                "/bin",
+                "/sbin",
+                "/usr",
+                "/lib",
+                "/lib64",
+                "/etc",
+                "/proc",
+                "/sys",
+                "/dev",
+                "/.awman/startup-gate",
+            ];
+            for overlay in &self.overlays {
+                validate_gated_guest_path(&overlay.container_path)?;
+                if forbidden
+                    .iter()
+                    .any(|root| paths_overlap(&overlay.container_path, Path::new(root)))
+                {
+                    return Err(ResolveError::Conflict(format!(
+                        "startup gate overlay overlaps protected path: {}",
+                        overlay.container_path.display()
+                    )));
+                }
+            }
+            if self
+                .env_passthrough
+                .iter()
+                .any(|v| v.0.starts_with("LD_") || v.0.starts_with("DYLD_"))
+                || self
+                    .env_literal
+                    .iter()
+                    .any(|v| v.key.starts_with("LD_") || v.key.starts_with("DYLD_"))
+            {
+                return Err(ResolveError::Conflict(
+                    "startup gate rejects dynamic-loader environment".into(),
+                ));
+            }
+        }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn validate_gated_guest_path(path: &Path) -> Result<(), ResolveError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let raw = path.as_os_str().as_bytes();
+    if raw == b"/" {
+        return Ok(());
+    }
+    if !raw.starts_with(b"/")
+        || raw.ends_with(b"/")
+        || raw[1..]
+            .split(|byte| *byte == b'/')
+            .any(|part| part.is_empty() || part == b"." || part == b"..")
+    {
+        return Err(ResolveError::Conflict(format!(
+            "startup gate overlay destination is not normalized: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_gated_guest_path(path: &Path) -> Result<(), ResolveError> {
+    let raw = path.to_string_lossy();
+    if raw == "/" {
+        return Ok(());
+    }
+    if !raw.starts_with('/')
+        || raw.ends_with('/')
+        || raw[1..]
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(ResolveError::Conflict(format!(
+            "startup gate overlay destination is not normalized: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn paths_overlap(a: &Path, b: &Path) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
 }
 
 #[derive(Debug, thiserror::Error)]

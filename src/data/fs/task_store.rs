@@ -478,7 +478,24 @@ impl TaskStore {
     }
 
     pub fn get(&self, name: &str) -> Result<Option<Task>, DataError> {
+        Self::get_in(&self.lock(), name)
+    }
+
+    /// A task and its most recent runs, newest first, read under one lock so
+    /// no run can open or finish between the two reads.
+    pub fn get_with_runs(
+        &self,
+        name: &str,
+        limit: usize,
+    ) -> Result<Option<(Task, Vec<Run>)>, DataError> {
         let conn = self.lock();
+        let Some(task) = Self::get_in(&conn, name)? else {
+            return Ok(None);
+        };
+        Ok(Some((task, Self::runs_for_in(&conn, name, limit)?)))
+    }
+
+    fn get_in(conn: &Connection, name: &str) -> Result<Option<Task>, DataError> {
         let raw = conn
             .query_row(
                 "SELECT id, name, description, repo_scope, mount_scope, overlays, interval_secs, status, agent, model,
@@ -762,7 +779,10 @@ impl TaskStore {
 
     /// The most recent runs for a task, newest first.
     pub fn runs_for(&self, name: &str, limit: usize) -> Result<Vec<Run>, DataError> {
-        let conn = self.lock();
+        Self::runs_for_in(&self.lock(), name, limit)
+    }
+
+    fn runs_for_in(conn: &Connection, name: &str, limit: usize) -> Result<Vec<Run>, DataError> {
         let mut stmt = conn.prepare(
             "SELECT r.id, r.task_id, r.status, r.workflow_path, r.workflow_state_path,
                     r.session_id, r.started_at, r.finished_at, r.error, r.unmet_env, r.reason

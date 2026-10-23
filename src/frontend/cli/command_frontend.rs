@@ -35,6 +35,43 @@ use super::user_message::CliUserMessageQueue;
 
 /// Single CLI frontend struct. Implements every per-command frontend trait
 /// in `src/frontend/cli/per_command/`.
+pub(crate) type NativeOutputWriters =
+    std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<std::io::Result<()>>>>>;
+
+/// Interactive PTY output drains, joined with a bound when the frontend drops.
+/// The `Mutex` satisfies the `Sync` bound on frontend traits.
+#[derive(Default)]
+pub(crate) struct PtyOutputDrains(
+    std::sync::Mutex<Vec<crate::engine::container::io_bridge::DrainThread>>,
+);
+
+impl PtyOutputDrains {
+    pub(crate) fn push(&mut self, drain: crate::engine::container::io_bridge::DrainThread) {
+        self.0
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(drain);
+    }
+
+    pub(crate) fn join_all(&mut self) {
+        let deadline =
+            std::time::Instant::now() + crate::engine::container::io_bridge::OUTPUT_DRAIN_BOUND;
+        let drains = self
+            .0
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for drain in drains.drain(..) {
+            drain.join_until(deadline);
+        }
+    }
+}
+
+impl Drop for PtyOutputDrains {
+    fn drop(&mut self) {
+        self.join_all();
+    }
+}
+
 pub struct CliFrontend {
     pub(crate) matches: ArgMatches,
     /// Cached canonical command path (resolved via `command_path_from_matches`).
@@ -43,6 +80,7 @@ pub struct CliFrontend {
     /// Effective non-interactive mode: true when explicitly requested via
     /// `--non-interactive` OR when stdin is not a TTY.
     pub(crate) non_interactive: bool,
+    pub(crate) native_output_writers: NativeOutputWriters,
     /// Receiver end of the background stdin-reader thread spawned for yolo
     /// countdown input. `None` until the first `yolo_countdown_tick` call on a
     /// TTY; consumed lines are mapped to `YoloTickOutcome` by the
@@ -51,6 +89,9 @@ pub struct CliFrontend {
     pub(crate) yolo_stdin_rx: Option<std::sync::Mutex<std::sync::mpsc::Receiver<String>>>,
     /// Throttle: last time a yolo countdown message was emitted to stderr.
     pub(crate) last_sink_message_time: Option<std::time::Instant>,
+    /// Declared before `raw_mode_guard` so the final output lands before
+    /// cooked mode returns.
+    pub(crate) pty_output_drains: PtyOutputDrains,
     /// RAII guard that restores cooked mode when dropped. Present while a
     /// full-screen interactive container owns the terminal.
     pub(crate) raw_mode_guard: Option<RawModeGuard>,
@@ -384,8 +425,10 @@ impl CliFrontend {
             command_path,
             messages: CliUserMessageQueue::new(),
             non_interactive,
+            native_output_writers: Default::default(),
             yolo_stdin_rx: None,
             last_sink_message_time: None,
+            pty_output_drains: PtyOutputDrains::default(),
             raw_mode_guard: None,
             stdin_reader_shutdown: None,
             stdin_reader_handle: None,
@@ -420,7 +463,7 @@ impl CliFrontend {
                 .copied()
                 .unwrap_or(false)
         };
-        flag("non-interactive") || flag("json")
+        flag("non-interactive") || flag("json") || flag("native-print")
     }
 
     /// Returns `true` when the `--json` flag is active for the current
@@ -498,6 +541,12 @@ impl CommandFrontend for CliFrontend {
             && !command_has_bool_flag(command_path, flag)
         {
             return Ok(None);
+        }
+        // The frontend owns TTY detection: when it auto-detected
+        // non-interactive mode, the built command must agree, or it launches
+        // `run -it` over piped stdio and the runtime fails with ENOTTY.
+        if flag == "non-interactive" && self.non_interactive {
+            return Ok(Some(true));
         }
         Ok(Some(m.get_flag(flag)))
     }
@@ -929,6 +978,38 @@ mod tests {
 
     // ─── flag_bool ────────────────────────────────────────────────────────────
 
+    /// Regression: with no TTY on stdin the frontend auto-detects
+    /// non-interactive mode, and the command it builds must see the same
+    /// mode. Otherwise `exec prompt` launches `container run -it` over piped
+    /// stdio and the runtime fails with ENOTTY.
+    #[test]
+    fn auto_detected_non_interactive_reaches_the_built_command_flag() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        let m = cmd
+            .try_get_matches_from(["awman", "exec", "prompt", "hi"])
+            .unwrap();
+        let mut f = CliFrontend::new(m);
+        f.non_interactive = true;
+        assert_eq!(
+            f.flag_bool(&["exec", "prompt"], "non-interactive").unwrap(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn interactive_frontend_leaves_absent_non_interactive_flag_false() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        let m = cmd
+            .try_get_matches_from(["awman", "exec", "prompt", "hi"])
+            .unwrap();
+        let mut f = CliFrontend::new(m);
+        f.non_interactive = false;
+        assert_eq!(
+            f.flag_bool(&["exec", "prompt"], "non-interactive").unwrap(),
+            Some(false)
+        );
+    }
+
     #[test]
     fn flag_bool_reads_set_true_flag_from_arg_matches() {
         let cmd = CommandCatalogue::get().build_clap_command();
@@ -1306,3 +1387,7 @@ mod tests {
         assert_eq!(v, None);
     }
 }
+
+#[cfg(test)]
+#[path = "native_print_cli_test.rs"]
+mod native_print_cli_test;

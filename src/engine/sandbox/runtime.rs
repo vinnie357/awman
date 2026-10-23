@@ -63,6 +63,13 @@ impl SandboxRuntime {
             backend: Arc::new(DSbxBackend::new()),
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn dsbx_for_option_resolution_test() -> Self {
+        Self {
+            backend: Arc::new(DSbxBackend::new()),
+        }
+    }
 }
 
 impl AgentRuntimeEngine for SandboxRuntime {

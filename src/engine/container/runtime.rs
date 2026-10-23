@@ -13,6 +13,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::data::session::{AgentHandle, Session};
 use crate::engine::agent_runtime::{
@@ -22,6 +25,15 @@ use crate::engine::container::apple::AppleBackend;
 use crate::engine::container::backend::ContainerBackend;
 use crate::engine::container::background::BackgroundContainer;
 use crate::engine::container::docker::DockerBackend;
+use crate::engine::container::gated_launch::{
+    provider_call_deadline, run_bounded_provider_cli, LaunchRetentionInitError,
+    LaunchRetentionRegistry, ProviderCliCustodyRegistry, ProviderCliRunOutcome,
+    ProviderCliStartFailure,
+};
+#[cfg(test)]
+use crate::engine::container::gated_launch::{
+    ProviderCliReapedFailure, ProviderCliReapedFailureKind,
+};
 use crate::engine::container::options::{OverlaySpec, ResolvedContainerOptions};
 use crate::engine::error::EngineError;
 
@@ -52,15 +64,196 @@ static CONTAINER_CAPABILITIES: Capabilities = Capabilities {
     session_label_supported: true,
 };
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(super) enum InitialInspectionOutcomeForTest {
+    CustodyUnavailable(ProviderCliStartFailure),
+    Completed(bool),
+    NotStarted(ProviderCliStartFailure),
+    ReapedFailure(ProviderCliReapedFailureKind),
+    RetainedFailure,
+}
+
+#[cfg(test)]
+pub(super) type InitialInspectionReceiptForTest =
+    Arc<Mutex<Option<InitialInspectionOutcomeForTest>>>;
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(super) struct InitialInspectionTerminalProofForTest {
+    pub outcome: InitialInspectionOutcomeForTest,
+    pub reaped: Option<ProviderCliReapedFailure>,
+}
+
+#[cfg(test)]
+pub(super) type InitialInspectionTerminalProofReceiptForTest =
+    Arc<Mutex<Option<InitialInspectionTerminalProofForTest>>>;
+
 pub struct ContainerRuntime {
     backend: Arc<dyn ContainerBackend>,
+    launch_retention: Result<Arc<LaunchRetentionRegistry>, LaunchRetentionInitError>,
+    provider_cli_custody: Result<Arc<ProviderCliCustodyRegistry>, ProviderCliStartFailure>,
+    #[cfg(test)]
+    test_boundary: Option<Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>>,
+    #[cfg(test)]
+    test_provider_executable: Option<std::path::PathBuf>,
+    #[cfg(test)]
+    test_image_home_dir: Option<String>,
+    #[cfg(test)]
+    test_initial_inspection_receipt: Option<InitialInspectionReceiptForTest>,
+    #[cfg(test)]
+    test_initial_inspection_terminal_proof: Option<InitialInspectionTerminalProofReceiptForTest>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GateImageConfig {
+    user: String,
+    env: Vec<String>,
+    entrypoint: Vec<String>,
+    trusted: bool,
+}
+
+fn parse_gate_image_config(runtime: &str, raw: &[u8]) -> Result<GateImageConfig, EngineError> {
+    let value: serde_json::Value = serde_json::from_slice(raw).map_err(|error| {
+        EngineError::Container(format!("parse startup-gate image inspection: {error}"))
+    })?;
+    let config = if runtime == "apple-containers" {
+        value
+            .get(0)
+            .and_then(|v| v.get("variants"))
+            .and_then(|v| v.as_array())
+            .and_then(|v| v.first())
+            .and_then(|v| v.get("config"))
+            .and_then(|v| v.get("config"))
+    } else {
+        Some(&value)
+    }
+    .ok_or_else(|| EngineError::Container("startup-gate image has no inspectable config".into()))?;
+    let user = config
+        .get("User")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let env = match config.get("Env") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| {
+                EngineError::Config("startup-gated image has malformed environment".into())
+            })?
+            .iter()
+            .map(|v| {
+                v.as_str().map(str::to_string).ok_or_else(|| {
+                    EngineError::Config("startup-gated image has malformed environment".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let entrypoint = match config.get("Entrypoint") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| {
+                EngineError::Config("startup-gated image has malformed entrypoint".into())
+            })?
+            .iter()
+            .map(|v| {
+                v.as_str().map(str::to_string).ok_or_else(|| {
+                    EngineError::Config("startup-gated image has malformed entrypoint".into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let trusted = config
+        .get("Labels")
+        .and_then(|v| v.as_object())
+        .and_then(|labels| labels.get("dev.awman.startup-gate"))
+        .and_then(|v| v.as_str())
+        == Some("1");
+    if !entrypoint.is_empty() {
+        return Err(EngineError::Config(
+            "startup-gated images may not define an entrypoint".into(),
+        ));
+    }
+    if env
+        .iter()
+        .filter_map(|entry| entry.split_once('=').map(|(key, _)| key))
+        .any(|key| {
+            key == "PYTHONHOME"
+                || key == "PYTHONPATH"
+                || key.starts_with("LD_")
+                || key.starts_with("DYLD_")
+        })
+    {
+        return Err(EngineError::Config(
+            "startup-gated images may not define Python or dynamic-loader environment".into(),
+        ));
+    }
+    Ok(GateImageConfig {
+        user,
+        env,
+        entrypoint,
+        trusted,
+    })
+}
+
+fn valid_orchestrated_runtime_user(value: &str) -> bool {
+    let Some((user, group)) = value.split_once(':') else {
+        return false;
+    };
+    user.parse::<u32>().is_ok_and(|uid| uid != 0) && group.parse::<u32>().is_ok_and(|gid| gid != 0)
 }
 
 impl ContainerRuntime {
+    #[cfg(test)]
+    pub(super) fn set_initial_inspection_receipt_for_test(
+        &mut self,
+        receipt: InitialInspectionReceiptForTest,
+    ) {
+        self.test_initial_inspection_receipt = Some(receipt);
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_initial_inspection_terminal_proof_for_test(
+        &mut self,
+        receipt: InitialInspectionTerminalProofReceiptForTest,
+    ) {
+        self.test_initial_inspection_terminal_proof = Some(receipt);
+    }
+
+    #[cfg(test)]
+    fn record_initial_inspection_outcome_for_test(
+        &self,
+        outcome: InitialInspectionOutcomeForTest,
+        reaped: Option<ProviderCliReapedFailure>,
+    ) {
+        if let Some(receipt) = &self.test_initial_inspection_receipt {
+            if let Ok(mut receipt) = receipt.try_lock() {
+                *receipt = Some(outcome);
+            }
+        }
+        if let Some(receipt) = &self.test_initial_inspection_terminal_proof {
+            if let Ok(mut receipt) = receipt.try_lock() {
+                *receipt = Some(InitialInspectionTerminalProofForTest { outcome, reaped });
+            }
+        }
+    }
     /// Construct with the Docker backend.
     pub fn docker() -> Self {
         Self {
             backend: Arc::new(DockerBackend),
+            launch_retention: LaunchRetentionRegistry::try_new(),
+            provider_cli_custody: ProviderCliCustodyRegistry::try_new(),
+            #[cfg(test)]
+            test_boundary: None,
+            #[cfg(test)]
+            test_provider_executable: None,
+            #[cfg(test)]
+            test_image_home_dir: None,
+            #[cfg(test)]
+            test_initial_inspection_receipt: None,
+            #[cfg(test)]
+            test_initial_inspection_terminal_proof: None,
         }
     }
 
@@ -69,7 +262,60 @@ impl ContainerRuntime {
     /// non-mac host yields a runtime whose probes simply fail.
     pub fn apple() -> Self {
         Self {
-            backend: Arc::new(AppleBackend),
+            backend: Arc::new(AppleBackend::default()),
+            launch_retention: LaunchRetentionRegistry::try_new(),
+            provider_cli_custody: ProviderCliCustodyRegistry::try_new(),
+            #[cfg(test)]
+            test_boundary: None,
+            #[cfg(test)]
+            test_provider_executable: None,
+            #[cfg(test)]
+            test_image_home_dir: None,
+            #[cfg(test)]
+            test_initial_inspection_receipt: None,
+            #[cfg(test)]
+            test_initial_inspection_terminal_proof: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apple_with_provider_executable_for_test(executable: &Path) -> Self {
+        Self {
+            backend: Arc::new(AppleBackend::default()),
+            launch_retention: LaunchRetentionRegistry::try_new(),
+            provider_cli_custody: ProviderCliCustodyRegistry::try_new(),
+            test_boundary: None,
+            test_provider_executable: Some(executable.to_path_buf()),
+            #[cfg(test)]
+            test_image_home_dir: None,
+            #[cfg(test)]
+            test_initial_inspection_receipt: None,
+            #[cfg(test)]
+            test_initial_inspection_terminal_proof: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apple_with_test_boundary(
+        boundary: Arc<dyn super::orchestrated_apple::OrchestratedAppleTestBoundary>,
+    ) -> Self {
+        let launch_retention = if boundary.retention_available() {
+            LaunchRetentionRegistry::try_new()
+        } else {
+            Err(LaunchRetentionInitError::SupervisorThreadUnavailable)
+        };
+        Self {
+            backend: Arc::new(AppleBackend::with_test_boundary(Arc::clone(&boundary))),
+            launch_retention,
+            provider_cli_custody: ProviderCliCustodyRegistry::try_new(),
+            test_boundary: Some(boundary),
+            test_provider_executable: None,
+            #[cfg(test)]
+            test_image_home_dir: None,
+            #[cfg(test)]
+            test_initial_inspection_receipt: None,
+            #[cfg(test)]
+            test_initial_inspection_terminal_proof: None,
         }
     }
 
@@ -92,12 +338,185 @@ impl ContainerRuntime {
         &CONTAINER_CAPABILITIES
     }
 
+    pub(crate) fn launch_retention(
+        &self,
+    ) -> Result<Arc<LaunchRetentionRegistry>, LaunchRetentionInitError> {
+        self.launch_retention.clone()
+    }
+
     /// Build a fully-configured `AgentInstance` from pre-resolved options.
     pub fn build(
         &self,
         options: ResolvedContainerOptions,
     ) -> Result<Box<dyn AgentInstance>, EngineError> {
-        self.backend.build(options)
+        let (options, launch_retention) = self.prepare_container_options(options)?;
+        self.backend
+            .build_with_launch_retention(options, launch_retention)
+    }
+
+    pub(crate) fn build_native_codex_auth(
+        &self,
+        options: ResolvedContainerOptions,
+        custody: Arc<crate::engine::agent::native_codex_preparation::AuthCustody>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        let (options, registry) = self.prepare_container_options(options)?;
+        let backend = AppleBackend::default();
+        #[cfg(test)]
+        let backend = self.test_boundary.as_ref().map_or(backend, |boundary| {
+            AppleBackend::with_test_boundary(Arc::clone(boundary))
+        });
+        backend.build_native_codex_auth(options, registry, custody)
+    }
+
+    pub(crate) fn build_native_codex_main(
+        &self,
+        options: ResolvedContainerOptions,
+        main: Arc<super::native_sdk_execution::NativeSdkExecution>,
+    ) -> Result<Box<dyn AgentInstance>, EngineError> {
+        let (options, registry) = self.prepare_container_options(options)?;
+        let backend = AppleBackend::default();
+        #[cfg(test)]
+        let backend = self.test_boundary.as_ref().map_or(backend, |boundary| {
+            AppleBackend::with_test_boundary(Arc::clone(boundary))
+        });
+        backend.build_native_codex_main(options, registry, main)
+    }
+
+    fn prepare_container_options(
+        &self,
+        mut options: ResolvedContainerOptions,
+    ) -> Result<
+        (
+            ResolvedContainerOptions,
+            Option<Arc<LaunchRetentionRegistry>>,
+        ),
+        EngineError,
+    > {
+        let orchestrated = options
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some());
+        let launch_retention = match self.launch_retention() {
+            Ok(registry) => Some(registry),
+            Err(_) if orchestrated => {
+                return Err(EngineError::Config(
+                    "orchestrated launch retention is unavailable".into(),
+                ));
+            }
+            Err(_) => None,
+        };
+        if let Some(startup_gate_timeout) = options.startup_gate.as_ref().map(|gate| gate.timeout) {
+            if !options.startup_gate_trusted_template {
+                return Err(EngineError::Config(
+                    "startup gate requires an awman-supported generated agent image".into(),
+                ));
+            }
+            let image = options
+                .image
+                .as_ref()
+                .ok_or_else(|| EngineError::MissingRequiredOption("startup gate image".into()))?;
+            let inspected = self.inspect_gate_image(image.as_str(), startup_gate_timeout)?;
+            debug_assert!(inspected.entrypoint.is_empty());
+            debug_assert!(inspected.env.iter().all(|entry| !entry.is_empty()));
+            if !inspected.trusted {
+                return Err(EngineError::Config("startup-gated image was not built from an awman startup-gate template; rebuild the project and agent images with `awman ready --no-cache`".into()));
+            }
+            options.startup_gate_runtime_user =
+                (!inspected.user.is_empty() && inspected.user != "0" && inspected.user != "root")
+                    .then_some(inspected.user);
+            if orchestrated
+                && !options
+                    .startup_gate_runtime_user
+                    .as_deref()
+                    .is_some_and(valid_orchestrated_runtime_user)
+            {
+                return Err(EngineError::Config(
+                    "orchestrated Apple launch requires an inspected numeric user and group".into(),
+                ));
+            }
+        }
+        Ok((options, launch_retention))
+    }
+
+    fn inspect_gate_image(
+        &self,
+        image: &str,
+        startup_gate_timeout: Duration,
+    ) -> Result<GateImageConfig, EngineError> {
+        #[cfg(test)]
+        if let Some(boundary) = &self.test_boundary {
+            let raw = boundary.image_inspection()?;
+            return parse_gate_image_config(self.backend.name(), &raw);
+        }
+        use std::process::Command;
+        #[cfg(test)]
+        let apple_executable = self
+            .test_provider_executable
+            .as_deref()
+            .unwrap_or_else(|| Path::new("container"));
+        #[cfg(not(test))]
+        let apple_executable = Path::new("container");
+        let mut command = match self.backend.name() {
+            "apple-containers" => Command::new(apple_executable),
+            _ => Command::new("docker"),
+        };
+        match self.backend.name() {
+            "apple-containers" => command.args(["image", "inspect", image]),
+            _ => command.args(["image", "inspect", "--format", "{{json .Config}}", image]),
+        };
+        #[cfg(test)]
+        if let Err(reason) = &self.provider_cli_custody {
+            self.record_initial_inspection_outcome_for_test(
+                InitialInspectionOutcomeForTest::CustodyUnavailable(*reason),
+                None,
+            );
+        }
+        let custody = self
+            .provider_cli_custody
+            .as_ref()
+            .map_err(|_| EngineError::Container("could not inspect startup-gate image".into()))?;
+        let deadline = provider_call_deadline(Instant::now() + startup_gate_timeout);
+        let outcome = run_bounded_provider_cli(command, deadline, custody);
+        #[cfg(test)]
+        {
+            let (terminal, reaped) = match &outcome {
+                ProviderCliRunOutcome::Completed(output) => (
+                    InitialInspectionOutcomeForTest::Completed(output.status.success()),
+                    None,
+                ),
+                ProviderCliRunOutcome::NotStarted(reason) => {
+                    (InitialInspectionOutcomeForTest::NotStarted(*reason), None)
+                }
+                ProviderCliRunOutcome::ReapedFailure(failure) => (
+                    InitialInspectionOutcomeForTest::ReapedFailure(failure.kind),
+                    Some(failure.clone()),
+                ),
+                ProviderCliRunOutcome::RetainedFailure(_) => {
+                    (InitialInspectionOutcomeForTest::RetainedFailure, None)
+                }
+            };
+            self.record_initial_inspection_outcome_for_test(terminal, reaped);
+        }
+        let output = match outcome {
+            ProviderCliRunOutcome::Completed(output) => output,
+            ProviderCliRunOutcome::RetainedFailure(retained) => {
+                let _ = retained.transfer();
+                return Err(EngineError::Container(
+                    "could not inspect startup-gate image".into(),
+                ));
+            }
+            ProviderCliRunOutcome::NotStarted(_) | ProviderCliRunOutcome::ReapedFailure(_) => {
+                return Err(EngineError::Container(
+                    "could not inspect startup-gate image".into(),
+                ));
+            }
+        };
+        if !output.status.success() {
+            return Err(EngineError::Container(
+                "could not inspect startup-gate image".into(),
+            ));
+        }
+        parse_gate_image_config(self.backend.name(), &output.stdout)
     }
 
     pub fn list_running(&self, session: &Session) -> Result<Vec<AgentHandle>, EngineError> {
@@ -188,7 +607,17 @@ impl ContainerRuntime {
     /// Returns `None` when the image is missing or the runtime CLI is
     /// unreachable.
     pub fn image_home_dir(&self, tag: &str) -> Option<String> {
+        #[cfg(test)]
+        if let Some(home) = &self.test_image_home_dir {
+            return Some(home.clone());
+        }
         self.backend.image_home_dir(tag)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_image_home_dir_for_test(mut self, home: &str) -> Self {
+        self.test_image_home_dir = Some(home.to_string());
+        self
     }
 
     /// Best-effort check whether an image tag exists locally on the runtime.
@@ -456,6 +885,135 @@ mod tests {
     use crate::engine::agent_runtime::ResolvedAgentOptions;
     use crate::engine::sandbox::options::ResolvedSandboxOptions;
 
+    fn docker_gate_config(env: serde_json::Value, entrypoint: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "User": "1000:1000",
+            "Env": env,
+            "Entrypoint": entrypoint,
+            "Labels": {"dev.awman.startup-gate": "1"}
+        }))
+        .expect("Docker inspect fixture")
+    }
+
+    fn apple_gate_config(env: serde_json::Value, entrypoint: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!([{
+            "variants": [{
+                "config": {
+                    "config": {
+                        "User": "1000:1000",
+                        "Env": env,
+                        "Entrypoint": entrypoint,
+                        "Labels": {"dev.awman.startup-gate": "1"}
+                    }
+                }
+            }]
+        }]))
+        .expect("Apple Containers inspect fixture")
+    }
+
+    #[test]
+    fn gate_image_parser_accepts_real_docker_and_apple_config_shapes() {
+        for (runtime, raw) in [
+            (
+                "docker",
+                docker_gate_config(
+                    serde_json::json!(["PATH=/usr/bin"]),
+                    serde_json::Value::Null,
+                ),
+            ),
+            (
+                "apple-containers",
+                apple_gate_config(serde_json::json!(["PATH=/usr/bin"]), serde_json::json!([])),
+            ),
+        ] {
+            let parsed =
+                parse_gate_image_config(runtime, &raw).expect("supported startup-gate image");
+            assert_eq!(
+                parsed,
+                GateImageConfig {
+                    user: "1000:1000".into(),
+                    env: vec!["PATH=/usr/bin".into()],
+                    entrypoint: Vec::new(),
+                    trusted: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_gate_label_does_not_allow_image_loader_environment() {
+        for key in [
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+        ] {
+            for (runtime, raw) in [
+                (
+                    "docker",
+                    docker_gate_config(
+                        serde_json::json!([format!("{key}=/untrusted")]),
+                        serde_json::Value::Null,
+                    ),
+                ),
+                (
+                    "apple-containers",
+                    apple_gate_config(
+                        serde_json::json!([format!("{key}=/untrusted")]),
+                        serde_json::json!([]),
+                    ),
+                ),
+            ] {
+                assert!(
+                    parse_gate_image_config(runtime, &raw).is_err(),
+                    "{runtime} must reject image variable {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trusted_gate_label_does_not_allow_an_image_entrypoint() {
+        for (runtime, raw) in [
+            (
+                "docker",
+                docker_gate_config(
+                    serde_json::json!(["PATH=/usr/bin"]),
+                    serde_json::json!(["/bin/sh", "-c"]),
+                ),
+            ),
+            (
+                "apple-containers",
+                apple_gate_config(
+                    serde_json::json!(["PATH=/usr/bin"]),
+                    serde_json::json!(["python3", "-c"]),
+                ),
+            ),
+        ] {
+            assert!(
+                parse_gate_image_config(runtime, &raw).is_err(),
+                "{runtime} image entrypoint could run before the fixed bootstrap"
+            );
+        }
+    }
+
+    #[test]
+    fn gate_image_parser_rejects_malformed_security_fields() {
+        let non_string_env = docker_gate_config(
+            serde_json::json!(["PATH=/usr/bin", 7]),
+            serde_json::Value::Null,
+        );
+        assert!(parse_gate_image_config("docker", &non_string_env).is_err());
+
+        let scalar_entrypoint = apple_gate_config(
+            serde_json::json!(["PATH=/usr/bin"]),
+            serde_json::json!("/bin/sh"),
+        );
+        assert!(parse_gate_image_config("apple-containers", &scalar_entrypoint).is_err());
+    }
+
     #[test]
     fn build_requires_image_option() {
         let rt = ContainerRuntime::docker();
@@ -504,3 +1062,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "isolated_settings_runtime_test.rs"]
+mod isolated_settings_runtime_test;

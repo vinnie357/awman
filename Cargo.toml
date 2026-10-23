@@ -1,6 +1,6 @@
 [package]
 name = "awman"
-version = "0.12.0"
+version = "0.11.3"
 edition = "2021"
 rust-version = "1.94.0"
 description = "A containerized code agent manager"
@@ -59,10 +59,12 @@ thiserror = "2"
 async-trait = "0.1"
 futures-util = "0.3"
 which = "8"
+zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["signal", "process", "fs", "poll"] }
+nix = { version = "0.31", features = ["signal", "process", "fs", "poll", "user"] }
 libc = "0.2"
+rustix = { version = "1.1", features = ["fs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libproc = "=0.14.11"
@@ -70,6 +72,9 @@ libproc = "=0.14.11"
 [dev-dependencies]
 reqwest = { version = "0.13", features = ["rustls", "json"], default-features = false }
 wiremock = "0.6"
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dev-dependencies]
+awman-test-spawn-barrier = { path = "tests/support/spawn-barrier" }
 
 # ── New architecture integration tests (WI 0073) ─────────────────────────────
 # autotests = false suppresses the legacy tests/; these explicit entries

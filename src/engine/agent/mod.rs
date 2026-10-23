@@ -25,6 +25,14 @@ use crate::engine::step_status::StepStatus;
 pub mod agent_matrix;
 pub mod download;
 pub mod frontend;
+pub(crate) mod native_codex_preparation;
+
+#[cfg(all(test, unix))]
+mod orchestrated_apple_cleanup_authority_test;
+#[cfg(all(test, unix))]
+mod orchestrated_apple_command_acceptance_test;
+#[cfg(all(test, unix))]
+mod orchestrated_apple_command_test_boundary;
 
 pub use frontend::AgentFrontend;
 
@@ -38,6 +46,7 @@ pub enum AutoMode {
 /// Options governing how an agent container is invoked.
 #[derive(Debug, Default, Clone)]
 pub struct AgentRunOptions {
+    pub startup_gate: Option<crate::data::startup_gate::StartupGateSpec>,
     pub yolo: Option<crate::engine::container::options::YoloMode>,
     pub auto: Option<crate::engine::container::options::AutoMode>,
     pub plan: Option<crate::engine::container::options::PlanMode>,
@@ -51,6 +60,12 @@ pub struct AgentRunOptions {
     pub disallowed_tools: Vec<String>,
     pub initial_prompt: Option<String>,
     pub allow_docker: bool,
+    /// Use engine-owned writable settings copies for supported agents.
+    pub isolated_settings: bool,
+    /// Stream the selected provider's canonical one-shot print protocol.
+    pub native_print: bool,
+    /// Provider-owned session identifier, interpreted only in native mode.
+    pub native_session: Option<String>,
     pub non_interactive: bool,
     /// Optional explicit model name; if `None`, the engine emits no model flag.
     pub model: Option<String>,
@@ -82,6 +97,10 @@ pub struct AgentEngine {
     /// RAII guards so the files live as long as this engine instance and are
     /// removed on drop — no `/tmp` leakage.
     prompt_tempfiles: Arc<std::sync::Mutex<Vec<tempfile::NamedTempFile>>>,
+    #[cfg(all(test, unix))]
+    native_codex_auth_observer: Option<Arc<native_codex_auth_preparation_test::AuthObserver>>,
+    #[cfg(all(test, unix))]
+    native_codex_main_test_opt_in: bool,
 }
 
 impl AgentEngine {
@@ -93,6 +112,10 @@ impl AgentEngine {
             overlay_engine,
             container_runtime,
             prompt_tempfiles: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(all(test, unix))]
+            native_codex_auth_observer: None,
+            #[cfg(all(test, unix))]
+            native_codex_main_test_opt_in: false,
         }
     }
 
@@ -210,6 +233,63 @@ impl AgentEngine {
         run: &AgentRunOptions,
         credentials: &AgentCredentials,
     ) -> Result<Vec<ContainerOption>, EngineError> {
+        if run.native_session.is_some() && !run.native_print {
+            return Err(EngineError::Config(
+                "--native-session requires --native-print".into(),
+            ));
+        }
+        let native = if run.native_print {
+            if !matches!(run.launch_mode, LaunchMode::Stdio)
+                || run.allow_docker
+                || matches!(run.yolo, Some(YoloMode::Enabled))
+                || matches!(
+                    run.auto,
+                    Some(crate::engine::container::options::AutoMode::Enabled)
+                )
+                || matches!(run.plan, Some(PlanMode::Enabled))
+                || !run.allowed_tools.is_empty()
+                || !run.disallowed_tools.is_empty()
+                || run.system_prompt.is_some()
+            {
+                return Err(EngineError::ConflictingOptions(
+                    "native print requires plain stdio without extra provider flags".into(),
+                ));
+            }
+            let request = agent_matrix::NativePrintRequest::new(
+                agent.as_str(),
+                run.model.as_deref(),
+                run.native_session.as_deref(),
+            )?;
+            let prompt = run.initial_prompt.as_deref().ok_or_else(|| {
+                EngineError::Config("native print requires an initial prompt".into())
+            })?;
+            Some(request.invocation(prompt))
+        } else {
+            None
+        };
+        let orchestrated_identity = run
+            .startup_gate
+            .as_ref()
+            .and_then(|gate| gate.control.orchestrated_parts())
+            .map(|(_, identity)| identity);
+        if orchestrated_identity.is_some() {
+            if self.container_runtime.runtime_name() != "apple-containers" {
+                return Err(EngineError::OptionNotSupportedByBackend {
+                    option: "orchestrated startup gate".into(),
+                    backend: self.container_runtime.runtime_name().into(),
+                });
+            }
+            if !matches!(run.launch_mode, LaunchMode::Stdio) {
+                return Err(EngineError::ConflictingOptions(
+                    "orchestrated startup gate requires stdio launch mode".into(),
+                ));
+            }
+            if run.allow_docker {
+                return Err(EngineError::ConflictingOptions(
+                    "orchestrated startup gate does not support --allow-docker".into(),
+                ));
+            }
+        }
         let matrix = agent_matrix::matrix_for(agent.as_str())?;
 
         // Validate plan mode support.
@@ -249,7 +329,9 @@ impl AgentEngine {
         // matrix lacks an `acp_entrypoint`, so `entrypoint_for_acp` cannot fail
         // here in practice — the `?` is defence-in-depth.
         let acp = matches!(run.launch_mode, LaunchMode::Acp);
-        let entrypoint = if acp {
+        let entrypoint = if let Some((entrypoint, _)) = &native {
+            entrypoint.clone()
+        } else if acp {
             agent_matrix::entrypoint_for_acp(&matrix)?
         } else {
             agent_matrix::entrypoint_for(&matrix, run.non_interactive)
@@ -258,13 +340,35 @@ impl AgentEngine {
         let mut options = vec![
             ContainerOption::Image(image),
             ContainerOption::Entrypoint(entrypoint),
-            ContainerOption::Interactive(!run.non_interactive),
+            ContainerOption::Interactive(!run.non_interactive && !run.native_print),
             ContainerOption::AllowDocker(run.allow_docker),
             ContainerOption::Label {
                 key: "awman.session".into(),
                 value: session.id().to_string(),
             },
         ];
+        if run.native_print {
+            options.push(ContainerOption::NativePrint(true));
+        }
+        if let Some(identity) = orchestrated_identity {
+            let token_digest = identity
+                .token_digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            options.extend([
+                ContainerOption::Name(identity.container_name.clone()),
+                ContainerOption::Label {
+                    key: "dev.awman.orchestrator-launch".into(),
+                    value: token_digest,
+                },
+                ContainerOption::KeepContainer,
+            ]);
+        }
+        if let Some(gate) = &run.startup_gate {
+            options.push(ContainerOption::StartupGateTrustedTemplate);
+            options.push(ContainerOption::StartupGate(gate.clone()));
+        }
 
         // Select the persistent piped-stdio (`-i`, no PTY) container path when
         // launching over ACP. Emitted only when actually ACP so ordinary stdio
@@ -324,11 +428,14 @@ impl AgentEngine {
             options.push(ContainerOption::AgentModeFlags(mode_flags));
         }
 
+        if let Some((_, Some(prompt))) = &native {
+            options.push(ContainerOption::SeededPrompt(prompt.clone()));
+        }
         // Initial prompt. In interactive mode most agents receive it as a
         // trailing positional arg; agents whose bare positional means something
         // else (opencode: a project dir) declare a delivery flag in the matrix.
         // Non-interactive runs pipe it over stdin regardless.
-        if let Some(prompt) = run.initial_prompt.as_ref() {
+        if let Some(prompt) = run.initial_prompt.as_ref().filter(|_| !run.native_print) {
             options.push(ContainerOption::SeededPrompt(prompt.clone()));
             if let agent_matrix::InteractiveSeedDelivery::Flag(flag) =
                 matrix.interactive_seed_delivery
@@ -338,7 +445,7 @@ impl AgentEngine {
         }
 
         // Model flag.
-        if let Some(model) = run.model.as_deref() {
+        if let Some(model) = run.model.as_deref().filter(|_| !run.native_print) {
             let flag = agent_matrix::model_flag_for(&matrix, model)?;
             options.push(ContainerOption::Model { flag });
         }
@@ -346,7 +453,7 @@ impl AgentEngine {
         // Non-interactive: also surface as a discrete option so backends that
         // need to know can react (display purposes etc.). The actual
         // entrypoint already encoded it.
-        if run.non_interactive {
+        if run.non_interactive && !run.native_print {
             if let Some(flag) = matrix.non_interactive_flag {
                 options.push(ContainerOption::NonInteractivePrintFlag(flag.to_string()));
             }
@@ -402,6 +509,7 @@ impl AgentEngine {
             container_home: container_home.clone(),
             context_overlays: run.context_overlays.clone(),
             materialize_credentials: false,
+            isolated_settings: run.isolated_settings || run.native_print,
         };
         let (overlays, staged_credentials) =
             if matches!(&credentials.delivery, CredentialDelivery::File(_)) {
@@ -475,7 +583,29 @@ impl AgentEngine {
         credentials: &AgentCredentials,
         runtime: &dyn AgentRuntimeEngine,
     ) -> Result<ResolvedAgentOptions, EngineError> {
+        if run
+            .startup_gate
+            .as_ref()
+            .is_some_and(|gate| gate.control.orchestrated_parts().is_some())
+            && runtime.runtime_name() != "apple-containers"
+        {
+            return Err(EngineError::OptionNotSupportedByBackend {
+                option: "orchestrated startup gate".into(),
+                backend: runtime.runtime_name().into(),
+            });
+        }
+        if run.native_print && runtime.capabilities().kit_declarative {
+            return Err(EngineError::NotImplemented(
+                "native print requires a container-class runtime",
+            ));
+        }
         if runtime.capabilities().kit_declarative {
+            if run.startup_gate.is_some() {
+                return Err(EngineError::OptionNotSupportedByBackend {
+                    option: "startup gate".into(),
+                    backend: runtime.runtime_name().into(),
+                });
+            }
             let mut options = self.build_sandbox_options(session, agent, run)?;
             if !credentials.env_vars.is_empty() {
                 options.push(SandboxOption::AgentCredentials {
@@ -509,6 +639,11 @@ impl AgentEngine {
         agent: &AgentName,
         run: &AgentRunOptions,
     ) -> Result<Vec<SandboxOption>, EngineError> {
+        if run.native_print || run.native_session.is_some() {
+            return Err(EngineError::NotImplemented(
+                "native print requires a container-class runtime",
+            ));
+        }
         let matrix = agent_matrix::matrix_for(agent.as_str())?;
 
         // Parity validation with the container path so a sandbox-configured user
@@ -1347,7 +1482,7 @@ mod tests {
     }
 
     #[test]
-    fn build_options_antigravity_model_flag_returns_error() {
+    fn build_options_legacy_antigravity_model_becomes_canonical_agy_space_arg() {
         let tmp = tempfile::tempdir().unwrap();
         let (engine, session) = make_agent_engine(tmp.path());
         let agent = crate::data::session::AgentName::new("antigravity").unwrap();
@@ -1355,19 +1490,15 @@ mod tests {
             model: Some("gemini-3.5-flash".to_string()),
             ..Default::default()
         };
-        let result = engine.build_options(&session, &agent, &run);
+        let options = engine.build_options(&session, &agent, &run).unwrap();
         assert!(
-            result.is_err(),
-            "build_options with model for antigravity must return Err; got {result:?}"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("antigravity"),
-            "error must name the agent 'antigravity'; got: {msg}"
-        );
-        assert!(
-            msg.contains("does not support a model flag"),
-            "error must say 'does not support a model flag'; got: {msg}"
+            options.iter().any(|option| matches!(
+                option,
+                ContainerOption::Model {
+                    flag: crate::engine::container::options::ModelFlagForm::Argument(model),
+                } if model == "gemini-3.5-flash"
+            )),
+            "legacy input must emit the canonical agy `--model gemini-3.5-flash` option: {options:?}"
         );
     }
 
@@ -2692,3 +2823,24 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+pub(crate) mod native_codex_auth_preparation_test;
+
+#[cfg(all(test, unix))]
+pub(crate) mod native_codex_main_test_support;
+
+#[cfg(all(test, unix))]
+pub(crate) mod native_codex_main_a2a_test_support;
+
+#[cfg(all(test, unix))]
+pub(crate) mod native_codex_main_a2m_test_support;
+
+#[cfg(all(test, unix))]
+pub(crate) mod native_codex_main_a2m_freshness_test_support;
+
+#[cfg(all(test, unix))]
+pub(crate) mod native_codex_main_a2b_test_support;
+
+#[cfg(all(test, unix))]
+pub(crate) mod native_codex_main_entry_marker_support;

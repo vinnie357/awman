@@ -893,3 +893,11 @@ If you see this warning for a path that should exist, check:
 ---
 
 [← Configuration](07-configuration.md) · [Next: API & Remote Mode →](09-api-and-remote-mode.md)
+# Startup-gated bindings
+
+Startup-gate bindings are declared by the orchestrator's `request.json`, not by
+the ordinary overlay flag. Their guest paths are limited to `/workspace`,
+`/review`, `/work`, `/data`, `/mnt`, and `/output` or descendants. Binding paths
+must not overlap. During a gated launch ordinary overlays may not overlap
+`/bin`, `/sbin`, `/usr`, `/lib`, `/lib64`, `/etc`, `/proc`, `/sys`, `/dev`, or
+`/.awman/startup-gate`.

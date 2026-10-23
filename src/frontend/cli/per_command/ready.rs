@@ -110,9 +110,14 @@ impl ReadyFrontend for CliFrontend {
         // Write the summary box directly to stderr without the per-line
         // "awman:" prefix used for status updates — the box is multi-line
         // content that reads better unprefixed.
+        let verdict = if summary.failed_steps().is_empty() {
+            "awman is ready."
+        } else {
+            "awman is NOT ready: required steps failed."
+        };
         let _ = std::io::Write::write_all(
             &mut std::io::stderr(),
-            format!("\n{box_str}awman is ready.\n").as_bytes(),
+            format!("\n{box_str}{verdict}\n").as_bytes(),
         );
 
         let has_missing = summary
