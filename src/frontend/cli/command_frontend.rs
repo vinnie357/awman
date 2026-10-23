@@ -972,6 +972,38 @@ mod tests {
 
     // ─── flag_bool ────────────────────────────────────────────────────────────
 
+    /// Regression: with no TTY on stdin the frontend auto-detects
+    /// non-interactive mode, and the command it builds must see the same
+    /// mode. Otherwise `exec prompt` launches `container run -it` over piped
+    /// stdio and the runtime fails with ENOTTY.
+    #[test]
+    fn auto_detected_non_interactive_reaches_the_built_command_flag() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        let m = cmd
+            .try_get_matches_from(["awman", "exec", "prompt", "hi"])
+            .unwrap();
+        let mut f = CliFrontend::new(m);
+        f.non_interactive = true;
+        assert_eq!(
+            f.flag_bool(&["exec", "prompt"], "non-interactive").unwrap(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn interactive_frontend_leaves_absent_non_interactive_flag_false() {
+        let cmd = CommandCatalogue::get().build_clap_command();
+        let m = cmd
+            .try_get_matches_from(["awman", "exec", "prompt", "hi"])
+            .unwrap();
+        let mut f = CliFrontend::new(m);
+        f.non_interactive = false;
+        assert_eq!(
+            f.flag_bool(&["exec", "prompt"], "non-interactive").unwrap(),
+            Some(false)
+        );
+    }
+
     #[test]
     fn flag_bool_reads_set_true_flag_from_arg_matches() {
         let cmd = CommandCatalogue::get().build_clap_command();
