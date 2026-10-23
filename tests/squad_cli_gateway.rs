@@ -17,7 +17,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use awman::command::commands::squad::commands::SquadServeConfig;
 use awman::command::commands::squad::daemon_runtime::SquadDaemonHandles;
-use awman::command::commands::squad::gateway::{CreateTask, DaemonStatus, TaskGateway, UpdateTask};
+use awman::command::commands::squad::gateway::{
+    CreateTask, DaemonStatus, TaskDetail, TaskGateway, UpdateTask,
+};
 use awman::command::dispatch::catalogue::CommandCatalogue;
 use awman::command::dispatch::parsed_input::parse as parse_command_box;
 use awman::command::dispatch::{BuiltCommand, Dispatch, Engines};
@@ -161,6 +163,14 @@ impl TaskGateway for RecordingGateway {
             reason: None,
             unmet_env: Vec::new(),
         }])
+    }
+
+    async fn detail(&self, name: &str, limit: usize) -> Result<TaskDetail, CommandError> {
+        self.push(format!("detail:{name}:{limit}"));
+        Ok(TaskDetail {
+            task: task(name),
+            runs: Vec::new(),
+        })
     }
 
     async fn set_status(&self, name: &str, status: TaskStatus) -> Result<(), CommandError> {
@@ -333,11 +343,12 @@ async fn cli_crud_uses_exactly_one_gateway_call_and_no_frontend_validation() {
             vec!["create:not a slug".to_string()],
         ),
         ("squad list", vec!["list".to_string()]),
-        // `show` is the contract-pinned exception: Layer 2 combines the
-        // task and its history with one `get` plus one `runs` call.
+        // `show` is one `detail` call: the task and its history must come
+        // from one snapshot, or a scheduler tick landing between two reads
+        // tears them apart (a run listed that the task does not know about).
         (
             "squad show recorded",
-            vec!["get:recorded".to_string(), "runs:recorded:20".to_string()],
+            vec!["detail:recorded:20".to_string()],
         ),
         // WI 0110: a scripted edit is one `update` call, exactly like the
         // other CRUD verbs, with no frontend-side validation of its own.
@@ -1162,6 +1173,34 @@ async fn daemon_command(base: &str, subcommand: &str, args: &[&str]) -> Value {
         .expect("daemon command JSON")
 }
 
+/// Run a CLI `--json` command bracketed by two daemon reads of the same
+/// command, returning `(cli_payload, daemon_payload)` from a round in which the
+/// daemon's answer did not change. The live scheduler may evaluate the task at
+/// any tick; a round it lands in is retried rather than compared, so a
+/// mismatch is a real CLI/daemon divergence and never a tick race.
+async fn cli_payload_against_settled_daemon(
+    root: &Path,
+    cwd: &Path,
+    cli_args: &[&str],
+    base: &str,
+    subcommand: &str,
+    args: &[&str],
+) -> (Value, Value) {
+    for _ in 0..5 {
+        let before = daemon_command(base, subcommand, args).await;
+        let cli = stdout_json(&run_binary(root, cwd, cli_args));
+        let after = daemon_command(base, subcommand, args).await;
+        if before == after {
+            let payload = cli
+                .get("payload")
+                .cloned()
+                .expect("CLI JSON must contain a payload");
+            return (payload, after);
+        }
+    }
+    panic!("daemon state for {subcommand} never settled across five rounds");
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_crud_round_trip_and_json_payloads_match_the_live_daemon() {
@@ -1198,30 +1237,32 @@ async fn cli_crud_round_trip_and_json_payloads_match_the_live_daemon() {
         String::from_utf8_lossy(&add.stderr)
     );
 
-    let list_json = stdout_json(&run_binary(
+    let list_payload = cli_payload_against_settled_daemon(
         root.path(),
         &repo,
         &["squad", "list", "--json"],
-    ));
-    let list_payload = list_json
-        .get("payload")
-        .expect("CLI list JSON must contain a payload");
+        &base,
+        "squad list",
+        &[],
+    )
+    .await;
     assert_eq!(
-        list_payload,
-        &daemon_command(&base, "squad list", &[]).await
+        list_payload.0, list_payload.1,
+        "CLI list must match the daemon"
     );
 
-    let show_json = stdout_json(&run_binary(
+    let show_payload = cli_payload_against_settled_daemon(
         root.path(),
         &repo,
         &["squad", "show", "cli-roundtrip", "--json"],
-    ));
-    let show_payload = show_json
-        .get("payload")
-        .expect("CLI show JSON must contain a payload");
+        &base,
+        "squad show",
+        &["cli-roundtrip"],
+    )
+    .await;
     assert_eq!(
-        show_payload,
-        &daemon_command(&base, "squad show", &["cli-roundtrip"]).await
+        show_payload.0, show_payload.1,
+        "CLI show must match the daemon"
     );
 
     let pause = run_binary(root.path(), &repo, &["squad", "pause", "cli-roundtrip"]);
