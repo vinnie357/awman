@@ -35,25 +35,26 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Install agent binary ──────────────────────────────────────────────────────
-# Codex CLI is installed via OpenAI's official installer, which fetches the
-# correct prebuilt binary for the current architecture. The installer drops the
-# binary under the invoking user's ~/.local/bin; copy it into /usr/local/bin so
-# it is on PATH for every user (including the runtime `awman` user below).
+# Codex CLI is installed via OpenAI's official installer into a shared package
+# root. Codex locates its package by canonicalizing its own executable and
+# expecting `<pkg>/bin/codex` next to `<pkg>/codex-package.json`; the app-server
+# daemon refuses to start without that layout. So the binary must NOT be copied
+# out of the package: keep the installer's /usr/local/bin/codex symlink, which
+# resolves back into /opt/codex/packages/standalone/current/bin/codex.
 #
-# The installer also unpacks a `codex-code-mode-host` helper (required for
-# Codex's Code Mode tool execution) into its release directory, but upstream's
-# install.sh only symlinks it into ~/.local/bin on macOS — on Linux it stays
-# un-linked, so Code Mode fails closed with "host executable was not found"
-# even though the binary was downloaded. Install it from the release
-# directory explicitly so Code Mode works from this Linux-based image too.
+# CODEX_HOME is set only for the installer. At runtime it stays default
+# (~/.codex) so auth and config live in the user's home. The package tree is
+# made world-readable so the runtime `awman` user can resolve it.
+#
+# The installer also unpacks a `codex-code-mode-host` helper but only links it
+# on macOS. Link it onto PATH here when present so PATH callers find it too.
 RUN curl -fsSL --retry 5 --retry-delay 2 --retry-max-time 120 \
-        https://chatgpt.com/codex/install.sh | sh \
-    && codex_bin="$(command -v codex || true)" \
-    && [ -n "$codex_bin" ] || codex_bin="$HOME/.local/bin/codex" \
-    && install -m 0755 "$codex_bin" /usr/local/bin/codex \
-    && install -m 0755 \
-        "$HOME/.codex/packages/standalone/current/bin/codex-code-mode-host" \
-        /usr/local/bin/codex-code-mode-host
+        https://chatgpt.com/codex/install.sh \
+        | CODEX_HOME=/opt/codex CODEX_INSTALL_DIR=/usr/local/bin sh \
+    && chmod -R a+rX /opt/codex \
+    && test -L /usr/local/bin/codex \
+    && host=/opt/codex/packages/standalone/current/bin/codex-code-mode-host \
+    && if [ -e "$host" ]; then ln -sf "$host" /usr/local/bin/codex-code-mode-host; fi
 
 # ── awman user + workspace (idempotent against a base that already created it) ─
 # Outer braces keep the && chain associated with the user-creation block,
@@ -72,6 +73,8 @@ WORKDIR /workspace
 
 # ── Smoke test: run as the runtime user so we verify the binary is on PATH and
 # executable from the actual entrypoint context, not just for root. ───────────
+# The package-layout check mirrors what codex itself requires at daemon start.
 RUN test -x "$(command -v codex)" \
     && test -x "$(command -v bwrap)" \
-    && test -x "$(command -v codex-code-mode-host)"
+    && test -x "$(command -v codex-code-mode-host)" \
+    && p="$(readlink -f "$(command -v codex)")"; [ "$(basename "$(dirname "$p")")" = bin ] && test -r "$(dirname "$p")/../codex-package.json"
