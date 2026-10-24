@@ -25,9 +25,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: awman-macos-arm64
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            artifact: awman-windows-amd64.exe
+          # Windows is dropped until it builds again: https://github.com/vinnie357/awman/issues/26
 
     steps:
       - uses: actions/checkout@v7
@@ -51,10 +49,6 @@ jobs:
       - name: Rename binary (unix)
         if: runner.os != 'Windows'
         run: cp target/${{ matrix.target }}/release/awman ${{ matrix.artifact }}
-
-      - name: Rename binary (windows)
-        if: runner.os == 'Windows'
-        run: cp target/${{ matrix.target }}/release/awman.exe ${{ matrix.artifact }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
