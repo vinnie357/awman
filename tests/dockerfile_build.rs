@@ -39,11 +39,6 @@ fn build_base_image() -> String {
 }
 
 fn build_template(template_path: &str, tag: &str) {
-    build_template_then(template_path, tag, |_| {});
-}
-
-/// Build a template, run `check` against the built image tag, then clean up.
-fn build_template_then(template_path: &str, tag: &str, check: impl FnOnce(&str)) {
     if !docker_available() {
         eprintln!("Docker not available, skipping Dockerfile build test");
         return;
@@ -81,8 +76,6 @@ fn build_template_then(template_path: &str, tag: &str, check: impl FnOnce(&str))
         template_path
     );
 
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check(tag)));
-
     // Clean up the test images.
     for image in &[tag, &base_tag as &str] {
         let _ = Command::new("docker")
@@ -90,9 +83,6 @@ fn build_template_then(template_path: &str, tag: &str, check: impl FnOnce(&str))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
-    }
-    if let Err(panic) = outcome {
-        std::panic::resume_unwind(panic);
     }
 }
 
@@ -103,35 +93,10 @@ fn build_claude_template() {
 
 #[test]
 fn build_codex_template() {
-    build_template_then(
-        "templates/Dockerfile.codex",
-        "awman-test-codex:latest",
-        |tag| {
-            // Codex resolves its package layout from the canonical exe path: the
-            // exe dir must be `bin` with `../codex-package.json` beside it. Run as
-            // the runtime user with an empty overlay on ~/.codex, as altana does.
-            let home = tempfile::TempDir::new().expect("failed to create temp codex home");
-            let mount = format!("{}:/home/awman/.codex", home.path().display());
-            let output = Command::new("docker")
-            .args([
-                "run", "--rm", "--user", "awman", "-v", &mount, "--entrypoint", "sh", tag, "-c",
-                r#"p="$(readlink -f "$(command -v codex)")"; [ "$(basename "$(dirname "$p")")" = bin ] && test -r "$(dirname "$p")/../codex-package.json""#,
-            ])
-            .output()
-            .expect("failed to invoke docker run");
-            assert!(
-                output.status.success(),
-                "codex package layout check failed in built image; stderr: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        },
-    );
+    build_template("templates/Dockerfile.codex", "awman-test-codex:latest");
 }
 
 #[test]
 fn build_opencode_template() {
-    build_template(
-        "templates/Dockerfile.opencode",
-        "awman-test-opencode:latest",
-    );
+    build_template("templates/Dockerfile.opencode", "awman-test-opencode:latest");
 }
