@@ -180,3 +180,7 @@ path = "tests/squad_env_cli.rs"
 [[test]]
 name = "squad_env_daemon"
 path = "tests/squad_env_daemon.rs"
+
+[[test]]
+name = "dockerfile_build"
+path = "tests/dockerfile_build.rs"

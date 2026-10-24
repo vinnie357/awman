@@ -106,4 +106,68 @@ mod tests {
         assert!(sbx_kit_template_for("actualagy").is_none());
         assert!(sbx_apply_script_for("actualagy").is_none());
     }
+
+    const CODEX_DISCRIMINATOR: &str = r#"p="$(readlink -f "$(command -v codex)")"; [ "$(basename "$(dirname "$p")")" = bin ] && test -r "$(dirname "$p")/../codex-package.json""#;
+
+    fn codex_template() -> &'static str {
+        agent_dockerfile_for("codex").expect("codex template exists")
+    }
+
+    #[test]
+    fn codex_template_does_not_copy_codex_binary_into_usr_local_bin() {
+        for line in codex_template().lines() {
+            let l = line.trim();
+            if l.starts_with('#') {
+                continue;
+            }
+            assert!(
+                !((l.contains("install ") || l.contains("cp ")) && l.contains("codex_bin")),
+                "codex template must keep the installer symlink, not copy the binary: {l}"
+            );
+            assert!(
+                !l.contains("/usr/local/bin/codex"),
+                "codex template must not write a codex binary into /usr/local/bin: {l}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_template_installs_with_codex_home_opt_codex() {
+        let t = codex_template();
+        assert!(
+            t.contains("CODEX_HOME=/opt/codex"),
+            "install must set CODEX_HOME=/opt/codex"
+        );
+        assert!(
+            t.contains("CODEX_INSTALL_DIR=/usr/local/bin"),
+            "install must set CODEX_INSTALL_DIR=/usr/local/bin"
+        );
+        assert!(
+            t.contains("chmod -R a+rX /opt/codex"),
+            "package tree must be world-readable"
+        );
+    }
+
+    #[test]
+    fn codex_template_has_no_runtime_codex_home_env() {
+        for line in codex_template().lines() {
+            let l = line.trim_start();
+            assert!(
+                !(l.starts_with("ENV") && l.contains("CODEX_HOME")),
+                "runtime CODEX_HOME must stay default: {l}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_template_smoke_runs_package_layout_discriminator_as_awman() {
+        let t = codex_template();
+        let user = t
+            .find("USER awman")
+            .expect("template must switch to USER awman");
+        let smoke = t
+            .find(CODEX_DISCRIMINATOR)
+            .expect("smoke must run the package-layout discriminator");
+        assert!(smoke > user, "discriminator must run after USER awman");
+    }
 }
