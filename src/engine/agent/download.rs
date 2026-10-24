@@ -11,7 +11,7 @@ use crate::engine::error::EngineError;
 
 /// GitHub raw URL prefix for awman-shipped Dockerfiles.
 pub const DOCKERFILE_RAW_URL_PREFIX: &str =
-    "https://raw.githubusercontent.com/prettysmartdev/awman/main/templates";
+    "https://raw.githubusercontent.com/vinnie357/awman/main/templates";
 
 /// Construct the canonical raw URL for an agent Dockerfile.
 pub fn dockerfile_url_for(agent: &str) -> String {
