@@ -31,7 +31,7 @@ CMD ["/bin/bash"]
 # The base image does not ship it, so install it here (as root, before dropping
 # to the runtime user) and prune apt lists to keep the layer small.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bubblewrap \
+    && apt-get install -y --no-install-recommends bubblewrap procps \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Install agent binary ──────────────────────────────────────────────────────
