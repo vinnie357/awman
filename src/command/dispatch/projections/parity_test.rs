@@ -383,7 +383,7 @@ fn edge_repeated_flag_accumulates_parity() {
 }
 
 /// Tokens that look like flags are captured as positionals verbatim after `--`,
-/// identically to clap's trailing-var-arg + allow-hyphen-values handling.
+/// identically to clap's handling.
 #[test]
 fn edge_flag_looking_values_after_double_dash_parity() {
     let cat = CommandCatalogue::get();
@@ -504,13 +504,6 @@ fn edge_dash_words_stay_in_the_prompt_parity() {
 /// expected typed [`CommandError`] from `parse_raw_args`, and clap rejects the
 /// same inputs.
 ///
-/// The unknown-flag case uses `config get` (a plain-positional command) rather
-/// than `exec prompt`: `exec prompt`'s trailing var-arg is declared
-/// `allow_hyphen_values`, so clap ABSORBS a leading `--unknown` into the prompt
-/// positional instead of rejecting it. `parse_raw_args` deliberately stays
-/// stricter there (unknown flag → structured error, never a silently-dropped
-/// flag — WI-0097 Finding A), so the two projections intentionally diverge for
-/// that one shape and it must not be asserted as parity.
 #[test]
 fn coercion_errors_produce_typed_errors_and_clap_rejects() {
     use crate::command::error::CommandError;

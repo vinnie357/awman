@@ -308,6 +308,11 @@ impl CommandCatalogue {
     }
 }
 
+/// A hyphen-prefixed token that is a value, not a flag: `-` or a number.
+fn is_positional_dash_word(arg: &str) -> bool {
+    arg == "-" || (arg.starts_with('-') && arg[1..].parse::<f64>().is_ok())
+}
+
 fn parse_against_spec(
     spec: &CommandSpec,
     path: &[&str],
@@ -316,28 +321,21 @@ fn parse_against_spec(
     let mut flags: BTreeMap<String, ParsedFlag> = BTreeMap::new();
     let mut positionals: Vec<String> = Vec::new();
 
-    // Whether the command's last positional is a greedy trailing var-arg, and
-    // how many fixed positionals precede it. Once positional collection reaches
-    // the trailing argument, remaining tokens (including hyphen-prefixed ones)
-    // are captured verbatim — matching clap's `trailing_var_arg` semantics.
+    // Trailing var-arg tokens may interleave with flags, so flags after the
+    // prompt parse as flags. Negative numbers and a bare `-` are prompt words,
+    // matching clap's `allow_negative_numbers`.
     let trailing = spec
         .arguments
         .last()
         .is_some_and(|a| matches!(a.kind, ArgumentKind::TrailingVarArgs));
-    let fixed_arg_count = spec
-        .arguments
-        .iter()
-        .filter(|a| !matches!(a.kind, ArgumentKind::TrailingVarArgs))
-        .count();
 
-    let mut greedy = false;
     let mut after_double_dash = false;
 
     let mut cursor = RawArgCursor::new(args, path);
     while !cursor.done() {
         let arg = cursor.peek().expect("not done").clone();
 
-        if greedy || after_double_dash {
+        if after_double_dash || (trailing && is_positional_dash_word(&arg)) {
             positionals.push(arg);
             cursor.advance();
             continue;
@@ -372,11 +370,6 @@ fn parse_against_spec(
             cursor.apply_flag(flag_spec, None, &mut flags)?;
         } else {
             positionals.push(arg);
-            // Begin greedy capture once we have started filling a trailing
-            // var-arg (i.e. once positionals exceed the fixed leading ones).
-            if trailing && positionals.len() > fixed_arg_count {
-                greedy = true;
-            }
             cursor.advance();
         }
     }
@@ -950,13 +943,13 @@ pub(crate) mod shared_cases {
             api_reads: &[],
         },
         Case {
-            name: "trailing arguments keep hyphen-leading tokens",
+            name: "trailing arguments keep dash words",
             path: PROMPT,
             canonical: PROMPT,
-            args: &["hello", "--not-a-flag", "-x"],
+            args: &["hello", "-5", "-"],
             reads: &[
-                Read::Arg("prompt", "hello --not-a-flag -x"),
-                Read::Args("prompt", &["hello", "--not-a-flag", "-x"]),
+                Read::Arg("prompt", "hello -5 -"),
+                Read::Args("prompt", &["hello", "-5", "-"]),
             ],
             tui_reads: &[],
             api_reads: &[],

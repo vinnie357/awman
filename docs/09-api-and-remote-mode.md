@@ -180,6 +180,8 @@ The `exec` subcommand group provides two commands for running agent tasks non-in
 
 Launches an agent container with a pre-supplied prompt. Behaves identically to `awman chat`, except the initial prompt is baked into the launch arguments rather than requiring a live terminal session.
 
+Flags may come before or after the prompt. Put `--` before prompt text that starts with a hyphen: `awman exec prompt -- --explain this`.
+
 ```sh
 # Run a single task and exit
 awman exec prompt "Fix the failing tests in src/api"

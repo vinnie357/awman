@@ -99,8 +99,8 @@ pub enum ArgumentKind {
     OptionalString,
     Path,
     OptionalPath,
-    /// `<COMMAND>...` style: collect every remaining token verbatim,
-    /// including hyphen-prefixed values, into a single argument.
+    /// `<COMMAND>...` style: collect positional tokens into one argument.
+    /// Flags may follow them; `--` makes the remaining tokens positional.
     TrailingVarArgs,
 }
 
