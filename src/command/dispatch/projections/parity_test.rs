@@ -444,6 +444,58 @@ fn edge_greedy_trailing_positional_parity() {
     assert_eq!(clap_prompt, vec!["fix", "the", "bug"]);
 }
 
+/// Flags written after the prompt parse as flags. Joining them into the prompt
+/// drops `--model` and `--overlay` and sends awman's argv to the agent.
+#[test]
+fn edge_flags_after_prompt_are_not_absorbed_parity() {
+    let cat = CommandCatalogue::get();
+    let path = ["exec", "prompt"];
+    let argv = [
+        "say hi",
+        "--agent",
+        "claude",
+        "--model",
+        "m",
+        "--overlay",
+        "env(FOO)",
+        "--non-interactive",
+    ];
+
+    let parsed = cat.parse_raw_args(&path, &to_vec(&argv)).unwrap();
+    assert_eq!(parsed.argument("prompt").as_deref(), Some("say hi"));
+    assert_eq!(parsed.flag_string("agent").as_deref(), Some("claude"));
+    assert_eq!(parsed.flag_string("model").as_deref(), Some("m"));
+    assert_eq!(parsed.flag_strings("overlay"), vec!["env(FOO)"]);
+    assert_eq!(parsed.flag_bool("non-interactive"), Some(true));
+
+    let m = clap_leaf(cat, &path, &argv);
+    let clap_prompt: Vec<String> = m
+        .get_many::<String>("prompt")
+        .map(|v| v.cloned().collect())
+        .unwrap_or_default();
+    assert_eq!(clap_prompt, vec!["say hi".to_string()]);
+    assert_eq!(m.get_one::<String>("model").map(String::as_str), Some("m"));
+    assert!(m.get_flag("non-interactive"));
+}
+
+/// Negative numbers and a bare `-` stay prompt words on both projections.
+#[test]
+fn edge_dash_words_stay_in_the_prompt_parity() {
+    let cat = CommandCatalogue::get();
+    let path = ["exec", "prompt"];
+    let argv = ["add", "-5", "-", "words"];
+
+    let parsed = cat.parse_raw_args(&path, &to_vec(&argv)).unwrap();
+    assert_eq!(parsed.arguments("prompt"), argv.to_vec());
+
+    let m = clap_leaf(cat, &path, &argv);
+    let clap_prompt: Vec<String> = m
+        .get_many::<String>("prompt")
+        .map(|v| v.cloned().collect())
+        .unwrap_or_default();
+    assert_eq!(clap_prompt, argv.to_vec());
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Type-coercion errors: raw_args rejects exactly where clap rejects
 // ═══════════════════════════════════════════════════════════════════════════
