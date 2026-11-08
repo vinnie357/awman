@@ -383,7 +383,7 @@ fn edge_repeated_flag_accumulates_parity() {
 }
 
 /// Tokens that look like flags are captured as positionals verbatim after `--`,
-/// identically to clap's trailing-var-arg + allow-hyphen-values handling.
+/// identically to clap's handling.
 #[test]
 fn edge_flag_looking_values_after_double_dash_parity() {
     let cat = CommandCatalogue::get();
@@ -444,6 +444,58 @@ fn edge_greedy_trailing_positional_parity() {
     assert_eq!(clap_prompt, vec!["fix", "the", "bug"]);
 }
 
+/// Flags written after the prompt parse as flags. Joining them into the prompt
+/// drops `--model` and `--overlay` and sends awman's argv to the agent.
+#[test]
+fn edge_flags_after_prompt_are_not_absorbed_parity() {
+    let cat = CommandCatalogue::get();
+    let path = ["exec", "prompt"];
+    let argv = [
+        "say hi",
+        "--agent",
+        "claude",
+        "--model",
+        "m",
+        "--overlay",
+        "env(FOO)",
+        "--non-interactive",
+    ];
+
+    let parsed = cat.parse_raw_args(&path, &to_vec(&argv)).unwrap();
+    assert_eq!(parsed.argument("prompt").as_deref(), Some("say hi"));
+    assert_eq!(parsed.flag_string("agent").as_deref(), Some("claude"));
+    assert_eq!(parsed.flag_string("model").as_deref(), Some("m"));
+    assert_eq!(parsed.flag_strings("overlay"), vec!["env(FOO)"]);
+    assert_eq!(parsed.flag_bool("non-interactive"), Some(true));
+
+    let m = clap_leaf(cat, &path, &argv);
+    let clap_prompt: Vec<String> = m
+        .get_many::<String>("prompt")
+        .map(|v| v.cloned().collect())
+        .unwrap_or_default();
+    assert_eq!(clap_prompt, vec!["say hi".to_string()]);
+    assert_eq!(m.get_one::<String>("model").map(String::as_str), Some("m"));
+    assert!(m.get_flag("non-interactive"));
+}
+
+/// Negative numbers and a bare `-` stay prompt words on both projections.
+#[test]
+fn edge_dash_words_stay_in_the_prompt_parity() {
+    let cat = CommandCatalogue::get();
+    let path = ["exec", "prompt"];
+    let argv = ["add", "-5", "-", "words"];
+
+    let parsed = cat.parse_raw_args(&path, &to_vec(&argv)).unwrap();
+    assert_eq!(parsed.arguments("prompt"), argv.to_vec());
+
+    let m = clap_leaf(cat, &path, &argv);
+    let clap_prompt: Vec<String> = m
+        .get_many::<String>("prompt")
+        .map(|v| v.cloned().collect())
+        .unwrap_or_default();
+    assert_eq!(clap_prompt, argv.to_vec());
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Type-coercion errors: raw_args rejects exactly where clap rejects
 // ═══════════════════════════════════════════════════════════════════════════
@@ -452,13 +504,6 @@ fn edge_greedy_trailing_positional_parity() {
 /// expected typed [`CommandError`] from `parse_raw_args`, and clap rejects the
 /// same inputs.
 ///
-/// The unknown-flag case uses `config get` (a plain-positional command) rather
-/// than `exec prompt`: `exec prompt`'s trailing var-arg is declared
-/// `allow_hyphen_values`, so clap ABSORBS a leading `--unknown` into the prompt
-/// positional instead of rejecting it. `parse_raw_args` deliberately stays
-/// stricter there (unknown flag → structured error, never a silently-dropped
-/// flag — WI-0097 Finding A), so the two projections intentionally diverge for
-/// that one shape and it must not be asserted as parity.
 #[test]
 fn coercion_errors_produce_typed_errors_and_clap_rejects() {
     use crate::command::error::CommandError;
